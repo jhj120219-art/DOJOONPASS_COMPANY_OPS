@@ -1,14 +1,20 @@
 """Daily History Generator (docs/06_DAILY_HISTORY_SPEC.md).
 
 Reads KEEP candidates from a History Repository for one target date and
-writes runtime/daily/YYYY-MM-DD.md. Read-only against the Repository —
+writes YYYY-MM-DD.md to `output_dir`. Read-only against the Repository —
 never adds, deletes, or modifies a stored HistoryCandidate; only calls
 `repository.list()`.
 
-Desktop 4 Local Master (D:\\DOJOONPASS_COO\\history\\daily\\) is
-intentionally NOT used yet — this Phase only writes inside the project's
-own runtime/daily/. GitHub Backup, Scheduler, Transport, Notion, and
-Monthly History are all out of scope here too.
+Per docs/06 section 5, the official Company History Local Master lives
+outside this project's own directory tree ("프로그램과 History 분리").
+This module does not resolve or hardcode that location itself — docs/05
+section 69 and docs/08 section 91 both defer the concrete path to the
+implementation/deployment step, and the existing `output_dir` parameter
+is that seam: pass the real Local Master path there. When `output_dir`
+is omitted, this function falls back to `DEFAULT_DAILY_DIR` (this
+project's own runtime/daily/), which is a local/dev fallback only, not
+the official Local Master. GitHub Backup, Scheduler, Transport, Notion,
+and Monthly History are all out of scope here too.
 """
 
 from __future__ import annotations

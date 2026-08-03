@@ -546,6 +546,35 @@ Backup 전에 최소한 알려진 Secret 파일이 포함되지 않았는지 확
 
 기본적으로 Backup 대상 Directory 자체를 제한하는 것이 더 중요하다.
 
+Secret Scan에서 다음과 같이 알려진 Secret 파일이 발견되면:
+
+    .env
+    .env.local
+    .env.production
+    .env.development
+    id_rsa
+    id_ed25519
+    *.pem
+    *.p12
+    *.key
+
+다음을 따른다.
+
+1. BackupStatus를 BACKUP_FAILED로 처리한다.
+2. git add를 시작하지 않는다.
+3. git commit을 수행하지 않는다.
+4. git push를 수행하지 않는다.
+5. 발견된 Secret 파일의 상대경로를 Error Reason에 기록한다.
+6. 사용자가 Secret을 제거하거나 Backup 대상에서 제외한 뒤 다시 Backup을 실행해야 한다.
+
+자동 제외(Auto Skip)는 하지 않는다.
+
+자동으로 계속 진행하지 않는다.
+
+자동 복구도 하지 않는다.
+
+Secret이 발견된 경우의 처리는 삭제 감지(section 43~47)와 동일한 성격의 안전장치다 — 자동화가 판단을 대신하지 않고, 사람이 확인한 뒤 재실행하는 구조를 따른다.
+
 ---
 
 ## 30. Backup Working Copy 생성
