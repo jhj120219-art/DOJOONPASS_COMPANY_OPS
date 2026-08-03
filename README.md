@@ -128,6 +128,8 @@ Desktop 3 ─ Reporter ─┘
 | Raw Event      | Event Storage             |
 | Runtime State  | Desktop 4 Runtime         |
 
+본 저장소와 `DOJOONPASS_COO` 사이의 Source of Truth 경계, 참조 방향, 변경 관리 규칙은 `DOJOONPASS_COO/00_foundation/04_repository_contract.md`의 「COO ↔ COMPANY_OPS Repository Contract v1」을 따른다.
+
 ---
 
 # 6. 핵심 원칙

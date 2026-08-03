@@ -17,6 +17,8 @@
 | 버전 | V1 |
 | 원칙 | 최소 기능으로 구축하고 도준패스 본 서비스 개발을 방해하지 않는다 |
 
+본 스펙은 `DOJOONPASS_COO/00_foundation/04_repository_contract.md`의 Repository Contract 범위 내에서 유효하며, 회사 전체 원칙과 충돌 시 Contract를 우선한다.
+
 이 문서는 DOJOONPASS Company Ops V1의 개발 기준을 정의한다.
 
 Company Ops는 도준패스 Product 및 Content OS와 분리된 별도의 내부 운영 프로젝트로 관리한다.
