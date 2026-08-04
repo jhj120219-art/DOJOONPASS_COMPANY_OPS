@@ -1267,6 +1267,8 @@ Burn-in 이후 다음을 검토한다.
 
     [ ] Burn-in
 
+    [ ] Release Environment Check (§101)
+
 ---
 
 # 78. V1 Acceptance 조건
@@ -1783,6 +1785,41 @@ Company Ops V1의 목적은 내부 관리 시스템 자체를 거대한 Product�
     Launch
 
 이다.
+
+---
+
+# 101. Release Environment Check
+
+Repository는 src-layout 구조다 (`src/app/runner.py`).
+
+실행 위치: Repository Root (`git rev-parse --show-toplevel` 결과 디렉터리)
+
+    1. python --version
+
+    2. python -m pytest
+
+    3. python -m compileall src
+
+    4. python -m src.app.runner
+
+    5. python -c "import src.app.runner"
+
+판정 기준:
+
+    5개 항목 모두 PASS → PASS
+
+    Pytest 또는 Compile 실패 → A. 코드 문제
+
+    Python/Import(4, 5) 실패 → B. 환경 문제
+
+금지:
+
+    import app.runner 를 검사 항목으로 사용하지 않는다.
+
+    (근거: `app` 최상위 패키지는 Repository 어디에도 존재하지 않는다.
+    실제 모듈은 `src/app/runner.py`이며, Root에서 유효한 경로는
+    `src.app.runner` 뿐이다. docs·기존 코드 어디에도
+    `import app.runner`를 검사 대상으로 삼을 근거가 없었다.)
 
 ---
 
