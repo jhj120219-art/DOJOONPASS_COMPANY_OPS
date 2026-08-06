@@ -33,6 +33,23 @@ class NotionClient:
             return HealthCheckResult(ok=False, database_id=self._database_id, error=str(exc))
         return HealthCheckResult(ok=True, database_id=self._database_id)
 
+    def get_database_parent(self) -> Mapping[str, Any]:
+        """The `parent` object of the Database this client is bound to.
+
+        Notion returns one of:
+            {"type": "page_id",   "page_id": "..."}    -> nested under a Page
+            {"type": "workspace", "workspace": true}   -> at workspace root
+
+        Used by `notion.dashboard` to place the OPS_* databases beside an
+        already-existing database instead of inventing a new location.
+        """
+        database = self._transport.retrieve_database(self._database_id)
+        return database.get("parent", {})
+
+    def search_pages(self) -> list[Mapping[str, Any]]:
+        """Pages this integration can see (read-only diagnostic)."""
+        return self._transport.search_pages()
+
     def get_database_schema(self) -> Mapping[str, Any]:
         """Notion Database Auto Bootstrap: 현재 Property 정의(스키마) 조회.
 
@@ -70,8 +87,25 @@ class NotionClient:
         return results[0] if results else None
 
     def create_project(self, properties: Mapping[str, Any]) -> Mapping[str, Any]:
-        """docs §6 CREATE branch."""
+        """docs §6 CREATE branch.
+
+        Generic "create one row in the database this client is bound to" —
+        named for its original PROJECTS use. `notion.dashboard` reuses it
+        with a client bound to an OPS_* database instead of adding a
+        second, identical method.
+        """
         return self._transport.create_page(self._database_id, properties)
+
+    def create_database(
+        self, *, parent_page_id: str, title: str, properties: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Create a brand-new Database under `parent_page_id`.
+
+        Used only by `notion.dashboard`'s one-time bootstrap (CEO Decision
+        ④). Unlike every other method here, this does not act on
+        `self._database_id` — it creates a database that does not exist yet.
+        """
+        return self._transport.create_database(parent_page_id, title, properties)
 
     def update_project(self, page_id: str, properties: Mapping[str, Any]) -> Mapping[str, Any]:
         """docs §6 UPDATE branch."""

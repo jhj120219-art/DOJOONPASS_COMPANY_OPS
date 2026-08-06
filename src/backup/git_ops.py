@@ -34,6 +34,40 @@ class GitOperationError(Exception):
     """Raised when a git subprocess call exits with a non-zero status."""
 
 
+# docs/08_BACKUP_SPEC.md §62 (Authentication 실패 -> BACKUP_FAILED, "무한
+# Retry Loop를 만들지 않는다") vs §19 (Internet OFF / GitHub 장애 / Push
+# 실패 -> BACKUP_PENDING, 다음 Runner에서 재시도). The two are decided from
+# git's own stderr, since that is the only signal available here.
+#
+# Matching is substring-based and lowercase; these are the phrases git and
+# the common credential helpers actually emit for a credential/permission
+# problem, as opposed to a transient network or remote-side failure.
+_AUTH_FAILURE_MARKERS = (
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "invalid username or password",
+    "permission denied",
+    "access denied",
+    "403 forbidden",
+    "support for password authentication was removed",
+    "terminal prompts disabled",
+    "no anonymous write access",
+)
+
+
+def is_authentication_failure(message: str) -> bool:
+    """True when `message` (a GitOperationError's text) indicates a
+    credential/permission problem rather than a transient failure.
+
+    docs/08 §21 classifies "Permission 오류 / 인증 설정 오류" as
+    BACKUP_FAILED — retrying those on a schedule cannot fix them and only
+    produces the infinite retry loop §62 forbids.
+    """
+    lowered = message.lower()
+    return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
+
+
 @dataclass(frozen=True)
 class GitStatusResult:
     has_changes: bool

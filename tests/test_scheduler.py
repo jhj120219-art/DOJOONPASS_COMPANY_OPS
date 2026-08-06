@@ -132,10 +132,14 @@ class DuplicateExecutionTests(SchedulerTestCase):
         first = self._run(now=now)
         # simulate a second Runner starting while the (already-released,
         # for a normal run) lock... so instead directly pre-create a fresh
-        # lock to simulate genuine overlap:
+        # lock to simulate genuine overlap. Per docs/07 §27, staleness is
+        # decided by whether the recorded process is actually running, so
+        # this must record a PID that genuinely is (this test process's own).
+        import os as _os
+
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path.write_text(
-            json.dumps({"process_id": 999999, "created_at": now.isoformat(timespec="seconds")}),
+            json.dumps({"process_id": _os.getpid(), "created_at": now.isoformat(timespec="seconds")}),
             encoding="utf-8",
         )
 
@@ -162,30 +166,27 @@ class DuplicateExecutionTests(SchedulerTestCase):
 
 
 class FailureIsolationTests(SchedulerTestCase):
-    def test_failure_on_one_date_stops_the_batch_without_skipping_ahead(self):
-        class FlakyRepository:
-            def __init__(self, real, fail_on_call_index):
-                self._real = real
-                self._fail_on_call_index = fail_on_call_index
-                self._calls = 0
-
+    def test_repository_list_failure_fails_the_whole_batch_before_any_date(self):
+        # Architecture 개선(P1, CEO 승인 Sprint): repository.list()는 이제
+        # 배치 시작 전 정확히 1회만 호출된다(Stress Audit이 실측한
+        # O(밀린 일수 x 누적 History) 문제 해결 — src/scheduler/scheduler.py
+        # 참고). 그 결과 repository.list() 실패는 항상 "어떤 날짜도 아직
+        # 시도되지 않은 시점"에 발생한다 — 예전처럼 특정 날짜에서만 실패하고
+        # 그 이전 날짜는 이미 성공해 있는 상황 자체가 더 이상 존재하지 않는다.
+        class AlwaysFailingListRepository:
             def list(self, decision=None):
-                self._calls += 1
-                if self._calls == self._fail_on_call_index:
-                    raise RuntimeError("simulated repository failure")
-                return self._real.list(decision=decision)
+                raise RuntimeError("simulated repository failure")
 
             def save(self, *args, **kwargs):
-                return self._real.save(*args, **kwargs)
+                raise NotImplementedError
 
             def get(self, *args, **kwargs):
-                return self._real.get(*args, **kwargs)
+                raise NotImplementedError
 
         save_state(self.state_path, SchedulerState(last_successful_daily_close=date(2026, 8, 1)))
-        flaky = FlakyRepository(self.repo, fail_on_call_index=2)  # fails on the 2nd date (08-03)
 
         result = run_once(
-            flaky,
+            AlwaysFailingListRepository(),
             history_start_date=date(2026, 8, 1),
             now=datetime(2026, 8, 5, 11, 0),  # range: 08-02, 08-03, 08-04
             state_path=self.state_path,
@@ -194,13 +195,16 @@ class FailureIsolationTests(SchedulerTestCase):
         )
 
         self.assertEqual(result.status, SchedulerStatus.FAILED)
-        self.assertEqual(result.generated_dates, (date(2026, 8, 2),))
-        self.assertEqual(result.failed_date, date(2026, 8, 3))
+        self.assertEqual(result.generated_dates, ())
+        self.assertEqual(result.failed_date, date(2026, 8, 2))  # earliest pending date
         self.assertIn("simulated repository failure", result.error)
+        self.assertFalse((self.daily_dir / "2026-08-02.md").exists())
+        self.assertFalse((self.daily_dir / "2026-08-03.md").exists())
         self.assertFalse((self.daily_dir / "2026-08-04.md").exists())
 
+        # State is untouched — no date was ever attempted.
         state = load_state(self.state_path)
-        self.assertEqual(state.last_successful_daily_close, date(2026, 8, 2))
+        self.assertEqual(state.last_successful_daily_close, date(2026, 8, 1))
 
     def test_lock_is_released_even_after_a_failure(self):
         class AlwaysFailingRepository:

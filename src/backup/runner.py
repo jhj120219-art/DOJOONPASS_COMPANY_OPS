@@ -18,7 +18,14 @@ from __future__ import annotations
 from datetime import date, datetime
 from pathlib import Path
 
-from .git_ops import GitOperationError, git_add_all, git_commit, git_push, git_status
+from .git_ops import (
+    GitOperationError,
+    git_add_all,
+    git_commit,
+    git_push,
+    git_status,
+    is_authentication_failure,
+)
 from .log import BackupLogEntry
 from .result import BackupStatus
 from .state import DEFAULT_STATE_PATH, load_state, save_state
@@ -171,12 +178,24 @@ def run_once(
             ),
         )
         git_push(working_copy_dir)
-    except GitOperationError:
+    except GitOperationError as exc:
         # Audit Sprint 1: record the attempt before propagating the same
         # exception, instead of leaving State unchanged. last_successful_backup
         # and last_backup_commit are intentionally left as loaded — only a
         # successful run below updates them.
-        state.backup_status = BackupStatus.PENDING
+        #
+        # docs/08 §19 vs §21/§62: a transient failure (Internet OFF, GitHub
+        # outage, rejected push) is BACKUP_PENDING and retried by the next
+        # Runner; an authentication/permission failure is BACKUP_FAILED,
+        # because retrying it on a schedule cannot fix it and would build
+        # exactly the infinite retry loop §62 forbids. The operator has to
+        # renew the credential (docs/12 §12: "사람이 Token/인증 갱신 후 수동
+        # 재개").
+        state.backup_status = (
+            BackupStatus.FAILED
+            if is_authentication_failure(str(exc))
+            else BackupStatus.PENDING
+        )
         save_state(resolved_state_path, state)
         raise
 

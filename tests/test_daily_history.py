@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from daily import generate_daily_history, render_daily_markdown  # noqa: E402
+from daily import build_keep_index, generate_daily_history, render_daily_markdown  # noqa: E402
 from events import Event  # noqa: E402
 from history import (  # noqa: E402
     FileHistoryRepository,
@@ -192,6 +192,179 @@ class RepositoryUntouchedTests(DailyGeneratorTestCase):
 
         self.assertEqual(spy.save_calls, 0)
         self.assertGreaterEqual(spy.list_calls, 1)
+
+
+class KeepCandidatesParameterTests(DailyGeneratorTestCase):
+    """Architecture 개선(P1, CEO 승인 Sprint): a caller (Scheduler catch-up)
+    can pass an already-fetched KEEP list via `keep_candidates` so this
+    call skips repository.list() entirely — see src/daily/generator.py.
+    """
+
+    class SpyRepository:
+        def __init__(self, real):
+            self._real = real
+            self.list_calls = 0
+
+        def save(self, *args, **kwargs):
+            return self._real.save(*args, **kwargs)
+
+        def get(self, *args, **kwargs):
+            return self._real.get(*args, **kwargs)
+
+        def list(self, *args, **kwargs):
+            self.list_calls += 1
+            return self._real.list(*args, **kwargs)
+
+    def test_repository_list_is_never_called_when_keep_candidates_is_provided(self):
+        event = sample_event(event_id="TEST-PREFETCH-001")
+        self.repo.save(self.filter.evaluate(event).candidate)
+        spy = self.SpyRepository(self.repo)
+        prefetched = self.repo.list(decision=HistoryDecision.KEEP)
+
+        generate_daily_history(
+            spy, date(2026, 8, 5), output_dir=self.daily_dir, keep_candidates=prefetched
+        )
+
+        self.assertEqual(spy.list_calls, 0)
+
+    def test_output_matches_between_prefetched_and_self_fetched(self):
+        event = sample_event(event_id="TEST-PREFETCH-002")
+        self.repo.save(self.filter.evaluate(event).candidate)
+        prefetched = self.repo.list(decision=HistoryDecision.KEEP)
+
+        path_a = generate_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir / "a"
+        )
+        path_b = generate_daily_history(
+            self.repo,
+            date(2026, 8, 5),
+            output_dir=self.daily_dir / "b",
+            keep_candidates=prefetched,
+        )
+
+        self.assertEqual(path_a.read_text(encoding="utf-8"), path_b.read_text(encoding="utf-8"))
+
+    def test_keep_candidates_is_still_filtered_by_target_date(self):
+        # A pre-fetched list can span many dates (that's the whole point of
+        # sharing one fetch across a Scheduler batch) — this call must still
+        # only include the ones matching target_date.
+        matching = sample_event(event_id="TEST-PREFETCH-MATCH", timestamp="2026-08-05T09:00:00+09:00")
+        other_day = sample_event(event_id="TEST-PREFETCH-OTHER", timestamp="2026-08-06T09:00:00+09:00")
+        self.repo.save(self.filter.evaluate(matching).candidate)
+        self.repo.save(self.filter.evaluate(other_day).candidate)
+        prefetched = self.repo.list(decision=HistoryDecision.KEEP)
+        self.assertEqual(len(prefetched), 2)  # sanity: both dates present in the pre-fetch
+
+        path = generate_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir, keep_candidates=prefetched
+        )
+
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("TEST-PREFETCH-MATCH", content)
+        self.assertNotIn("TEST-PREFETCH-OTHER", content)
+
+
+class KeepIndexParameterTests(DailyGeneratorTestCase):
+    """CEO Decision ② (History Repository Cache): Scheduler builds a
+    date -> candidates index once and reuses it. The rendered Markdown must
+    stay byte-for-byte identical to both older paths.
+    """
+
+    def _populate_multi_day(self):
+        # Several candidates per day, deliberately saved out of timestamp
+        # order so the render-time sort is actually exercised.
+        for day in (5, 6, 7):
+            for hour in (15, 9, 20):
+                event = sample_event(
+                    event_id=f"TEST-IDX-{day:02d}-{hour:02d}",
+                    timestamp=f"2026-08-{day:02d}T{hour:02d}:00:00+09:00",
+                )
+                self.repo.save(self.filter.evaluate(event).candidate)
+
+    def test_all_three_paths_render_byte_identical_markdown(self):
+        self._populate_multi_day()
+        prefetched = self.repo.list(decision=HistoryDecision.KEEP)
+        index = build_keep_index(prefetched)
+        fixed_generated_at = "2026-08-08T11:00:00+09:00"
+
+        for target in (date(2026, 8, 5), date(2026, 8, 6), date(2026, 8, 7)):
+            with self.subTest(target=target):
+                a = generate_daily_history(
+                    self.repo, target, output_dir=self.daily_dir / "a",
+                    generated_at=fixed_generated_at,
+                ).read_bytes()
+                b = generate_daily_history(
+                    self.repo, target, output_dir=self.daily_dir / "b",
+                    generated_at=fixed_generated_at, keep_candidates=prefetched,
+                ).read_bytes()
+                c = generate_daily_history(
+                    self.repo, target, output_dir=self.daily_dir / "c",
+                    generated_at=fixed_generated_at, keep_index=index,
+                ).read_bytes()
+                self.assertEqual(a, b)
+                self.assertEqual(a, c)
+
+    def test_index_path_sorts_by_timestamp_like_the_other_paths(self):
+        self._populate_multi_day()
+        index = build_keep_index(self.repo.list(decision=HistoryDecision.KEEP))
+
+        path = generate_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir, keep_index=index
+        )
+        content = path.read_text(encoding="utf-8")
+
+        pos_09 = content.index("TEST-IDX-05-09")
+        pos_15 = content.index("TEST-IDX-05-15")
+        pos_20 = content.index("TEST-IDX-05-20")
+        self.assertLess(pos_09, pos_15)
+        self.assertLess(pos_15, pos_20)
+
+    def test_date_absent_from_index_is_an_empty_day(self):
+        self._populate_multi_day()
+        index = build_keep_index(self.repo.list(decision=HistoryDecision.KEEP))
+        fixed = "2026-08-08T11:00:00+09:00"
+
+        indexed = generate_daily_history(
+            self.repo, date(2026, 8, 1), output_dir=self.daily_dir / "idx",
+            generated_at=fixed, keep_index=index,
+        ).read_bytes()
+        scanned = generate_daily_history(
+            self.repo, date(2026, 8, 1), output_dir=self.daily_dir / "scan",
+            generated_at=fixed,
+        ).read_bytes()
+
+        self.assertEqual(indexed, scanned)
+
+    def test_index_is_never_consulted_for_repository_access(self):
+        self._populate_multi_day()
+        index = build_keep_index(self.repo.list(decision=HistoryDecision.KEEP))
+
+        class ExplodingRepository:
+            def list(self, *a, **kw):
+                raise AssertionError("repository.list() must not be called")
+
+            def save(self, *a, **kw):
+                raise AssertionError("repository.save() must not be called")
+
+            def get(self, *a, **kw):
+                raise AssertionError("repository.get() must not be called")
+
+        generate_daily_history(
+            ExplodingRepository(), date(2026, 8, 5),
+            output_dir=self.daily_dir, keep_index=index,
+        )
+
+    def test_build_keep_index_buckets_every_candidate_exactly_once(self):
+        self._populate_multi_day()
+        candidates = self.repo.list(decision=HistoryDecision.KEEP)
+
+        index = build_keep_index(candidates)
+
+        self.assertEqual(sum(len(v) for v in index.values()), len(candidates))
+        self.assertEqual(set(index), {date(2026, 8, 5), date(2026, 8, 6), date(2026, 8, 7)})
+
+    def test_build_keep_index_of_empty_list_is_empty(self):
+        self.assertEqual(build_keep_index([]), {})
 
 
 class MarkdownFormatTests(unittest.TestCase):

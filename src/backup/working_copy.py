@@ -59,6 +59,26 @@ def _is_in_scope(rel_path: str) -> bool:
     return bool(parts) and parts[0] in _ALLOWED_TOP_LEVEL_DIRS
 
 
+def _content_differs(src: Path, dst: Path) -> bool:
+    """Exact, *content*-based comparison — never mtime/stat-signature based.
+
+    Deliberately a thin named wrapper over `filecmp.cmp(shallow=False)`
+    rather than a hand-rolled fast path. This Sprint measured an explicit
+    size short-circuit here (`getsize(src) != getsize(dst)` before
+    delegating) and found it to be a net ~19% *slowdown* at every scale
+    from 30 to 10,000 files: `filecmp.cmp` already performs exactly that
+    size check internally, even with shallow=False (CPython filecmp:
+    `s1 = _sig(os.stat(f1)); ...; if s1[1] != s2[1]: return False`), so
+    the extra stat calls were pure duplicated syscalls with no benefit.
+
+    Detection stays content-based on purpose: switching to a stat/mtime
+    signature (`shallow=True`) is ~9x faster but silently weakens what
+    "modified" means, which is a Backup contract change, not an
+    optimization — see this Sprint's report.
+    """
+    return not filecmp.cmp(src, dst, shallow=False)
+
+
 def _relative_files(root: Path) -> set[str]:
     if not root.is_dir():
         return set()
@@ -122,9 +142,17 @@ def sync_to_working_copy(master_dir: Path, working_copy_dir: Path) -> WorkingCop
     """Copy Local Master into the Backup Working Copy, one direction only.
 
     Compares the Working Copy's files as they exist *before* this call
-    against Master's current files to compute added/modified/deleted,
-    then makes the Working Copy match Master exactly (new/changed files
-    copied in, files no longer in Master removed from the Working Copy).
+    against Master's current files to compute added/modified/deleted first,
+    without touching disk. Section 31/44-47: if any deletion is detected,
+    this call applies nothing at all (neither the deletion nor any
+    unrelated add/modify) and just reports it — runner.py's caller then
+    stops before commit/push. Applying the deletion to the Working Copy
+    here regardless (as a prior version of this function did) would make
+    the very next call's "before" state already match the deleted Master,
+    so the next run would see no deletion to report and would silently
+    finish committing/pushing it — the one-run block would not actually
+    hold the line. Only once `deleted` comes back empty is the Working
+    Copy actually brought in sync with Master (new/changed files copied in).
     """
     working_copy_dir.mkdir(parents=True, exist_ok=True)
 
@@ -138,15 +166,17 @@ def sync_to_working_copy(master_dir: Path, working_copy_dir: Path) -> WorkingCop
         dst = working_copy_dir / rel_path
         if rel_path not in existing_files:
             added.append(rel_path)
-        elif not filecmp.cmp(src, dst, shallow=False):
+        elif _content_differs(src, dst):
             modified.append(rel_path)
+
+    deleted = sorted(existing_files - master_files)
+    if deleted:
+        return WorkingCopySyncResult(added=tuple(added), modified=tuple(modified), deleted=tuple(deleted))
+
+    for rel_path in added + modified:
+        src = master_dir / rel_path
+        dst = working_copy_dir / rel_path
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
-    deleted = sorted(existing_files - master_files)
-    for rel_path in deleted:
-        target = working_copy_dir / rel_path
-        if target.exists():
-            target.unlink()
-
-    return WorkingCopySyncResult(added=tuple(added), modified=tuple(modified), deleted=tuple(deleted))
+    return WorkingCopySyncResult(added=tuple(added), modified=tuple(modified), deleted=())

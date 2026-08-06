@@ -10,6 +10,7 @@ is made anywhere in this file. Verifies:
     - Notion Sync failure does not stop History / Daily / Backup / Transport
 """
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from notion import (  # noqa: E402
     NotionClient,
     SyncStatus,
 )
+from notion.dashboard_pending import load_pending  # noqa: E402
 from reporter import DesktopProfile, Reporter  # noqa: E402
 from scheduler import SchedulerStatus  # noqa: E402
 
@@ -52,6 +54,13 @@ class RunnerNotionIntegrationTests(unittest.TestCase):
         self.review_dir = self.root / "runtime" / "history_candidates" / "review"
         self.scheduler_state_path = self.root / "runtime" / "state" / "daily_history_state.json"
         self.backup_state_path = self.root / "runtime" / "state" / "backup_state.json"
+        self.notion_sync_log_path = self.root / "runtime" / "logs" / "notion_sync.log"
+        self.notion_retry_queue_path = self.root / "runtime" / "state" / "notion_retry_queue.json"
+        self.dashboard_pending_path = self.root / "runtime" / "state" / "dashboard_pending.json"
+        self.dashboard_transport = InMemoryNotionTransport()
+        self.dashboard_client = NotionClient(
+            transport=self.dashboard_transport, database_id="ops-runs-db"
+        )
 
         self.transport = InMemoryNotionTransport()
         client = NotionClient(transport=self.transport, database_id="DB-1")
@@ -98,8 +107,10 @@ class RunnerNotionIntegrationTests(unittest.TestCase):
         _, path = self.reporter.report_and_write(directory=self.incoming_dir, **data)
         return path
 
-    def _run(self, *, notion_sync=None, now=None):
+    def _run(self, *, notion_sync=None, now=None, dashboard_client=None):
         return run_once(
+            dashboard_client=dashboard_client,
+            dashboard_pending_path=self.dashboard_pending_path,
             local_master_dir=self.local_master_dir,
             backup_working_copy_dir=self.backup_working_copy_dir,
             history_start_date=date(2026, 8, 1),
@@ -112,6 +123,8 @@ class RunnerNotionIntegrationTests(unittest.TestCase):
             collector_log_path=self.collector_log_path,
             collector_state_path=self.collector_state_path,
             notion_sync=notion_sync,
+            notion_sync_log_path=self.notion_sync_log_path,
+            notion_retry_queue_path=self.notion_retry_queue_path,
             keep_dir=self.keep_dir,
             review_dir=self.review_dir,
             scheduler_state_path=self.scheduler_state_path,
@@ -188,6 +201,114 @@ class RunnerNotionIntegrationTests(unittest.TestCase):
 
         # Backup still ran.
         self.assertIsNotNone(backup_entry)
+
+    def test_failed_event_is_queued_then_retried_first_on_next_run(self):
+        # CEO Policy Decision — Notion Retry Architecture Plan A: a failed
+        # Notion Sync is queued, and the *next* Runner execution retries the
+        # queue before touching anything newly collected that run.
+        self.transport.fail_next_call = True
+        self._write_event(
+            event_id="RUNNER-INT-RETRY-001",
+            event_type="MILESTONE_COMPLETED",
+            milestone="Search UI",
+            history_candidate=True,
+        )
+
+        first = self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 2, 9, 0))
+        _, _, _, _, first_results = first
+        self.assertEqual(first_results[0].status, SyncStatus.NOTION_RETRY_REQUIRED)
+
+        queued_text = self.notion_retry_queue_path.read_text(encoding="utf-8")
+        self.assertIn("RUNNER-INT-RETRY-001", queued_text)
+
+        # Second run: nothing new arrives in incoming/, but the queued
+        # event must still be retried and, on success, removed from the
+        # queue (not duplicated, not left behind).
+        second = self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 3, 9, 0))
+        _, collector_summary, _, _, second_results = second
+
+        self.assertEqual(collector_summary.accepted, 0)  # nothing new collected
+        self.assertEqual(len(second_results), 1)
+        self.assertEqual(second_results[0].event_id, "RUNNER-INT-RETRY-001")
+        self.assertEqual(second_results[0].status, SyncStatus.NOTION_CREATED)
+
+        remaining_queue = json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(remaining_queue["entries"], [])
+
+    def test_dashboard_records_one_row_per_run(self):
+        # CEO Decision 4: Runner records the Operations Dashboard once, at
+        # the very end of the execution.
+        self._write_event(event_id="RUNNER-DASH-001")
+
+        self._run(notion_sync=self.notion_sync, dashboard_client=self.dashboard_client)
+
+        rows = list(self.dashboard_transport._pages.values())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["properties"]["Accepted"]["number"], 1)
+
+    def test_dashboard_failure_does_not_stop_the_runtime(self):
+        # The whole point of CEO Decision 4's constraint: History, Daily and
+        # Backup must all still complete when the Dashboard write fails.
+        self.dashboard_transport.fail_next_call = True
+        self._write_event(
+            event_id="RUNNER-DASH-FAIL-001",
+            event_type="MILESTONE_COMPLETED",
+            milestone="Search UI",
+        )
+
+        result = self._run(
+            notion_sync=self.notion_sync,
+            now=datetime(2026, 8, 2, 9, 0),
+            dashboard_client=self.dashboard_client,
+        )
+
+        self.assertIsNotNone(result)
+        _, collector_summary, scheduler_result, backup_entry, _ = result
+        self.assertEqual(collector_summary.accepted, 1)
+        self.assertTrue((self.local_master_dir / "daily" / "2026-08-01.md").exists())
+        self.assertIsNotNone(backup_entry)
+        self.assertEqual(scheduler_result.generated_dates, (date(2026, 8, 1),))
+
+    def test_failed_dashboard_record_is_queued_and_retried_next_run(self):
+        self.dashboard_transport.fail_next_call = True
+        self._write_event(event_id="RUNNER-DASH-RETRY-001")
+
+        self._run(
+            notion_sync=self.notion_sync,
+            now=datetime(2026, 8, 2, 9, 0),
+            dashboard_client=self.dashboard_client,
+        )
+        pending = load_pending(self.dashboard_pending_path)
+        self.assertEqual(len(pending), 1)
+
+        # Second run: the queued record is retried first and drains.
+        self._run(
+            notion_sync=self.notion_sync,
+            now=datetime(2026, 8, 3, 9, 0),
+            dashboard_client=self.dashboard_client,
+        )
+
+        self.assertEqual(load_pending(self.dashboard_pending_path), [])
+
+    def test_dashboard_is_skipped_when_not_configured(self):
+        self._write_event(event_id="RUNNER-DASH-NONE-001")
+
+        self._run(notion_sync=self.notion_sync, dashboard_client=None)
+
+        self.assertEqual(self.dashboard_transport._pages, {})
+        self.assertEqual(load_pending(self.dashboard_pending_path), [])
+
+    def test_notion_sync_writes_log_entry(self):
+        # docs/04_NOTION_SYNC_SPEC.md §55: event_id / project_id / sync
+        # timestamp / result 최소 기록.
+        self._write_event(event_id="RUNNER-INT-LOG-001")
+
+        self._run(notion_sync=self.notion_sync)
+
+        log_text = self.notion_sync_log_path.read_text(encoding="utf-8")
+        self.assertIn("RUNNER-INT-LOG-001", log_text)
+        self.assertIn("SEARCH_FRONTEND", log_text)
+        self.assertIn("NOTION_CREATED", log_text)
 
     def test_notion_sync_skipped_when_not_configured(self):
         self._write_event(event_id="RUNNER-INT-NOSYNC-001")

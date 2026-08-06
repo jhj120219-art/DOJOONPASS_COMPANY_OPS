@@ -5,6 +5,10 @@ Phase 2에서 추가).
 이 모듈은 새로운 알고리즘/데이터 모델/클래스를 추가하지 않는다. 이미 존재하는
 transport / collector / notion / history / scheduler / backup 모듈의 함수를
 문서가 정한 순서 그대로 호출하여 조립하는 것이 이 파일의 유일한 책임이다.
+(예외: notion.retry_queue는 CEO Policy Decision — Notion Retry Architecture
+Plan A — 에 따라 이번 Sprint에 신설된 유일한 신규 모듈이다. §55/§28/§32-33이
+요구하던 "다음 실행 시 재처리 가능" 계약을 실제로 충족시키기 위한 것으로,
+새로운 정책을 만드는 것이 아니라 이미 확정된 정책을 구현한다.)
 
 실행 순서 (사용자 확정, docs/07 §37을 9단계로 요약한 것에, docs/04 §3 기준
 Notion Sync 단계를 Collector 직후에 추가한 것 — Notion Sync 자체는 docs/07이
@@ -13,7 +17,8 @@ Notion Sync 단계를 Collector 직후에 추가한 것 — Notion Sync 자체�
     1. Runner Lock Acquire
     2. Transport
     3. Collector
-    4. Notion Sync   (신규 — docs/04 §3/§6, Collector ACCEPTED Event만 대상)
+    4. Notion Sync   (Retry Queue 우선 처리 -> 이번 실행 신규 ACCEPTED Event 순.
+                       docs/04 §3/§6/§55, Notion Retry Architecture Plan A)
     5. History Filter
     6. Daily History
     7. Backup
@@ -44,6 +49,11 @@ from pathlib import Path
 # app/ 한 단계 더 깊이 있는 위치에 맞춰 그대로 적용한 것뿐이다(parents[1] = src/).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# collector/runtime.py의 PROJECT_ROOT/DEFAULT_*_PATH 관례를 그대로 따른다
+# (src/<module>/<file>.py 기준 parents[2] = Repository Root).
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_NOTION_SYNC_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "notion_sync.log"
+
 from backup.runner import run_once as backup_run_once  # noqa: E402  (backup/__init__.py 없음 — 서브모듈 직접 import)
 from collector import (  # noqa: E402
     Collector,
@@ -53,10 +63,47 @@ from collector import (  # noqa: E402
 )
 from events import Event  # noqa: E402
 from history import FileHistoryRepository, HistoryFilter  # noqa: E402
-from notion import ExecutionPlanSync, SyncResult, SyncStatus  # noqa: E402
+from notion import (  # noqa: E402
+    DEFAULT_QUEUE_PATH as DEFAULT_NOTION_RETRY_QUEUE_PATH,
+    DashboardOutcome,
+    ExecutionPlanSync,
+    NotionClient,
+    SyncResult,
+    SyncStatus,
+    dequeue as retry_queue_dequeue,
+    enqueue as retry_queue_enqueue,
+    load_queue as load_retry_queue,
+    record_run as dashboard_record_run,
+)
+from notion.dashboard_pending import (  # noqa: E402
+    DEFAULT_DASHBOARD_PENDING_PATH,
+    drain_pending,
+    save_pending,
+)
 from scheduler import run_once as scheduler_run_once  # noqa: E402
 from scheduler.lock import release_lock, try_acquire_lock  # noqa: E402  (scheduler/__init__.py가 재노출하지 않음)
 from transport import run_intake  # noqa: E402
+
+
+def _log_notion_sync(log_path: Path, sync_result: SyncResult) -> None:
+    """docs/04_NOTION_SYNC_SPEC.md §55: event_id / project_id / sync
+    timestamp / result을 최소 기록한다. §56에 따라 NOTION_API_TOKEN 등
+    민감정보는 절대 기록하지 않는다 — SyncResult에 애초에 그런 값이 담기지
+    않으므로(§56) 여기서 별도로 걸러낼 것이 없다. 형식은
+    collector/runtime.py `_log()`와 동일한 관례(타임스탬프 접두 1줄)를 따른다.
+    """
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        line = (
+            f"{timestamp} EVENT {sync_result.event_id} "
+            f"PROJECT {sync_result.project_id} "
+            f"NOTION_RESULT {sync_result.status.value}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
 
 
 def run_once(
@@ -73,6 +120,10 @@ def run_once(
     collector_log_path: Path | None = None,
     collector_state_path: Path | None = None,
     notion_sync: ExecutionPlanSync | None = None,
+    notion_sync_log_path: Path | None = None,
+    notion_retry_queue_path: Path | None = None,
+    dashboard_client: NotionClient | None = None,
+    dashboard_pending_path: Path | None = None,
     keep_dir: Path | None = None,
     review_dir: Path | None = None,
     scheduler_state_path: Path | None = None,
@@ -124,12 +175,16 @@ def run_once(
         )
         seen_store.record_run(now.isoformat(timespec="seconds"))
 
-        # 4. Notion Sync — docs/04_NOTION_SYNC_SPEC.md §3, §6, §29-37 (신규,
-        #    Notion Runtime Integration Phase 2에서 연결). Collector가 ACCEPTED으로
-        #    분류한 Event만 대상이다 — DUPLICATE/REJECTED/FAILED는 애초에 이
-        #    목록에 없으므로 Sync하지 않는다. History Filter의 KEEP/REVIEW/DROP
-        #    판단과는 독립적으로 동작한다(§3 "History는 별도 흐름이다").
-        #    notion_sync가 주어지지 않으면(Notion 미설정) 이 단계는 건너뛴다.
+        # 4. Notion Sync — docs/04_NOTION_SYNC_SPEC.md §3, §6, §29-37, §55
+        #    (Notion Runtime Integration Phase 2에서 연결; Retry Queue는
+        #    CEO Policy Decision "Notion Retry Architecture Plan A"로 이번
+        #    Sprint에 추가). Collector가 ACCEPTED으로 분류한 Event만 대상이다 —
+        #    DUPLICATE/REJECTED/FAILED는 애초에 이 목록에 없으므로 Sync하지
+        #    않는다. History Filter의 KEEP/REVIEW/DROP 판단과는 독립적으로
+        #    동작한다(§3 "History는 별도 흐름이다"). notion_sync가 주어지지
+        #    않으면(Notion 미설정) 이 단계는 Retry Queue 처리까지 포함해 전부
+        #    건너뛴다 — Queue에 남은 Event는 다음 Notion 설정된 실행까지 그대로
+        #    보존된다(삭제하지 않음).
         #    Notion Sync 실패는 Runtime을 중단하지 않는다 — ExecutionPlanSync.sync()는
         #    NotionAPIError를 내부에서 흡수해 NOTION_RETRY_REQUIRED만 반환하지만,
         #    예상 밖의 예외까지 이 단계 밖으로 새어나가 나머지 단계(History/Daily/
@@ -137,10 +192,18 @@ def run_once(
         #    (collector_runtime.run_once가 이미 쓰는 것과 동일한 방식, docs/03 §53).
         notion_sync_results: list[SyncResult] = []
         if notion_sync is not None:
-            for processed_file in collector_summary.files:
-                if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
-                    continue
-                event = Event.from_json(processed_file.destination_path.read_text(encoding="utf-8"))
+            resolved_notion_sync_log_path = (
+                Path(notion_sync_log_path)
+                if notion_sync_log_path is not None
+                else DEFAULT_NOTION_SYNC_LOG_PATH
+            )
+            resolved_retry_queue_path = (
+                Path(notion_retry_queue_path)
+                if notion_retry_queue_path is not None
+                else DEFAULT_NOTION_RETRY_QUEUE_PATH
+            )
+
+            def _sync_and_record(event: Event) -> SyncResult:
                 try:
                     sync_result = notion_sync.sync(event)
                 except Exception as exc:  # noqa: BLE001  (구현 범위 3: Notion 실패가 Runtime을 막지 않는다)
@@ -150,7 +213,28 @@ def run_once(
                         project_id=event.project_id,
                         error=str(exc),
                     )
-                notion_sync_results.append(sync_result)
+                _log_notion_sync(resolved_notion_sync_log_path, sync_result)
+                # CEO Policy Decision (Notion Retry Architecture Plan A):
+                # a still-failing event stays queued (upsert, never
+                # duplicated — retry_queue.enqueue() dedups by event_id);
+                # any non-error result clears it from the queue, whether it
+                # arrived there via the queue itself or fresh this run.
+                if sync_result.status in (SyncStatus.NOTION_RETRY_REQUIRED, SyncStatus.NOTION_FAILED):
+                    retry_queue_enqueue(resolved_retry_queue_path, event, now=now)
+                else:
+                    retry_queue_dequeue(resolved_retry_queue_path, event.event_id)
+                return sync_result
+
+            # 4a. Retry Queue를 가장 먼저 처리한다 (CEO Policy Decision).
+            for queued_entry in load_retry_queue(resolved_retry_queue_path):
+                notion_sync_results.append(_sync_and_record(queued_entry.to_event()))
+
+            # 4b. 이번 실행에서 새로 수집된 ACCEPTED Event.
+            for processed_file in collector_summary.files:
+                if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
+                    continue
+                event = Event.from_json(processed_file.destination_path.read_text(encoding="utf-8"))
+                notion_sync_results.append(_sync_and_record(event))
 
         # 5. History Filter — docs/07 §37 step 6 "History Pipeline",
         #    docs/05 §2 Event -> History Filter -> Candidate
@@ -198,10 +282,56 @@ def run_once(
         # 9. Log — docs/07 §37 step 11 "Log 기록"
         #    Collector는 3단계 호출 과정에서 이미 자신의 로그 파일(collector.log)을
         #    기록했다. Scheduler/Backup에는 로그 파일을 쓰는 기존 함수가 없으므로
-        #    (이전 Gap 7) 새로 만들지 않는다. Notion Sync도 별도 로그 파일을 쓰는
-        #    기존 함수가 없어 만들지 않는다(§55 Sync Logging은 이번 Sprint 범위
-        #    밖 — 남은 Backlog). 대신 각 단계의 기존 반환값을 그대로 호출자에게
-        #    돌려준다.
+        #    (이전 Gap 7) 새로 만들지 않는다. Notion Sync는 4단계에서 매 호출마다
+        #    `_log_notion_sync()`가 event_id/project_id/timestamp/result를
+        #    notion_sync.log에 이미 기록했다(§55, P1 Backlog 해소). 나머지 단계는
+        #    각자의 기존 반환값을 그대로 호출자에게 돌려준다.
+
+        # 9b. Operations Dashboard — CEO Decision ④. Runner 종료 직전 1회만
+        #     기록한다(Event당 기록 금지 — docs/04 §53 "Notion 데이터 과잉 방지").
+        #     이 단계는 이미 확정된 위 단계들의 결과만 읽는다 — History/Backup/
+        #     Event를 건드리지 않는다.
+        #
+        #     실패해도 Runtime을 절대 중단시키지 않는다(CEO ④): record_run()은
+        #     예외를 던지지 않고 결과만 돌려주며, 실패한 기록은 pending 파일에
+        #     저장되어 다음 실행에서 재시도된다(Retry Queue와 동일한 방식 —
+        #     자세한 이유는 notion/dashboard_pending.py docstring 참고).
+        #     dashboard_client가 없으면(미설정) 이 단계 전체를 건너뛴다.
+        if dashboard_client is not None:
+            resolved_dashboard_pending_path = (
+                Path(dashboard_pending_path)
+                if dashboard_pending_path is not None
+                else DEFAULT_DASHBOARD_PENDING_PATH
+            )
+            resolved_run_id = run_id or now.isoformat(timespec="seconds")
+
+            # 밀린 기록 먼저 재시도한다(Retry Queue와 동일한 "먼저 처리" 원칙).
+            drain_pending(resolved_dashboard_pending_path, dashboard_client)
+
+            dashboard_result = dashboard_record_run(
+                dashboard_client,
+                run_id=resolved_run_id,
+                run_at=now,
+                intake_summary=intake_summary,
+                collector_summary=collector_summary,
+                scheduler_result=scheduler_result,
+                backup_entry=backup_entry,
+                notion_sync_results=notion_sync_results,
+            )
+            if (
+                dashboard_result.outcome is DashboardOutcome.FAILED
+                and dashboard_result.properties is not None
+            ):
+                try:
+                    save_pending(
+                        resolved_dashboard_pending_path,
+                        run_id=resolved_run_id,
+                        properties=dashboard_result.properties,
+                        now=now,
+                    )
+                except Exception:  # noqa: BLE001  (기록 실패가 Runtime을 막지 않는다)
+                    pass
+
         return (
             intake_summary,
             collector_summary,

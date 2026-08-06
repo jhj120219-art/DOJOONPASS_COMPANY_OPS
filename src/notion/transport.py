@@ -62,6 +62,30 @@ class NotionTransport(abc.ABC):
         Bootstrap) — ExecutionPlanSync never calls this."""
         raise NotImplementedError
 
+    def search_pages(self) -> list[Mapping[str, Any]]:
+        """Pages this integration can actually see (read-only).
+
+        Deliberately NOT an abstractmethod: it is a diagnostic capability
+        used only by `notion.dashboard`'s readiness check, and making it
+        abstract would break every existing NotionTransport double that has
+        no reason to implement it. Implementations that can search override
+        this; the rest inherit "I cannot search", which the diagnosis
+        reports as UNKNOWN rather than treating as an error.
+        """
+        raise NotImplementedError("this transport cannot search the workspace")
+
+    @abc.abstractmethod
+    def create_database(
+        self, parent_page_id: str, title: str, properties: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Create a brand-new Database under `parent_page_id`.
+
+        Used only by notion.dashboard's one-time bootstrap (CEO Decision ④
+        Operations Dashboard) — never by ExecutionPlanSync or the Runtime
+        pipeline, which only ever read/write rows in databases that already
+        exist."""
+        raise NotImplementedError
+
 
 class RealNotionTransport(NotionTransport):
     """Live Notion REST API transport using only the standard library."""
@@ -126,6 +150,24 @@ class RealNotionTransport(NotionTransport):
     ) -> Mapping[str, Any]:
         return self._request("PATCH", f"/databases/{database_id}", {"properties": properties})
 
+    def create_database(
+        self, parent_page_id: str, title: str, properties: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        body = {
+            "parent": {"type": "page_id", "page_id": parent_page_id},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": properties,
+        }
+        return self._request("POST", "/databases", body)
+
+    def search_pages(self) -> list[Mapping[str, Any]]:
+        response = self._request(
+            "POST",
+            "/search",
+            {"filter": {"value": "page", "property": "object"}, "page_size": 100},
+        )
+        return list(response.get("results") or [])
+
 
 def _rich_text_value(prop: Mapping[str, Any] | None) -> str | None:
     if not prop:
@@ -148,9 +190,27 @@ class InMemoryNotionTransport(NotionTransport):
     flags are independent and either can trigger a failure.
     """
 
-    def __init__(self, *, initial_properties: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        initial_properties: Mapping[str, Any] | None = None,
+        parent: Mapping[str, Any] | None = None,
+    ) -> None:
+        # Simulated Database `parent`. Defaults to workspace root, which is
+        # what the real PROJECTS database actually reports — tests that need
+        # a Page-hosted database pass parent={"type": "page_id", ...}.
+        self._parent: dict[str, Any] = dict(parent or {"type": "workspace", "workspace": True})
+        # Pages `search_pages()` reports, in the shape Notion's /search
+        # returns. Empty by default, matching a workspace where nothing has
+        # been shared with the integration.
+        self.searchable_pages: list[dict[str, Any]] = []
         self._pages: dict[str, dict] = {}
         self._next_id = 1
+        self._next_database_id = 1
+        # Databases created via create_database(), keyed by the id handed
+        # back to the caller: {"title": ..., "properties": ...}. Lets a test
+        # assert what notion.dashboard's bootstrap actually created.
+        self.created_databases: dict[str, dict[str, Any]] = {}
         self.fail_next_call = False
         self.fail_next_method: str | None = None
         # Simulated Database schema (docs/04 §8 Property definitions), for
@@ -173,6 +233,7 @@ class InMemoryNotionTransport(NotionTransport):
         return {
             "object": "database",
             "id": database_id,
+            "parent": dict(self._parent),
             "properties": dict(self._schema_properties),
         }
 
@@ -229,3 +290,25 @@ class InMemoryNotionTransport(NotionTransport):
             raise NotionAPIError(f"unknown page_id: {page_id}", status_code=404)
         self._pages[page_id]["properties"].update(properties)
         return self._pages[page_id]
+
+    def search_pages(self) -> list[Mapping[str, Any]]:
+        self._maybe_fail("search_pages")
+        return [dict(page) for page in self.searchable_pages]
+
+    def create_database(
+        self, parent_page_id: str, title: str, properties: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        self._maybe_fail("create_database")
+        database_id = f"mock-db-{self._next_database_id}"
+        self._next_database_id += 1
+        self.created_databases[database_id] = {
+            "parent_page_id": parent_page_id,
+            "title": title,
+            "properties": dict(properties),
+        }
+        return {
+            "object": "database",
+            "id": database_id,
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": dict(properties),
+        }

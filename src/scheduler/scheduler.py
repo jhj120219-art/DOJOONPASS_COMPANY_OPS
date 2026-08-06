@@ -21,8 +21,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from daily import DEFAULT_DAILY_DIR, generate_daily_history
-from history import HistoryRepository
+from daily import DEFAULT_DAILY_DIR, build_keep_index, generate_daily_history
+from history import HistoryDecision, HistoryRepository
 
 from .lock import DEFAULT_LOCK_PATH, release_lock, try_acquire_lock
 from .result import SchedulerRunResult, SchedulerStatus
@@ -114,12 +114,51 @@ def _generate_pending_dates(
     )
     end = now.date() - timedelta(days=1)  # today is never processed
 
+    pending_dates = _pending_dates(start, end)
+
+    # Architecture 개선(CEO Decision ②, History Repository Cache A안):
+    # 이 배치에서 실제로 History 생성이 필요할 수 있는 경우에만,
+    # repository.list()를 배치당 정확히 1회 호출하고, 그 결과로 날짜별
+    # History Index를 1회만 만들어 모든 날짜가 재사용한다.
+    #
+    # 예전에는 (1) generate_daily_history()가 매 날짜마다 repository.list()를
+    # 다시 호출했고, (2) 그 뒤에도 매 날짜마다 전체 후보를 선형 스캔하며
+    # timestamp를 재파싱했다. Index는 timestamp를 후보당 정확히 1회만
+    # 파싱하고, 날짜별 조회를 dict 조회로 만든다.
+    #
+    # 계약은 전혀 바뀌지 않는다 — repository.list()가 무엇을 반환하는지도,
+    # 어떤 후보가 어느 날짜에 들어가는지도(docs/06 §12) 동일하며, 렌더링
+    # 직전 timestamp 정렬도 그대로다(= Markdown 결과 100% 동일).
+    # generate_daily_history()를 직접 호출하는 다른 caller(테스트 등)는
+    # keep_index/keep_candidates를 넘기지 않으면 예전 경로 그대로 동작한다.
+    if pending_dates:
+        try:
+            keep_index = build_keep_index(repository.list(decision=HistoryDecision.KEEP))
+        except Exception as exc:  # noqa: BLE001  (repository.list()도 다른 단계와
+            # 동일하게 실패를 감춰서는 안 된다 — 예전에는 이 호출이 각 날짜의
+            # generate_daily_history() 안에서 일어나 그 날짜의 try/except가
+            # 잡았다. 지금은 배치 시작 전 1회이므로 여기서 직접 잡아 동일한
+            # FAILED 계약(SchedulerRunResult, 예외를 밖으로 새어나가게 하지
+            # 않음)을 유지한다 — 이 실패 시점 자체가 더 일찍이므로
+            # generated_dates는 항상 빈 tuple이다(어떤 날짜도 아직 시도되지
+            # 않았기 때문).
+            return SchedulerRunResult(
+                status=SchedulerStatus.FAILED,
+                generated_dates=(),
+                failed_date=pending_dates[0],
+                error=str(exc),
+            )
+    else:
+        keep_index = None
+
     generated: list[date] = []
-    for target_date in _pending_dates(start, end):
+    for target_date in pending_dates:
         final_path = daily_dir / f"{target_date.isoformat()}.md"
         if not final_path.exists():
             try:
-                generate_daily_history(repository, target_date, output_dir=daily_dir)
+                generate_daily_history(
+                    repository, target_date, output_dir=daily_dir, keep_index=keep_index
+                )
             except Exception as exc:  # noqa: BLE001
                 # Dates close in order; stop here rather than skip ahead
                 # and leave a gap in the sequence (section 30).
