@@ -7,7 +7,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from scheduler.state import SchedulerState, load_state, save_state  # noqa: E402
+from scheduler.state import (  # noqa: E402
+    SchedulerState,
+    SchedulerStateError,
+    load_state,
+    save_state,
+)
 
 
 class SchedulerStateTestCase(unittest.TestCase):
@@ -34,17 +39,27 @@ class RoundTripTests(SchedulerStateTestCase):
 class CorruptedStateTests(SchedulerStateTestCase):
     def test_corrupted_json_raises_and_does_not_delete_the_bad_file(self):
         # docs/10_E2E_OPERATIONS_SPEC.md §46-49: State 손상 시 프로그램이
-        # 임의로 History를 재생성/삭제하면 안 된다. Characterizing current
-        # behavior (not fixing it): load_state() has no dedicated
-        # corruption handling — json.loads() raises directly, same gap as
-        # backup/state.py (see test_backup_state.py).
+        # 임의로 History를 재생성/삭제하면 안 된다.
+        #
+        # State Recovery 통일 (CEO 승인 A안): this used to characterize the
+        # gap — load_state() had no dedicated corruption handling and a raw
+        # json.JSONDecodeError escaped, unlike collector/state.py. Every state
+        # loader now reports a damaged file as its own named error instead.
+        # The file itself must still survive untouched either way.
         self.state_path.parent.mkdir(parents=True)
         self.state_path.write_text("{not valid json", encoding="utf-8")
 
-        with self.assertRaises(json.JSONDecodeError):
+        with self.assertRaises(SchedulerStateError):
             load_state(self.state_path)
 
         self.assertEqual(self.state_path.read_text(encoding="utf-8"), "{not valid json")
+
+    def test_wrong_top_level_shape_raises_the_typed_error(self):
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+
+        with self.assertRaises(SchedulerStateError):
+            load_state(self.state_path)
 
     def test_valid_json_with_malformed_date_raises(self):
         self.state_path.parent.mkdir(parents=True)

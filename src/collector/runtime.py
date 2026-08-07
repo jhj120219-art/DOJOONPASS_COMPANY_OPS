@@ -128,8 +128,20 @@ def run_once(
             target_dir = processed_dir
             _log(log_path, f"ACCEPTED {result.event.event_id}")
 
+        # An ACCEPTED verdict already recorded this event_id as seen, but the
+        # Event is only really consumed once its file leaves incoming/. If the
+        # move fails, roll that mark back — otherwise the retry this function
+        # promises ("the file stays in incoming/ so the next run retries it")
+        # can only ever produce a DUPLICATE, which app/runner.py skips, and the
+        # History Candidate is lost permanently (Audit BUG-9).
+        # CEO-approved B안: undo the mark on the failure path.
+        def _rollback_mark() -> None:
+            if outcome is RuntimeOutcome.ACCEPTED and result.event is not None:
+                collector.unmark_seen(result.event.event_id)
+
         destination = target_dir / path.name
         if destination.exists():
+            _rollback_mark()
             _log(log_path, f"FAILED {path.name}: destination already exists ({destination})")
             results.append(
                 ProcessedFile(path, None, RuntimeOutcome.FAILED, ("destination already exists",))
@@ -139,6 +151,7 @@ def run_once(
         try:
             os.replace(path, destination)
         except OSError as exc:
+            _rollback_mark()
             _log(log_path, f"FAILED {path.name}: could not move file ({exc})")
             results.append(ProcessedFile(path, None, RuntimeOutcome.FAILED, (str(exc),)))
             continue

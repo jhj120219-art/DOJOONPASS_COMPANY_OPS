@@ -10,6 +10,7 @@ an actual Collector is out of scope for this phase.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
@@ -22,11 +23,31 @@ DEFAULT_EVENT_OUTPUT_DIR = PROJECT_ROOT / "runtime" / "events" / "incoming"
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 
+# See history/file_repository.py for the same bound and the reason for it.
+_MAX_FILENAME_STEM = 120
+
 
 def safe_event_filename(event_id: str) -> str:
-    """Derive a Windows-safe filename from an event_id (never from summary/user text)."""
-    sanitized = _UNSAFE_FILENAME_CHARS.sub("_", event_id).strip("._") or "event"
-    return f"{sanitized}.json"
+    """Derive a Windows-safe filename from an event_id (never from summary/user text).
+
+    Bounds both content and length. `event_id` is unbounded in docs/02's
+    schema, and a ~250-character one produced a path Windows rejects
+    (WinError 123) — here that aborted the Reporter's own write. When the name
+    has to be changed at all, a short digest of the original id is appended,
+    because both sanitising and truncating are many-to-one and two Events
+    must never collide on one filename.
+
+    Kept byte-for-byte identical to `transport.onedrive.safe_event_filename()`
+    and in step with `history.file_repository.safe_candidate_filename()`;
+    tests assert the two copies agree.
+    """
+    sanitized = _UNSAFE_FILENAME_CHARS.sub("_", event_id).strip("._")
+    if sanitized == event_id and len(event_id) <= _MAX_FILENAME_STEM:
+        return f"{event_id}.json"
+
+    digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:12]
+    stem = sanitized[:_MAX_FILENAME_STEM] or "event"
+    return f"{stem}-{digest}.json"
 
 
 def write_event_json(

@@ -23,6 +23,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_PATH = PROJECT_ROOT / "runtime" / "state" / "daily_history_state.json"
 
 
+class SchedulerStateError(ValueError):
+    """Raised when daily_history_state.json exists but cannot be read as
+    valid Scheduler state (bad JSON, wrong shape, wrong field types).
+
+    Never raised for a simply-missing file — that starts an empty state.
+
+    State Recovery 통일 (CEO 승인 A안): this mirrors
+    `collector.state.CollectorStateError`, which was previously the only
+    loader in the project that reported a damaged state file as a typed,
+    named error instead of letting a raw JSONDecodeError escape. docs/10 §46
+    treats a damaged state file as a normal operational situation to be
+    reported, not an arbitrary crash — so every state loader now says so in
+    the same way.
+    """
+
+
 @dataclass
 class SchedulerState:
     last_successful_daily_close: date | None = None
@@ -32,11 +48,33 @@ def load_state(state_path: Path) -> SchedulerState:
     if not state_path.exists():
         return SchedulerState()
 
-    data = json.loads(state_path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SchedulerStateError(
+            f"scheduler state file is corrupted: {state_path} ({exc})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise SchedulerStateError(
+            f"scheduler state file must contain a JSON object: {state_path}"
+        )
+
     value = data.get("last_successful_daily_close")
-    return SchedulerState(
-        last_successful_daily_close=date.fromisoformat(value) if value else None
-    )
+    if value is not None and not isinstance(value, str):
+        raise SchedulerStateError(
+            f"scheduler state file has an invalid last_successful_daily_close "
+            f"field: {state_path}"
+        )
+
+    try:
+        parsed = date.fromisoformat(value) if value else None
+    except ValueError as exc:
+        raise SchedulerStateError(
+            f"scheduler state file has an unparseable date: {state_path} ({exc})"
+        ) from exc
+
+    return SchedulerState(last_successful_daily_close=parsed)
 
 
 def save_state(state_path: Path, state: SchedulerState) -> None:

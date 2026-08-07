@@ -24,6 +24,26 @@ class SeenEventStore(abc.ABC):
     def mark_seen(self, event_id: str) -> None:
         raise NotImplementedError
 
+    def unmark_seen(self, event_id: str) -> None:
+        """Undo a `mark_seen()` whose Event was not actually consumed.
+
+        Collector marks an event_id as seen while judging it ACCEPTED, but
+        the Runtime only finishes consuming that Event once it has moved the
+        file out of `incoming/`. If the move fails, the id has been burned:
+        the file is retried on the next run, is judged DUPLICATE, and — since
+        app/runner.py only routes ACCEPTED events onward — never reaches
+        Notion Sync or History Filter. The History Candidate is lost for good
+        (Audit BUG-9, and the main ingredient of BUG-20's measured loss).
+
+        CEO-approved B안: keep `collect()`'s existing contract and give the
+        Runtime a way to roll the mark back on the failure path.
+
+        Not abstract on purpose — a store that cannot roll back (or a double
+        that does not need to) inherits this no-op rather than being forced to
+        implement it, exactly as `NotionTransport.search_pages()` does.
+        """
+        return None
+
 
 class InMemorySeenEventStore(SeenEventStore):
     """Test/dev-only SeenEventStore backed by a plain set. Not persistent."""
@@ -36,3 +56,6 @@ class InMemorySeenEventStore(SeenEventStore):
 
     def mark_seen(self, event_id: str) -> None:
         self._seen.add(event_id)
+
+    def unmark_seen(self, event_id: str) -> None:
+        self._seen.discard(event_id)

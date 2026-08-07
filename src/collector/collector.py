@@ -30,6 +30,22 @@ class Collector:
     def __init__(self, *, seen_store: SeenEventStore):
         self._seen_store = seen_store
 
+    def unmark_seen(self, event_id: str) -> None:
+        """Roll back the mark_seen() collect() performed for an ACCEPTED Event
+        that the caller then failed to consume.
+
+        collect() decides ACCEPTED and records the id in one step, but the
+        Event is not truly consumed until the Runtime has moved its file out
+        of `incoming/`. Only the Runtime knows whether that succeeded, so only
+        the Runtime can undo the mark — this is the seam for it
+        (docs/03 §53's "one file's failure must not affect the rest", applied
+        to the duplicate-check state as well as the batch).
+
+        Delegates to the injected SeenEventStore, which decides whether a
+        rollback is possible at all (the base class defaults to a no-op).
+        """
+        self._seen_store.unmark_seen(event_id)
+
     def collect(self, raw: CollectorInput) -> CollectorResult:
         if isinstance(raw, (str, bytes)):
             try:

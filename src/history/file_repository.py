@@ -12,8 +12,10 @@ This Phase only uses runtime/history_candidates/{keep,review}/.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -23,6 +25,59 @@ from .result import HistoryCandidate, HistoryDecision
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_KEEP_DIR = PROJECT_ROOT / "runtime" / "history_candidates" / "keep"
 DEFAULT_REVIEW_DIR = PROJECT_ROOT / "runtime" / "history_candidates" / "review"
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+
+# Longest stem kept before the digest suffix. Windows rejects a path over
+# ~260 characters (WinError 123), and the candidate directory itself already
+# consumes part of that budget, so the stem is bounded well below the limit.
+# Every real history_id ("HIST-" + a UUID = 41 characters) is far shorter.
+_MAX_FILENAME_STEM = 120
+
+
+def safe_candidate_filename(history_id: str) -> str:
+    """Derive a filesystem-safe filename from a `history_id`.
+
+    `history_id` is `f"HIST-{event.event_id}"`, and `event_id` arrives from
+    another Desktop through a shared folder — it is untrusted input that
+    docs/02's schema constrains only to "present and non-null". Before this
+    guard, a crafted id escaped the candidate directory entirely
+    (`../../../PWNED` wrote into `runtime/history_candidates/`) and an id
+    containing a character Windows forbids in a filename aborted the whole
+    Runner with an OSError (Audit BUG-2 / BUG-5).
+
+    CEO-approved B안: sanitise at the storage boundary rather than tightening
+    the Event Schema, so docs/02 is untouched and no previously-valid Event
+    becomes invalid. Same rule as
+    `reporter.local_output.safe_event_filename()`, which already protects the
+    Reporter's own write path.
+
+    Two properties this must hold, and the reason for the digest suffix:
+
+      1. An id that is already safe is returned UNCHANGED. Every real
+         `history_id` in this project (`HIST-` + a UUID or a structured id)
+         is already safe, so no existing candidate is ever renamed.
+
+      2. Sanitising is many-to-one — `"HIST-   "` and `"HIST-  "` both reduce
+         to `"HIST-"`, and two over-long ids share a truncated stem — and two
+         candidates sharing a filename would collide on `save()`
+         (FileExistsError, aborting the run). So whenever the name had to be
+         changed at all, a short digest of the *original* id is appended,
+         keeping distinct ids distinct.
+
+    Length is bounded as well as content. `event_id` is unbounded in the
+    schema, and a ~250-character id produced a path Windows rejects
+    (WinError 123), which aborted the whole Runner at the History Filter step
+    — the same class of failure this guard exists to prevent, just reached
+    through length instead of illegal characters.
+    """
+    sanitized = _UNSAFE_FILENAME_CHARS.sub("_", history_id).strip("._")
+    if sanitized == history_id and len(history_id) <= _MAX_FILENAME_STEM:
+        return f"{history_id}.json"
+
+    digest = hashlib.sha256(history_id.encode("utf-8")).hexdigest()[:12]
+    stem = sanitized[:_MAX_FILENAME_STEM] or "candidate"
+    return f"{stem}-{digest}.json"
 
 
 class FileHistoryRepository(HistoryRepository):
@@ -43,7 +98,7 @@ class FileHistoryRepository(HistoryRepository):
             return False
 
         target_dir.mkdir(parents=True, exist_ok=True)
-        final_path = target_dir / f"{candidate.history_id}.json"
+        final_path = target_dir / safe_candidate_filename(candidate.history_id)
         if final_path.exists() and not overwrite:
             raise FileExistsError(f"history candidate already stored: {final_path}")
 
@@ -62,7 +117,9 @@ class FileHistoryRepository(HistoryRepository):
 
     def get(self, history_id: str) -> HistoryCandidate | None:
         for directory in (self.keep_dir, self.review_dir):
-            path = directory / f"{history_id}.json"
+            # Must derive the name the same way save() does, or a sanitised
+            # candidate would be unreachable by its own history_id.
+            path = directory / safe_candidate_filename(history_id)
             if path.exists():
                 data = json.loads(path.read_text(encoding="utf-8"))
                 return HistoryCandidate.from_dict(data)

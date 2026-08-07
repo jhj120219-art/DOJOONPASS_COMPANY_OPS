@@ -63,13 +63,47 @@ class RetryQueueEntry:
         return Event.from_dict(self.event_data)
 
 
+class RetryQueueError(ValueError):
+    """Raised when notion_retry_queue.json exists but cannot be read as a
+    valid queue (bad JSON, wrong shape, malformed entry).
+
+    Never raised for a simply-missing file — that is an empty queue.
+    State Recovery 통일 (CEO 승인 A안): same contract as
+    `collector.state.CollectorStateError`, per docs/10 §46. Naming the
+    failure matters especially here, because README RULE 5 puts Notion off
+    the History critical path — an operator must be able to tell a damaged
+    Notion queue apart from a damaged History state at a glance.
+    """
+
+
 def load_queue(path: Path) -> list[RetryQueueEntry]:
     if not path.exists():
         return []
-    raw = path.read_text(encoding="utf-8")
-    data = json.loads(raw)
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RetryQueueError(
+            f"notion retry queue file is corrupted: {path} ({exc})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise RetryQueueError(
+            f"notion retry queue file must contain a JSON object: {path}"
+        )
+
     entries = data.get("entries", [])
-    return [RetryQueueEntry.from_dict(e) for e in entries]
+    if not isinstance(entries, list):
+        raise RetryQueueError(
+            f"notion retry queue file has an invalid entries field: {path}"
+        )
+
+    try:
+        return [RetryQueueEntry.from_dict(e) for e in entries]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise RetryQueueError(
+            f"notion retry queue file has a malformed entry: {path} ({exc})"
+        ) from exc
 
 
 def save_queue(path: Path, entries: list[RetryQueueEntry]) -> None:
@@ -88,14 +122,26 @@ def save_queue(path: Path, entries: list[RetryQueueEntry]) -> None:
         raise
 
 
-def enqueue(path: Path, event: Event, *, now: datetime | None = None) -> None:
-    """Upsert: a re-failing event's existing entry is updated (attempt_count
-    incremented, event_data refreshed) rather than duplicated — dedup is by
-    `event_id`, matching Collector's own event_id-based duplicate model.
+def upsert_entry(
+    entries: list[RetryQueueEntry], event: Event, *, now: datetime | None = None
+) -> None:
+    """In-memory half of `enqueue()`: upsert `event` into `entries`.
+
+    Retry Queue Batch Save (CEO 승인 B안). `enqueue()` reads and rewrites the
+    whole file on every single call, so a Notion outage affecting n Events
+    costs O(n^2) bytes — measured this Sprint at 7.9 ms/enqueue for a 50-entry
+    queue rising to 19.3 ms at 800 entries (551KB). Exposing the list
+    operation lets `app/runner.py` load once, apply every change in memory,
+    and write once per run, while `enqueue()` keeps its existing contract for
+    every other caller.
+
+    Dedup and semantics are unchanged: one entry per `event_id`,
+    `attempt_count` incremented, `event_data` refreshed, `added_at` preserved.
     """
     now = now or datetime.now().astimezone()
-    entries = load_queue(path)
-    existing_index = next((i for i, e in enumerate(entries) if e.event_id == event.event_id), None)
+    existing_index = next(
+        (i for i, e in enumerate(entries) if e.event_id == event.event_id), None
+    )
 
     if existing_index is None:
         entries.append(
@@ -117,6 +163,28 @@ def enqueue(path: Path, event: Event, *, now: datetime | None = None) -> None:
             attempt_count=old.attempt_count + 1,
         )
 
+
+def remove_entry(entries: list[RetryQueueEntry], event_id: str) -> bool:
+    """In-memory half of `dequeue()`. Returns True if anything was removed,
+    so a batching caller knows whether the file needs rewriting at all."""
+    remaining = [e for e in entries if e.event_id != event_id]
+    if len(remaining) == len(entries):
+        return False
+    entries[:] = remaining
+    return True
+
+
+def enqueue(path: Path, event: Event, *, now: datetime | None = None) -> None:
+    """Upsert: a re-failing event's existing entry is updated (attempt_count
+    incremented, event_data refreshed) rather than duplicated — dedup is by
+    `event_id`, matching Collector's own event_id-based duplicate model.
+
+    Read-modify-write against the file. `app/runner.py` uses `upsert_entry()`
+    with a single load/save per run instead (B안); this remains the simple
+    entry point for one-off callers.
+    """
+    entries = load_queue(path)
+    upsert_entry(entries, event, now=now)
     save_queue(path, entries)
 
 
@@ -125,6 +193,5 @@ def dequeue(path: Path, event_id: str) -> None:
     per successful sync regardless of whether it came from the queue or
     from this run's freshly-collected events)."""
     entries = load_queue(path)
-    remaining = [e for e in entries if e.event_id != event_id]
-    if len(remaining) != len(entries):
-        save_queue(path, remaining)
+    if remove_entry(entries, event_id):
+        save_queue(path, entries)

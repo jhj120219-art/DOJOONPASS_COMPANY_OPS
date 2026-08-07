@@ -22,6 +22,22 @@ class NotionConfigError(ValueError):
 class NotionConfig:
     api_token: str
     projects_database_id: str
+    ops_runs_database_id: str | None = None
+    """Operations Dashboard OPS_RUNS Database ID (CEO Decision ④).
+
+    Optional on purpose. Notion Dashboard Production 연결 (CEO 승인 A안):
+    `record_run()` and its pending-retry queue were fully implemented and
+    tested, but no entrypoint ever built a client for them, so the Dashboard
+    had never executed against real Notion. Wiring it through configuration —
+    rather than hardcoding an id or inventing a second config source — keeps
+    the project's existing rule that the Runner never decides for itself
+    whether Notion is configured.
+
+    A deployment that does not set NOTION_OPS_RUNS_DATABASE_ID simply runs
+    without the Dashboard, exactly as it does today: `run_once()` already
+    skips the whole step when `dashboard_client is None`, and `record_run()`
+    reports SKIPPED_NOT_CONFIGURED. Nothing breaks for existing installs.
+    """
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "NotionConfig":
@@ -40,4 +56,9 @@ class NotionConfig:
             raise NotionConfigError(
                 f"missing required environment variable(s): {', '.join(missing)}"
             )
-        return cls(api_token=token, projects_database_id=database_id)
+        return cls(
+            api_token=token,
+            projects_database_id=database_id,
+            # Optional: absent means "run without the Operations Dashboard".
+            ops_runs_database_id=source.get("NOTION_OPS_RUNS_DATABASE_ID") or None,
+        )

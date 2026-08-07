@@ -134,6 +134,17 @@ def git_commit(repo_dir: Path, message: str) -> str:
     return _run_git(["rev-parse", "HEAD"], repo_dir).strip()
 
 
+def git_head_commit(repo_dir: Path) -> str:
+    """The Working Copy's current HEAD commit hash.
+
+    Uses the same `rev-parse HEAD` this module already runs inside
+    git_commit() — no new git command is introduced. Needed by the Backup
+    Pending retry path (docs/08 §19), which pushes a commit that a *previous*
+    run created and therefore never recorded a hash for.
+    """
+    return _run_git(["rev-parse", "HEAD"], repo_dir).strip()
+
+
 def git_push(repo_dir: Path) -> None:
     """docs/08 section 12, 32-36: plain push only, no pull, no force.
 

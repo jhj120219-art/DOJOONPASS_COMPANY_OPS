@@ -70,10 +70,11 @@ from notion import (  # noqa: E402
     NotionClient,
     SyncResult,
     SyncStatus,
-    dequeue as retry_queue_dequeue,
-    enqueue as retry_queue_enqueue,
     load_queue as load_retry_queue,
     record_run as dashboard_record_run,
+    remove_entry as retry_queue_remove,
+    save_queue as save_retry_queue,
+    upsert_entry as retry_queue_upsert,
 )
 from notion.dashboard_pending import (  # noqa: E402
     DEFAULT_DASHBOARD_PENDING_PATH,
@@ -203,7 +204,25 @@ def run_once(
                 else DEFAULT_NOTION_RETRY_QUEUE_PATH
             )
 
+            # Retry Queue Batch Save (CEO 승인 B안): load the queue exactly
+            # once, apply every change in memory, and write it back once at
+            # the end of this step. Previously each enqueue()/dequeue() call
+            # re-read and rewrote the entire file, so a Notion outage over n
+            # Events cost O(n^2) bytes (measured: 7.9 ms/enqueue at 50 entries
+            # -> 19.3 ms at 800). Semantics are unchanged — same upsert, same
+            # event_id dedup, same "queue first" ordering.
+            #
+            # Crash safety: if this run dies before the single save, the queue
+            # keeps its previous contents. That is safe because a successfully
+            # synced Event simply stays queued and is retried next run, where
+            # docs/04 §62's duplicate guard recognises it (Last Event ID
+            # match) and returns NOTION_SKIPPED_OLD_EVENT before it is
+            # dequeued. No Event is lost, and none is applied twice.
+            queue_entries = load_retry_queue(resolved_retry_queue_path)
+            queue_dirty = False
+
             def _sync_and_record(event: Event) -> SyncResult:
+                nonlocal queue_dirty
                 try:
                     sync_result = notion_sync.sync(event)
                 except Exception as exc:  # noqa: BLE001  (구현 범위 3: Notion 실패가 Runtime을 막지 않는다)
@@ -216,25 +235,47 @@ def run_once(
                 _log_notion_sync(resolved_notion_sync_log_path, sync_result)
                 # CEO Policy Decision (Notion Retry Architecture Plan A):
                 # a still-failing event stays queued (upsert, never
-                # duplicated — retry_queue.enqueue() dedups by event_id);
-                # any non-error result clears it from the queue, whether it
-                # arrived there via the queue itself or fresh this run.
+                # duplicated — dedup is by event_id); any non-error result
+                # clears it from the queue, whether it arrived there via the
+                # queue itself or fresh this run.
                 if sync_result.status in (SyncStatus.NOTION_RETRY_REQUIRED, SyncStatus.NOTION_FAILED):
-                    retry_queue_enqueue(resolved_retry_queue_path, event, now=now)
-                else:
-                    retry_queue_dequeue(resolved_retry_queue_path, event.event_id)
+                    retry_queue_upsert(queue_entries, event, now=now)
+                    queue_dirty = True
+                elif retry_queue_remove(queue_entries, event.event_id):
+                    queue_dirty = True
                 return sync_result
 
-            # 4a. Retry Queue를 가장 먼저 처리한다 (CEO Policy Decision).
-            for queued_entry in load_retry_queue(resolved_retry_queue_path):
-                notion_sync_results.append(_sync_and_record(queued_entry.to_event()))
+            # 4c는 `finally`다. Batch Save(B안)는 쓰기 횟수만 줄이려는 변경이고
+            # 내구성을 낮추려는 변경이 아니다 — 단계별 저장이던 시절에는 4b 도중
+            # 예외가 나도 그때까지의 큐 변경은 이미 파일에 있었다. 한 번만 저장하게
+            # 바꾸면서 그 보장이 사라졌고, 측정 결과 Notion 장애 6건 중 4번째에서
+            # 예외가 나면 6건 전부가 큐에서 사라졌다. 그 Event들은 이미 수집 완료로
+            # 표시돼 다시 수집되지 않으므로 Notion에 영원히 반영되지 않는다.
+            # 따라서 이 블록을 어떻게 빠져나가든 델타는 반드시 기록한다.
+            try:
+                # 4a. Retry Queue를 가장 먼저 처리한다 (CEO Policy Decision).
+                #     Iterate a snapshot: _sync_and_record() mutates queue_entries.
+                for queued_entry in list(queue_entries):
+                    notion_sync_results.append(_sync_and_record(queued_entry.to_event()))
 
-            # 4b. 이번 실행에서 새로 수집된 ACCEPTED Event.
-            for processed_file in collector_summary.files:
-                if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
-                    continue
-                event = Event.from_json(processed_file.destination_path.read_text(encoding="utf-8"))
-                notion_sync_results.append(_sync_and_record(event))
+                # 4b. 이번 실행에서 새로 수집된 ACCEPTED Event.
+                for processed_file in collector_summary.files:
+                    if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
+                        continue
+                    event = Event.from_json(
+                        processed_file.destination_path.read_text(encoding="utf-8")
+                    )
+                    notion_sync_results.append(_sync_and_record(event))
+            finally:
+                # 4c. 이 단계에서 발생한 모든 큐 변경을 1회만 기록한다 (B안).
+                if queue_dirty:
+                    try:
+                        save_retry_queue(resolved_retry_queue_path, queue_entries)
+                    except Exception:  # noqa: BLE001
+                        # 저장 자체가 실패하면 원래 예외를 가리지 않는다. 정상
+                        # 경로에서는 여기서 삼킬 것이 없다 — 아래 재발생이 알린다.
+                        if sys.exc_info()[0] is None:
+                            raise
 
         # 5. History Filter — docs/07 §37 step 6 "History Pipeline",
         #    docs/05 §2 Event -> History Filter -> Candidate

@@ -17,8 +17,14 @@ command is needed for it. What to do about a non-empty `deleted` result
 (stop before commit/push, per section 44-47) is left to runner.py; this
 module only computes and reports it via WorkingCopySyncResult.deleted.
 
-Secret Scan (section 29) is not implemented here — Issue #3 (what action
-to take on a match) is still unresolved, per this Sprint's instructions.
+Secret Scan (section 29) IS implemented here, as `scan_for_secrets()`.
+This paragraph used to say it was not, and that Issue #3 (what action to
+take on a match) was unresolved — both claims are now false and the
+function's own docstring was corrected earlier for the same reason.
+Issue #3 was decided: backup/runner.py calls `scan_for_secrets()` at step
+2 and a match FAILS the whole backup before Working Copy Sync or any git
+command runs. Detection remains filename-based only; file contents are
+never read (measured scope is in the function's docstring).
 
 Backup target scope (sections 26-28): only files under `daily/` and
 `monthly/` (section 26's "포함" list) are considered at all — by either
@@ -110,12 +116,30 @@ def _looks_like_secret(name: str) -> bool:
 
 
 def scan_for_secrets(root: Path) -> tuple[str, ...]:
-    """docs/08 section 29: detect known secret-like filenames only.
+    """docs/08 section 29: detect known secret-like FILENAMES only.
 
-    Detection only. No exception is raised, nothing is excluded from a
-    sync, nothing is logged, and this is not called from
-    sync_to_working_copy(), check_master_directory(), or runner.py —
-    what to do about a match is Issue #3, still unresolved.
+    Docstring corrected — every claim in the previous version is now false,
+    and one of them was dangerous: it declared that no caller existed in
+    backup/runner.py, that a sync excluded nothing, and that Issue #3 was
+    still open. Issue #3 has since been decided: backup/runner.py
+    calls this at step 2 and a match FAILS the whole backup before Working
+    Copy Sync or any git command runs, recording the matched paths in the
+    BackupLogEntry. Left as it was, the docstring invited someone to delete a
+    live security gate as dead code.
+
+    What it does NOT do, measured rather than assumed. Planting twelve
+    realistic secrets under a master directory, this catches three:
+
+        .env, .env.local, id_rsa                        detected (filename)
+        secrets.json, credentials.yml, token.txt        NOT detected
+        a Notion token / GitHub PAT / AWS key / RSA
+        private key pasted into a Daily History file    NOT detected (0 of 6)
+
+    File CONTENT is never read, so a secret pasted into Company History
+    reaches the backup remote untouched. That is the documented design of
+    section 29, not a defect in this function — but because a match now
+    blocks the backup, the gate reads as stronger protection than it is.
+    Widening it is a policy decision, not a code cleanup.
     """
     if not root.is_dir():
         return ()

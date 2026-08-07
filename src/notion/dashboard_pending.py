@@ -59,11 +59,48 @@ class PendingDashboardRecord:
         )
 
 
+class DashboardPendingError(ValueError):
+    """Raised when dashboard_pending.json exists but cannot be read as a
+    valid pending set (bad JSON, wrong shape, malformed record).
+
+    Never raised for a simply-missing file — that is an empty set.
+    State Recovery 통일 (CEO 승인 A안): same contract as
+    `collector.state.CollectorStateError`, per docs/10 §46.
+
+    Note the division of labour with `drain_pending()`: this names the
+    failure, and `drain_pending()` absorbs it, because CEO Decision ④ says a
+    Dashboard problem must never interrupt the Runtime.
+    """
+
+
 def load_pending(path: Path) -> list[PendingDashboardRecord]:
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return [PendingDashboardRecord.from_dict(e) for e in data.get("entries", [])]
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise DashboardPendingError(
+            f"dashboard pending file is corrupted: {path} ({exc})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise DashboardPendingError(
+            f"dashboard pending file must contain a JSON object: {path}"
+        )
+
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        raise DashboardPendingError(
+            f"dashboard pending file has an invalid entries field: {path}"
+        )
+
+    try:
+        return [PendingDashboardRecord.from_dict(e) for e in entries]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise DashboardPendingError(
+            f"dashboard pending file has a malformed record: {path} ({exc})"
+        ) from exc
 
 
 def save_all(path: Path, records: list[PendingDashboardRecord]) -> None:
@@ -132,7 +169,16 @@ def drain_pending(path: Path, client) -> tuple[int, int]:
     be retried by a later Runner execution. Like `record_run()`, this must
     never interrupt the Runtime, so all exceptions are absorbed here.
     """
-    records = load_pending(path)
+    try:
+        records = load_pending(path)
+    except DashboardPendingError:
+        # CEO Decision ④: a Dashboard problem must never interrupt the
+        # Runtime, and this function's contract is "Never raises". A damaged
+        # pending file is therefore reported as "nothing to drain" rather than
+        # propagated — the file is left untouched for an operator to inspect
+        # (docs/10 §46: 프로그램이 임의로 삭제하지 않는다).
+        return (0, 0)
+
     if not records:
         return (0, 0)
 

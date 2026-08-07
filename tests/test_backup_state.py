@@ -8,7 +8,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from backup.result import BackupStatus  # noqa: E402
-from backup.state import BackupState, load_state, save_state  # noqa: E402
+from backup.state import (  # noqa: E402
+    BackupState,
+    BackupStateError,
+    load_state,
+    save_state,
+)
 
 
 class BackupStateTestCase(unittest.TestCase):
@@ -41,18 +46,26 @@ class RoundTripTests(BackupStateTestCase):
 class CorruptedStateTests(BackupStateTestCase):
     def test_corrupted_json_raises_and_does_not_delete_the_bad_file(self):
         # docs/10_E2E_OPERATIONS_SPEC.md §46: "프로그램이 임의로 모든 History를
-        # 삭제하거나 다시 생성하면 안 된다." Characterizing current behavior
-        # (not fixing it): unlike collector/state.py's CollectorStateError,
-        # backup/state.py's load_state() has no dedicated handling for a
-        # malformed file — json.loads() raises directly. The file itself
-        # must still survive untouched either way.
+        # 삭제하거나 다시 생성하면 안 된다."
+        #
+        # State Recovery 통일 (CEO 승인 A안): this used to characterize the
+        # gap — unlike collector/state.py's CollectorStateError, load_state()
+        # let a raw json.JSONDecodeError escape. It now raises its own named
+        # BackupStateError. The file itself must still survive untouched.
         self.state_path.parent.mkdir(parents=True)
         self.state_path.write_text("{not valid json", encoding="utf-8")
 
-        with self.assertRaises(json.JSONDecodeError):
+        with self.assertRaises(BackupStateError):
             load_state(self.state_path)
 
         self.assertEqual(self.state_path.read_text(encoding="utf-8"), "{not valid json")
+
+    def test_wrong_top_level_shape_raises_the_typed_error(self):
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(json.dumps("not an object"), encoding="utf-8")
+
+        with self.assertRaises(BackupStateError):
+            load_state(self.state_path)
 
     def test_valid_json_with_wrong_shape_raises(self):
         self.state_path.parent.mkdir(parents=True)

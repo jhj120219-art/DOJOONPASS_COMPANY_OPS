@@ -54,18 +54,44 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 
 
-def _build_notion_sync() -> ExecutionPlanSync | None:
+def _build_notion_clients() -> tuple[ExecutionPlanSync | None, NotionClient | None]:
+    """(Notion Sync, Operations Dashboard client). Either may be None.
+
+    Notion Dashboard Production 연결 (CEO 승인 A안): the Dashboard client is
+    built here, from configuration, exactly like the Sync client — previously
+    nothing constructed it, so `app.runner.run_once()`'s `dashboard_client`
+    parameter was permanently None in production and CEO Decision ④'s
+    Operations Dashboard never recorded a single run.
+
+    Both are optional and independent:
+        no NOTION_API_TOKEN / NOTION_PROJECTS_DATABASE_ID -> no Sync, no Dashboard
+        no NOTION_OPS_RUNS_DATABASE_ID                    -> Sync only
+    """
     try:
         config = NotionConfig.from_env()
     except NotionConfigError:
         print(
-            "[INFO] Notion 미설정 — Notion Sync 단계를 건너뜁니다 "
-            "(NOTION_API_TOKEN / NOTION_PROJECTS_DATABASE_ID 없음)."
+            "[INFO] Notion 미설정 — Notion Sync / Operations Dashboard 단계를 "
+            "건너뜁니다 (NOTION_API_TOKEN / NOTION_PROJECTS_DATABASE_ID 없음)."
         )
-        return None
+        return None, None
+
     transport = RealNotionTransport(api_token=config.api_token)
-    client = NotionClient(transport=transport, database_id=config.projects_database_id)
-    return ExecutionPlanSync(client=client)
+    notion_sync = ExecutionPlanSync(
+        client=NotionClient(transport=transport, database_id=config.projects_database_id)
+    )
+
+    if not config.ops_runs_database_id:
+        print(
+            "[INFO] Operations Dashboard 미설정 — 해당 단계를 건너뜁니다 "
+            "(NOTION_OPS_RUNS_DATABASE_ID 없음). Notion Sync는 정상 동작합니다."
+        )
+        return notion_sync, None
+
+    dashboard_client = NotionClient(
+        transport=transport, database_id=config.ops_runs_database_id
+    )
+    return notion_sync, dashboard_client
 
 
 def _resolve_history_start_date() -> date:
@@ -94,7 +120,7 @@ def _resolve_history_start_date() -> date:
 
 def main() -> int:
     history_start_date = _resolve_history_start_date()
-    notion_sync = _build_notion_sync()
+    notion_sync, dashboard_client = _build_notion_clients()
 
     local_master_dir = RUNTIME_DIR / "local_master"
     local_master_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +131,7 @@ def main() -> int:
         history_start_date=history_start_date,
         runner_lock_path=RUNTIME_DIR / "locks" / "company_ops.lock",
         notion_sync=notion_sync,
+        dashboard_client=dashboard_client,
     )
 
     if result is None:

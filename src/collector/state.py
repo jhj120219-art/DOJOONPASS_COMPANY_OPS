@@ -41,10 +41,14 @@ class CollectorStateError(CollectorError):
 class PersistentSeenEventStore(SeenEventStore):
     """SeenEventStore that survives process restarts via a JSON state file.
 
-    Every mark_seen()/record_run() call saves the full state atomically
-    (temp file + os.replace) before returning, so a crash right after
-    either call never leaves a torn file and never loses an update that
+    Every mark_seen()/unmark_seen()/record_run() call saves the full state
+    atomically (temp file + os.replace) before returning, so a crash right
+    after any of them never leaves a torn file and never loses an update that
     already reported success.
+
+    unmark_seen() persists for the same reason mark_seen() does: the rollback
+    it performs must survive a crash, or the retry it exists to enable would
+    be lost with it.
     """
 
     def __init__(self, state_path: Path | None = None):
@@ -113,11 +117,32 @@ class PersistentSeenEventStore(SeenEventStore):
         self._seen_ids.add(event_id)
         self._save()
 
+    def unmark_seen(self, event_id: str) -> None:
+        """Roll back a mark_seen() whose Event was never consumed.
+
+        See SeenEventStore.unmark_seen() for why this exists. Persists
+        immediately, like mark_seen(), so the rollback survives a crash right
+        after it. A no-op (and no write) when the id is not present, so it is
+        safe to call unconditionally on a failure path.
+        """
+        if event_id not in self._seen_ids:
+            return
+        self._seen_ids.discard(event_id)
+        self._save()
+
     def record_run(self, timestamp: str | None = None) -> None:
         """Record that a Collector run happened, for the state file's `last_run`.
 
-        Not called automatically by anything yet — a future Scheduler/Runtime
-        phase decides when a "run" starts or ends and calls this explicitly.
+        Docstring corrected: it used to say no caller existed yet. One does —
+        `app/runner.py` calls this immediately after the Collector step, once
+        per Runner execution, with the run's `now`. The stale wording invited
+        the same mistake as the one already corrected in
+        `backup/working_copy.scan_for_secrets()`: reading a live call site as
+        dead code.
+
+        `last_run` is written but never read back by anything, so it is a
+        record for a human inspecting collector_state.json, not a value the
+        Runtime branches on.
         """
         self.last_run = timestamp or datetime.now().astimezone().isoformat(timespec="seconds")
         self._save()

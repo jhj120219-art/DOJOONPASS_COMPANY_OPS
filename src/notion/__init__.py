@@ -35,7 +35,9 @@ from .retry_queue import (
     dequeue,
     enqueue,
     load_queue,
+    remove_entry,
     save_queue,
+    upsert_entry,
 )
 from .sync import ExecutionPlanSync, SyncResult, SyncStatus
 from .transport import (
@@ -81,7 +83,9 @@ __all__ = [
     "dequeue",
     "enqueue",
     "load_queue",
+    "remove_entry",
     "save_queue",
+    "upsert_entry",
     "TARGET_PROPERTIES",
     "BootstrapResult",
     "PropertyBootstrapReport",

@@ -22,6 +22,7 @@ from .git_ops import (
     GitOperationError,
     git_add_all,
     git_commit,
+    git_head_commit,
     git_push,
     git_status,
     is_authentication_failure,
@@ -149,7 +150,46 @@ def run_once(
     status = git_status(working_copy_dir)
 
     # 6. 변경 없음 -> BACKUP_NOT_REQUIRED
+    #
+    #    예외: 직전 실행이 BACKUP_PENDING으로 끝났다면 commit은 이미 만들어졌고
+    #    push만 실패한 상태다. 그 경우 Working Copy는 깨끗하지만 Remote는 뒤처져
+    #    있으므로, `git status`만 보고 NOT_REQUIRED로 끝내면 docs/08 §19가 약속한
+    #    "다음 Runner에서 재시도"가 영원히 일어나지 않는다(Audit BUG-1). 게다가
+    #    backup_status가 PENDING -> NOT_REQUIRED로 덮어써져 미완료 신호까지
+    #    사라진다. CEO 승인 A안: State가 PENDING이면 push를 먼저 재시도한다.
     if not status.has_changes:
+        if state.backup_status is BackupStatus.PENDING:
+            try:
+                git_push(working_copy_dir)
+            except GitOperationError as exc:
+                # 7번 단계와 동일한 분류 규칙(docs/08 §19 vs §21/§62).
+                state.backup_status = (
+                    BackupStatus.FAILED
+                    if is_authentication_failure(str(exc))
+                    else BackupStatus.PENDING
+                )
+                save_state(resolved_state_path, state)
+                raise
+
+            final_status = BackupStatus.SUCCESS
+            backup_end = datetime.now().astimezone()
+            entry = BackupLogEntry(
+                run_id=resolved_run_id,
+                backup_start=backup_start,
+                source=resolved_source,
+                changed_files=(),
+                deleted_files=(),
+                commit_hash=git_head_commit(working_copy_dir),
+                push_result="SUCCESS (pending backup retried)",
+                backup_end=backup_end,
+                final_status=final_status,
+            )
+            state.last_successful_backup = backup_end
+            state.last_backup_commit = entry.commit_hash
+            state.backup_status = final_status
+            save_state(resolved_state_path, state)
+            return entry
+
         final_status = BackupStatus.NOT_REQUIRED
         entry = BackupLogEntry(
             run_id=resolved_run_id,

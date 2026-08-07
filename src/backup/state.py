@@ -22,6 +22,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE_PATH = PROJECT_ROOT / "runtime" / "state" / "backup_state.json"
 
 
+class BackupStateError(ValueError):
+    """Raised when backup_state.json exists but cannot be read as valid
+    Backup state (bad JSON, wrong shape, unknown status value).
+
+    Never raised for a simply-missing file — that starts an empty state.
+    State Recovery 통일 (CEO 승인 A안): same contract and wording as
+    `collector.state.CollectorStateError` and
+    `scheduler.state.SchedulerStateError`, per docs/10 §46.
+    """
+
+
 @dataclass
 class BackupState:
     last_successful_backup: datetime | None = None
@@ -33,15 +44,48 @@ def load_state(state_path: Path) -> BackupState:
     if not state_path.exists():
         return BackupState()
 
-    data = json.loads(state_path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BackupStateError(
+            f"backup state file is corrupted: {state_path} ({exc})"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise BackupStateError(
+            f"backup state file must contain a JSON object: {state_path}"
+        )
+
     timestamp_value = data.get("last_successful_backup")
     status_value = data.get("backup_status")
-    return BackupState(
-        last_successful_backup=(
+    commit_value = data.get("last_backup_commit")
+
+    if commit_value is not None and not isinstance(commit_value, str):
+        raise BackupStateError(
+            f"backup state file has an invalid last_backup_commit field: {state_path}"
+        )
+
+    try:
+        parsed_timestamp = (
             datetime.fromisoformat(timestamp_value) if timestamp_value else None
-        ),
-        last_backup_commit=data.get("last_backup_commit"),
-        backup_status=BackupStatus(status_value) if status_value else None,
+        )
+    except (TypeError, ValueError) as exc:
+        raise BackupStateError(
+            f"backup state file has an unparseable last_successful_backup: "
+            f"{state_path} ({exc})"
+        ) from exc
+
+    try:
+        parsed_status = BackupStatus(status_value) if status_value else None
+    except ValueError as exc:
+        raise BackupStateError(
+            f"backup state file has an unknown backup_status: {state_path} ({exc})"
+        ) from exc
+
+    return BackupState(
+        last_successful_backup=parsed_timestamp,
+        last_backup_commit=commit_value,
+        backup_status=parsed_status,
     )
 
 
