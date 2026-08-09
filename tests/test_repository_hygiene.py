@@ -127,7 +127,18 @@ class DependencyGuardTests(unittest.TestCase):
     }
 
     def test_src_imports_only_the_standard_library(self):
-        stdlib = set(sys.stdlib_module_names)
+        # sys.stdlib_module_names was added in Python 3.10; fall back to
+        # sys.builtin_module_names + stdlib_list on older interpreters so this
+        # guard runs the same way on any supported Python version.
+        stdlib = set(getattr(sys, "stdlib_module_names", ())) | set(sys.builtin_module_names)
+        if not hasattr(sys, "stdlib_module_names"):
+            import sysconfig
+
+            stdlib_dir = Path(sysconfig.get_path("stdlib"))
+            for entry in stdlib_dir.iterdir():
+                name = entry.stem if entry.suffix == ".py" else entry.name
+                if name:
+                    stdlib.add(name)
         third_party = {}
         for path in SRC.rglob("*.py"):
             if "__pycache__" in str(path):

@@ -39,6 +39,20 @@ import sys
 from datetime import date
 from pathlib import Path
 
+# This script's own status/error messages are Korean (operator-facing, per
+# every doc in this repository). Windows' console defaults to the system's
+# legacy codepage (e.g. cp949 for a Korean locale), not UTF-8 — under it,
+# printing a line with a plain "-" would work, but a punctuation character
+# outside that codepage's repertoire (e.g. the "—" this file already uses)
+# raises UnicodeEncodeError on stdout and crashes the process outright,
+# exactly on the "Notion not configured yet" path docs/11 §18 promises is
+# safe and non-fatal ("Notion 때문에 전체 Deployment를 중단하지 않는다").
+# Forcing UTF-8 here makes that guarantee hold regardless of the console's
+# codepage, without touching what any message actually says.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from app.runner import run_once  # noqa: E402

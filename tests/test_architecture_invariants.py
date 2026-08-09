@@ -24,6 +24,8 @@ OS processes.
 Nothing here changes production code, Runtime behaviour, or any spec.
 """
 
+from __future__ import annotations
+
 import ast
 import inspect
 import json
@@ -1311,6 +1313,10 @@ class ExitCodeContractTests(unittest.TestCase):
 
 
 def _force_rmtree_if_present(path: Path) -> None:
+    """shutil.rmtree's `onexc` callback was added in Python 3.12; `onerror`
+    (deprecated there, still the only option before it) has a different
+    callback signature, so which kwarg to pass has to be chosen at runtime.
+    """
     if path.exists():
         def onexc(func, target, exc):
             try:
@@ -1319,7 +1325,13 @@ def _force_rmtree_if_present(path: Path) -> None:
             except OSError:
                 pass
 
-        shutil.rmtree(path, onexc=onexc)
+        def onerror(func, target, exc_info):
+            onexc(func, target, exc_info[1])
+
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=onexc)
+        else:
+            shutil.rmtree(path, onerror=onerror)
 
 
 class ResultFieldConsumptionTests(unittest.TestCase):

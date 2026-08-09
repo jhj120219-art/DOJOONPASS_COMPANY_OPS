@@ -90,6 +90,28 @@ class BootstrapProjectAlreadyNamedTests(unittest.TestCase):
         self.assertEqual(schema["Project"], {"type": "title", "title": {}})
 
 
+class BootstrapTitleRenameCollisionTests(unittest.TestCase):
+    """The Title property can be named anything before Bootstrap renames it
+    to "Project" (V1.1). If that original name collides with one of §8's
+    other Target Properties (e.g. a Title literally named "Status"), the
+    rename consumes that name — the real "Status" Select property still
+    does not exist afterwards, and must still be created."""
+
+    def test_a_target_property_name_freed_by_the_rename_is_still_created(self):
+        transport = InMemoryNotionTransport(initial_properties={"Status": {"type": "title", "title": {}}})
+        client = NotionClient(transport=transport, database_id="DB-1")
+
+        result = bootstrap_database(client)
+
+        by_name = {r.name: r for r in result.reports}
+        self.assertEqual(by_name["Project"].outcome, PropertyOutcome.RENAMED)
+        self.assertEqual(by_name["Status"].outcome, PropertyOutcome.CREATED)
+
+        schema = client.get_database_schema()
+        self.assertEqual(schema["Project"]["type"], "title")
+        self.assertEqual(schema["Status"], {"select": {}})
+
+
 class BootstrapTitleRenameFailureTests(unittest.TestCase):
     """작업 6, 시나리오 3: Rename 실패 시 Runtime 중단 없이 Error 반환."""
 

@@ -70,6 +70,7 @@ from notion import (  # noqa: E402
     NotionClient,
     SyncResult,
     SyncStatus,
+    build_index as build_retry_queue_index,
     load_queue as load_retry_queue,
     record_run as dashboard_record_run,
     remove_entry as retry_queue_remove,
@@ -220,6 +221,13 @@ def run_once(
             # dequeued. No Event is lost, and none is applied twice.
             queue_entries = load_retry_queue(resolved_retry_queue_path)
             queue_dirty = False
+            # in-memory lookup index for this run's upserts/removes below —
+            # a Notion outage held open across n queued Events previously cost
+            # O(n^2) list scans draining the queue (measured: 0.45 ms at 100
+            # entries -> 3,637 ms at 10,000). Additive only: entries' on-disk
+            # shape, upsert semantics, and every other caller of upsert_entry/
+            # remove_entry (enqueue(), dequeue(), tests) are unchanged.
+            queue_index = build_retry_queue_index(queue_entries)
 
             def _sync_and_record(event: Event) -> SyncResult:
                 nonlocal queue_dirty
@@ -239,9 +247,9 @@ def run_once(
                 # clears it from the queue, whether it arrived there via the
                 # queue itself or fresh this run.
                 if sync_result.status in (SyncStatus.NOTION_RETRY_REQUIRED, SyncStatus.NOTION_FAILED):
-                    retry_queue_upsert(queue_entries, event, now=now)
+                    retry_queue_upsert(queue_entries, event, now=now, index=queue_index)
                     queue_dirty = True
-                elif retry_queue_remove(queue_entries, event.event_id):
+                elif retry_queue_remove(queue_entries, event.event_id, index=queue_index):
                     queue_dirty = True
                 return sync_result
 
@@ -271,10 +279,19 @@ def run_once(
                 if queue_dirty:
                     try:
                         save_retry_queue(resolved_retry_queue_path, queue_entries)
-                    except Exception:  # noqa: BLE001
+                    except Exception as save_exc:  # noqa: BLE001
                         # 저장 자체가 실패하면 원래 예외를 가리지 않는다. 정상
-                        # 경로에서는 여기서 삼킬 것이 없다 — 아래 재발생이 알린다.
-                        if sys.exc_info()[0] is None:
+                        # 경로에서는(원래 예외가 없으면) 저장 실패 자체를 알린다.
+                        #
+                        # `sys.exc_info()`는 이 except 블록 안에서 항상 지금
+                        # 잡은 예외(save_exc) 자신을 가리켜 이 조건이 절대
+                        # 참이 될 수 없었다(발견: 이 저장 실패가 try 블록
+                        # 성공/실패 여부와 무관하게 항상 조용히 삼켜짐 — Retry
+                        # Queue에 새로 추가된 재시도 대상이 디스크에 반영되지
+                        # 않고 유실됨). `save_exc.__context__`는 이 예외가
+                        # *발생한 시점*에 이미 전파 중이던 예외를 가리키므로
+                        # (원래 예외 없음 -> None) 의도한 판단을 실제로 한다.
+                        if save_exc.__context__ is None:
                             raise
 
         # 5. History Filter — docs/07 §37 step 6 "History Pipeline",
@@ -338,40 +355,48 @@ def run_once(
         #     저장되어 다음 실행에서 재시도된다(Retry Queue와 동일한 방식 —
         #     자세한 이유는 notion/dashboard_pending.py docstring 참고).
         #     dashboard_client가 없으면(미설정) 이 단계 전체를 건너뛴다.
+        #
+        #     drain_pending()/dashboard_record_run()은 스스로 예외를 던지지
+        #     않도록 구현돼 있지만(각자의 docstring 참고), 이 호출부는 그 내부
+        #     구현을 신뢰하기만 할 뿐 구조적으로 강제하지 않았다 — 4단계의
+        #     notion_sync.sync() 호출부가 `except Exception`으로 한 번 더
+        #     감싸는 것과 다른 처리였다. 이미 History/Backup까지 전부 성공한
+        #     실행 결과가 Dashboard 기록 단계의 예기치 못한 회귀 하나로 유실되지
+        #     않도록, 같은 파일의 기존 방어 패턴과 동일하게 여기서도 감싼다.
         if dashboard_client is not None:
-            resolved_dashboard_pending_path = (
-                Path(dashboard_pending_path)
-                if dashboard_pending_path is not None
-                else DEFAULT_DASHBOARD_PENDING_PATH
-            )
-            resolved_run_id = run_id or now.isoformat(timespec="seconds")
+            try:
+                resolved_dashboard_pending_path = (
+                    Path(dashboard_pending_path)
+                    if dashboard_pending_path is not None
+                    else DEFAULT_DASHBOARD_PENDING_PATH
+                )
+                resolved_run_id = run_id or now.isoformat(timespec="seconds")
 
-            # 밀린 기록 먼저 재시도한다(Retry Queue와 동일한 "먼저 처리" 원칙).
-            drain_pending(resolved_dashboard_pending_path, dashboard_client)
+                # 밀린 기록 먼저 재시도한다(Retry Queue와 동일한 "먼저 처리" 원칙).
+                drain_pending(resolved_dashboard_pending_path, dashboard_client)
 
-            dashboard_result = dashboard_record_run(
-                dashboard_client,
-                run_id=resolved_run_id,
-                run_at=now,
-                intake_summary=intake_summary,
-                collector_summary=collector_summary,
-                scheduler_result=scheduler_result,
-                backup_entry=backup_entry,
-                notion_sync_results=notion_sync_results,
-            )
-            if (
-                dashboard_result.outcome is DashboardOutcome.FAILED
-                and dashboard_result.properties is not None
-            ):
-                try:
+                dashboard_result = dashboard_record_run(
+                    dashboard_client,
+                    run_id=resolved_run_id,
+                    run_at=now,
+                    intake_summary=intake_summary,
+                    collector_summary=collector_summary,
+                    scheduler_result=scheduler_result,
+                    backup_entry=backup_entry,
+                    notion_sync_results=notion_sync_results,
+                )
+                if (
+                    dashboard_result.outcome is DashboardOutcome.FAILED
+                    and dashboard_result.properties is not None
+                ):
                     save_pending(
                         resolved_dashboard_pending_path,
                         run_id=resolved_run_id,
                         properties=dashboard_result.properties,
                         now=now,
                     )
-                except Exception:  # noqa: BLE001  (기록 실패가 Runtime을 막지 않는다)
-                    pass
+            except Exception:  # noqa: BLE001  (CEO ④: Dashboard 실패가 Runtime을 막지 않는다)
+                pass
 
         return (
             intake_summary,

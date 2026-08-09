@@ -42,9 +42,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCK_PATH = PROJECT_ROOT / "runtime" / "locks" / "company_ops.lock"
 
 
+def _long_path(path: Path) -> Path:
+    """A Path usable even past Windows' 260-character MAX_PATH.
+
+    Lock filenames are not chosen by this module, so a legal-but-long name
+    (or one with characters like `:` that create an NTFS alternate data
+    stream) must not be mistaken for an acquisition failure. The `\\\\?\\`
+    prefix lifts the limit, but only for an absolute, backslash-separated
+    path, so it is built from the resolved path rather than the raw input.
+    `Path.resolve()` strips an existing `\\\\?\\` prefix from its input
+    before normalising, so there is nothing to special-case there — every
+    resolved path reaching here is prefix-free and gets exactly one added.
+    """
+    if sys.platform != "win32":
+        return path
+    resolved = path.resolve()
+    text = str(resolved)
+    if text.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + text[2:])
+    return Path("\\\\?\\" + text)
+
+
 def _read_lock(lock_path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(lock_path.read_text(encoding="utf-8"))
+        return json.loads(_long_path(lock_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -88,7 +109,7 @@ def _take_over_stale(lock_path: Path, observed: dict[str, Any] | None) -> bool:
     if _read_lock(lock_path) != observed:
         return False
     try:
-        os.unlink(lock_path)
+        os.unlink(_long_path(lock_path))
     except OSError:
         return False
     return True
@@ -126,7 +147,7 @@ def try_acquire_lock(lock_path: Path, *, now: datetime) -> bool:
     # lock was cleared. A further collision means another run got there first.
     for _ in range(2):
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(_long_path(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             observed = _read_lock(lock_path)
             pid = observed.get("process_id") if observed is not None else None
@@ -144,7 +165,7 @@ def try_acquire_lock(lock_path: Path, *, now: datetime) -> bool:
                 json.dump(payload, handle)
         except BaseException:
             try:
-                os.unlink(lock_path)
+                os.unlink(_long_path(lock_path))
             except OSError:
                 pass
             raise
@@ -163,6 +184,6 @@ def try_acquire_lock(lock_path: Path, *, now: datetime) -> bool:
 
 def release_lock(lock_path: Path) -> None:
     try:
-        lock_path.unlink()
+        _long_path(lock_path).unlink()
     except OSError:
         pass

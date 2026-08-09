@@ -37,6 +37,13 @@ from scheduler.consistency import ConsistencyStatus, check_state_consistency  # 
 
 
 def _force_rmtree(path: Path) -> None:
+    """git object files are read-only on Windows; clear the flag first.
+
+    shutil.rmtree's `onexc` callback was added in Python 3.12; `onerror`
+    (deprecated there, still the only option before it) has a different
+    callback signature, so which kwarg to pass has to be chosen at runtime.
+    """
+
     def onexc(func, target, exc):
         try:
             Path(target).chmod(stat.S_IWRITE)
@@ -44,7 +51,13 @@ def _force_rmtree(path: Path) -> None:
         except OSError:
             pass
 
-    shutil.rmtree(path, onexc=onexc)
+    def onerror(func, target, exc_info):
+        onexc(func, target, exc_info[1])
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=onexc)
+    else:
+        shutil.rmtree(path, onerror=onerror)
 
 
 class DisasterScenarioTestCase(unittest.TestCase):

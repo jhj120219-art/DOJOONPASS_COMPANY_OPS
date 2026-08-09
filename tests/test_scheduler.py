@@ -206,6 +206,66 @@ class FailureIsolationTests(SchedulerTestCase):
         state = load_state(self.state_path)
         self.assertEqual(state.last_successful_daily_close, date(2026, 8, 1))
 
+    def test_a_mid_batch_failure_keeps_earlier_days_and_stops_cleanly(self):
+        """The complement of the test above: repository.list() succeeding but
+        generate_daily_history() itself failing partway through a multi-day
+        batch (day 2 of 4, not the first). Found via `python -m trace
+        --count` to have zero coverage across the combined backup/scheduler/
+        notion-dashboard/runner-failure-paths/e2e suites (261 tests) despite
+        being exactly the "long idle period, one bad day" scenario docs/07
+        §30 describes ("Dates close in order; stop here rather than skip
+        ahead"). Verified here: day 1's file/state survive, the run reports
+        FAILED at day 2 without raising, and a later retry resumes at day 2
+        rather than re-doing day 1."""
+        import scheduler.scheduler as scheduler_module
+
+        original = scheduler_module.generate_daily_history
+        calls = {"n": 0}
+
+        def failing_on_day_2(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("simulated failure generating day 2")
+            return original(*args, **kwargs)
+
+        scheduler_module.generate_daily_history = failing_on_day_2
+        self.addCleanup(setattr, scheduler_module, "generate_daily_history", original)
+
+        result = run_once(
+            self.repo,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 8, 5, 11, 0),  # range: 08-01..08-04
+            state_path=self.state_path,
+            lock_path=self.lock_path,
+            daily_output_dir=self.daily_dir,
+        )
+
+        self.assertEqual(result.status, SchedulerStatus.FAILED)
+        self.assertEqual(result.generated_dates, (date(2026, 8, 1),))
+        self.assertEqual(result.failed_date, date(2026, 8, 2))
+        self.assertTrue((self.daily_dir / "2026-08-01.md").exists())
+        self.assertFalse((self.daily_dir / "2026-08-02.md").exists())
+
+        state = load_state(self.state_path)
+        self.assertEqual(state.last_successful_daily_close, date(2026, 8, 1))
+
+        # Recovery: a later run (failure gone) resumes at day 2, not day 1.
+        scheduler_module.generate_daily_history = original
+        result2 = run_once(
+            self.repo,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 8, 5, 11, 0),
+            state_path=self.state_path,
+            lock_path=self.lock_path,
+            daily_output_dir=self.daily_dir,
+        )
+        self.assertEqual(result2.status, SchedulerStatus.COMPLETED)
+        self.assertEqual(
+            result2.generated_dates, (date(2026, 8, 2), date(2026, 8, 3), date(2026, 8, 4))
+        )
+        for day in ("2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04"):
+            self.assertTrue((self.daily_dir / f"{day}.md").exists())
+
     def test_lock_is_released_even_after_a_failure(self):
         class AlwaysFailingRepository:
             def list(self, decision=None):

@@ -616,5 +616,43 @@ class LockFileContractTests(LockTestCase):
         self.assertEqual(sorted(p.name for p in self.lock_path.parent.iterdir()), before)
 
 
+@unittest.skipUnless(sys.platform == "win32", "extended-length path prefix is Windows-only")
+class LongPathHelperTests(unittest.TestCase):
+    """`_long_path()` is what makes `test_unusual_but_legal_filenames_still_work`
+    pass a 200+ character name — this pins its two branches directly,
+    including the UNC one no lock path in this project actually takes
+    (runtime/locks is always local), so it stays covered on its own."""
+
+    def test_a_local_path_gets_the_bare_extended_prefix(self):
+        from scheduler.lock import _long_path
+
+        result = _long_path(Path(r"C:\some\lock\dir\company_ops.lock"))
+
+        self.assertTrue(str(result).startswith("\\\\?\\"))
+        self.assertNotIn("UNC", str(result))
+
+    def test_a_unc_path_gets_the_unc_extended_prefix(self):
+        from scheduler.lock import _long_path
+
+        result = _long_path(Path(r"\\fakeserver\fakeshare\locks\company_ops.lock"))
+
+        self.assertTrue(str(result).startswith("\\\\?\\UNC\\"))
+        self.assertIn("fakeserver", str(result))
+        self.assertIn("fakeshare", str(result))
+
+    def test_an_already_extended_path_still_comes_out_extended(self):
+        """`Path.resolve()` strips an existing `\\\\?\\` prefix before this
+        function ever sees it (verified: `resolve()` normalises it away), so
+        there is no special case to take — the plain branch re-adds exactly
+        one prefix either way."""
+        from scheduler.lock import _long_path
+
+        already = Path("\\\\?\\C:\\some\\lock\\dir\\company_ops.lock")
+
+        result = _long_path(already)
+
+        self.assertEqual(str(result), "\\\\?\\C:\\some\\lock\\dir\\company_ops.lock")
+
+
 if __name__ == "__main__":
     unittest.main()

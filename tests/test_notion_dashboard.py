@@ -349,6 +349,20 @@ class RecordRunTests(unittest.TestCase):
         self.assertEqual(result.outcome, DashboardOutcome.FAILED)
         self.assertIsNotNone(result.error)
 
+    def test_a_malformed_result_object_fails_the_build_without_raising(self):
+        """The OTHER except clause in record_run() (building properties, not
+        the API call) — found via `python -m trace --count` to have zero
+        coverage anywhere in the suite. `backup_entry.final_status` is
+        accessed directly (not via getattr), so a caller passing a malformed
+        result object (backup_entry=None here) must still hit CEO Decision
+        ④'s "never raise" guarantee, one step earlier than every other test
+        in this class exercises."""
+        result = self._record(self.client, backup_entry=None)
+
+        self.assertEqual(result.outcome, DashboardOutcome.FAILED)
+        self.assertIsNotNone(result.error)
+        self.assertIsNone(result.properties)
+
     def test_failed_record_carries_properties_for_retry(self):
         self.transport.fail_next_call = True
 
@@ -371,6 +385,71 @@ class RecordRunTests(unittest.TestCase):
         page = self.transport._pages[result.page_id]
         self.assertEqual(page["properties"]["Notion Synced"]["number"], 2)
         self.assertEqual(page["properties"]["Notion Retried"]["number"], 2)
+
+
+class _FalseNegativeCreateTransport(InMemoryNotionTransport):
+    """A create_page call that lands server-side (the page really is
+    created) but raises anyway on the way back — e.g. the response was lost
+    to a network glitch after Notion had already written it. Used to check
+    the "can never produce two OPS_RUNS rows" claim in
+    notion/dashboard_pending.py's module docstring."""
+
+    def __init__(self, *args, fail_once=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fail_once = fail_once
+
+    def create_page(self, database_id, properties):
+        page = super().create_page(database_id, properties)
+        if self._fail_once:
+            self._fail_once = False
+            raise ConnectionResetError("simulated: response lost after the write landed")
+        return page
+
+
+class RecordRunRetryDuplicationTests(unittest.TestCase):
+    """CHARACTERIZATION: pins today's behaviour, not the spec's claim.
+
+    dashboard_pending.py's own docstring states "one Runner execution can
+    never produce two OPS_RUNS rows, whether it is recorded on the first
+    attempt or the tenth." Neither record_run() nor drain_pending() actually
+    enforces that — both call client.create_project() unconditionally, with
+    no find-before-create step (unlike notion.sync.ExecutionPlanSync, which
+    calls find_project() first for exactly this reason). A false-negative
+    network failure (the write reaches Notion, but the caller sees an
+    exception) followed by a successful retry therefore creates a second
+    page for the same run_id. If this test starts failing, a
+    find-before-create guard was added and dashboard_pending.py's docstring
+    claim became true — this test should then be rewritten as the
+    guarantee."""
+
+    def test_a_false_negative_failure_then_a_successful_retry_creates_two_rows(self):
+        transport = _FalseNegativeCreateTransport()
+        client = NotionClient(transport=transport, database_id="ops-runs-db")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pending_path = Path(tmp) / "dashboard_pending.json"
+
+            first = record_run(
+                client,
+                run_id="run-dup",
+                run_at=datetime(2026, 8, 8, 11, 0),
+                intake_summary=_FakeIntake(),
+                collector_summary=_FakeCollector(accepted=1),
+                scheduler_result=_FakeScheduler(),
+                backup_entry=_FakeBackup(),
+                notion_sync_results=(),
+            )
+            self.assertEqual(first.outcome, DashboardOutcome.FAILED)
+            save_pending(pending_path, run_id="run-dup", properties=first.properties)
+
+            # The page from the "failed" first attempt already exists.
+            self.assertEqual(len(transport._pages), 1)
+
+            recorded, still_pending = drain_pending(pending_path, client)
+
+            self.assertEqual((recorded, still_pending), (1, 0))
+            # Two separate Notion pages now exist for the same run_id.
+            self.assertEqual(len(transport._pages), 2)
 
 
 class DashboardPendingTests(unittest.TestCase):

@@ -32,6 +32,7 @@ from .dashboard import (
 from .retry_queue import (
     DEFAULT_QUEUE_PATH,
     RetryQueueEntry,
+    build_index,
     dequeue,
     enqueue,
     load_queue,
@@ -80,6 +81,7 @@ __all__ = [
     "resolve_parent_page_id",
     "DEFAULT_QUEUE_PATH",
     "RetryQueueEntry",
+    "build_index",
     "dequeue",
     "enqueue",
     "load_queue",

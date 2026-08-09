@@ -192,6 +192,15 @@ def bootstrap_database(client: NotionClient) -> BootstrapResult:
 
     title_report = _bootstrap_title_property(client, current_properties)
 
+    if title_report.outcome is PropertyOutcome.RENAMED:
+        # The rename just mutated the live Database. If the old Title name
+        # happened to collide with another §8 Target Property (e.g. a Title
+        # named "Status"), diffing against the pre-rename snapshot would
+        # still see that name as EXISTS and skip creating the real "Status"
+        # property, which the rename just consumed. Re-fetching reflects
+        # what the Database actually looks like now.
+        current_properties = client.get_database_schema()
+
     to_create, decided = diff_properties(current_properties)
     reports: list[PropertyBootstrapReport] = [title_report, *decided]
 

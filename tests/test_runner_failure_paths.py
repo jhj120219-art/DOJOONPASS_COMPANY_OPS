@@ -67,7 +67,12 @@ from reporter import Reporter  # noqa: E402
 
 
 def _force_rmtree(path: Path) -> None:
-    """git object files are read-only on Windows; clear the flag first."""
+    """git object files are read-only on Windows; clear the flag first.
+
+    shutil.rmtree's `onexc` callback was added in Python 3.12; `onerror`
+    (deprecated there, still the only option before it) has a different
+    callback signature, so which kwarg to pass has to be chosen at runtime.
+    """
 
     def onexc(func, target, exc):
         try:
@@ -76,7 +81,13 @@ def _force_rmtree(path: Path) -> None:
         except OSError:
             pass
 
-    shutil.rmtree(path, onexc=onexc)
+    def onerror(func, target, exc_info):
+        onexc(func, target, exc_info[1])
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=onexc)
+    else:
+        shutil.rmtree(path, onerror=onerror)
 
 
 class StrictNotionTransport(InMemoryNotionTransport):
@@ -931,6 +942,61 @@ class RetryQueueBatchSaveDurabilityTests(RunnerFailurePathTestCase):
 
         self.assertEqual(calls, [4])
         self.assertEqual(len(self._queued_ids()), 4)
+
+    def test_a_save_failure_with_no_other_error_is_not_silently_swallowed(self):
+        """Found via `python -m trace --count`: this except clause's `if
+        sys.exc_info()[0] is None: raise` could never be true — inside its
+        own except block, sys.exc_info() always refers to the exception that
+        block just caught (the save failure itself), never None. So a
+        save_retry_queue() failure was silently swallowed unconditionally,
+        contradicting the comment's own stated intent ("정상 경로에서는 여기서
+        삼킬 것이 없다") and losing every Retry Queue delta computed this run
+        with no signal at all. Fixed via `save_exc.__context__` (set by
+        Python's exception chaining to whatever was already propagating when
+        save_retry_queue() raised — None here, since the try block above
+        succeeded)."""
+        for i in range(2):
+            self._write_event(event_id=f"BATCHSAVEFAIL-{i:03d}")
+
+        def failing_save(path, entries):
+            raise OSError("simulated disk failure during save_retry_queue")
+
+        runner_module.save_retry_queue = failing_save
+        self.addCleanup(lambda: setattr(runner_module, "save_retry_queue", save_retry_queue))
+
+        with self.assertRaises(OSError):
+            self._run(notion_sync=self._failing_sync())
+
+    def test_a_save_failure_during_an_active_exception_does_not_mask_it(self):
+        """The other half of the same fix: when the try block already raised,
+        save_retry_queue() ALSO failing in the finally must not replace the
+        original exception with the save's."""
+        self._run_with_failure_at_and_failing_save(nth=3)
+
+    def _run_with_failure_at_and_failing_save(self, nth):
+        for i in range(4):
+            self._write_event(event_id=f"BATCHSAVEFAIL2-{i:03d}")
+
+        original = Event.from_json
+        calls = {"n": 0}
+
+        def counting_from_json(raw):
+            calls["n"] += 1
+            if calls["n"] == nth:
+                raise ValueError("ORIGINAL injected failure inside the Notion step")
+            return original(raw)
+
+        Event.from_json = staticmethod(counting_from_json)
+        self.addCleanup(lambda: setattr(Event, "from_json", original))
+
+        def failing_save(path, entries):
+            raise OSError("save ALSO fails while the ORIGINAL exception is propagating")
+
+        runner_module.save_retry_queue = failing_save
+        self.addCleanup(lambda: setattr(runner_module, "save_retry_queue", save_retry_queue))
+
+        with self.assertRaises(ValueError):
+            self._run(notion_sync=self._failing_sync())
 
 
 class NotionLastUpdatedParsingTests(unittest.TestCase):
@@ -3129,6 +3195,38 @@ class ExceptionPropagationBoundaryTests(RunnerFailurePathTestCase):
         self.assertIn("sync_result = notion_sync.sync(event)", source)
         self.assertIn("except Exception as exc:  # noqa: BLE001", source)
 
+    def test_a_regression_inside_the_dashboard_block_does_not_abort_a_successful_run(self):
+        """CEO Decision ④ ("Dashboard 기록 실패는 Runtime을 절대 중단시키면
+        안 된다") is honored today only because drain_pending() and
+        dashboard_record_run() each promise, internally, never to raise. This
+        call site trusted that promise with no defence of its own — unlike
+        step 4's Notion Sync call, which wraps notion_sync.sync() in its own
+        `except Exception` for the identical reason. Fault injection (a
+        drain_pending() that raises, simulating a future regression in its
+        own internal safety net) confirmed the gap: an otherwise fully
+        successful run (History written, Backup pushed) was lost entirely.
+        Hardened to match the Notion Sync call site's existing pattern."""
+        self._write_event(event_id="DASHBOARD-DEFENSE-001")
+
+        original = runner_module.drain_pending
+
+        def exploding_drain(*args, **kwargs):
+            raise RuntimeError("simulated regression inside drain_pending()")
+
+        runner_module.drain_pending = exploding_drain
+        self.addCleanup(setattr, runner_module, "drain_pending", original)
+
+        dashboard_transport = InMemoryNotionTransport(
+            initial_properties={"Run ID": {"type": "title", "title": {}}}
+        )
+        dashboard_client = NotionClient(transport=dashboard_transport, database_id="OPS_RUNS_DB")
+
+        result = self._run(dashboard_client=dashboard_client)
+
+        self.assertIsNotNone(result, "a Dashboard-block regression must not lose an otherwise successful run")
+        backup_entry = result[3]
+        self.assertEqual(backup_entry.final_status.value, "BACKUP_SUCCESS")
+
 
 class BackupJunctionTraversalTests(unittest.TestCase):
     """BUG-57 (NOT FIXED): the backup scan follows directory links, so content
@@ -3414,6 +3512,38 @@ class LockFailurePathTests(RunnerFailurePathTestCase):
 
         self.assertIsNotNone(self._run())
         self.assertFalse(self.runner_lock_path.exists())
+
+
+class NotionSyncLogWriteFailureTests(unittest.TestCase):
+    """`_log_notion_sync()`'s `except OSError: pass` had zero test coverage
+    across this entire suite (found via `python -m trace --count`, not by
+    reading — no existing test drives a log write failure). Verified here
+    directly: a write failure while logging one Notion Sync result must not
+    propagate, matching every other "diagnostic logging must not block the
+    Runtime" guarantee already tested elsewhere (collector/runtime.py's own
+    log, dashboard recording)."""
+
+    def test_a_log_write_failure_is_swallowed_not_propagated(self):
+        from app.runner import _log_notion_sync
+        from notion.sync import SyncResult, SyncStatus
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+
+        # log_path's PARENT is a file, not a directory -- mkdir(parents=True)
+        # raises FileExistsError (an OSError subclass) before any write is
+        # attempted.
+        blocker_file = root / "logs"
+        blocker_file.write_text("not a directory", encoding="utf-8")
+        bad_log_path = blocker_file / "notion_sync.log"
+
+        sync_result = SyncResult(status=SyncStatus.NOTION_CREATED, event_id="E1", project_id="P1")
+
+        try:
+            _log_notion_sync(bad_log_path, sync_result)
+        except OSError:
+            self.fail("_log_notion_sync() must swallow OSError, not propagate it")
 
 
 if __name__ == "__main__":

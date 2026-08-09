@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import transport.intake as intake_module  # noqa: E402
 from transport import run_intake  # noqa: E402
 
 
@@ -144,6 +145,61 @@ class EmptyAndIdempotentTests(IntakeTestCase):
         self.assertEqual(first.moved, ("TEST-IDEMPOTENT-001.json",))
         self.assertEqual(second.moved, ())
         self.assertEqual(len(list(self.incoming_dir.glob("*.json"))), 1)
+
+
+class IntakeReplaceFailureTests(IntakeTestCase):
+    """`os.replace()` failing partway through the scan — found via `python -m
+    trace --count` to have zero coverage anywhere in the suite (the only
+    existing OSError-adjacent coverage is BUG-53's existence check, a
+    different code path entirely). A real-world trigger: antivirus or a
+    backup tool holding a transient lock on the destination directory."""
+
+    def test_a_replace_failure_is_recorded_and_the_file_is_not_lost(self):
+        event_file = self.transport_dir / "E1.json"
+        event_file.write_text('{"a": 1}', encoding="utf-8")
+        old_time = time.time() - 100
+        os.utime(event_file, (old_time, old_time))
+
+        original_replace = intake_module.os.replace
+
+        def failing_replace(*args, **kwargs):
+            raise OSError("simulated replace failure")
+
+        intake_module.os.replace = failing_replace
+        self.addCleanup(setattr, intake_module.os, "replace", original_replace)
+
+        summary = run_intake(
+            transport_dir=self.transport_dir, incoming_dir=self.incoming_dir,
+            processed_dir=self.processed_dir, rejected_dir=self.rejected_dir,
+            stable_after_seconds=1.0,
+        )
+
+        self.assertEqual(summary.moved, ())
+        self.assertEqual(summary.failed, ("E1.json",))
+        self.assertTrue(event_file.exists(), "the file must stay in transport/, not be lost")
+
+    def test_a_later_run_recovers_once_the_failure_is_gone(self):
+        event_file = self.transport_dir / "E1.json"
+        event_file.write_text('{"a": 1}', encoding="utf-8")
+        old_time = time.time() - 100
+        os.utime(event_file, (old_time, old_time))
+
+        original_replace = intake_module.os.replace
+        intake_module.os.replace = lambda *a, **kw: (_ for _ in ()).throw(OSError("simulated"))
+        run_intake(
+            transport_dir=self.transport_dir, incoming_dir=self.incoming_dir,
+            processed_dir=self.processed_dir, rejected_dir=self.rejected_dir,
+            stable_after_seconds=1.0,
+        )
+        intake_module.os.replace = original_replace
+
+        summary = run_intake(
+            transport_dir=self.transport_dir, incoming_dir=self.incoming_dir,
+            processed_dir=self.processed_dir, rejected_dir=self.rejected_dir,
+            stable_after_seconds=1.0,
+        )
+
+        self.assertEqual(summary.moved, ("E1.json",))
 
 
 class IntakePathSafetyTests(unittest.TestCase):

@@ -142,6 +142,35 @@ class AtomicSaveTests(RepositoryTestCase):
         stored_again = self.repo.save(result.candidate, overwrite=True)
         self.assertTrue(stored_again)
 
+    def test_a_crash_during_the_atomic_replace_leaves_nothing_behind(self):
+        """Found via `python -m trace --count` to have zero coverage anywhere
+        in the suite: the cleanup half of the atomic write (`except
+        BaseException: os.remove(tmp_path); raise`) had never actually been
+        exercised by a real failure during `os.replace()` — every other
+        AtomicSaveTests case checks the happy path's absence of leftovers,
+        not what happens when the commit itself is interrupted."""
+        import history.file_repository as repo_module
+
+        event = sample_event(event_id="TEST-ATOMIC-CRASH-001")
+        result = self.filter.evaluate(event)
+
+        original_replace = repo_module.os.replace
+        repo_module.os.replace = lambda *a, **kw: (_ for _ in ()).throw(
+            KeyboardInterrupt("simulated crash before the atomic replace commits")
+        )
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.repo.save(result.candidate)
+        finally:
+            repo_module.os.replace = original_replace
+
+        self.assertEqual(list(self.keep_dir.glob("*.json")), [])
+        self.assertEqual(list(self.keep_dir.glob(".tmp-*")), [])
+
+        # Recovery: saving again (no crash this time) succeeds cleanly.
+        self.assertTrue(self.repo.save(result.candidate))
+        self.assertIsNotNone(self.repo.get(result.candidate.history_id))
+
 
 class RepositoryLookupTests(RepositoryTestCase):
     def test_get_missing_candidate_returns_none(self):
