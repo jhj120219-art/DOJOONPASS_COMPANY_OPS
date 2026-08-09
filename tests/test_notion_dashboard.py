@@ -32,6 +32,7 @@ from notion import (  # noqa: E402
     resolve_parent_page_id,
 )
 from notion.dashboard_pending import (  # noqa: E402
+    DashboardPendingError,
     drain_pending,
     load_pending,
     save_pending,
@@ -462,6 +463,29 @@ class DashboardPendingTests(unittest.TestCase):
 
     def test_missing_file_is_empty(self):
         self.assertEqual(load_pending(self.path), [])
+
+    def test_a_malformed_record_inside_otherwise_valid_json_raises_the_typed_error(self):
+        """Coverage gap found via `python -m trace` this Sprint: the
+        `except (AttributeError, KeyError, TypeError)` around
+        `PendingDashboardRecord.from_dict()` had zero executions across the
+        whole suite. Every existing corruption test uses invalid JSON text
+        (`test_corrupt_dashboard_pending_no_longer_stops_the_runtime` in
+        test_runner_failure_paths.py), which hits the earlier
+        `except (OSError, ValueError)` around `json.loads()` instead --
+        never this one, where the JSON itself parses fine but one entry is
+        missing a required key.
+        """
+        import json
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"entries": [{"properties": {}, "queued_at": "x", "attempt_count": 0}]}),
+            encoding="utf-8",
+        )  # missing "run_id"
+
+        with self.assertRaises(DashboardPendingError) as caught:
+            load_pending(self.path)
+        self.assertIn("malformed record", str(caught.exception))
 
     def test_save_then_load_round_trips(self):
         save_pending(self.path, run_id="r1", properties={"Run ID": {}})

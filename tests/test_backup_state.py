@@ -74,6 +74,33 @@ class CorruptedStateTests(BackupStateTestCase):
         with self.assertRaises(ValueError):
             load_state(self.state_path)
 
+    def test_an_unparseable_timestamp_raises_the_typed_error(self):
+        # Coverage gap found via `python -m trace` this Sprint: the
+        # `except (TypeError, ValueError)` around
+        # `datetime.fromisoformat(timestamp_value)` had zero executions
+        # across the whole suite -- every existing corruption test hits a
+        # different branch (bad JSON, wrong top-level shape, bad status
+        # enum), never a bad `last_successful_backup` value specifically.
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(
+            json.dumps({"last_successful_backup": "not-a-real-timestamp"}), encoding="utf-8"
+        )
+
+        with self.assertRaises(BackupStateError) as caught:
+            load_state(self.state_path)
+        self.assertIn("last_successful_backup", str(caught.exception))
+
+    def test_a_non_string_timestamp_raises_the_typed_error(self):
+        """The `TypeError` half of the same except clause: `fromisoformat()`
+        raises `TypeError`, not `ValueError`, when given a non-string."""
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(
+            json.dumps({"last_successful_backup": 20260806}), encoding="utf-8"
+        )
+
+        with self.assertRaises(BackupStateError):
+            load_state(self.state_path)
+
 
 if __name__ == "__main__":
     unittest.main()

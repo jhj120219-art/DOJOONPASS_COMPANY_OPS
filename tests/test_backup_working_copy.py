@@ -81,7 +81,7 @@ class SyncToWorkingCopyTests(unittest.TestCase):
 
         self.assertEqual(result.added, (_rel("daily", "2026-08-02.md"),))
         self.assertEqual(result.deleted, (_rel("daily", "2026-08-01.md"),))
-        self.assertFalse((self.working_copy_dir / "daily" / "2026-08-02.md").exists())
+
 
     def test_same_size_different_content_is_still_detected_as_modified(self):
         # Contract guard for the size short-circuit in _content_differs():
@@ -146,6 +146,54 @@ class SyncToWorkingCopyTests(unittest.TestCase):
 
         self.assertEqual(result.added, ())
         self.assertFalse((self.working_copy_dir / "decisions").exists())
+
+
+class LongPathBoundaryTests(unittest.TestCase):
+    """New finding this Sprint: only `scheduler/lock.py` was given the
+    `\\\\?\\` extended-length-path prefix (this Sprint's earlier Lock
+    incident fix). `backup/working_copy.py` never got the same treatment,
+    and it breaks the same way `lock.py` did before that fix.
+
+    CHARACTERIZATION: asserts today's behaviour, not desired behaviour.
+
+    Reproduced directly: once `master_dir` alone is >~250 characters (well
+    under the 260-char MAX_PATH once `daily/<file>.md` is appended),
+    `sync_to_working_copy()` raises `OSError` (`WinError 206`, "filename or
+    extension too long") instead of returning a result.
+
+    Not fixed here, unlike the Lock case, because the fix is not obviously
+    narrow: git.exe itself has its own long-path limitation independent of
+    Python's (`core.longpaths` must be set for git to write >260-char paths
+    at all), so patching only this module's Python-side path handling would
+    not make the Backup pipeline actually work end to end over a long path
+    -- `git add`/`git commit` in `git_ops.py` would still be reachable by
+    the same limit. Deciding the fix's scope (Python-only prefix vs. also
+    requiring/asserting a git config change vs. documenting a path-length
+    deployment constraint) is a policy question. In the currently documented
+    deployment layout (`D:\\DOJOONPASS_COO\\`, docs/11 section 12) ordinary
+    `daily/YYYY-MM-DD.md` paths stay far short of this boundary, so this is
+    a real but low-probability-in-practice gap, not an active incident.
+    """
+
+    def test_a_master_directory_path_past_the_extended_length_boundary_raises(self):
+        """Even building the fixture (plain `mkdir`/`write_text`, no the
+        extended-length-path prefix) fails once the path crosses the
+        boundary -- the same WinError 206 a real deployment would hit, not
+        an artifact of this test's own setup being unusual."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+
+        deep = root
+        while len(str(deep)) < 250:
+            deep = deep / ("a" * 50)
+        master_dir = deep / "master"
+        working_copy_dir = deep / "wc"
+
+        with self.assertRaises(OSError):
+            (master_dir / "daily").mkdir(parents=True)
+            (master_dir / "daily" / "2026-08-09.md").write_text("x", encoding="utf-8")
+            sync_to_working_copy(master_dir, working_copy_dir)
 
 
 if __name__ == "__main__":

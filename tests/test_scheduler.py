@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from events import Event  # noqa: E402
-from history import FileHistoryRepository, HistoryDecision, HistoryFilter  # noqa: E402
+from history import FileHistoryRepository, HistoryCandidate, HistoryDecision, HistoryFilter  # noqa: E402
 from scheduler import SchedulerStatus, load_state, run_once, save_state  # noqa: E402
 from scheduler.state import SchedulerState  # noqa: E402
 
@@ -265,6 +265,50 @@ class FailureIsolationTests(SchedulerTestCase):
         )
         for day in ("2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04"):
             self.assertTrue((self.daily_dir / f"{day}.md").exists())
+
+    def test_a_stored_candidate_with_an_unparseable_timestamp_permanently_stalls_catch_up(self):
+        """New finding this Sprint, distinct from the mocked failure above:
+        a REAL corrupted stored HistoryCandidate (e.g. from a manual JSON
+        edit -- docs/11 section 71 explicitly permits editing Local Master
+        History by hand) makes `daily.generator._candidate_date()` raise an
+        uncaught `ValueError` from `datetime.fromisoformat()` (see
+        events/schema.py's own Z-suffix finding this Sprint for why an
+        otherwise-valid-looking timestamp can end up unparseable). Unlike
+        the test above, nothing here is transient: the SAME candidate is
+        still on disk on the next run, so the SAME failure recurs -- catch-up
+        is stuck at this date forever, not just delayed, until a human finds
+        and fixes/removes the bad record. Scheduler still correctly reports
+        FAILED rather than raising (isolation holds), so this pins the
+        deeper "no automatic recovery from stored data corruption" gap
+        rather than any missing exception handling.
+        """
+        self.repo.save(
+            HistoryCandidate(
+                history_id="HIST-ZBUG-001",
+                event_id="ZBUG-001",
+                timestamp="2026-08-02T20:31:00Z",  # valid ISO-8601, unparseable by fromisoformat() on py<3.11
+                category="MILESTONE",
+                project_id="PRJ-Z",
+                role="COO",
+                summary="stored candidate with an unparseable timestamp",
+                evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+        )
+        save_state(self.state_path, SchedulerState(last_successful_daily_close=date(2026, 8, 1)))
+
+        first = self._run(now=datetime(2026, 8, 5, 11, 0))
+        self.assertEqual(first.status, SchedulerStatus.FAILED)
+        self.assertEqual(first.failed_date, date(2026, 8, 2))
+
+        # Nothing removed or repaired the bad candidate -- a second run hits
+        # the identical failure, not a fresh one and not silent progress.
+        second = self._run(now=datetime(2026, 8, 6, 11, 0))
+        self.assertEqual(second.status, SchedulerStatus.FAILED)
+        self.assertEqual(second.failed_date, date(2026, 8, 2))
+
+        state = load_state(self.state_path)
+        self.assertEqual(state.last_successful_daily_close, date(2026, 8, 1))
 
     def test_lock_is_released_even_after_a_failure(self):
         class AlwaysFailingRepository:

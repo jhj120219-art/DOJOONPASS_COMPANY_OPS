@@ -34,6 +34,36 @@ class GitOperationError(Exception):
     """Raised when a git subprocess call exits with a non-zero status."""
 
 
+class WorkingCopyNotAGitRepositoryError(GitOperationError):
+    """Raised when `working_copy_dir` has no `.git` of its own.
+
+    git itself does not require the exact directory passed as `cwd` to be a
+    repository root — it walks up through parent directories looking for
+    the nearest `.git`. If the Backup Working Copy was never initialised as
+    its own repository (e.g. a fresh `runtime/backup_working_copy/` that a
+    setup step never ran `git init` in), every git command this module
+    issues silently operates on whichever ancestor repository git finds
+    instead — for a Working Copy nested inside this project's own checkout,
+    that is this project's own repository. `git add -A` / `git commit` /
+    `git push` would then act on the caller's real, unrelated working tree
+    and its real `origin`, not the intended Backup destination — reachable
+    exactly at first-run setup (docs/11 §24-26 Backup 연결), the moment this
+    precondition is most likely to be unmet and least likely to be noticed
+    before `git push` already ran.
+    """
+
+
+def check_working_copy_is_a_git_repository(working_copy_dir: Path) -> None:
+    """Raise WorkingCopyNotAGitRepositoryError unless `working_copy_dir`
+    itself (not some parent directory) is a git repository."""
+    if not (working_copy_dir / ".git").exists():
+        raise WorkingCopyNotAGitRepositoryError(
+            f"Backup Working Copy is not a git repository: {working_copy_dir} "
+            "(no .git found directly inside it - run `git init` and configure "
+            "`origin` there first; docs/08 sections 12, 30)"
+        )
+
+
 # docs/08_BACKUP_SPEC.md §62 (Authentication 실패 -> BACKUP_FAILED, "무한
 # Retry Loop를 만들지 않는다") vs §19 (Internet OFF / GitHub 장애 / Push
 # 실패 -> BACKUP_PENDING, 다음 Runner에서 재시도). The two are decided from

@@ -3266,10 +3266,22 @@ class BackupJunctionTraversalTests(unittest.TestCase):
     redirect a folder to another drive — someone moving `daily/` for disk
     space would silently widen what gets pushed, with nothing reporting it.
 
-    Not fixed: `is_file(follow_symlinks=False)` plus a `is_symlink()`/reparse
-    check would stop it, but deciding whether a redirected `daily/` should be
-    backed up AT ALL is a deployment policy question, not a code cleanup —
-    refusing it would break a legitimate storage layout.
+    Not fixed (junctions specifically): deciding whether a redirected
+    `daily/` should be backed up AT ALL is a deployment policy question,
+    not a code cleanup — refusing it would break a legitimate storage
+    layout. Still true after this Sprint's `_relative_files()` change
+    below.
+
+    That same Sprint added an `is_symlink()` check to `_relative_files()`,
+    but for a *different, narrower* bug (BUG, this Sprint: a single file
+    under `daily/` symlinked to an external secret, invisible to the
+    filename-only Secret Scan — no legitimate-storage-layout justification
+    exists for that shape, unlike a whole-folder junction redirect). It
+    does not touch this class's scenario: measured directly, a junction's
+    `Path.is_symlink()` is `False` on Windows (junctions are NTFS reparse
+    points, not POSIX-style symlinks), so `test_a_junction_pulls_outside_content_into_the_scan`
+    and `test_that_content_is_copied_into_the_working_copy` below still
+    pass — junction traversal is exactly as unfixed as before.
     """
 
     def _make_junction(self, link_path, target):
@@ -3334,12 +3346,18 @@ class BackupJunctionTraversalTests(unittest.TestCase):
         self.assertTrue(_is_in_scope(str(Path("daily") / "linked" / "secret.md")))
 
     def test_the_scan_follows_links_by_default(self):
-        """The structural cause."""
+        """The structural cause, for JUNCTIONS specifically: `is_file()`
+        alone follows a junction, and `_relative_files()` now guards with
+        `is_symlink()` (added this Sprint for the unrelated file-symlink
+        bug above) -- which measured `False` for a junction, so that guard
+        provides no protection here. `test_a_junction_pulls_outside_content_into_the_scan`
+        is the direct behavioural proof; this test pins the source-level
+        reason it still happens.
+        """
         source = inspect.getsource(sys.modules["backup.working_copy"]._relative_files)
 
         self.assertIn("path.is_file()", source)
         self.assertNotIn("follow_symlinks=False", source)
-        self.assertNotIn("is_symlink", source)
 
 
 class NotionErrorBodyTests(unittest.TestCase):
@@ -3463,6 +3481,77 @@ class NotionErrorBodyTests(unittest.TestCase):
 
         self.assertIn("exc.reason", source)
         self.assertNotIn("exc.read()", source)
+
+
+class NetworkFailureTransportTests(unittest.TestCase):
+    """Coverage gap found via `python -m trace` this Sprint: `_request()`'s
+    `except urllib.error.URLError` branch (docs/11 section 62's "장애 —
+    Internet": DNS failure / connection refused / offline) had zero test
+    coverage -- every existing transport test drives the `HTTPError`
+    branch (a real HTTP response, just a bad one) via `NotionErrorBodyTests`
+    above, never the lower-level "could not even connect" branch.
+
+    VERIFIED CORRECT: `URLError` is converted to `NotionAPIError` the same
+    way `HTTPError` is (docs/04 section 66-5's "Notion 실패해도 Runner는
+    계속 진행" relies on every Notion failure surfacing as this one
+    exception type), and `status_code` stays `None` since `URLError` --
+    unlike `HTTPError` -- never has an HTTP status at all.
+    """
+
+    def _transport(self):
+        from notion.transport import RealNotionTransport
+
+        transport = RealNotionTransport.__new__(RealNotionTransport)
+        transport._base_url = "https://api.notion.com/v1"
+        transport._api_token = "ntn_test_token"
+        transport._timeout = 10.0
+        return transport
+
+    def _request_raising_url_error(self, reason):
+        import urllib.error
+        import urllib.request
+
+        real_urlopen = urllib.request.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.URLError(reason)
+
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+    def test_a_connection_failure_becomes_a_notion_api_error(self):
+        from notion.transport import NotionAPIError
+
+        self._request_raising_url_error("[Errno 11001] getaddrinfo failed")
+
+        with self.assertRaises(NotionAPIError) as caught:
+            self._transport()._request("POST", "/pages", {"x": 1})
+
+        self.assertIn("Notion API request failed", str(caught.exception))
+        self.assertIn("getaddrinfo failed", str(caught.exception))
+
+    def test_a_connection_failure_has_no_status_code(self):
+        """Unlike HTTPError, URLError never carries an HTTP status -- a
+        caller that assumes `status_code` is always set (e.g. to decide
+        retry-vs-fail) would see None here, not a made-up value."""
+        from notion.transport import NotionAPIError
+
+        self._request_raising_url_error("Connection refused")
+
+        with self.assertRaises(NotionAPIError) as caught:
+            self._transport()._request("GET", "/databases/x")
+
+        self.assertIsNone(caught.exception.status_code)
+
+    def test_the_api_token_never_appears_in_a_connection_failure_error(self):
+        from notion.transport import NotionAPIError
+
+        self._request_raising_url_error("Connection refused")
+
+        with self.assertRaises(NotionAPIError) as caught:
+            self._transport()._request("POST", "/pages", {"x": 1})
+
+        self.assertNotIn("ntn_test_token", str(caught.exception))
 
     def test_the_api_version_is_pinned(self):
         """Unrelated but verified while here: the Notion-Version header is a

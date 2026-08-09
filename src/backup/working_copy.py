@@ -86,11 +86,24 @@ def _content_differs(src: Path, dst: Path) -> bool:
 
 
 def _relative_files(root: Path) -> set[str]:
+    """Regular files only, in scope.
+
+    A symlink/junction is excluded even when it resolves to a file
+    (`path.is_symlink()` checked before `path.is_file()`, since
+    `Path.is_file()` follows the link). Without this, a link placed under
+    `daily/`/`monthly/` pointing outside `root` would have its TARGET's
+    content copied into the Working Copy and pushed to the git remote,
+    while `scan_for_secrets()` — filename-based, see that function's
+    docstring — checks only the link's own name and cannot see what it
+    resolves to. Reproduced end to end this Sprint: a symlink named
+    `notes.md` pointing at an external `.env` was not flagged by the scan
+    and its content was copied into the Working Copy verbatim.
+    """
     if not root.is_dir():
         return set()
     result: set[str] = set()
     for path in root.rglob("*"):
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             continue
         rel = str(path.relative_to(root))
         if _is_in_scope(rel):
@@ -140,13 +153,24 @@ def scan_for_secrets(root: Path) -> tuple[str, ...]:
     section 29, not a defect in this function — but because a match now
     blocks the backup, the gate reads as stronger protection than it is.
     Widening it is a policy decision, not a code cleanup.
+
+    A symlink/junction is *always* flagged as a match here regardless of
+    its own filename. This function can only judge a name, never a
+    target (no content is read), so a link renamed to something
+    innocuous is otherwise invisible to it while `_relative_files()`
+    (working_copy.py, same Sprint) showed such a link's target content
+    does get copied into the Working Copy. Nothing under a Company
+    History master directory is expected to be a link, so treating any
+    link as a match — failing the backup loudly — is the same posture
+    section 29 already takes for a filename hit, applied to the one shape
+    a filename check cannot see through.
     """
     if not root.is_dir():
         return ()
     matches = [
         str(path.relative_to(root))
         for path in root.rglob("*")
-        if path.is_file() and _looks_like_secret(path.name)
+        if path.is_symlink() or (path.is_file() and _looks_like_secret(path.name))
     ]
     return tuple(sorted(matches))
 

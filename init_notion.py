@@ -25,6 +25,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Same fix as run_company_ops.py (this Sprint's audit): this script's own
+# status output can include real Notion API error text, and Windows'
+# console defaults to the system's legacy codepage, not UTF-8 — a
+# non-ASCII character in that text would raise UnicodeEncodeError on
+# stdout's default strict error handling and crash the script.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from notion import (  # noqa: E402

@@ -40,6 +40,45 @@ class LoadEmptyQueueTests(RetryQueueTestCase):
         self.assertEqual(load_queue(self.queue_path), [])
 
 
+class CorruptedQueueTests(RetryQueueTestCase):
+    """Coverage gap found via `python -m trace` this Sprint: `load_queue()`
+    had NO corruption test at all before this class. In particular the
+    `except (AttributeError, KeyError, TypeError)` around
+    `RetryQueueEntry.from_dict()` -- valid JSON, valid top-level shape, but
+    one entry missing a required key -- had zero executions across the
+    whole suite."""
+
+    def test_invalid_json_raises_the_typed_error(self):
+        import json as json_module
+
+        from notion.retry_queue import RetryQueueError
+
+        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.queue_path.write_text("{not valid json", encoding="utf-8")
+
+        with self.assertRaises(RetryQueueError):
+            load_queue(self.queue_path)
+
+        self.assertEqual(self.queue_path.read_text(encoding="utf-8"), "{not valid json")
+
+    def test_a_malformed_entry_inside_otherwise_valid_json_raises(self):
+        import json as json_module
+
+        from notion.retry_queue import RetryQueueError
+
+        self.queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.queue_path.write_text(
+            json_module.dumps(
+                {"entries": [{"project_id": "P", "event_data": {}, "added_at": "x", "attempt_count": 0}]}
+            ),
+            encoding="utf-8",
+        )  # missing "event_id"
+
+        with self.assertRaises(RetryQueueError) as caught:
+            load_queue(self.queue_path)
+        self.assertIn("malformed entry", str(caught.exception))
+
+
 class EnqueueDequeueTests(RetryQueueTestCase):
     def test_enqueue_then_load_round_trips(self):
         enqueue(self.queue_path, sample_event("EVT-1"), now=datetime(2026, 8, 1, 12, 0))

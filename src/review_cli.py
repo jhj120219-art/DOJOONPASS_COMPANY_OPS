@@ -16,7 +16,21 @@ without any sys.path tricks:
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Callable
+
+# Same defensive fix as run_company_ops.py/init_notion.py (this Sprint's
+# audit): every Korean string this file prints IS safe on a Korean
+# Windows console's default cp949 codepage, so no crash is reproduced
+# today -- but stdout's default strict error handling means any future
+# non-cp949 character added to a print_fn() call (an em-dash, for
+# instance, already present in this file's own docstrings/comments,
+# just never printed) would crash this entry point the same way it did
+# run_company_ops.py. Applied for consistency across all three CLI
+# entry points, not in response to a reproduced failure here.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 from history import (
     FileHistoryRepository,

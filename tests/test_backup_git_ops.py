@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from backup.git_ops import (  # noqa: E402
     GitOperationError,
+    WorkingCopyNotAGitRepositoryError,
+    check_working_copy_is_a_git_repository,
     git_add_all,
     git_commit,
     git_push,
@@ -175,6 +177,80 @@ class GitPushSuccessTests(GitOpsTestCase):
 
         remote_log = _run_git(["log", "-1", "--format=%s"], cwd=bare_remote_dir)
         self.assertEqual(remote_log.strip(), "add b.txt")
+
+
+class WorkingCopyGitRepositoryGuardTests(unittest.TestCase):
+    """Incident finding (this Sprint): a Working Copy with no `.git` of its
+    own lets every git command below silently walk up to whatever ancestor
+    repository git finds instead (verified: `git add -A` / `git commit` /
+    `git push` all landed in the *caller's* real, unrelated repository and
+    pushed to its real `origin`). This guard makes that precondition
+    checked and named instead of silently assumed."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def test_a_directory_with_no_git_of_its_own_is_rejected(self):
+        working_copy = self.root / "backup_working_copy"
+        working_copy.mkdir()
+
+        with self.assertRaises(WorkingCopyNotAGitRepositoryError):
+            check_working_copy_is_a_git_repository(working_copy)
+
+    def test_a_directory_that_does_not_exist_yet_is_rejected_cleanly(self):
+        """First-ever setup, before anything has run `mkdir` on the Working
+        Copy path at all: must raise the same named error, not something
+        unexpected like FileNotFoundError."""
+        never_created = self.root / "backup_working_copy"
+        self.assertFalse(never_created.exists())
+
+        with self.assertRaises(WorkingCopyNotAGitRepositoryError):
+            check_working_copy_is_a_git_repository(never_created)
+
+    def test_a_properly_initialised_working_copy_passes(self):
+        working_copy = self.root / "backup_working_copy"
+        working_copy.mkdir()
+        _run_git(["init", "-b", "main"], cwd=working_copy)
+
+        check_working_copy_is_a_git_repository(working_copy)  # must not raise
+
+    def test_the_error_names_the_exact_directory_and_never_touches_an_ancestor_repo(self):
+        """The incident, reproduced end to end and proven contained: an
+        ancestor repository (simulating the caller's own real checkout)
+        with a working_copy_dir nested inside it that was never git-init'd.
+        Before this guard, `backup.runner.run_once()` would reach `git
+        status`/`git add -A`/`git commit` with cwd=working_copy_dir and git
+        would silently operate on the ancestor repository instead."""
+        _run_git(["init", "-b", "main"], cwd=self.root)
+        _run_git(["config", "user.email", "t@example.invalid"], cwd=self.root)
+        _run_git(["config", "user.name", "guard test"], cwd=self.root)
+        (self.root / "pre-existing.txt").write_text("ancestor repo content", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.root)
+        _run_git(["commit", "-m", "ancestor repo initial commit"], cwd=self.root)
+        ancestor_head_before = _run_git(["rev-parse", "HEAD"], cwd=self.root).strip()
+
+        master_dir = self.root / "local_master"
+        working_copy_dir = self.root / "backup_working_copy"  # deliberately not git-init'd
+        master_dir.mkdir()
+        (master_dir / "daily").mkdir()
+        (master_dir / "daily" / "2026-08-09.md").write_text("history", encoding="utf-8")
+        working_copy_dir.mkdir()
+
+        from backup.runner import run_once as backup_run_once
+
+        with self.assertRaises(WorkingCopyNotAGitRepositoryError):
+            backup_run_once(master_dir, working_copy_dir, state_path=self.root / "backup_state.json")
+
+        ancestor_head_after = _run_git(["rev-parse", "HEAD"], cwd=self.root).strip()
+        self.assertEqual(ancestor_head_before, ancestor_head_after)
+        ancestor_status = _run_git(["status", "--porcelain"], cwd=self.root)
+        # Only the untracked local_master/ directory this test created —
+        # nothing STAGED (an "A " or "M " prefix) from the guarded backup
+        # attempt.
+        for line in ancestor_status.splitlines():
+            self.assertTrue(line.startswith("??"), f"unexpected staged change: {line}")
 
 
 if __name__ == "__main__":

@@ -212,6 +212,56 @@ class HistoryRepositoryPathEscapeTests(unittest.TestCase):
         names = [safe_candidate_filename(i) for i in ids]
         self.assertEqual(len(set(names)), len(ids), names)
 
+    def test_two_distinct_events_sharing_an_empty_event_id_collide(self):
+        """New finding this Sprint, and NOT the same shape as the test above:
+        that test's ids are all distinct STRINGS, so the digest (hash of the
+        original id) tells them apart even after garbling to the same
+        sanitized form. Here the input itself -- not just its sanitized
+        form -- is IDENTICAL for two genuinely different events, because
+        docs/02's schema accepts event_id="" (rejects only a missing/None
+        id, see EventIdValidationTests.test_schema_still_rejects_a_missing_event_id).
+        No digest can disambiguate two calls with the same input: sha256("")
+        is the same hash both times. `history_id = f"HIST-{event_id}"` makes
+        this "HIST-" for every such event, and `sanitized == "HIST-" ==
+        original` takes the unchanged-is-safe branch, same collision either
+        way. This is a schema question (should event_id="" be rejected like
+        None already is?), not a sanitizer bug -- the sanitizer is doing
+        exactly what it is documented to do (never assumes DIFFERENT inputs
+        collide; two genuinely IDENTICAL inputs are indistinguishable to it
+        by design, matching how the rest of this codebase treats a repeated
+        event_id as the same event).
+        """
+        from history.file_repository import safe_candidate_filename
+
+        history_id = f"HIST-{''}"
+        self.assertEqual(safe_candidate_filename(history_id), "HIST-.json")
+
+        second_history_id = f"HIST-{''}"
+        self.assertEqual(
+            safe_candidate_filename(history_id), safe_candidate_filename(second_history_id)
+        )
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        keep_dir = Path(tmp.name) / "keep"
+        repo = FileHistoryRepository(keep_dir=keep_dir, review_dir=Path(tmp.name) / "review")
+
+        first = HistoryCandidate(
+            history_id=history_id, event_id="", timestamp="2026-08-01T10:00:00+09:00",
+            category="MILESTONE", project_id="PRJ-A", role="COO",
+            summary="first genuinely different event with an empty event_id",
+            evidence=(), filter_result=HistoryDecision.KEEP,
+        )
+        second = HistoryCandidate(
+            history_id=second_history_id, event_id="", timestamp="2026-08-01T11:00:00+09:00",
+            category="MILESTONE", project_id="PRJ-B", role="COO",
+            summary="second, unrelated event that also happens to have an empty event_id",
+            evidence=(), filter_result=HistoryDecision.KEEP,
+        )
+        self.assertTrue(repo.save(first))
+        with self.assertRaises(FileExistsError):
+            repo.save(second)  # the second, genuinely different event is lost here
+
     def test_an_over_long_event_id_does_not_abort_the_save(self):
         """The schema accepts an unbounded event_id, and a ~250-character one
         produced a path Windows rejects (WinError 123), aborting the whole
@@ -452,6 +502,65 @@ class SecretScanCoverageTests(unittest.TestCase):
             )
 
         self.assertEqual(scan_for_secrets(self.master), ())
+
+
+class SymlinkSecretExfiltrationTests(unittest.TestCase):
+    """This Sprint: a symlink under `daily/`, renamed to something
+    innocuous, is invisible to `scan_for_secrets()` (filename-only, see
+    that function's docstring) while `sync_to_working_copy()` used to
+    follow it and copy the TARGET's content into the Working Copy —
+    reproduced end to end with a link named `notes.md` pointing at an
+    external `.env`, whose content landed in the git-tracked Working Copy
+    verbatim. Fixed: `_relative_files()` now excludes symlinks from
+    copying, and `scan_for_secrets()` flags any symlink regardless of its
+    own name, so the backup fails loudly instead of silently leaking.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.master = self.root / "local_master"
+        (self.master / "daily").mkdir(parents=True)
+
+    def _make_symlink(self, link_path: Path, target: Path) -> bool:
+        try:
+            link_path.symlink_to(target)
+            return True
+        except OSError:
+            return False
+
+    def test_a_renamed_symlink_to_an_external_secret_is_flagged(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        secret = outside / ".env"
+        secret.write_text("NOTION_API_TOKEN=super-secret\n", encoding="utf-8")
+
+        link = self.master / "daily" / "innocuous_notes.md"
+        if not self._make_symlink(link, secret):
+            self.skipTest("symlink creation not permitted in this environment")
+
+        detected = scan_for_secrets(self.master)
+
+        self.assertIn(str(Path("daily", "innocuous_notes.md")), detected)
+
+    def test_a_symlink_is_never_copied_into_the_working_copy(self):
+        from backup.working_copy import sync_to_working_copy
+
+        outside = self.root / "outside"
+        outside.mkdir()
+        secret = outside / ".env"
+        secret.write_text("NOTION_API_TOKEN=super-secret\n", encoding="utf-8")
+
+        link = self.master / "daily" / "innocuous_notes.md"
+        if not self._make_symlink(link, secret):
+            self.skipTest("symlink creation not permitted in this environment")
+
+        working_copy = self.root / "backup_working_copy"
+        result = sync_to_working_copy(self.master, working_copy)
+
+        self.assertEqual(result.added, ())
+        self.assertFalse((working_copy / "daily" / "innocuous_notes.md").exists())
 
 
 class EvidenceMarkdownInjectionTests(unittest.TestCase):

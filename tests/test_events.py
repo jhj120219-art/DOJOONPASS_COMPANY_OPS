@@ -113,6 +113,33 @@ class EventValidationTests(unittest.TestCase):
                 with self.assertRaises(EventValidationError):
                     Event.from_dict(data)
 
+    def test_a_z_suffixed_utc_timestamp_is_rejected_though_valid_iso_8601(self):
+        """CHARACTERIZATION, not desired behaviour -- new finding this
+        Sprint. docs/02_EVENT_SCHEMA.md section 7 requires "ISO-8601" and
+        never says the trailing 'Z' (Zulu/UTC) designator is disallowed --
+        it IS valid ISO-8601, equivalent to '+00:00', and extremely common
+        (e.g. JavaScript's `Date.prototype.toISOString()`, many JSON APIs
+        emit it by default). `events/schema.py::_timestamp_error()` uses
+        `datetime.fromisoformat()` to validate, and Python 3.9's
+        `fromisoformat()` does not accept 'Z' (only 3.11+ does), so a
+        completely valid Event carrying a 'Z' timestamp is rejected here
+        with the (slightly misleading) message "not valid ISO-8601" -- it
+        is valid ISO-8601, just not parseable by this Python version's
+        stdlib without normalizing 'Z' to '+00:00' first.
+
+        Not fixed: `daily/generator.py::_candidate_date()` and other
+        callers also call `datetime.fromisoformat()` directly on an
+        already-validated `timestamp` string, so validating 'Z' here
+        without normalizing the STORED value would just move the same
+        crash downstream instead of removing it -- a coordinated fix
+        across every direct `fromisoformat()` call site (or a single
+        normalize-at-the-boundary point), which is a design decision, not
+        a one-line change.
+        """
+        data = sample_data(timestamp="2026-08-01T20:31:00Z")
+        with self.assertRaises(EventValidationError):
+            Event.from_dict(data)
+
     def test_blocked_without_blocker_rejected(self):
         data = sample_data(event_type="BLOCKED", status="BLOCKED", blocker=None)
         with self.assertRaises(EventValidationError):

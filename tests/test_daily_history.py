@@ -417,6 +417,63 @@ class MarkdownFormatTests(unittest.TestCase):
         markdown = render_daily_markdown(date(2026, 8, 5), [candidate], "2026-08-06T11:00:00+09:00")
         self.assertIn("## Learnings", markdown)
 
+    def test_a_category_less_keep_candidate_silently_loses_its_detail(self):
+        """New finding this Sprint, distinct from the pre-existing "CANCELLED
+        category is undefined" issue this module's own docstring already
+        flags: this pins the RENDERING CONSEQUENCE, not just the ambiguity.
+
+        `category=None` only reaches a KEEP candidate through an unusual
+        path -- CANCELLED normally maps to REVIEW, never KEEP (history/
+        filter.py), and `review_cli.py` deliberately never promotes REVIEW
+        to KEEP. But docs/11 section 71 explicitly permits a human to edit
+        Local Master / History Candidate files by hand, so a manually
+        promoted CANCELLED-derived candidate (or any future category=None
+        KEEP candidate) is a reachable state, not a purely theoretical one.
+
+        `render_daily_markdown()`'s category loop only files a candidate
+        under a section when `candidate.category in by_category` -- `None`
+        never matches any of the four keys, so the candidate is dropped
+        from every category section. Its bare `summary` still appears in
+        the Summary block (iterated before the category split), but its
+        Event ID, Owner, and any Decision Context/Outcome/Lessons Learned
+        never appear anywhere in the rendered Daily History at all --
+        silent partial loss of exactly the traceability key (Event ID)
+        docs/11 section 50 lists "History 손실" as a P0 example of.
+        """
+        candidate = make_candidate(
+            history_id="HIST-CATEGORYLESS",
+            event_id="CATEGORYLESS-001",
+            category=None,
+            summary="a category-less candidate that reached KEEP",
+            evidence=(),  # isolates the category-section loss from the separate Evidence section
+        )
+        markdown = render_daily_markdown(date(2026, 8, 5), [candidate], "2026-08-06T11:00:00+09:00")
+
+        self.assertIn("a category-less candidate that reached KEEP", markdown)
+        self.assertNotIn("CATEGORYLESS-001", markdown)
+        for header in ("## Decisions", "## Milestones", "## Issues", "## Learnings"):
+            self.assertNotIn(header, markdown)
+
+    def test_a_category_less_candidates_event_id_survives_only_via_evidence(self):
+        """The one path an Event ID CAN still survive: the Evidence section
+        iterates every candidate regardless of category, so a category-less
+        candidate that also happens to carry evidence keeps its Event ID
+        visible there -- but Owner/Decision Context/Outcome/Lessons Learned
+        are still gone, and a candidate with no evidence (the previous test)
+        loses the Event ID completely."""
+        candidate = make_candidate(
+            history_id="HIST-CATEGORYLESS-2",
+            event_id="CATEGORYLESS-002",
+            category=None,
+            summary="a category-less candidate with evidence",
+            evidence=("some proof",),
+        )
+        markdown = render_daily_markdown(date(2026, 8, 5), [candidate], "2026-08-06T11:00:00+09:00")
+
+        self.assertIn("CATEGORYLESS-002: some proof", markdown)
+        for header in ("## Decisions", "## Milestones", "## Issues", "## Learnings"):
+            self.assertNotIn(header, markdown)
+
     def test_evidence_section_lists_event_id_and_evidence_text(self):
         candidate = make_candidate(evidence=("TypeScript PASS", "Integration Test PASS"))
         markdown = render_daily_markdown(date(2026, 8, 5), [candidate], "2026-08-06T11:00:00+09:00")

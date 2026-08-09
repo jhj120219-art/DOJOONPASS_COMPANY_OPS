@@ -182,6 +182,26 @@ class CollectorInternalFailureTests(unittest.TestCase):
         with self.assertRaises(CollectorError):
             collector.collect(sample_event_dict(event_id="TEST-INTERNAL-FAIL-001"))
 
+    def test_mark_seen_failure_alone_raises_collector_error(self):
+        """`BrokenStore` above fails `is_seen()` first, so `collect()` never
+        actually reaches the separate `mark_seen()` try/except (confirmed via
+        `python -m trace` coverage this Sprint: that branch had zero
+        executions across the whole suite). Isolates it: `is_seen()`
+        succeeds (not a duplicate), only `mark_seen()` fails."""
+
+        class MarkSeenBrokenStore(SeenEventStore):
+            def is_seen(self, event_id: str) -> bool:
+                return False
+
+            def mark_seen(self, event_id: str) -> None:
+                raise RuntimeError("state file unwritable")
+
+        collector = Collector(seen_store=MarkSeenBrokenStore())
+        with self.assertRaises(CollectorError) as caught:
+            collector.collect(sample_event_dict(event_id="TEST-INTERNAL-FAIL-002"))
+
+        self.assertIn("TEST-INTERNAL-FAIL-002", str(caught.exception))
+
 
 class CollectorBoundaryTests(unittest.TestCase):
     def test_collector_module_does_not_import_transport_or_reporter(self):

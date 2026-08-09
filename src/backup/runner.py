@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .git_ops import (
     GitOperationError,
+    check_working_copy_is_a_git_repository,
     git_add_all,
     git_commit,
     git_head_commit,
@@ -78,6 +79,16 @@ def run_once(
 
     # 2. Master Directory Validation
     check_master_directory(master_dir)
+
+    # 2b. Working Copy Validation (Audit finding, this Sprint): every git
+    # command below runs with cwd=working_copy_dir. If that directory has no
+    # `.git` of its own, git silently walks up to the nearest ancestor
+    # repository instead — for a Working Copy nested inside this project's
+    # own checkout, that is this project's own repository. Failing fast here
+    # means a missing `git init` in the Working Copy surfaces as a named,
+    # caught GitOperationError before any git command runs, never as a
+    # commit/push landing somewhere unintended.
+    check_working_copy_is_a_git_repository(working_copy_dir)
 
     secret_matches = scan_for_secrets(master_dir)
 
