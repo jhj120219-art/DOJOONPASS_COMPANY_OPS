@@ -22,10 +22,22 @@ class DesktopProfile:
     role: str
 
 
+# The mapping is docs/02_EVENT_SCHEMA.md §8's own table, verbatim. It is
+# not a second opinion about which Desktop does what — `source` and `role`
+# are both schema-constrained values (`events.schema.SOURCES` / `ROLES`),
+# and this table only pairs them the way the spec already does.
+#
+# DESKTOP_4 was missing here even though docs/02 §8 lists it as an allowed
+# `source` and §9 lists COO as an allowed `role`. That gap meant the COO's
+# own execution work had no way to become an Event at all: Desktop 4 could
+# collect every other Desktop's work but never report its own. Filling it
+# adds no new source, role, or Event type — only the pairing the schema
+# already permits.
 PROFILES: Mapping[str, DesktopProfile] = {
     "DESKTOP_1": DesktopProfile(name="DESKTOP_1", source="DESKTOP_1", role="CTO_BACKEND"),
     "DESKTOP_2": DesktopProfile(name="DESKTOP_2", source="DESKTOP_2", role="CMO"),
     "DESKTOP_3": DesktopProfile(name="DESKTOP_3", source="DESKTOP_3", role="CTO_FRONTEND"),
+    "DESKTOP_4": DesktopProfile(name="DESKTOP_4", source="DESKTOP_4", role="COO"),
 }
 
 

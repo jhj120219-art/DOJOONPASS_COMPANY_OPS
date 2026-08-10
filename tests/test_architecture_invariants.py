@@ -540,6 +540,8 @@ class ConcurrentProcessMutualExclusionTests(unittest.TestCase):
             "    processed_dir=root / 'processed',\n"
             "    rejected_dir=root / 'rejected',\n"
             "    collector_log_path=root / 'logs' / 'collector.log',\n"
+            "    late_update_log_path=root / 'logs' / 'daily_late_update.log',\n"
+            "    monthly_state_path=root / 'state' / 'monthly_history_state.json',\n"
             "    collector_state_path=root / 'state' / 'collector_state.json',\n"
             "    keep_dir=root / 'keep',\n"
             "    review_dir=root / 'review',\n"
@@ -1211,10 +1213,13 @@ class ExitCodeContractTests(unittest.TestCase):
     stdout is not captured by Task Scheduler by default, no log records the
     failure, and the exit code says success. Nothing tells anyone.
 
-    The one nonzero exit is an uncaught exception (SystemExit via traceback),
-    which means the failures that ARE handled gracefully are exactly the ones
-    that become invisible, while an unhandled crash is the only thing that
-    reports.
+    The one nonzero exit was an uncaught exception (SystemExit via
+    traceback), which means the failures that ARE handled gracefully are
+    exactly the ones that become invisible, while an unhandled crash is the
+    only thing that reports. A later Sprint gave that one case a defined
+    code (2) and a readable message instead of a traceback — the same
+    condition, reported better. Which OTHER conditions deserve a nonzero
+    exit is still the open decision below.
 
     Not fixed: which conditions deserve a nonzero exit is a policy call. A
     non-zero code on `collector_summary.failed > 0` would make an ordinary
@@ -1222,29 +1227,36 @@ class ExitCodeContractTests(unittest.TestCase):
     should alert. That is the CEO's call, not a cleanup.
     """
 
-    def _main_function(self):
+    def _function(self, name):
         source = (REPO_ROOT / "run_company_ops.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         return next(
             node
             for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "main"
+            if isinstance(node, ast.FunctionDef) and node.name == name
         )
 
-    def test_every_return_path_returns_zero(self):
+    def _main_function(self):
+        return self._function("main")
+
+    def test_the_reporting_path_returns_zero_whatever_it_printed(self):
+        """`main()` was split into `_print_result()` (the run completed) and
+        `_report_backup_failure()` (Backup raised). The characterized
+        property lives in the first: it prints every failure signal it knows
+        about and still returns 0."""
         returns = [
             ast.unparse(node.value) if node.value else "None"
-            for node in ast.walk(self._main_function())
+            for node in ast.walk(self._function("_print_result"))
             if isinstance(node, ast.Return)
         ]
 
-        self.assertTrue(returns, "main() has no return statement")
+        self.assertTrue(returns, "_print_result() has no return statement")
         self.assertEqual(set(returns), {"0"})
 
     def test_no_failure_status_is_ever_tested_in_a_condition(self):
-        main = self._main_function()
+        reporter = self._function("_print_result")
         conditions = " ".join(
-            ast.unparse(node.test) for node in ast.walk(main) if isinstance(node, ast.If)
+            ast.unparse(node.test) for node in ast.walk(reporter) if isinstance(node, ast.If)
         )
 
         for signal in (
@@ -1254,9 +1266,30 @@ class ExitCodeContractTests(unittest.TestCase):
         ):
             with self.subTest(signal=signal):
                 # Printed...
-                self.assertIn(signal, ast.unparse(main))
+                self.assertIn(signal, ast.unparse(reporter))
                 # ...but never branched on.
                 self.assertNotIn(signal, conditions)
+
+    def test_a_raised_backup_failure_exits_nonzero_with_an_explanation(self):
+        """NOT a change to the exit-code policy this class characterizes.
+
+        A Backup `GitOperationError` always exited nonzero — it propagated
+        as an unhandled exception, which is exactly what this docstring
+        calls "the one nonzero exit". What changed is that the operator now
+        gets an explanation and a defined code instead of a traceback. The
+        signals BUG-36 is about — `final_status`, `scheduler_result.status`,
+        `collector_summary.failed` — are still printed and still ignored, on
+        the `_print_result()` path above.
+        """
+        reporter = self._function("_report_backup_failure")
+        returns = {
+            ast.unparse(node.value) if node.value else "None"
+            for node in ast.walk(reporter)
+            if isinstance(node, ast.Return)
+        }
+
+        self.assertEqual(returns, {"2"})
+        self.assertIn("is_authentication_failure", ast.unparse(reporter))
 
     def test_a_backup_failure_is_reachable_and_would_exit_zero(self):
         """The failure really happens — the Secret Scan gate produces it."""
@@ -1300,6 +1333,8 @@ class ExitCodeContractTests(unittest.TestCase):
             processed_dir=root / "processed",
             rejected_dir=root / "rejected",
             collector_log_path=root / "collector.log",
+            late_update_log_path=root / "daily_late_update.log",
+            monthly_state_path=root / "monthly_history_state.json",
             collector_state_path=root / "collector_state.json",
             keep_dir=root / "keep",
             review_dir=root / "review",
@@ -1889,6 +1924,8 @@ class ConcurrentRunnerDataLossTests(unittest.TestCase):
             "        transport_dir=root / 'transport', incoming_dir=root / 'incoming',\n"
             "        processed_dir=root / 'processed', rejected_dir=root / 'rejected',\n"
             "        collector_log_path=root / 'logs' / 'collector.log',\n"
+            "        late_update_log_path=root / 'logs' / 'daily_late_update.log',\n"
+            "        monthly_state_path=root / 'state' / 'monthly_history_state.json',\n"
             "        collector_state_path=root / 'state' / 'collector_state.json',\n"
             "        keep_dir=root / 'keep', review_dir=root / 'review',\n"
             "        scheduler_state_path=root / 'state' / 'daily_history_state.json',\n"
@@ -1977,3 +2014,167 @@ class ConcurrentRunnerDataLossTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentBoundaryInvariantTests(unittest.TestCase):
+    """The Agent is the SENDING side. It must not grow a dependency on the
+    Desktop 4 collection layer.
+
+    This project has enforced the same kind of boundary since Phase 3 —
+    `transport/intake.py` is asserted not to import collector/reporter/daily
+    (tests/test_transport_intake.py) — and the Multi-Desktop Agent adds a
+    second one worth stating explicitly: an Agent runs on a machine that has
+    no Collector, no History Repository, no Notion credentials, and no
+    Backup remote. Importing any of them would compile fine here and fail
+    (or, worse, quietly work against the wrong directories) on Desktop 1.
+
+    `reporter`, `transport`, `events`, and `scheduler.lock` ARE allowed:
+    identity, delivery, the Event Schema, and mutual exclusion are exactly
+    what a sending machine needs, and reusing them is why the Agent added no
+    parallel implementations.
+    """
+
+    FORBIDDEN_FOR_AGENT = ("collector", "notion", "backup", "daily", "history", "app")
+
+    def _imported_top_level_modules(self, path: Path) -> set[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    names.add(node.module.split(".")[0])
+        return names
+
+    def test_the_agent_package_never_imports_the_desktop4_layer(self):
+        for path in sorted((SRC / "agent").glob("*.py")):
+            with self.subTest(module=path.name):
+                imported = self._imported_top_level_modules(path)
+                for forbidden in self.FORBIDDEN_FOR_AGENT:
+                    self.assertNotIn(
+                        forbidden,
+                        imported,
+                        f"src/agent/{path.name} imports {forbidden!r} — an Agent "
+                        f"machine has no such layer",
+                    )
+
+    def test_the_agent_package_does_use_the_shared_layers(self):
+        """The boundary above is only meaningful if the Agent is in fact
+        built on the existing shared modules rather than reimplementing
+        them."""
+        imported: set[str] = set()
+        for path in (SRC / "agent").glob("*.py"):
+            imported |= self._imported_top_level_modules(path)
+
+        for expected in ("events", "reporter", "transport", "scheduler"):
+            with self.subTest(module=expected):
+                self.assertIn(expected, imported)
+
+    def test_the_desktop4_status_view_does_not_depend_on_the_agent(self):
+        """Desktop 4 reads Events, not another machine's Agent internals.
+        A dependency here would mean the COO view could only be built on a
+        machine that also runs an Agent."""
+        imported = self._imported_top_level_modules(SRC / "app" / "desktop_activity.py")
+        self.assertNotIn("agent", imported)
+
+    def test_late_event_update_runs_before_backup_in_the_runner(self):
+        """Ordering invariant, not a style preference: an updated Daily file
+        that is written after the Backup step would not reach the backup
+        remote until the next run that happens to change something else.
+        docs/08 §65's "backup: history late update" commit template exists
+        precisely because the update is expected to be in the same run.
+        """
+        source = inspect.getsource(runner_module.run_once)
+        self.assertLess(
+            source.index("update_daily_history("),
+            source.index("backup_run_once("),
+            "Late Event Update must precede Backup",
+        )
+
+
+class MonthlyBoundaryInvariantTests(unittest.TestCase):
+    """docs/09 §12-13 do not merely prefer Daily as Monthly's input — they
+    give a reason: re-deriving from Events would duplicate the History
+    Filter and let Daily and Monthly disagree about the same day.
+
+    The strongest way to guarantee that is structural. `monthly` imports
+    nothing from this project at all: not `history`, not `collector`, not
+    `events`. It cannot re-apply a filter it has no access to, and it cannot
+    read a Repository it cannot import. A future change that reaches for one
+    of them fails here rather than producing a Monthly that quietly
+    contradicts its own Daily files.
+    """
+
+    LOCAL_PACKAGES = {
+        "agent", "app", "backup", "collector", "daily", "events",
+        "history", "notion", "reporter", "scheduler", "transport",
+    }
+
+    def _project_imports(self, path: Path) -> set[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    found.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])
+        return found & self.LOCAL_PACKAGES
+
+    def test_monthly_imports_nothing_from_the_rest_of_the_project(self):
+        for path in sorted((SRC / "monthly").glob("*.py")):
+            with self.subTest(module=path.name):
+                self.assertEqual(
+                    self._project_imports(path),
+                    set(),
+                    f"src/monthly/{path.name} reaches outside the package; "
+                    f"docs/09 §13 requires Monthly to consolidate Daily files only",
+                )
+
+    def test_monthly_reads_no_event_or_repository_path(self):
+        """The same rule from the other side: even without an import, a
+        hardcoded path into `history_candidates/` or `events/` would
+        reintroduce the coupling."""
+        for path in sorted((SRC / "monthly").glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            code = "\n".join(
+                line for line in text.splitlines() if not line.strip().startswith("#")
+            )
+            for forbidden in ("history_candidates", "events/incoming", "processed"):
+                with self.subTest(module=path.name, path=forbidden):
+                    self.assertNotIn(forbidden, code)
+
+    def test_monthly_consolidation_runs_after_daily_and_before_backup(self):
+        """docs/09 §50's order. Before Daily, the month would be consolidated
+        from files the Scheduler is about to create; after Backup, a new
+        Monthly would sit unbacked-up until something else changed."""
+        source = inspect.getsource(runner_module.run_once)
+        self.assertLess(
+            source.index("scheduler_run_once("),
+            source.index("monthly_run_once("),
+            "Monthly must follow Daily Catch-up",
+        )
+        self.assertLess(
+            source.index("monthly_run_once("),
+            source.index("backup_run_once("),
+            "Monthly must precede Backup",
+        )
+
+    def test_a_dirty_month_is_marked_before_it_is_consolidated(self):
+        """docs/09 §55-57: the Late Event marks the month, and the same run
+        rebuilds it. Marking after consolidation would leave the Monthly
+        disagreeing with its Daily until the following run."""
+        # Comment lines stripped: the step's own comment names
+        # monthly_run_once() while explaining the ordering, which would put
+        # the mention before the call it is describing.
+        source = "\n".join(
+            line
+            for line in inspect.getsource(runner_module.run_once).splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertLess(
+            source.index("mark_month_dirty("),
+            source.index("monthly_run_once("),
+        )

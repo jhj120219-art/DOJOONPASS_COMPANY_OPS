@@ -641,10 +641,18 @@ class LongPathHelperTests(unittest.TestCase):
         self.assertIn("fakeshare", str(result))
 
     def test_an_already_extended_path_still_comes_out_extended(self):
-        """`Path.resolve()` strips an existing `\\\\?\\` prefix before this
-        function ever sees it (verified: `resolve()` normalises it away), so
-        there is no special case to take — the plain branch re-adds exactly
-        one prefix either way."""
+        """An input that already carries the `\\\\?\\` prefix is returned
+        unchanged — exactly one prefix, and never the UNC form.
+
+        This test previously asserted the same expectation but passed for
+        the wrong reason on Python < 3.11, where `Path.resolve()` stripped
+        the prefix so the plain branch re-added it. On 3.13 `resolve()`
+        preserves it; the still-`\\\\`-leading text then took the UNC branch
+        and produced `\\\\?\\UNC\\?\\C:\\...`, a path no Windows API accepts.
+        Every lock operation on it raises OSError, which `try_acquire_lock()`
+        reads as "another Runner holds it" — so a Runner configured with an
+        already-prefixed lock path would skip every run forever.
+        """
         from scheduler.lock import _long_path
 
         already = Path("\\\\?\\C:\\some\\lock\\dir\\company_ops.lock")
@@ -652,6 +660,29 @@ class LongPathHelperTests(unittest.TestCase):
         result = _long_path(already)
 
         self.assertEqual(str(result), "\\\\?\\C:\\some\\lock\\dir\\company_ops.lock")
+        self.assertNotIn("UNC", str(result))
+
+    @unittest.skipUnless(sys.platform == "win32", "extended-length paths are Windows-only")
+    def test_a_lock_at_an_already_extended_path_can_actually_be_acquired(self):
+        """The operational consequence of the branch above, end to end: a
+        Runner handed an already-prefixed lock path must be able to take,
+        hold, and release the lock like any other. Before the fix this
+        returned False on the very first attempt — indistinguishable from
+        "another Runner is running", so the real Runner never ran at all.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        lock_path = Path("\\\\?\\" + str(Path(tmp.name).resolve() / "company_ops.lock"))
+        now = datetime(2026, 8, 10, 11, 0)
+
+        self.assertTrue(try_acquire_lock(lock_path, now=now))
+        try:
+            self.assertFalse(try_acquire_lock(lock_path, now=now))
+        finally:
+            release_lock(lock_path)
+        self.assertTrue(try_acquire_lock(lock_path, now=now))
+        release_lock(lock_path)
 
 
 if __name__ == "__main__":

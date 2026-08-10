@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # (src/<module>/<file>.py 기준 parents[2] = Repository Root).
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_NOTION_SYNC_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "notion_sync.log"
+DEFAULT_LATE_UPDATE_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "daily_late_update.log"
 
 from backup.runner import run_once as backup_run_once  # noqa: E402  (backup/__init__.py 없음 — 서브모듈 직접 import)
 from collector import (  # noqa: E402
@@ -61,8 +62,15 @@ from collector import (  # noqa: E402
     RuntimeOutcome,
     run_once as collector_run_once,
 )
+from daily import LateUpdateOutcome, update_daily_history  # noqa: E402
 from events import Event  # noqa: E402
-from history import FileHistoryRepository, HistoryFilter  # noqa: E402
+from history import FileHistoryRepository, HistoryDecision, HistoryFilter  # noqa: E402
+from monthly import (  # noqa: E402
+    DEFAULT_STATE_PATH as DEFAULT_MONTHLY_STATE_PATH,
+    MonthlyStatus,
+    mark_month_dirty,
+    run_once as monthly_run_once,
+)
 from notion import (  # noqa: E402
     DEFAULT_QUEUE_PATH as DEFAULT_NOTION_RETRY_QUEUE_PATH,
     DashboardOutcome,
@@ -108,6 +116,23 @@ def _log_notion_sync(log_path: Path, sync_result: SyncResult) -> None:
         pass
 
 
+def _log_late_update(log_path: Path, message: str) -> None:
+    """docs/06 §41: a History update failure must be recorded, not swallowed.
+
+    Same one-line, timestamp-prefixed convention as `_log_notion_sync()` and
+    `collector/runtime.py::_log()`, and the same rule: logging must never be
+    the thing that fails a run. Only dates, counts, and event_ids are
+    written — no Event content, no path outside this project.
+    """
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} LATE_UPDATE {message}\n")
+    except OSError:
+        pass
+
+
 def run_once(
     *,
     local_master_dir: Path,
@@ -123,6 +148,8 @@ def run_once(
     collector_state_path: Path | None = None,
     notion_sync: ExecutionPlanSync | None = None,
     notion_sync_log_path: Path | None = None,
+    late_update_log_path: Path | None = None,
+    monthly_state_path: Path | None = None,
     notion_retry_queue_path: Path | None = None,
     dashboard_client: NotionClient | None = None,
     dashboard_pending_path: Path | None = None,
@@ -300,12 +327,27 @@ def run_once(
         #    processed_dir 재스캔이 아니라 이번 실행의 반환값만 사용한다 — Gap 3.)
         history_filter = HistoryFilter()
         repository = FileHistoryRepository(keep_dir=keep_dir, review_dir=review_dir)
+        # 이번 실행에서 KEEP Candidate가 새로 생긴 날짜들. 6.5단계(Late Event
+        # Update)가 어떤 날짜를 다시 확인해야 하는지 판단하는 근거이며, 그
+        # 판단을 위해 Repository를 추가로 조회하지 않기 위한 것이다 — Architecture
+        # Invariant("아무것도 pending이 아니면 repository.list()를 호출하지 않는다",
+        # tests/test_architecture_invariants.py)를 그대로 지킨다.
+        kept_dates: set[date] = set()
         for processed_file in collector_summary.files:
             if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
                 continue
             event = Event.from_json(processed_file.destination_path.read_text(encoding="utf-8"))
             filter_result = history_filter.evaluate(event)
             repository.save(filter_result.candidate)
+            if filter_result.decision is HistoryDecision.KEEP:
+                # 오류 처리를 덧붙이지 않는다. 바로 위 Event.from_json()이 이미
+                # events.schema의 timestamp 검증(_timestamp_error 역시
+                # datetime.fromisoformat을 쓴다)을 통과시켰으므로 여기서 파싱이
+                # 실패할 수 없다. 방어 코드를 넣으면 이 단계에 per-event 오류
+                # 처리가 없다는 문서화된 성질(BUG-20 characterization,
+                # tests/test_architecture_invariants.py)을 코드 텍스트상으로
+                # 흐리게 만들 뿐 실제로 바뀌는 것은 없다.
+                kept_dates.add(datetime.fromisoformat(event.timestamp).date())
 
         # 6. Daily History — docs/07 §37 steps 7-8
         #    "Missing Daily Date 계산" + "Daily Catch-up"
@@ -320,6 +362,120 @@ def run_once(
             daily_output_dir=local_master_dir / "daily",
             already_locked=True,
         )
+
+        # 6.5. Late Event Update — docs/06 §36-40.
+        #     Audit BUG-17(P0) 해소. 이미 Daily Close가 끝난 날짜의 Event가
+        #     뒤늦게 도착하면(Desktop이 며칠 꺼져 있었던 경우 — Multi-Desktop
+        #     구성에서는 예외가 아니라 일상이다) Collector는 ACCEPTED,
+        #     History Filter는 KEEP, Notion Sync는 성공으로 처리하지만
+        #     scheduler.run_once()는 .md가 이미 있는 날짜를 건너뛰고
+        #     generate_daily_history()는 덮어쓰기를 거부한다. 결과적으로 그
+        #     Event는 Company History에 영원히 들어가지 못하면서 모든 지표는
+        #     성공을 보고했다(README RULE 7 위반).
+        #
+        #     대상 날짜는 5단계에서 모은 `kept_dates`뿐이다 — 이번 실행에서
+        #     KEEP Candidate가 새로 생기지 않았다면 Late Event도 있을 수 없으므로
+        #     이 단계 전체가 아무 일도 하지 않는다(파일 조회조차 하지 않는다).
+        #     방금 Scheduler가 생성한 날짜도 그 파일이 이미 새 Candidate를
+        #     포함하고 있으므로 NO_LATE_EVENTS로 끝난다 — 이중 기록되지 않는다.
+        #
+        #     Backup(7단계)보다 먼저 실행해야 갱신된 Daily 파일이 같은 실행에서
+        #     백업된다. backup/runner.py의 "backup: history late update" 커밋
+        #     템플릿(docs/08 §65)이 바로 이 경우를 위해 이미 존재한다.
+        #     반환값(tuple)은 바꾸지 않는다 — Late Event Update는 새로운
+        #     파이프라인 단계가 아니라 Daily History 단계 안의 보정이고,
+        #     Runner의 반환 계약은 이미 안정적인 공개 API다. §40이 요구하는
+        #     "언제 수정됐는지 추적 가능"은 갱신된 Daily 파일 자신의
+        #     `Last Updated At` / `Late Events Added`가 담당한다. 다만 실패는
+        #     그 파일에 남지 않으므로(§41 "오류 기록") 로그로 남긴다.
+        resolved_late_update_log_path = (
+            Path(late_update_log_path)
+            if late_update_log_path is not None
+            else DEFAULT_LATE_UPDATE_LOG_PATH
+        )
+        late_updated_dates: list[date] = []
+        for kept_date in sorted(kept_dates):
+            late_result = update_daily_history(
+                repository,
+                kept_date,
+                output_dir=local_master_dir / "daily",
+                now=now,
+            )
+            if late_result.outcome is LateUpdateOutcome.UPDATED_LATE_EVENT:
+                late_updated_dates.append(kept_date)
+                _log_late_update(
+                    resolved_late_update_log_path,
+                    f"UPDATED_LATE_EVENT {kept_date.isoformat()} "
+                    f"added={len(late_result.added_event_ids)} "
+                    f"events={','.join(late_result.added_event_ids)}",
+                )
+            elif late_result.outcome is LateUpdateOutcome.FAILED:
+                _log_late_update(
+                    resolved_late_update_log_path,
+                    f"FAILED {kept_date.isoformat()} {late_result.error}",
+                )
+
+        # 6.7. Monthly Consolidation — docs/09 §50-51.
+        #      docs/09 §50이 정한 순서 그대로다: Daily Catch-up 다음, Backup
+        #      앞. §51은 Daily와 Monthly가 별도 프로세스로 경쟁하지 않도록
+        #      "동일 Company Ops Runner → Daily 작업 먼저 → Monthly 작업"을
+        #      권장하며, 이 위치가 정확히 그것이다 — Monthly는 이미 이 실행에서
+        #      확정된 Daily 파일만 읽는다(§12-13).
+        #
+        #      Late Event로 Daily가 바뀐 달은 먼저 DIRTY로 표시한다(§54-56).
+        #      다음 줄의 monthly_run_once()가 같은 실행 안에서 그 달을 다시
+        #      만들어 MONTHLY_UPDATED로 끝낸다(§57) — Monthly가 자기 Daily와
+        #      어긋난 채 남아 있는 창이 없다.
+        #
+        #      Monthly 실패는 Runtime을 중단시키지 않는다. Daily/Backup은 이미
+        #      끝났고, PENDING/FAILED인 달은 다음 실행에서 다시 시도된다
+        #      (§39, §44, §74). Notion Sync·Dashboard 단계와 같은 방어 방식이다.
+        resolved_monthly_state_path = (
+            Path(monthly_state_path)
+            if monthly_state_path is not None
+            else DEFAULT_MONTHLY_STATE_PATH
+        )
+        try:
+            for updated_date in late_updated_dates:
+                mark_month_dirty(resolved_monthly_state_path, updated_date)
+
+            monthly_result = monthly_run_once(
+                daily_dir=local_master_dir / "daily",
+                monthly_dir=local_master_dir / "monthly",
+                history_start_date=history_start_date,
+                now=now,
+                state_path=resolved_monthly_state_path,
+            )
+            for month_result in monthly_result.results:
+                if month_result.status in (
+                    MonthlyStatus.MONTHLY_GENERATED,
+                    MonthlyStatus.MONTHLY_UPDATED,
+                ):
+                    _log_late_update(
+                        resolved_late_update_log_path,
+                        f"{month_result.status.value} {month_result.key} "
+                        f"items={month_result.item_count}",
+                    )
+                elif month_result.status in (
+                    MonthlyStatus.MONTHLY_PENDING,
+                    MonthlyStatus.MONTHLY_FAILED,
+                ):
+                    _log_late_update(
+                        resolved_late_update_log_path,
+                        f"{month_result.status.value} {month_result.key} "
+                        f"{month_result.error}",
+                    )
+        except Exception as monthly_exc:  # noqa: BLE001  (§74: Monthly 실패가 Runtime을 막지 않는다)
+            # 삼키되, 흔적 없이 삼키지는 않는다. monthly_run_once()가 스스로
+            # 반환하는 PENDING/FAILED는 위에서 기록되지만, 그 바깥으로 새는
+            # 예기치 못한 예외는 이전에 아무 기록도 남기지 않았다 — Monthly가
+            # 조용히 사라지고 운영자가 알아챌 방법이 없었다.
+            # docs/09 §44/§74는 실패를 "기록하되 Runtime을 막지 않는다"로
+            # 정하고 있으므로, 여기서 막지 않는 것과 기록하는 것은 양립한다.
+            _log_late_update(
+                resolved_late_update_log_path,
+                f"MONTHLY_FAILED (unexpected) {type(monthly_exc).__name__}: {monthly_exc}",
+            )
 
         # 7. Backup — docs/07 §37 step 9 "Backup Pending 처리", docs/08 §14-15
         backup_entry = backup_run_once(

@@ -131,6 +131,8 @@ class OperationsScenarioTestCase(unittest.TestCase):
             collector_state_path=self.collector_state_path,
             notion_sync=notion_sync,
             notion_sync_log_path=self.notion_sync_log_path,
+            late_update_log_path=self.logs_dir / "daily_late_update.log",
+            monthly_state_path=self.logs_dir / "monthly_history_state.json",
             notion_retry_queue_path=self.notion_retry_queue_path,
             keep_dir=self.keep_dir,
             review_dir=self.review_dir,
@@ -376,19 +378,20 @@ class Scenario5CeoDecisionTests(OperationsScenarioTestCase):
 
 
 class ReporterProfileCoverageTests(unittest.TestCase):
-    """Audit finding GAP-10.
+    """Audit finding GAP-10, now closed.
 
     events.schema allows source=DESKTOP_4 and role=COO, and docs/10 section 16
     (Scenario 5, CEO Decision) plus section 66 (COO 권한) both describe
-    COO-originated Events. But reporter.profiles.PROFILES maps only
-    DESKTOP_1/2/3, so there is no supported producer for a COO Event: it can
-    only be created by calling events.create_event() directly and writing the
-    JSON by hand.
+    COO-originated Events. reporter.profiles.PROFILES nevertheless mapped only
+    DESKTOP_1/2/3, so there was no supported producer for a COO Event: it
+    could only be created by calling events.create_event() directly and
+    writing the JSON by hand.
 
-    Recorded as characterization, not asserted as correct — README section 3
-    does describe Desktop 4 as Company Ops' own host rather than a reporting
-    Desktop, so a missing profile may well be intentional. What is not
-    recorded anywhere is how a CEO Decision Event is meant to be produced.
+    The Multi-Desktop Agent made that gap operational rather than theoretical
+    — the COO Desktop runs the same Agent as every other Desktop, and without
+    a profile it could not report its own execution work at all. The profile
+    was therefore added, pairing two values docs/02 §8/§9 already allow. No
+    new source, role, or Event type exists as a result.
     """
 
     def test_schema_allows_desktop4_and_coo(self):
@@ -397,13 +400,45 @@ class ReporterProfileCoverageTests(unittest.TestCase):
         self.assertIn("DESKTOP_4", SOURCES)
         self.assertIn("COO", ROLES)
 
-    def test_reporter_has_no_profile_for_desktop4_or_coo(self):
-        from reporter.profiles import PROFILES, ReporterConfigError, resolve_profile
+    def test_every_schema_source_has_exactly_one_reporter_profile(self):
+        from events import ROLES, SOURCES
+        from reporter.profiles import PROFILES, resolve_profile
 
-        self.assertEqual(sorted(PROFILES), ["DESKTOP_1", "DESKTOP_2", "DESKTOP_3"])
-        self.assertNotIn("COO", {p.role for p in PROFILES.values()})
+        self.assertEqual(sorted(PROFILES), sorted(SOURCES))
+        for name, profile in PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertEqual(profile.name, name)
+                self.assertIn(profile.source, SOURCES)
+                self.assertIn(profile.role, ROLES)
+
+        coo = resolve_profile("DESKTOP_4")
+        self.assertEqual(coo.source, "DESKTOP_4")
+        self.assertEqual(coo.role, "COO")
+
+    def test_an_unknown_profile_name_is_still_refused(self):
+        from reporter.profiles import ReporterConfigError, resolve_profile
+
         with self.assertRaises(ReporterConfigError):
-            resolve_profile("DESKTOP_4")
+            resolve_profile("DESKTOP_5")
+
+    def test_a_coo_decision_event_can_now_be_produced_through_reporter(self):
+        """The gap's actual consequence: producing a COO Event no longer
+        requires bypassing Reporter and hand-writing the identity fields."""
+        from events import validate_event
+        from reporter import Reporter
+
+        event = Reporter(profile="DESKTOP_4").report(
+            project_id="CLOSED_BETA",
+            event_type="DECISION_APPROVED",
+            status="IN_PROGRESS",
+            summary="Closed Beta Scope 확정.",
+            history_candidate=True,
+            event_id="GAP10-002",
+            timestamp="2026-08-05T10:00:00+09:00",
+        )
+        self.assertEqual(event.source, "DESKTOP_4")
+        self.assertEqual(event.role, "COO")
+        self.assertEqual(validate_event(event.to_dict()), [])
 
     def test_a_coo_decision_event_is_still_schema_valid_when_built_directly(self):
         from events import validate_event

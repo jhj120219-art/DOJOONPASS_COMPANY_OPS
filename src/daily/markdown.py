@@ -50,7 +50,23 @@ def _display_role(role: str) -> str:
     return _ROLE_DISPLAY_NAMES.get(role, role)
 
 
-def _render_item_block(candidate: HistoryCandidate) -> str:
+def _render_item_block(candidate: HistoryCandidate, *, include_category: bool = False) -> str:
+    """One item block, per docs/06 sections 18-21.
+
+    `include_category` adds a `- Category:` bullet. It is used **only** by
+    `late_events.py` for the `## Late Events` section, and never in the four
+    sections docs/06 fixes, whose template stays exactly as specified.
+
+    The reason it exists at all: every canonical section states its items'
+    category through its own heading (`## Decisions` -> DECISION), so an item
+    inside one is self-describing. A late item is not — `## Late Events`
+    holds items of every category at once — and Monthly History consolidates
+    strictly from the Daily files (docs/09 sections 12-13, which forbid
+    re-reading raw Events or the Repository to avoid "판단 기준 불일치").
+    Without this bullet a late DECISION could not be filed under Major
+    Decisions in the Monthly, and a Desktop that was offline across a Daily
+    Close is exactly the common case that produces late items.
+    """
     lines = [
         f"### {_display_project_name(candidate.project_id)}",
         "",
@@ -58,6 +74,8 @@ def _render_item_block(candidate: HistoryCandidate) -> str:
         f"- Owner: {_display_role(candidate.role)}",
         f"- Event ID: {candidate.event_id}",
     ]
+    if include_category and candidate.category:
+        lines.append(f"- Category: {candidate.category}")
     if candidate.decision_context:
         lines.append(f"- Decision Context: {candidate.decision_context}")
     if candidate.expected_outcome:

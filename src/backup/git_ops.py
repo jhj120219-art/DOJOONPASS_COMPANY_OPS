@@ -24,6 +24,7 @@ Working Copy's remote was already configured with (section 30).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,13 +106,70 @@ class GitStatusResult:
     deleted_files: tuple[str, ...]
 
 
+# A git call must always end. The Runner holds the system-wide lock for the
+# whole Backup step (app/runner.py step 7), so a git command that blocks
+# blocks every future Runner execution too — strictly worse than the
+# infinite retry loop docs/08 §62 forbids, because a retry loop at least
+# keeps collecting Events.
+#
+# Two ways a push can block indefinitely, both closed below:
+#
+#   credential prompt   git asks on the terminal, or Git Credential Manager
+#                       opens a GUI dialog. Neither has a timeout of its own,
+#                       and a scheduled task has nobody to answer them.
+#   network stall       a remote that accepts and never responds. git's own
+#                       connect timeout covers a refused/black-holed address
+#                       (measured: ~21 s), but not a connection that opens
+#                       and then stops.
+#
+# 300 s is far above any healthy push of a few Markdown files and far below
+# "never".
+_GIT_TIMEOUT_SECONDS = 300.0
+
+
+def _git_environment() -> dict[str, str]:
+    """The environment every git call runs under: no interactive prompts.
+
+    `_AUTH_FAILURE_MARKERS` already lists "terminal prompts disabled" — the
+    message git emits when `GIT_TERMINAL_PROMPT=0` is set. Nothing set it,
+    so that marker could never match and the condition it describes hung
+    instead of failing. Setting it makes the classification reachable.
+
+    `GCM_INTERACTIVE=never` covers the Windows Git Credential Manager,
+    which does not consult `GIT_TERMINAL_PROMPT` and would otherwise open a
+    dialog no scheduled task can answer.
+
+    Passed as environment rather than `-c` flags on purpose: the command
+    line stays exactly the approved set
+    (tests/test_spec_conformance.py::test_git_ops_runs_only_the_approved_command_set).
+    """
+    environment = dict(os.environ)
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GCM_INTERACTIVE"] = "never"
+    return environment
+
+
 def _run_git(args: Sequence[str], repo_dir: Path) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            env=_git_environment(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Reported as an ordinary GitOperationError so backup/runner.py
+        # classifies it the way it classifies any other non-auth failure:
+        # BACKUP_PENDING, retried on the next run (docs/08 §19). A timeout is
+        # transient by nature, and `is_authentication_failure()` correctly
+        # does not match this message.
+        raise GitOperationError(
+            f"git {' '.join(args)} timed out after {_GIT_TIMEOUT_SECONDS:.0f}s "
+            f"(no output; the remote may be unreachable or waiting for credentials)"
+        ) from exc
+
     if result.returncode != 0:
         raise GitOperationError(
             f"git {' '.join(args)} failed (exit {result.returncode}): {result.stderr.strip()}"

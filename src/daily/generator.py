@@ -30,8 +30,10 @@ and Monthly History are all out of scope here too.
 
 from __future__ import annotations
 
+import enum
 import os
 import tempfile
+from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +41,7 @@ from typing import Mapping, Sequence
 
 from history import HistoryCandidate, HistoryDecision, HistoryRepository
 
+from .late_events import append_late_events, select_late_candidates
 from .markdown import render_daily_markdown
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -137,3 +140,118 @@ def generate_daily_history(
             pass
         raise
     return final_path
+
+
+class LateUpdateOutcome(enum.Enum):
+    """docs/06 §65's per-date result vocabulary, narrowed to this function's
+    two possible answers plus the two ways it can decline to act."""
+
+    UPDATED_LATE_EVENT = "UPDATED_LATE_EVENT"
+    NO_LATE_EVENTS = "NO_LATE_EVENTS"
+    NO_EXISTING_FILE = "NO_EXISTING_FILE"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class LateUpdateResult:
+    date: date_type
+    outcome: LateUpdateOutcome
+    added_event_ids: tuple[str, ...] = ()
+    path: Path | None = None
+    error: str | None = None
+
+
+def update_daily_history(
+    repository: HistoryRepository,
+    target_date: date_type,
+    *,
+    output_dir: Path | None = None,
+    now: datetime | None = None,
+    keep_candidates: Sequence[HistoryCandidate] | None = None,
+) -> LateUpdateResult:
+    """Add any Late KEEP Events to an already-written Daily History (docs/06 §37).
+
+    This closes the gap docs/06 §36 names: an Event dated 08-05 that arrives
+    on 08-07 is accepted, filtered, stored in keep/, and synced to Notion,
+    but `scheduler.run_once()` skips any date whose `.md` already exists and
+    `generate_daily_history()` refuses to overwrite — so Company History
+    never receives it while every other indicator reports success. With four
+    Desktops the triggering condition (one machine offline across a Daily
+    Close) is routine rather than exceptional.
+
+    Deliberately narrow and side-effect-free unless there is real work:
+
+        no existing file      -> NO_EXISTING_FILE, nothing written
+                                 (that date is `generate_daily_history()`'s
+                                  job, not this one's)
+        nothing new           -> NO_LATE_EVENTS, nothing written
+        genuinely late Events -> the file is rewritten atomically with the
+                                 original content preserved verbatim and the
+                                 new items appended (see late_events.py)
+
+    Never raises for an I/O or rendering failure — docs/06 §41 requires that
+    a History write failure leave the existing History intact, delete no
+    candidate, and be retried on the next run. Returning FAILED gives the
+    caller that behaviour for free: nothing was written, nothing advanced,
+    and the same Events are still pending next time.
+    """
+    output_dir = Path(output_dir) if output_dir is not None else DEFAULT_DAILY_DIR
+    now = now or datetime.now().astimezone()
+    final_path = output_dir / f"{target_date.isoformat()}.md"
+
+    if not final_path.exists():
+        return LateUpdateResult(date=target_date, outcome=LateUpdateOutcome.NO_EXISTING_FILE)
+
+    try:
+        existing = final_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return LateUpdateResult(
+            date=target_date, outcome=LateUpdateOutcome.FAILED, error=str(exc)
+        )
+
+    try:
+        source = (
+            keep_candidates
+            if keep_candidates is not None
+            else repository.list(decision=HistoryDecision.KEEP)
+        )
+        for_this_date = [
+            candidate for candidate in source if _candidate_date(candidate) == target_date
+        ]
+    except Exception as exc:  # noqa: BLE001  (§41: report, never crash the run)
+        return LateUpdateResult(
+            date=target_date, outcome=LateUpdateOutcome.FAILED, error=str(exc)
+        )
+
+    late = select_late_candidates(existing, for_this_date)
+    if not late:
+        return LateUpdateResult(
+            date=target_date, outcome=LateUpdateOutcome.NO_LATE_EVENTS, path=final_path
+        )
+
+    try:
+        updated = append_late_events(
+            existing, late, now_iso=now.isoformat(timespec="seconds")
+        )
+        fd, tmp_path = tempfile.mkstemp(dir=output_dir, prefix=".tmp-", suffix=".md")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+            os.replace(tmp_path, final_path)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:  # noqa: BLE001
+        return LateUpdateResult(
+            date=target_date, outcome=LateUpdateOutcome.FAILED, error=str(exc)
+        )
+
+    return LateUpdateResult(
+        date=target_date,
+        outcome=LateUpdateOutcome.UPDATED_LATE_EVENT,
+        added_event_ids=tuple(candidate.event_id for candidate in late),
+        path=final_path,
+    )

@@ -161,6 +161,15 @@ class LongPathBoundaryTests(unittest.TestCase):
     `sync_to_working_copy()` raises `OSError` (`WinError 206`, "filename or
     extension too long") instead of returning a result.
 
+    Whether that limit applies at all is a property of the machine, not of
+    this code: Windows lifts it per-system via the `LongPathsEnabled`
+    registry setting, and POSIX never had it. The test below therefore
+    probes the filesystem first and asserts whichever branch is real here,
+    so it keeps describing the gap on a machine that has it and pins the
+    working behaviour on one that does not. It previously hard-asserted
+    `OSError` and so failed outright on a long-path-enabled machine — the
+    coverage silently became a false alarm rather than a finding.
+
     Not fixed here, unlike the Lock case, because the fix is not obviously
     narrow: git.exe itself has its own long-path limitation independent of
     Python's (`core.longpaths` must be set for git to write >260-char paths
@@ -176,10 +185,15 @@ class LongPathBoundaryTests(unittest.TestCase):
     """
 
     def test_a_master_directory_path_past_the_extended_length_boundary_raises(self):
-        """Even building the fixture (plain `mkdir`/`write_text`, no the
+        """Even building the fixture (plain `mkdir`/`write_text`, no
         extended-length-path prefix) fails once the path crosses the
         boundary -- the same WinError 206 a real deployment would hit, not
-        an artifact of this test's own setup being unusual."""
+        an artifact of this test's own setup being unusual.
+
+        On a machine where long paths ARE supported, the same setup
+        succeeds; then what must hold is that `sync_to_working_copy()`
+        completes normally rather than failing for some other reason.
+        """
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -190,10 +204,21 @@ class LongPathBoundaryTests(unittest.TestCase):
         master_dir = deep / "master"
         working_copy_dir = deep / "wc"
 
-        with self.assertRaises(OSError):
+        try:
             (master_dir / "daily").mkdir(parents=True)
             (master_dir / "daily" / "2026-08-09.md").write_text("x", encoding="utf-8")
-            sync_to_working_copy(master_dir, working_copy_dir)
+        except OSError:
+            # The documented gap: the OS rejects the path before Company Ops
+            # code is even reached.
+            with self.assertRaises(OSError):
+                sync_to_working_copy(master_dir, working_copy_dir)
+            return
+
+        result = sync_to_working_copy(master_dir, working_copy_dir)
+        self.assertEqual(result.added, (_rel("daily", "2026-08-09.md"),))
+        self.assertEqual(
+            (working_copy_dir / "daily" / "2026-08-09.md").read_text(encoding="utf-8"), "x"
+        )
 
 
 if __name__ == "__main__":

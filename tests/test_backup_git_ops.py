@@ -253,5 +253,195 @@ class WorkingCopyGitRepositoryGuardTests(unittest.TestCase):
             self.assertTrue(line.startswith("??"), f"unexpected staged change: {line}")
 
 
+class NonBlockingGuaranteeTests(unittest.TestCase):
+    """A git call must always end.
+
+    `app/runner.py` holds the system-wide lock for the whole Backup step, so
+    a git command that blocks blocks every future Runner run as well — worse
+    than the infinite retry loop docs/08 section 62 forbids, because a retry
+    loop at least keeps collecting Events.
+
+    Two ways a push could block indefinitely, neither previously closed:
+    a credential prompt (terminal or the Windows Git Credential Manager
+    dialog), and a remote that accepts a connection and then stalls.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        for args in (
+            ["init", "-q", "-b", "main", "."],
+            ["config", "user.email", "t@example.invalid"],
+            ["config", "user.name", "Timeout Test"],
+        ):
+            subprocess.run(["git", *args], cwd=self.repo, capture_output=True, check=True)
+
+    def test_every_git_call_carries_a_timeout(self):
+        import inspect
+
+        from backup import git_ops
+
+        source = inspect.getsource(git_ops._run_git)
+        self.assertIn("timeout=_GIT_TIMEOUT_SECONDS", source)
+        self.assertIn("subprocess.TimeoutExpired", source)
+
+    def test_a_timeout_becomes_a_git_operation_error(self):
+        """Not a raw TimeoutExpired: `backup/runner.py` classifies
+        GitOperationError, and anything else would escape that handling and
+        take the Runner down mid-Backup."""
+        from backup import git_ops
+
+        original = git_ops._GIT_TIMEOUT_SECONDS
+        git_ops._GIT_TIMEOUT_SECONDS = 0.001
+        self.addCleanup(setattr, git_ops, "_GIT_TIMEOUT_SECONDS", original)
+
+        with self.assertRaises(GitOperationError) as caught:
+            git_ops._run_git(["status", "--porcelain"], self.repo)
+
+        self.assertIn("timed out", str(caught.exception))
+
+    def test_a_timeout_is_not_mistaken_for_an_authentication_failure(self):
+        """A timeout is transient -> BACKUP_PENDING (retry next run). An auth
+        failure is permanent -> BACKUP_FAILED. Misclassifying the first as
+        the second would abandon a backup that would have succeeded."""
+        from backup import git_ops
+
+        message = (
+            "git push timed out after 300s (no output; the remote may be "
+            "unreachable or waiting for credentials)"
+        )
+        self.assertFalse(git_ops.is_authentication_failure(message))
+
+    def test_interactive_prompts_are_disabled_for_every_call(self):
+        """`_AUTH_FAILURE_MARKERS` already listed "terminal prompts disabled"
+        — the message git emits only when GIT_TERMINAL_PROMPT=0. Nothing set
+        it, so that marker could never match and the condition it describes
+        hung instead of failing."""
+        from backup import git_ops
+
+        environment = git_ops._git_environment()
+
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GCM_INTERACTIVE"], "never")
+
+    def test_the_marker_the_environment_enables_is_actually_matched(self):
+        from backup import git_ops
+
+        self.assertTrue(
+            git_ops.is_authentication_failure(
+                "fatal: could not read Username for 'https://github.com': "
+                "terminal prompts disabled"
+            )
+        )
+
+    def test_the_git_environment_does_not_discard_the_rest_of_the_environment(self):
+        """git needs PATH, HOME/USERPROFILE, and on Windows SystemRoot. A
+        replaced (rather than extended) environment breaks git itself."""
+        import os
+
+        from backup import git_ops
+
+        environment = git_ops._git_environment()
+
+        for key in list(os.environ)[:5]:
+            with self.subTest(key=key):
+                self.assertIn(key, environment)
+
+    def test_a_normal_call_still_works_under_the_hardened_environment(self):
+        """The guard must not break the ordinary path."""
+        from backup import git_ops
+
+        result = git_ops.git_status(self.repo)
+
+        self.assertFalse(result.has_changes)
+
+    def test_no_credential_prompt_can_block_a_push(self):
+        """End to end: a remote that would require credentials fails rather
+        than waiting for an answer nobody is there to give."""
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://127.0.0.1:1/private.git"],
+            cwd=self.repo,
+            capture_output=True,
+            check=True,
+        )
+        (self.repo / "a.txt").write_text("x", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "init"], cwd=self.repo, capture_output=True, check=True
+        )
+
+        from backup import git_ops
+
+        with self.assertRaises(GitOperationError):
+            git_ops.git_push(self.repo)
+
+
+class PorcelainRenameBoundaryTests(unittest.TestCase):
+    """CHARACTERIZATION — records today's parsing, not desired parsing.
+
+    `_parse_porcelain()` splits each line as `code = line[:2]`,
+    `path = line[3:]`. For a rename git writes `R  old -> new`, so the whole
+    `"old -> new"` string becomes one entry — not a path that exists.
+
+    Unreachable in production, verified rather than assumed:
+    `sync_to_working_copy()` never deletes from the Working Copy (docs/08
+    section 31/44-47 — it *reports* a deletion and the backup runner stops).
+    The Working Copy therefore only ever gains or updates files, and git
+    needs a delete plus an add of similar content to detect a rename at all.
+
+    NOT FIXED: how a rename should be represented in `changed_files` (one
+    entry? two? which name?) is a reporting decision, and the code path
+    cannot currently be reached to justify making it. Pinned so that a
+    future change which DOES make renames reachable — anything that lets the
+    Working Copy lose a file — shows up here rather than as a nonsense path
+    in a backup log.
+    """
+
+    def test_a_rename_becomes_one_entry_that_is_not_a_path(self):
+        from backup.git_ops import _parse_porcelain
+
+        result = _parse_porcelain("R  daily/old.md -> daily/new.md")
+
+        self.assertEqual(result.changed_files, ("daily/old.md -> daily/new.md",))
+        self.assertEqual(result.deleted_files, ())
+        self.assertTrue(result.has_changes)
+
+    def test_a_copy_parses_the_same_way(self):
+        from backup.git_ops import _parse_porcelain
+
+        result = _parse_porcelain("C  daily/a.md -> daily/b.md")
+
+        self.assertEqual(result.changed_files, ("daily/a.md -> daily/b.md",))
+
+    def test_ordinary_statuses_parse_correctly(self):
+        """The reachable cases, which Backup actually produces."""
+        from backup.git_ops import _parse_porcelain
+
+        for line, changed, deleted in (
+            ("A  daily/new.md", ("daily/new.md",), ()),
+            (" M daily/mod.md", ("daily/mod.md",), ()),
+            ("?? daily/untracked.md", ("daily/untracked.md",), ()),
+            (" D daily/gone.md", (), ("daily/gone.md",)),
+        ):
+            with self.subTest(line=line):
+                result = _parse_porcelain(line)
+                self.assertEqual(result.changed_files, changed)
+                self.assertEqual(result.deleted_files, deleted)
+
+    def test_the_working_copy_sync_never_deletes_which_is_why_this_is_unreachable(self):
+        """The structural reason. If this ever stops being true, the rename
+        parse above becomes reachable and the characterization must be
+        revisited."""
+        import inspect
+
+        from backup import working_copy
+
+        source = inspect.getsource(working_copy.sync_to_working_copy)
+        for destructive in ("unlink(", "rmtree(", "os.remove("):
+            with self.subTest(call=destructive):
+                self.assertNotIn(destructive, source)
+
+
 if __name__ == "__main__":
     unittest.main()

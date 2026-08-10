@@ -10,9 +10,13 @@ import review_cli  # noqa: E402
 from events import Event  # noqa: E402
 from history import (  # noqa: E402
     FileHistoryRepository,
+    HistoryCandidate,
+    HistoryDecision,
     HistoryFilter,
+    HistoryReviewer,
     RepositoryHistoryReviewer,
 )
+from review_cli import run_interactive_review  # noqa: E402
 
 
 def sample_event(**overrides):
@@ -217,6 +221,113 @@ class ReviewCliBoundaryTests(unittest.TestCase):
         code_without_docstrings = re.sub(r'""".*?"""', "", content, flags=re.DOTALL)
         for token in ("C:\\Users", "D:\\", "OneDrive\\"):
             self.assertNotIn(token, code_without_docstrings)
+
+
+class SaveFailureIsolationTests(unittest.TestCase):
+    """One candidate's save failure must not end the session.
+
+    Reproduced before the fix: `submit_review()` raising took the whole CLI
+    down. The text the COO had just typed was gone, and every remaining
+    candidate was abandoned without ever being offered.
+
+    That is the same per-item isolation `collector/runtime.py`,
+    `outbox.drain()`, and `monthly/generator.py` all apply — and it matters
+    more here than in any of them, because the input came from a person.
+    Decision Context is what README RULE 11/12 call the company's most
+    valuable asset; losing a paragraph of it to a transient disk error is
+    not an acceptable failure mode.
+    """
+
+    TYPED = "경쟁사 대비 출시 시점을 앞당기기 위해 범위를 줄였다"
+
+    def _candidate(self, index):
+        return HistoryCandidate(
+            history_id=f"HIST-{index}",
+            event_id=f"EVT-{index}",
+            timestamp="2026-08-08T10:00:00+09:00",
+            category="DECISION",
+            project_id="P",
+            role="COO",
+            summary=f"item {index}",
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _run(self, failing_ids, count=3):
+        saved = []
+
+        class Reviewer(HistoryReviewer):
+            def list_reviewable(inner, decision=None):
+                return [self._candidate(i) for i in range(1, count + 1)]
+
+            def submit_review(inner, history_id, **updates):
+                if history_id in failing_ids:
+                    raise OSError("disk full")
+                saved.append(history_id)
+                return self._candidate(0)
+
+        printed = []
+        # Per candidate: proceed(Enter), then the four field prompts.
+        answers = []
+        for _ in range(count):
+            answers.extend(["", self.TYPED, "", "", ""])
+        answers_iter = iter(answers)
+
+        updated = run_interactive_review(
+            Reviewer(),
+            input_fn=lambda prompt: next(answers_iter, ""),
+            print_fn=lambda *a, **k: printed.append(" ".join(str(x) for x in a)),
+        )
+        return updated, saved, chr(10).join(printed)
+
+    def test_a_save_failure_does_not_end_the_session(self):
+        updated, saved, _ = self._run({"HIST-1"})
+
+        self.assertEqual(saved, ["HIST-2", "HIST-3"])
+        self.assertEqual(updated, 2)
+
+    def test_the_failure_is_reported_not_silently_counted_as_a_skip(self):
+        _, _, output = self._run({"HIST-1"})
+
+        self.assertIn("[실패] HIST-1", output)
+        self.assertIn("disk full", output)
+
+    def test_the_typed_text_is_echoed_back_so_it_is_recoverable(self):
+        """The whole point: the person's words must not simply vanish."""
+        _, _, output = self._run({"HIST-1"})
+
+        self.assertIn(self.TYPED, output)
+        self.assertIn("Decision Context", output)
+
+    def test_failures_are_named_again_in_the_summary(self):
+        """A failure printed thirty candidates ago has scrolled off, and
+        "저장됨 2건" alone reads like success."""
+        _, _, output = self._run({"HIST-1", "HIST-3"})
+
+        self.assertIn("저장 실패: 2건", output)
+        self.assertIn("HIST-1", output.rsplit("리뷰 완료", 1)[1])
+        self.assertIn("HIST-3", output.rsplit("리뷰 완료", 1)[1])
+
+    def test_every_candidate_failing_still_completes_the_session(self):
+        updated, saved, output = self._run({"HIST-1", "HIST-2", "HIST-3"})
+
+        self.assertEqual(updated, 0)
+        self.assertEqual(saved, [])
+        self.assertIn("저장 실패: 3건", output)
+
+    def test_a_clean_session_reports_no_failures(self):
+        _, saved, output = self._run(set())
+
+        self.assertEqual(saved, ["HIST-1", "HIST-2", "HIST-3"])
+        self.assertNotIn("저장 실패", output)
+
+    def test_a_skip_and_a_failure_are_distinguishable(self):
+        from review_cli import ReviewOutcome
+
+        self.assertNotEqual(ReviewOutcome.SKIPPED, ReviewOutcome.FAILED)
+        self.assertEqual(
+            {o.value for o in ReviewOutcome}, {"SAVED", "SKIPPED", "FAILED"}
+        )
 
 
 if __name__ == "__main__":

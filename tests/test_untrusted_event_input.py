@@ -785,6 +785,8 @@ class LogInjectionTests(unittest.TestCase):
                 collector_state_path=self.root / "state" / "collector_state.json",
                 notion_sync=sync,
                 notion_sync_log_path=log_path,
+                late_update_log_path=log_path.parent / "daily_late_update.log",
+                monthly_state_path=log_path.parent / "monthly_history_state.json",
                 notion_retry_queue_path=self.root / "state" / "notion_retry_queue.json",
                 keep_dir=self.root / "keep",
                 review_dir=self.root / "review",

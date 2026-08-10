@@ -28,6 +28,36 @@ class NotionAPIError(Exception):
         super().__init__(message)
 
 
+# Enough of Notion's error body to name the offending property, not enough to
+# paste a whole proxy HTML page into a console or a SyncResult.
+_MAX_ERROR_DETAIL = 400
+
+
+def _error_detail(exc: "urllib.error.HTTPError") -> str:
+    """Notion's own explanation of a rejected request, as a suffix.
+
+    Best effort by design: reading it must never turn one failure into two,
+    so every problem here yields an empty string and the caller still gets
+    the status code it already had.
+
+    Never carries a credential — the API token travels in a request header,
+    and this reads the *response*.
+    """
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not body:
+        return ""
+    if len(body) > _MAX_ERROR_DETAIL:
+        body = body[:_MAX_ERROR_DETAIL] + "..."
+    # ASCII separator on purpose. This string reaches `SyncResult.error`,
+    # which `run_company_ops.py` prints; that script forces UTF-8 on stdout,
+    # but an error message should not depend on every future caller
+    # remembering to.
+    return f" | {body}"
+
+
 class NotionTransport(abc.ABC):
     """Low-level Notion REST API operations NotionClient depends on."""
 
@@ -118,13 +148,43 @@ class RealNotionTransport(NotionTransport):
         )
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                raw = response.read()
         except urllib.error.HTTPError as exc:
+            # `exc.reason` is only the status text ("Bad Request"). Notion puts
+            # the actionable part — which property it rejected and why — in the
+            # response body, and discarding it left an operator with nothing to
+            # act on. That matters most for a permanent 4xx, which the retry
+            # queue will otherwise re-send on every run forever (BUG-13).
             raise NotionAPIError(
-                f"Notion API returned {exc.code}: {exc.reason}", status_code=exc.code
+                f"Notion API returned {exc.code}: {exc.reason}{_error_detail(exc)}",
+                status_code=exc.code,
             ) from exc
         except urllib.error.URLError as exc:
             raise NotionAPIError(f"Notion API request failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            # urllib does NOT wrap a read timeout in URLError — it escapes as a
+            # bare TimeoutError. Verified against a socket that accepts and
+            # never replies. A timeout is the most likely real failure of all,
+            # and it was the one this class did not convert, so callers that
+            # catch NotionAPIError (ExecutionPlanSync, bootstrap, dashboard)
+            # saw an exception type they do not handle.
+            raise NotionAPIError(
+                f"Notion API request timed out after {self._timeout}s"
+            ) from exc
+        except OSError as exc:
+            # Anything else the socket layer raises. Same reasoning: this
+            # class's contract is "network problems become NotionAPIError".
+            raise NotionAPIError(f"Notion API request failed: {exc}") from exc
+
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            # A 200 whose body is not JSON — a captive portal, a proxy error
+            # page, a truncated response. Previously escaped as JSONDecodeError
+            # or UnicodeDecodeError, neither of which any caller expects.
+            raise NotionAPIError(
+                f"Notion API returned a body that is not JSON: {exc}"
+            ) from exc
 
     def retrieve_database(self, database_id: str) -> Mapping[str, Any]:
         return self._request("GET", f"/databases/{database_id}")

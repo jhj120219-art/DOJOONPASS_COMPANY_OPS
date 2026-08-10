@@ -50,14 +50,25 @@ def _long_path(path: Path) -> Path:
     stream) must not be mistaken for an acquisition failure. The `\\\\?\\`
     prefix lifts the limit, but only for an absolute, backslash-separated
     path, so it is built from the resolved path rather than the raw input.
-    `Path.resolve()` strips an existing `\\\\?\\` prefix from its input
-    before normalising, so there is nothing to special-case there — every
-    resolved path reaching here is prefix-free and gets exactly one added.
+
+    An input that *already* carries the prefix is returned unchanged. This
+    used to be a documented non-case ("`Path.resolve()` strips an existing
+    `\\\\?\\` prefix, so there is nothing to special-case") — that claim is
+    false on the Python this project runs (verified on 3.13: `resolve()`
+    preserves the prefix). The prefixed path then still began with `\\\\`,
+    so it took the UNC branch below and came out as
+    `\\\\?\\UNC\\?\\C:\\...` — not a path any Windows API accepts. Every
+    `os.open`/`unlink`/`read_text` on it fails with OSError, which
+    `try_acquire_lock()` reports as "someone else holds the lock": a Runner
+    given an already-prefixed `lock_path` could never acquire it and would
+    skip every single run, silently, forever.
     """
     if sys.platform != "win32":
         return path
     resolved = path.resolve()
     text = str(resolved)
+    if text.startswith("\\\\?\\"):
+        return resolved
     if text.startswith("\\\\"):
         return Path("\\\\?\\UNC\\" + text[2:])
     return Path("\\\\?\\" + text)

@@ -210,6 +210,8 @@ class RunnerFailurePathTestCase(unittest.TestCase):
             collector_state_path=self.collector_state_path,
             notion_sync=notion_sync,
             notion_sync_log_path=self.notion_sync_log_path,
+            late_update_log_path=self.notion_sync_log_path.parent / "daily_late_update.log",
+            monthly_state_path=self.notion_sync_log_path.parent / "monthly_history_state.json",
             notion_retry_queue_path=self.notion_retry_queue_path,
             dashboard_client=dashboard_client,
             dashboard_pending_path=self.dashboard_pending_path,
@@ -776,16 +778,19 @@ class HistoryRepositoryFailurePathTests(RunnerFailurePathTestCase):
         with self.assertRaises(FileExistsError):
             self._run(now=datetime(2026, 8, 2, 13, 0).astimezone())
 
-    def test_already_written_daily_history_is_never_updated(self):
-        """BUG-17 (P0): an Event whose date is already closed is accepted,
-        stored in keep/, and synced to Notion — but scheduler.run_once() skips
-        any date whose .md exists, and generate_daily_history() defaults to
-        overwrite=False. The Event never reaches Company History, and every
-        other indicator reports success.
+    def test_a_late_arriving_event_is_added_to_the_already_written_daily(self):
+        """BUG-17 (P0), FIXED. This asserted the loss; now it asserts the fix.
 
-        docs/10 section 33 requires "2026-08-20 Daily -> 안전 Update".
-        docs/08 section 65's "backup: history late update" commit template
-        exists for precisely this case and is therefore unreachable.
+        An Event whose date was already closed used to be accepted, stored in
+        keep/, and synced to Notion — while `scheduler.run_once()` skipped any
+        date whose .md existed and `generate_daily_history()` refused to
+        overwrite. The Event never reached Company History and every other
+        indicator reported success. With four Desktops the trigger (one
+        machine offline across a Daily Close) is routine, not exceptional.
+
+        docs/06 §36-40 already specified the remedy, and docs/08 §65's
+        "backup: history late update" commit template existed for exactly
+        this case; runner.py step 6.5 now implements it.
         """
         self._write_event(event_id="FAILPATH-LATE-001", summary="on-time work")
         self._run(now=datetime(2026, 8, 5, 12, 0).astimezone())
@@ -801,12 +806,42 @@ class HistoryRepositoryFailurePathTests(RunnerFailurePathTestCase):
         )
         result = self._run(now=datetime(2026, 8, 10, 12, 0).astimezone())
 
-        # Accepted, filtered, stored — every signal says "processed".
         self.assertEqual(result[1].accepted, 1)
         self.assertTrue((self.keep_dir / "HIST-FAILPATH-LATE-002.json").exists())
-        # But Company History is unchanged.
-        self.assertEqual(daily_file.read_text(encoding="utf-8"), before)
-        self.assertNotIn("critical late-arriving decision", before)
+
+        after = daily_file.read_text(encoding="utf-8")
+        # The late Event is now in Company History...
+        self.assertIn("critical late-arriving decision", after)
+        self.assertIn("FAILPATH-LATE-002", after)
+        # ...the original content survived verbatim (docs/06 §57)...
+        self.assertIn("on-time work", after)
+        self.assertIn("- Generated At: ", after)
+        # ...and the change is recorded rather than silent (docs/06 §39-40).
+        self.assertIn("- Last Updated At: ", after)
+        self.assertIn("- Late Events Added: 1", after)
+
+    def test_a_late_update_is_not_repeated_on_the_next_run(self):
+        """docs/06 §38: an event_id already present is not added again."""
+        self._write_event(event_id="FAILPATH-LATE-011", summary="on-time work")
+        self._run(now=datetime(2026, 8, 5, 12, 0).astimezone())
+
+        self._write_event(
+            event_id="FAILPATH-LATE-012",
+            summary="the late one",
+            timestamp="2026-08-01T18:00:00+09:00",
+        )
+        self._run(now=datetime(2026, 8, 10, 12, 0).astimezone())
+
+        daily_file = self.local_master_dir / "daily" / "2026-08-01.md"
+        after_first = daily_file.read_text(encoding="utf-8")
+
+        # A later run that collects nothing new for this date must not touch
+        # the file at all — not even to refresh `Last Updated At`.
+        self._run(now=datetime(2026, 8, 11, 12, 0).astimezone())
+
+        self.assertEqual(daily_file.read_text(encoding="utf-8"), after_first)
+        self.assertEqual(after_first.count("FAILPATH-LATE-012"), 1)
+        self.assertIn("- Late Events Added: 1", after_first)
 
 
 class NotionPermanentFailurePathTests(RunnerFailurePathTestCase):
@@ -2424,6 +2459,13 @@ class DrainPendingPartialSuccessTests(unittest.TestCase):
         self.assertIn("Never raises", inspect.getdoc(drain_pending))
 
 
+# Values that look set but contain nothing — exactly what a trailing space
+# after `=`, a stray tab, or a copied newline produces in a hand-written
+# `.env`. Built with escapes rather than literal characters so the intent
+# survives an editor that trims whitespace.
+BLANK_VALUES = ("   ", "\t", "\n", " \t\n ")
+
+
 class NotionConfigWhitespaceTests(unittest.TestCase):
     """BUG-51 (NOT FIXED): configuration values are never trimmed, so the
     ordinary ways of mistyping a `.env` line are accepted and fail later.
@@ -2455,9 +2497,18 @@ class NotionConfigWhitespaceTests(unittest.TestCase):
     schema problems it cannot see (BUG-45). So checking health before the
     first run catches this class of mistake and not the other.
 
-    Not fixed: trimming changes what a deployment's existing values mean, and
-    deciding whether to strip quotes as well as whitespace is a judgement
-    call about how much to second-guess the operator.
+    PARTLY FIXED, split along the line where judgement starts.
+
+    Fixed — a BLANK value is treated as absent. `""` was already rejected,
+    so accepting `"   "` was an inconsistency in the existing rule rather
+    than a decision anyone had made. No legitimate deployment sets a
+    whitespace-only token or database id.
+
+    Not fixed — a value that does contain characters is still passed through
+    byte for byte: `"  ntn_x  "` and `'"ntn_x"'` reach Notion unchanged.
+    Trimming or unquoting those would be second-guessing what the operator
+    set, which is a judgement call recorded in BACKLOG.md. The tests below
+    pin both halves so the boundary stays where it was drawn.
     """
 
     def _from_env(self, **env):
@@ -2481,10 +2532,22 @@ class NotionConfigWhitespaceTests(unittest.TestCase):
 
                     NotionConfig.from_env(env)
 
-    def test_a_whitespace_only_token_is_accepted(self):
-        config = self._from_env(NOTION_API_TOKEN="   ")
+    def test_a_blank_token_is_now_refused(self):
+        """FIXED (the blank half). `""` was already rejected; `"   "` was
+        not, though it is the same mistake with an invisible character.
 
-        self.assertEqual(config.api_token, "   ")
+        It mattered because of where the failure landed: a blank token
+        reached Notion as a 401, became NOTION_RETRY_REQUIRED, and queued
+        every Event forever since nothing caps that retry. Now it is one
+        loud message before anything runs.
+        """
+        from notion.config import NotionConfigError
+
+        for blank in BLANK_VALUES:
+            with self.subTest(value=blank):
+                with self.assertRaises(NotionConfigError) as caught:
+                    self._from_env(NOTION_API_TOKEN=blank)
+                self.assertIn("NOTION_API_TOKEN", str(caught.exception))
 
     def test_surrounding_whitespace_and_quotes_are_preserved(self):
         for raw in ("  ntn_valid  ", '"ntn_valid"', "'ntn_valid'", "ntn_valid\n"):
@@ -2494,14 +2557,14 @@ class NotionConfigWhitespaceTests(unittest.TestCase):
                 self.assertEqual(config.api_token, raw)
                 self.assertNotEqual(config.api_token, "ntn_valid")
 
-    def test_a_whitespace_only_optional_id_enables_the_dashboard(self):
-        """`or None` treats "   " as configured, so the Dashboard runs against
-        an id Notion will reject."""
-        blank = self._from_env(NOTION_OPS_RUNS_DATABASE_ID="")
-        spaces = self._from_env(NOTION_OPS_RUNS_DATABASE_ID="   ")
-
-        self.assertIsNone(blank.ops_runs_database_id)
-        self.assertEqual(spaces.ops_runs_database_id, "   ")
+    def test_a_blank_optional_id_is_treated_as_unset(self):
+        """FIXED. `""` already meant "no Dashboard"; `"   "` meant "run the
+        Dashboard against an id Notion will 404 on". Same intention, two
+        different outcomes — now both mean unset."""
+        for blank in ("",) + BLANK_VALUES:
+            with self.subTest(value=blank):
+                config = self._from_env(NOTION_OPS_RUNS_DATABASE_ID=blank)
+                self.assertIsNone(config.ops_runs_database_id)
 
     def test_nothing_in_the_project_loads_a_dotenv_file(self):
         """Why the raw OS value is what reaches the config unchanged."""
@@ -3399,9 +3462,13 @@ class NotionErrorBodyTests(unittest.TestCase):
     that — Notion's error body does not echo the token, but a naive "include
     everything" fix could start including request details.
 
-    Not fixed: reading `exc.read()` inside the handler changes what is stored
-    in the retry queue and written to the log, and the log already has an
-    injection concern (BUG-6), so message content is not a free edit.
+    FIXED. `_error_detail()` now appends Notion's own message, bounded to
+    400 characters and wrapped so that a failure to read the body cannot
+    itself raise. The retry queue stores the Event rather than the error, and
+    `_log_notion_sync()` writes only the status value, so the widened message
+    reaches the operator's console without entering either the queue file or
+    notion_sync.log — which is why the log-injection concern (BUG-6) does not
+    apply to it.
     """
 
     ERROR_BODY = {
@@ -3440,7 +3507,14 @@ class NotionErrorBodyTests(unittest.TestCase):
         urllib.request.urlopen = fake_urlopen
         self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
 
-    def test_the_response_body_is_discarded(self):
+    def test_the_response_body_now_reaches_the_error(self):
+        """FIXED. This asserted the loss; now it asserts the diagnosis.
+
+        The message Notion supplies is the whole diagnosis for a rejected
+        property, and it used to be dropped on the floor — an operator saw
+        "Bad Request" on every retry, forever, with no way to learn which
+        property was wrong.
+        """
         from notion.transport import NotionAPIError
 
         self._request_raising(400, "Bad Request", self.ERROR_BODY)
@@ -3448,8 +3522,8 @@ class NotionErrorBodyTests(unittest.TestCase):
         with self.assertRaises(NotionAPIError) as caught:
             self._transport()._request("POST", "/pages", {"x": 1})
 
-        self.assertEqual(str(caught.exception), "Notion API returned 400: Bad Request")
-        self.assertNotIn("Status is expected to be status", str(caught.exception))
+        self.assertIn("Notion API returned 400: Bad Request", str(caught.exception))
+        self.assertIn("Status is expected to be status", str(caught.exception))
 
     def test_the_status_code_is_preserved(self):
         """What IS kept — enough to classify, not enough to diagnose."""
@@ -3475,12 +3549,25 @@ class NotionErrorBodyTests(unittest.TestCase):
         self.assertNotIn(token, str(caught.exception))
         self.assertNotIn("Bearer", str(caught.exception))
 
-    def test_the_handler_never_reads_the_body(self):
-        """The structural cause, so a refactor cannot lose the finding."""
-        source = inspect.getsource(sys.modules["notion.transport"].RealNotionTransport._request)
+    def test_the_handler_reads_the_body_through_a_bounded_helper(self):
+        """The structural half of the fix.
 
+        Reading the body must stay bounded and must never turn one failure
+        into two — an error path that can itself raise is worse than the
+        opaque message it replaced. Both properties live in
+        `_error_detail()`, so the handler is expected to delegate rather
+        than inline an `exc.read()`.
+        """
+        import notion.transport as transport_module
+
+        source = inspect.getsource(transport_module.RealNotionTransport._request)
         self.assertIn("exc.reason", source)
-        self.assertNotIn("exc.read()", source)
+        self.assertIn("_error_detail(exc)", source)
+
+        helper = inspect.getsource(transport_module._error_detail)
+        self.assertIn("exc.read()", helper)
+        self.assertIn("_MAX_ERROR_DETAIL", helper)
+        self.assertIn("except", helper)
 
 
 class NetworkFailureTransportTests(unittest.TestCase):
@@ -3633,6 +3720,189 @@ class NotionSyncLogWriteFailureTests(unittest.TestCase):
             _log_notion_sync(bad_log_path, sync_result)
         except OSError:
             self.fail("_log_notion_sync() must swallow OSError, not propagate it")
+
+
+class BackupFailurePresentationTests(unittest.TestCase):
+    """The other half of BUG-4.
+
+    `app/runner.py` still propagates a Backup `GitOperationError` — the
+    Runner's return tuple has no shape for "Backup failed", and inventing
+    one is a contract decision. That characterization stands above.
+
+    What WAS fixable is what the operator sees. docs/08 section 19 calls a
+    failed push routine and recoverable, yet `run_company_ops.py` answered
+    it with a raw Python traceback — which reads like the system broke, when
+    in fact Backup runs last and every earlier stage is already durable.
+    Nothing about the Runner's contract changes here; only the CLI's
+    presentation of an exception it already received.
+    """
+
+    def _entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _report(self, message):
+        import io
+        import contextlib
+
+        module = self._entrypoint()
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = module._report_backup_failure(GitOperationError(message))
+        return code, buffer.getvalue()
+
+    def test_a_transient_failure_exits_two_not_with_a_traceback(self):
+        code, _ = self._report("git push failed (exit 128): Could not read from remote")
+
+        self.assertEqual(code, 2)
+
+    def test_the_operator_is_told_no_data_was_lost(self):
+        """Backup runs last; History is already on disk. That is the single
+        most important thing to say and it was not being said."""
+        _, output = self._report("git push failed (exit 128): connection reset")
+
+        self.assertIn("유실된 데이터는 없습니다", output)
+
+    def test_a_transient_failure_says_the_next_run_retries(self):
+        _, output = self._report("git push failed (exit 128): connection reset")
+
+        self.assertIn("BACKUP_PENDING", output)
+        self.assertIn("따로 할 일은 없습니다", output)
+
+    def test_an_authentication_failure_says_a_human_must_act(self):
+        """docs/08 section 21/62: retrying a credential problem on a schedule
+        cannot fix it. Telling the operator "nothing to do" would be wrong."""
+        _, output = self._report(
+            "git push failed (exit 128): fatal: Authentication failed for 'https://github.com'"
+        )
+
+        self.assertIn("BACKUP_FAILED", output)
+        self.assertIn("자격증명", output)
+        self.assertNotIn("따로 할 일은 없습니다", output)
+
+    def test_the_classification_matches_what_backup_recorded(self):
+        """The message must agree with the persisted state, or the operator
+        is told one thing while backup_state.json says another."""
+        module = self._entrypoint()
+
+        for message, expected_permanent in (
+            ("git push failed: Authentication failed", True),
+            ("git push failed: could not read Username", True),
+            ("git push failed: Could not resolve host", False),
+            ("git push timed out after 300s", False),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(
+                    module.is_authentication_failure(message), expected_permanent
+                )
+
+    def test_the_original_git_error_is_still_shown(self):
+        """Explaining the situation must not hide what git actually said."""
+        _, output = self._report("git push failed (exit 128): some very specific reason")
+
+        self.assertIn("some very specific reason", output)
+
+    def test_the_operator_is_pointed_at_the_status_command(self):
+        _, output = self._report("git push failed (exit 128): x")
+
+        self.assertIn("ops_status.py", output)
+
+
+class MonthlyStepIsolationTests(RunnerFailurePathTestCase):
+    """docs/09 §74: a Monthly failure must not stop the Runtime — and §44
+    says it must be recorded.
+
+    The Runner absorbs the Monthly step's exceptions so that Backup still
+    runs and the run still completes. What it did not do was leave any
+    trace: `monthly_run_once()`'s own PENDING/FAILED results were logged,
+    but an unexpected exception escaping that call was swallowed with
+    `pass`. Monthly simply did not happen and nothing said so.
+    """
+
+    def _explode_monthly(self, exc):
+        import app.runner as runner_module
+
+        original = runner_module.monthly_run_once
+
+        def exploding(**kwargs):
+            raise exc
+
+        runner_module.monthly_run_once = exploding
+        self.addCleanup(setattr, runner_module, "monthly_run_once", original)
+
+    def _late_update_log(self) -> str:
+        path = self.notion_sync_log_path.parent / "daily_late_update.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_a_monthly_explosion_does_not_stop_the_run(self):
+        self._write_event(event_id="FAILPATH-MONTHLY-001")
+        self._explode_monthly(RuntimeError("monthly blew up"))
+
+        result = self._run()
+
+        self.assertIsNotNone(result, "the Runner aborted on a Monthly failure")
+        self.assertEqual(result[1].accepted, 1)
+
+    def test_backup_still_runs_after_a_monthly_explosion(self):
+        """Monthly sits between Daily and Backup; swallowing its failure is
+        only correct if Backup genuinely still happens."""
+        self._write_event(event_id="FAILPATH-MONTHLY-002")
+        self._explode_monthly(RuntimeError("monthly blew up"))
+
+        result = self._run()
+
+        self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+
+    def test_history_and_daily_survive_a_monthly_explosion(self):
+        self._write_event(event_id="FAILPATH-MONTHLY-003")
+        self._explode_monthly(RuntimeError("monthly blew up"))
+
+        self._run()
+
+        self.assertTrue((self.keep_dir / "HIST-FAILPATH-MONTHLY-003.json").exists())
+        self.assertTrue((self.local_master_dir / "daily" / "2026-08-01.md").exists())
+
+    def test_the_explosion_is_recorded_rather_than_silently_swallowed(self):
+        self._write_event(event_id="FAILPATH-MONTHLY-004")
+        self._explode_monthly(RuntimeError("monthly blew up"))
+
+        self._run()
+
+        log = self._late_update_log()
+        self.assertIn("MONTHLY_FAILED (unexpected)", log)
+        self.assertIn("RuntimeError", log)
+        self.assertIn("monthly blew up", log)
+
+    def test_a_state_error_from_the_dirty_marker_is_also_absorbed(self):
+        """`mark_month_dirty()` runs inside the same block and reads state;
+        a corrupted monthly_history_state.json must not end the run."""
+        import app.runner as runner_module
+
+        original = runner_module.mark_month_dirty
+
+        def exploding(*args, **kwargs):
+            raise ValueError("monthly state file is corrupted")
+
+        runner_module.mark_month_dirty = exploding
+        self.addCleanup(setattr, runner_module, "mark_month_dirty", original)
+
+        self._write_event(event_id="FAILPATH-MONTHLY-005")
+        result = self._run()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+
+    def test_a_normal_run_writes_no_unexpected_failure_line(self):
+        self._write_event(event_id="FAILPATH-MONTHLY-006")
+
+        self._run()
+
+        self.assertNotIn("(unexpected)", self._late_update_log())
 
 
 if __name__ == "__main__":

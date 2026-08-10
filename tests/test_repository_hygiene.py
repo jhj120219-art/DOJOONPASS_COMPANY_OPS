@@ -18,7 +18,7 @@ Guards (must keep passing forever):
 Characterization (records a known gap, audit finding BUG-12 / BUG-16):
     README section 12's document list vs the real docs/ directory
     stale `D:\\DOJOONPASS_COMPANY_OPS` path headers
-    notion.dashboard_pending.remove_pending() has no caller
+    notion.dashboard_pending.remove_pending() has no production caller
 
 Nothing here changes production code, Runtime behaviour, or any spec.
 """
@@ -44,7 +44,25 @@ def _git(*args) -> subprocess.CompletedProcess:
 
 
 def _tracked_files() -> list[Path]:
-    result = _git("ls-files")
+    """Every file that would be in the repository after `git add -A`.
+
+    Widened from plain `git ls-files` (committed files only). The guards
+    below exist to stop a secret from entering the repository, and a
+    secret-bearing file that is merely *not committed yet* is exactly the
+    state in which stopping it is still cheap — once `git ls-files` can
+    see it, the leak has already happened and the guard is reporting
+    history rather than preventing it.
+
+    This was not hypothetical: the Multi-Desktop Agent Sprint added test
+    files carrying deliberately secret-shaped fixtures, and the narrow
+    version of this function reported a clean repository for every one of
+    them right up until the commit that would have published them.
+
+    `--exclude-standard` keeps .gitignore authoritative, so `.env`,
+    `runtime/`, and `*.log` are still out of scope here — they are covered
+    by `test_secret_and_runtime_paths_are_git_ignored` instead.
+    """
+    result = _git("ls-files", "--cached", "--others", "--exclude-standard")
     return [REPO_ROOT / line for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -122,8 +140,8 @@ class DependencyGuardTests(unittest.TestCase):
     (docs/11 section 101's Release Environment Check)."""
 
     LOCAL_PACKAGES = {
-        "app", "backup", "collector", "daily", "events", "history",
-        "notion", "reporter", "scheduler", "transport", "review_cli",
+        "agent", "app", "backup", "collector", "daily", "events", "history",
+        "monthly", "notion", "reporter", "scheduler", "transport", "review_cli",
     }
 
     def test_src_imports_only_the_standard_library(self):
@@ -255,8 +273,21 @@ class DeadCodeCharacterizationTests(unittest.TestCase):
                 count += 1
         return count
 
-    def test_remove_pending_has_no_caller(self):
-        """drain_pending() removes records inline instead of calling it."""
+    def test_remove_pending_has_no_production_caller(self):
+        """`drain_pending()` rebuilds the remaining list and saves once,
+        which is strictly better than calling `remove_pending()` per record
+        (one write instead of N) — so this is not an oversight to correct by
+        wiring it in.
+
+        "No caller" means no caller in `src/` or the root entrypoints; this
+        counter never looked at `tests/`. It does have tests now
+        (`test_notion_dashboard.py::RemovePendingCharacterizationTests`),
+        added because an exported function that is both unused and untested
+        is a trap: it looks available, and the next person to reach for it
+        would inherit whatever it happens to do. Its behaviour is pinned;
+        whether it should exist at all is a deletion decision, recorded in
+        BACKLOG.md.
+        """
         self.assertEqual(self._reference_count("remove_pending"), 0)
 
     def test_previously_suspected_functions_are_actually_used(self):
@@ -269,3 +300,184 @@ class DeadCodeCharacterizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIsolationGuardTests(unittest.TestCase):
+    """A test must never write into the developer's real `runtime/`.
+
+    `app.runner.run_once()` defaults every path it is not given to a
+    PROJECT_ROOT-relative location. Miss one in a test and the suite quietly
+    appends to the operator's live logs — which is exactly what happened
+    when `late_update_log_path` was added: `runtime/logs/daily_late_update.log`
+    filled up with fabricated LATE_UPDATE records for Events that never
+    existed, in the one file an operator would read to find out which real
+    Events arrived late.
+
+    Nothing failed, and nothing would have. Hence a static guard: any test
+    module that drives the Runner must pass every log path explicitly.
+    """
+
+    # Written on every run that has work, regardless of configuration, so
+    # every runner-driving test must redirect them. `monthly_state_path` is
+    # here for the same reason even though it is state rather than a log:
+    # it defaults into the real `runtime/state/`, and Monthly Consolidation
+    # saves it as soon as any month becomes complete.
+    UNCONDITIONAL_LOG_PARAMS = (
+        "collector_log_path",
+        "late_update_log_path",
+        "monthly_state_path",
+    )
+    # Only written when a Notion Sync is actually configured.
+    NOTION_LOG_PARAM = "notion_sync_log_path"
+
+    def _test_modules_driving_the_runner(self) -> list[Path]:
+        """Detected by `local_master_dir=`, which only `app.runner.run_once()`
+        takes. Matching on the import instead would both miss the modules
+        that build a runner call inside a subprocess script string and match
+        this file, which merely names the function in prose.
+        """
+        modules = []
+        for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
+            if path.name == Path(__file__).name:
+                # This file names the parameter in order to search for it.
+                continue
+            if "local_master_dir=" in path.read_text(encoding="utf-8"):
+                modules.append(path)
+        return modules
+
+    def test_at_least_one_module_drives_the_runner(self):
+        """Guard against the guard silently matching nothing."""
+        self.assertGreater(len(self._test_modules_driving_the_runner()), 3)
+
+    def test_every_runner_driving_test_redirects_the_unconditional_logs(self):
+        for path in self._test_modules_driving_the_runner():
+            text = path.read_text(encoding="utf-8")
+            for param in self.UNCONDITIONAL_LOG_PARAMS:
+                with self.subTest(module=path.name, param=param):
+                    self.assertIn(
+                        f"{param}=",
+                        text,
+                        f"tests/{path.name} drives app.runner.run_once() without "
+                        f"passing {param} — it will write into the real runtime/",
+                    )
+
+    def test_notion_driving_tests_also_redirect_the_notion_log(self):
+        """`notion_sync.log` is only written when a Notion Sync is passed, so
+        the requirement applies only to the modules that pass one."""
+        for path in self._test_modules_driving_the_runner():
+            text = path.read_text(encoding="utf-8")
+            if "notion_sync=" not in text:
+                continue
+            with self.subTest(module=path.name):
+                self.assertIn(f"{self.NOTION_LOG_PARAM}=", text)
+
+    def test_the_runner_still_has_the_log_parameters_this_guard_names(self):
+        """If a parameter is renamed, this guard must fail loudly rather
+        than keep passing while checking for a name nothing uses."""
+        import inspect
+
+        sys.path.insert(0, str(SRC))
+        from app.runner import run_once as runner_run_once
+
+        signature = inspect.signature(runner_run_once)
+        for param in self.UNCONDITIONAL_LOG_PARAMS + (self.NOTION_LOG_PARAM,):
+            with self.subTest(param=param):
+                self.assertIn(param, signature.parameters)
+
+
+class EnvironmentContractTests(unittest.TestCase):
+    """`.env.example` is the only place an operator learns what to set.
+
+    Nothing loads it — every entrypoint reads `os.environ` directly, which
+    `.env.example` states and this project has deliberately kept. That makes
+    the template documentation rather than configuration, and documentation
+    that drifts is worse than none: a variable the code requires but the
+    template omits produces a deployment that fails at logon, with the exit
+    code going to a scheduled task nobody watches.
+
+    So the two are checked against each other in both directions.
+    """
+
+    ENTRYPOINTS = ("run_company_ops.py", "run_agent.py", "init_notion.py", "ops_status.py")
+
+    def _declared_variables(self) -> set[str]:
+        declared = set()
+        for line in (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            declared.add(stripped.split("=", 1)[0].strip())
+        return declared
+
+    def _read_variables(self) -> dict[str, set[str]]:
+        """Every environment variable the code actually looks up.
+
+        Matches both the direct `os.environ.get("NAME")` form and the
+        `NAME_ENV_VAR = "COMPANY_OPS_PROFILE"` indirection
+        `reporter/profiles.py` uses, since only the latter names the
+        variable at all.
+        """
+        found: dict[str, set[str]] = {}
+        sources = list(SRC.rglob("*.py")) + [REPO_ROOT / name for name in self.ENTRYPOINTS]
+        for path in sources:
+            if "__pycache__" in str(path) or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            patterns = (
+                r'os\.environ(?:\.get)?\(?\[?\s*["\']([A-Z_][A-Z0-9_]*)["\']',
+                r'source\.get\(\s*["\']([A-Z_][A-Z0-9_]*)["\']',
+                r'^[A-Z_]*ENV_VAR\s*=\s*["\']([A-Z_][A-Z0-9_]*)["\']',
+            )
+            for pattern in patterns:
+                for match in re.finditer(pattern, text, re.M):
+                    found.setdefault(match.group(1), set()).add(path.name)
+        return found
+
+    def test_every_variable_the_code_reads_is_documented(self):
+        declared = self._declared_variables()
+        for name, where in sorted(self._read_variables().items()):
+            with self.subTest(variable=name):
+                self.assertIn(
+                    name,
+                    declared,
+                    f"{name} is read by {sorted(where)} but is missing from .env.example",
+                )
+
+    def test_every_documented_variable_is_actually_read(self):
+        """The other direction: a template entry nothing reads is an
+        instruction to the operator to configure something that does
+        nothing."""
+        read = set(self._read_variables())
+        for name in sorted(self._declared_variables()):
+            with self.subTest(variable=name):
+                self.assertIn(name, read, f"{name} is documented but nothing reads it")
+
+    def test_the_scan_finds_the_variables_we_know_exist(self):
+        """Guard against the patterns above silently matching nothing and
+        turning both checks into no-ops."""
+        read = set(self._read_variables())
+        for name in (
+            "COMPANY_OPS_PROFILE",
+            "COMPANY_OPS_HISTORY_START_DATE",
+            "COMPANY_OPS_AGENT_SYNC_FOLDER",
+            "NOTION_API_TOKEN",
+        ):
+            with self.subTest(variable=name):
+                self.assertIn(name, read)
+
+    def test_no_entrypoint_silently_loads_a_dotenv_file(self):
+        """`.env.example` states that nothing auto-loads it. If that ever
+        changes, the template's own instructions become wrong."""
+        for name in self.ENTRYPOINTS:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+            with self.subTest(entrypoint=name):
+                self.assertNotIn("dotenv", text.lower())
+                self.assertNotIn('".env"', text)
+
+    def test_the_template_names_every_entrypoint(self):
+        """An operator reading only this file must be able to tell which
+        command needs which variable."""
+        text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                self.assertIn(name, text)

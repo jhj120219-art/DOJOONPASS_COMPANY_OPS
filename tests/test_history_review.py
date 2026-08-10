@@ -2,15 +2,20 @@ import re
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from daily import generate_daily_history  # noqa: E402
+from daily import (  # noqa: E402
+    LateUpdateOutcome,
+    generate_daily_history,
+    update_daily_history,
+)
 from events import Event  # noqa: E402
 from history import (  # noqa: E402
     FileHistoryRepository,
+    HistoryCandidate,
     HistoryDecision,
     HistoryFilter,
     HistoryReviewer,
@@ -225,6 +230,142 @@ class ReviewPathSafetyTests(unittest.TestCase):
         code_without_docstrings = re.sub(r'""".*?"""', "", content, flags=re.DOTALL)
         for token in ("C:\\Users", "D:\\", "OneDrive\\"):
             self.assertNotIn(token, code_without_docstrings)
+
+
+class ReviewedContextReachesNothingTests(unittest.TestCase):
+    """CHARACTERIZATION — records today's behaviour, not desired behaviour.
+
+    README RULE 11/12 name Decision Context the company's most valuable
+    asset: "회사의 가장 중요한 자산은 코드가 아니라 시간이 지나도 복원
+    가능한 Decision Context이다". `RepositoryHistoryReviewer` is the only
+    way to record it, since Event Schema was deliberately left without those
+    fields.
+
+    Measured below: once a COO fills them in, they reach nowhere a human
+    will ever look.
+
+        stored on the candidate            yes
+        rendered into the Daily file       NO  (the file already exists;
+                                                update_daily_history() sees
+                                                the event_id is present and
+                                                correctly reports
+                                                NO_LATE_EVENTS)
+        included in the git Backup         NO  (docs/08 §26-28 syncs only
+                                                daily/ and monthly/, and
+                                                candidates live under
+                                                runtime/, outside Local
+                                                Master entirely)
+
+    So the one asset the system says matters most survives only as
+    `runtime/history_candidates/keep/*.json` on Desktop 4 — the single
+    location that is neither Company History nor backed up. A disk failure
+    loses it and nothing reports the loss.
+
+    NOT FIXED, because every route out is a decision this Sprint may not
+    make:
+
+        re-render the Daily      discards the COO's manual edits, which
+                                 docs/06 §57 explicitly protects — the same
+                                 reason Late Events are appended rather than
+                                 re-rendered
+        edit the item in place   text surgery on a hand-editable document
+        extend Late Event update docs/06 §37 covers a late *Event*, not late
+                                 *enrichment* of one already present
+        back up candidates       docs/08 §26-28 fixes the backup scope
+
+    Recorded in BACKLOG.md. Pinned here so the gap is visible to the next
+    reader rather than discovered by a COO wondering where their reasoning
+    went.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = FileHistoryRepository(
+            keep_dir=self.root / "keep", review_dir=self.root / "review"
+        )
+        self.day = date(2026, 8, 8)
+        self.repo.save(
+            HistoryCandidate(
+                history_id="HIST-CTX",
+                event_id="EVT-CTX",
+                timestamp=f"{self.day.isoformat()}T10:00:00+09:00",
+                category="DECISION",
+                project_id="CLOSED_BETA",
+                role="COO",
+                summary="Closed Beta Scope confirmed.",
+                evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+        )
+        self.daily_path = generate_daily_history(
+            self.repo, self.day, output_dir=self.root / "daily"
+        )
+
+    def _review(self):
+        RepositoryHistoryReviewer(self.repo).submit_review(
+            "HIST-CTX",
+            decision_context="Shipped ahead of a competitor.",
+            lessons_learned="Narrowing scope first would have been faster.",
+        )
+
+    def test_the_review_is_stored_on_the_candidate(self):
+        """The half that works."""
+        self._review()
+
+        stored = self.repo.get("HIST-CTX")
+        self.assertEqual(stored.decision_context, "Shipped ahead of a competitor.")
+        self.assertEqual(
+            stored.lessons_learned, "Narrowing scope first would have been faster."
+        )
+
+    def test_the_already_written_daily_never_receives_it(self):
+        before = self.daily_path.read_text(encoding="utf-8")
+        self._review()
+
+        after = self.daily_path.read_text(encoding="utf-8")
+        self.assertEqual(after, before)
+        self.assertNotIn("Decision Context", after)
+        self.assertNotIn("Shipped ahead of a competitor.", after)
+
+    def test_the_late_event_update_correctly_declines_to_help(self):
+        """`update_daily_history()` is not at fault — the event_id is already
+        in the file, so NO_LATE_EVENTS is the right answer to the question it
+        was asked. It simply is not the mechanism for this."""
+        self._review()
+
+        result = update_daily_history(
+            self.repo,
+            self.day,
+            output_dir=self.root / "daily",
+            now=datetime(2026, 8, 12, 10, 0).astimezone(),
+        )
+
+        self.assertEqual(result.outcome, LateUpdateOutcome.NO_LATE_EVENTS)
+        self.assertNotIn(
+            "Shipped ahead of a competitor.",
+            self.daily_path.read_text(encoding="utf-8"),
+        )
+
+    def test_a_daily_rendered_after_the_review_would_include_it(self):
+        """The renderer has always supported these fields — the gap is
+        propagation into an existing file, not rendering."""
+        self._review()
+
+        fresh = generate_daily_history(
+            self.repo, self.day, output_dir=self.root / "fresh"
+        )
+
+        self.assertIn("- Decision Context: Shipped ahead of a competitor.", fresh.read_text(encoding="utf-8"))
+
+    def test_the_backup_scope_excludes_where_the_context_lives(self):
+        """docs/08 §26-28: only daily/ and monthly/ are ever synced. The
+        candidate store is not under Local Master at all."""
+        from backup.working_copy import _ALLOWED_TOP_LEVEL_DIRS
+
+        self.assertEqual(_ALLOWED_TOP_LEVEL_DIRS, frozenset({"daily", "monthly"}))
+        self.assertNotIn("history_candidates", _ALLOWED_TOP_LEVEL_DIRS)
 
 
 if __name__ == "__main__":

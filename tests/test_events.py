@@ -113,32 +113,45 @@ class EventValidationTests(unittest.TestCase):
                 with self.assertRaises(EventValidationError):
                     Event.from_dict(data)
 
-    def test_a_z_suffixed_utc_timestamp_is_rejected_though_valid_iso_8601(self):
-        """CHARACTERIZATION, not desired behaviour -- new finding this
-        Sprint. docs/02_EVENT_SCHEMA.md section 7 requires "ISO-8601" and
-        never says the trailing 'Z' (Zulu/UTC) designator is disallowed --
-        it IS valid ISO-8601, equivalent to '+00:00', and extremely common
-        (e.g. JavaScript's `Date.prototype.toISOString()`, many JSON APIs
-        emit it by default). `events/schema.py::_timestamp_error()` uses
-        `datetime.fromisoformat()` to validate, and Python 3.9's
-        `fromisoformat()` does not accept 'Z' (only 3.11+ does), so a
-        completely valid Event carrying a 'Z' timestamp is rejected here
-        with the (slightly misleading) message "not valid ISO-8601" -- it
-        is valid ISO-8601, just not parseable by this Python version's
-        stdlib without normalizing 'Z' to '+00:00' first.
+    def test_a_z_suffixed_utc_timestamp_agrees_with_every_downstream_parser(self):
+        """docs/02_EVENT_SCHEMA.md section 7 requires "ISO-8601" and never
+        disallows the trailing 'Z' (Zulu/UTC) designator -- it IS valid
+        ISO-8601, equivalent to '+00:00', and extremely common (JavaScript's
+        `Date.prototype.toISOString()`, many JSON APIs emit it by default).
 
-        Not fixed: `daily/generator.py::_candidate_date()` and other
-        callers also call `datetime.fromisoformat()` directly on an
-        already-validated `timestamp` string, so validating 'Z' here
-        without normalizing the STORED value would just move the same
-        crash downstream instead of removing it -- a coordinated fix
-        across every direct `fromisoformat()` call site (or a single
-        normalize-at-the-boundary point), which is a design decision, not
-        a one-line change.
+        This used to be a CHARACTERIZATION test asserting flat rejection,
+        because `_timestamp_error()` validates with
+        `datetime.fromisoformat()` and Python < 3.11 could not parse 'Z'.
+        The reason given for not fixing it was that
+        `daily/generator.py::_candidate_date()` and the other direct
+        `fromisoformat()` call sites would then crash on a stored value
+        validation had already accepted -- i.e. the real requirement was
+        never "reject Z", it was "validation and every downstream parser
+        must agree".
+
+        On Python 3.11+ `fromisoformat()` accepts 'Z' at every one of those
+        call sites at once, so that agreement now holds by construction.
+        What this test pins is the agreement itself, on any Python: whatever
+        validation decides about 'Z', the downstream parser decides the
+        same. A future Python or a hand-rolled parser that breaks the tie
+        fails here rather than in a Daily History run.
         """
-        data = sample_data(timestamp="2026-08-01T20:31:00Z")
-        with self.assertRaises(EventValidationError):
-            Event.from_dict(data)
+        z_timestamp = "2026-08-01T20:31:00Z"
+        data = sample_data(timestamp=z_timestamp)
+
+        try:
+            datetime.fromisoformat(z_timestamp)
+        except ValueError:
+            downstream_can_parse = False
+        else:
+            downstream_can_parse = True
+
+        if downstream_can_parse:
+            event = Event.from_dict(data)
+            self.assertEqual(event.timestamp, z_timestamp)
+        else:
+            with self.assertRaises(EventValidationError):
+                Event.from_dict(data)
 
     def test_blocked_without_blocker_rejected(self):
         data = sample_data(event_type="BLOCKED", status="BLOCKED", blocker=None)

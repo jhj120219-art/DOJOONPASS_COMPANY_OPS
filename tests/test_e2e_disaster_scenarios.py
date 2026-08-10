@@ -132,6 +132,8 @@ class DisasterScenarioTestCase(unittest.TestCase):
             processed_dir=self.processed_dir,
             rejected_dir=self.rejected_dir,
             collector_log_path=self.collector_log_path,
+            late_update_log_path=self.collector_log_path.parent / "daily_late_update.log",
+            monthly_state_path=self.collector_log_path.parent / "monthly_history_state.json",
             collector_state_path=self.collector_state_path,
             keep_dir=self.keep_dir,
             review_dir=self.review_dir,

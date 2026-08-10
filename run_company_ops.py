@@ -56,6 +56,7 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from app.runner import run_once  # noqa: E402
+from backup.git_ops import GitOperationError, is_authentication_failure  # noqa: E402
 from notion import (  # noqa: E402
     ExecutionPlanSync,
     NotionClient,
@@ -83,11 +84,13 @@ def _build_notion_clients() -> tuple[ExecutionPlanSync | None, NotionClient | No
     """
     try:
         config = NotionConfig.from_env()
-    except NotionConfigError:
-        print(
-            "[INFO] Notion 미설정 — Notion Sync / Operations Dashboard 단계를 "
-            "건너뜁니다 (NOTION_API_TOKEN / NOTION_PROJECTS_DATABASE_ID 없음)."
-        )
+    except NotionConfigError as exc:
+        # Print the actual reason rather than a fixed guess. The message
+        # distinguishes "never set" from "set but blank", and those need
+        # opposite reactions: the first is a normal pre-Notion deployment,
+        # the second is a typo the operator can see in their own `.env` and
+        # would otherwise be told is "없음" while looking straight at it.
+        print(f"[INFO] Notion 미설정 — Notion Sync / Operations Dashboard 단계를 건너뜁니다: {exc}")
         return None, None
 
     transport = RealNotionTransport(api_token=config.api_token)
@@ -139,15 +142,61 @@ def main() -> int:
     local_master_dir = RUNTIME_DIR / "local_master"
     local_master_dir.mkdir(parents=True, exist_ok=True)
 
-    result = run_once(
-        local_master_dir=local_master_dir,
-        backup_working_copy_dir=RUNTIME_DIR / "backup_working_copy",
-        history_start_date=history_start_date,
-        runner_lock_path=RUNTIME_DIR / "locks" / "company_ops.lock",
-        notion_sync=notion_sync,
-        dashboard_client=dashboard_client,
-    )
+    try:
+        result = run_once(
+            local_master_dir=local_master_dir,
+            backup_working_copy_dir=RUNTIME_DIR / "backup_working_copy",
+            history_start_date=history_start_date,
+            runner_lock_path=RUNTIME_DIR / "locks" / "company_ops.lock",
+            notion_sync=notion_sync,
+            dashboard_client=dashboard_client,
+        )
+    except GitOperationError as exc:
+        # docs/08 §19 calls a failed push a routine, recoverable condition:
+        # BACKUP_PENDING, retried by the next Runner. `app.runner.run_once()`
+        # nevertheless lets it propagate (a known, characterized gap — the
+        # Runner's return tuple has no shape for "Backup failed", and
+        # inventing one is a contract decision this script may not take).
+        #
+        # What this script CAN fix is what the operator sees. A raw Python
+        # traceback for an expected condition reads like the system broke,
+        # when in fact Backup runs last and everything before it is already
+        # durable on disk.
+        return _report_backup_failure(exc)
 
+    return _print_result(result)
+
+
+def _report_backup_failure(exc: "GitOperationError") -> int:
+    """Explain a failed Backup in terms of what is and is not at risk."""
+    permanent = is_authentication_failure(str(exc))
+
+    print(f"[FAILED] Backup: {exc}", file=sys.stderr)
+    print(file=sys.stderr)
+    print(
+        "Event 수집 · History Filter · Daily · Monthly 단계는 Backup보다 먼저\n"
+        "끝났고 이미 디스크에 저장되어 있습니다. 유실된 데이터는 없습니다.",
+        file=sys.stderr,
+    )
+    if permanent:
+        print(
+            "\n이 실패는 인증/권한 문제로 분류되어 BACKUP_FAILED로 기록됐습니다.\n"
+            "일정에 맡겨 재시도해도 해결되지 않습니다 — 자격증명을 갱신한 뒤\n"
+            "다시 실행하세요(docs/08 §21, §62).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "\n이 실패는 일시적인 것으로 분류되어 BACKUP_PENDING으로 기록됐습니다.\n"
+            "다음 Runner 실행이 같은 commit을 자동으로 다시 push합니다(docs/08 §19).\n"
+            "따로 할 일은 없습니다.",
+            file=sys.stderr,
+        )
+    print("\n현재 상태는 `python ops_status.py`로 확인할 수 있습니다.", file=sys.stderr)
+    return 2
+
+
+def _print_result(result) -> int:
     if result is None:
         print("[SKIPPED] 다른 Runner가 이미 실행 중입니다(Lock 획득 실패).")
         return 0

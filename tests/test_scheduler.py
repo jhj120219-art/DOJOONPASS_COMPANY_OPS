@@ -271,9 +271,7 @@ class FailureIsolationTests(SchedulerTestCase):
         a REAL corrupted stored HistoryCandidate (e.g. from a manual JSON
         edit -- docs/11 section 71 explicitly permits editing Local Master
         History by hand) makes `daily.generator._candidate_date()` raise an
-        uncaught `ValueError` from `datetime.fromisoformat()` (see
-        events/schema.py's own Z-suffix finding this Sprint for why an
-        otherwise-valid-looking timestamp can end up unparseable). Unlike
+        uncaught `ValueError` from `datetime.fromisoformat()`. Unlike
         the test above, nothing here is transient: the SAME candidate is
         still on disk on the next run, so the SAME failure recurs -- catch-up
         is stuck at this date forever, not just delayed, until a human finds
@@ -286,7 +284,13 @@ class FailureIsolationTests(SchedulerTestCase):
             HistoryCandidate(
                 history_id="HIST-ZBUG-001",
                 event_id="ZBUG-001",
-                timestamp="2026-08-02T20:31:00Z",  # valid ISO-8601, unparseable by fromisoformat() on py<3.11
+                # A hand-edit typo: day 32. Unparseable by fromisoformat()
+                # on every Python version. This used to be
+                # "2026-08-02T20:31:00Z", which only failed to parse on
+                # py < 3.11 -- so on 3.11+ the corruption this test exists
+                # to describe was never actually created and the run simply
+                # COMPLETED, silently retiring the coverage.
+                timestamp="2026-08-32T20:31:00+09:00",
                 category="MILESTONE",
                 project_id="PRJ-Z",
                 role="COO",

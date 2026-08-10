@@ -145,6 +145,34 @@ class DashboardParentError(Exception):
     """
 
 
+class DashboardBootstrapPartialError(Exception):
+    """Raised when creating the OPS_* databases fails part-way through.
+
+    Carries `created` — the `{name: database_id}` map for the databases that
+    were created *before* the failure. Those databases really exist in the
+    workspace, and this function is not allowed to delete them, so the ids
+    are the only thing standing between the operator and a duplicate set on
+    the next attempt.
+
+    `failed_database` names the one that did not get created, and `cause` is
+    the original error (also chained, so a traceback still shows it).
+
+    Retry guidance for a caller: pass the names that are still missing via
+    `only=`, never the whole set again.
+    """
+
+    def __init__(self, *, created: dict, failed_database: str, cause: BaseException):
+        self.created = dict(created)
+        self.failed_database = failed_database
+        self.cause = cause
+        already = ", ".join(f"{k}={v}" for k, v in self.created.items()) or "none"
+        super().__init__(
+            f"creating {failed_database!r} failed: {cause}. "
+            f"Already created (record these ids before retrying, and retry with "
+            f"only= the remaining names): {already}"
+        )
+
+
 def resolve_parent_page_id(client: NotionClient) -> str:
     """Reuse the existing Workspace structure: return the Page that already
     hosts the database `client` is bound to (e.g. PROJECTS).
@@ -219,7 +247,30 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
     never raises for an unusable workspace — an unusable workspace IS the
     answer it is meant to report.
     """
-    parent = client.get_database_parent()
+    try:
+        parent = client.get_database_parent()
+    except Exception as exc:  # noqa: BLE001  (진단은 절대 실패하지 않는다)
+        # This function's stated contract is that it never raises for an
+        # unusable workspace, and the `search_pages()` call below already
+        # honours it. The parent lookup did not: a network failure, an
+        # expired token, or a deleted reference database made the
+        # *diagnostic* explode — the tool an operator reaches for precisely
+        # because Notion is not behaving. Unreachable is itself a finding,
+        # so it is reported in the same shape as every other one.
+        return BootstrapDiagnosis(
+            readiness=BootstrapReadiness.NEEDS_SHARED_PAGE,
+            reference_parent_type="unreachable",
+            resolved_parent_page_id=None,
+            hostable_pages=(),
+            search_available=False,
+            required_action=(
+                f"Could not read the reference database: {exc}. Check "
+                "NOTION_API_TOKEN and NOTION_PROJECTS_DATABASE_ID, and that the "
+                "database is still shared with this integration. Nothing about "
+                "the Dashboard can be determined until that call succeeds."
+            ),
+        )
+
     parent_type = parent.get("type", "unknown")
     resolved_parent_page_id = parent.get("page_id") if parent_type == "page_id" else None
 
@@ -310,10 +361,41 @@ def bootstrap_dashboard_databases(
     created: dict[str, str] = {}
     for name in names:
         properties = DASHBOARD_DATABASES[name]
-        response = client.create_database(
-            parent_page_id=resolved_parent_page_id, title=name, properties=properties
-        )
-        created[name] = response.get("id")
+        try:
+            response = client.create_database(
+                parent_page_id=resolved_parent_page_id, title=name, properties=properties
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Databases created before this point EXIST in the operator's
+            # workspace. Letting the exception through discarded their ids,
+            # and this function's own contract says the caller "is
+            # responsible for not re-creating databases it already has
+            # (their ids belong in configuration)" — which is impossible
+            # without the ids. Re-running then silently produced a second
+            # OPS_RUNS, a second OPS_BACKUP, and so on, with nothing able to
+            # say which is which and no delete path to clean up.
+            #
+            # So the partial result is carried out on the exception instead
+            # of being thrown away. Nothing is retried or rolled back here:
+            # deciding that is the caller's, and creating is all this
+            # function is allowed to do.
+            raise DashboardBootstrapPartialError(
+                created=created, failed_database=name, cause=exc
+            ) from exc
+
+        database_id = response.get("id")
+        if not database_id:
+            # Created, but Notion did not hand back an id to record. Failing
+            # loudly beats returning None, which `database_id()` would later
+            # report as "not created" for a database that exists.
+            raise DashboardBootstrapPartialError(
+                created=created,
+                failed_database=name,
+                cause=ValueError(
+                    f"Notion returned no id for the created database {name!r}"
+                ),
+            )
+        created[name] = database_id
     return DashboardBootstrapResult(created=created)
 
 

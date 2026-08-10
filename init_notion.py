@@ -18,6 +18,7 @@ types are chosen as Select rather than the literal §8 wording, and why.
     6. 없는 Property만 생성
     7. 존재하는 Property는 그대로 유지
     8. 결과 Report 출력
+    9. Operations Dashboard 준비 상태 안내 (읽기 전용 진단, 생성하지 않음)
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from notion import (  # noqa: E402
     NotionConfigError,
     RealNotionTransport,
     bootstrap_database,
+    diagnose_dashboard_bootstrap,
     format_report,
 )
 
@@ -82,6 +84,32 @@ def main() -> int:
         f"SKIPPED={len(result.skipped)} "
         f"FAILED={len(result.failed)}"
     )
+
+    # 9. Operations Dashboard 준비 상태 안내.
+    #
+    # `diagnose_dashboard_bootstrap()` answers exactly the question an
+    # operator has at this moment — "can the OPS_* databases be created, and
+    # if not, what do I do?" — and was exported, tested, and never called by
+    # anything. A diagnosis nobody runs diagnoses nothing.
+    #
+    # Read-only and advisory: it inspects the workspace and prints. It does
+    # not create a Database, does not choose a parent Page (that is an
+    # operator decision), and its outcome never changes this script's exit
+    # code — PROJECTS bootstrap succeeding is what this command is for, and
+    # the Dashboard is an independent, optional layer.
+    print()
+    print("Operations Dashboard 준비 상태:")
+    diagnosis = diagnose_dashboard_bootstrap(client)
+    print(f"  readiness      : {diagnosis.readiness.value}")
+    print(f"  reference 부모 : {diagnosis.reference_parent_type}")
+    if diagnosis.hostable_pages:
+        print("  사용 가능한 Page:")
+        for page in diagnosis.hostable_pages[:5]:
+            print(f"    - {page.title} ({page.page_id})")
+    if not diagnosis.search_available:
+        print("  (이 integration은 Workspace 검색 권한이 없어 Page 목록을 확인하지 못했다)")
+    print(f"  다음 할 일     : {diagnosis.required_action}")
+
     return 0
 
 
