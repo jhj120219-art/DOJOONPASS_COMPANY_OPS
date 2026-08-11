@@ -7,8 +7,10 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-08-11 (C16 Delivery Integrity — E-9b 탐지기 신설(수정 아님),
-탐지 정확도 실측 0/0, 신규 탐지기 2종 성능 6배 개선)
+마지막 갱신: 2026-08-12 (C18 Deep Audit Sweep — 병렬 감사 5건
+[Traceability/Release, E2E 연쇄 시나리오, Multi-Desktop 상호작용, Failure
+Isolation, Observability/기술부채] 전부 재확인만 하고 종료 — 신규 실행 가능한
+결함 없음, 코드 변경 없음. C17까지의 실제 결함 6건 수정은 그대로 유지)
 
 ---
 
@@ -511,6 +513,274 @@ C8(도달 불가 확인 후 특성화), `bootstrap_dashboard_databases()` → C9
    사용자 환경변수로 영구 저장해 실질적으로 우회하고 있다. 이번 Sprint에
    문서와 코드가 어긋나지 않도록 양방향 계약 테스트를 붙였으므로(C5),
    현 구조가 유지되는 한 드리프트는 더 이상 발생하지 않는다.
+
+---
+
+## C18. Deep Audit Sweep
+
+C17 직후 이어서 진행한 Sprint. C17에서 이미 고친 6개 영역은 반복하지 않고,
+그 주변에서 아직 보지 않은 각도를 병렬 조사 fork 5개로 훑었다. **모든 fork가
+"신규 실행 가능한 결함 없음"으로 종료** — 이번 Sprint에서 코드 변경은 없다.
+
+### 조사 범위와 결과
+
+1. **Traceability / Release Readiness** — Event 3가지 경로(ACCEPTED/
+   DUPLICATE/REJECTED)의 로그-파일 상관관계, `docs/14`의 Severity 표와
+   `app/runner.py`의 실제 매핑 대조, 4개 진입점의 Exit Code 문서 일치성,
+   `requirements.txt` 부재(의도된 설계 — 표준 라이브러리만 사용) 확인.
+   **결함 없음.** 사소한 문서 완결성 메모 하나(docs/14 §7이 Lock 미획득 시의
+   정확한 exit code를 명시하지 않음 — 동작 자체는 일관되고 테스트도 있어 버그
+   아님, docs/ 수정은 Spec 영역이라 보고만 함).
+2. **E2E 연쇄 시나리오** — Late Event가 Monthly 재생성 중 Backup까지 실패하는
+   복합 상황, Retry Queue 항목이 property mapping 변경을 건너뛰는지, 같은
+   실행 안에서 Daily Close 전/후 Event가 섞여 도착하는 경우, Backup
+   local-commit 성공/push 실패 후 즉시 재실행 — **4개 시나리오 전부 이미
+   올바르게 처리됨**을 코드로 확인(각각 구조적 이유가 있음: Monthly State는
+   Backup 이전에 로컬 저장 완료, Retry Queue는 Event 원본을 저장해 매번
+   Property를 재생성, Collector가 배치 전체를 처리한 뒤에야 History Filter가
+   시작되므로 같은 실행 내 순서 역전 불가능, push 재시도는 이미 CEO 승인
+   A안으로 구현·테스트됨).
+3. **Multi-Desktop 상호작용/동시 장애** — 여러 Desktop 동시 이상 상태(마스킹
+   없음 확인), Desktop 4 자신의 Agent vs Runner 구분(섹션이 명확히 분리돼
+   있어 혼동 불가), Desktop 간 Clock Skew(미래 시각 Event는 그 날짜가 실제로
+   올 때까지 대기할 뿐 손실·손상 없음 — 기존 "오늘/미래 처리 안 함" 불변식이
+   부작용 없이 흡수), 다중 날짜 Catch-up 중 하루의 Signal 거부(나머지 날짜를
+   막지 않음, 실제 전달 실패만 FAILED를 유발). **결함 없음.** 저우선순위
+   관측성 개선 후보 하나: `IntakeBacklog.rejected`/`awaiting_intake`
+   (`app/desktop_activity.py`)가 Desktop별로 귀속되지 않은 전역 합계 —
+   여러 Desktop이 동시에 거부된 Signal을 만들면 파일을 직접 열어야 어느
+   Desktop인지 안다. 버그는 아니고(파일 자체는 검사 가능), 신규 결함도
+   아니라 개선 여지일 뿐이라 이번 Sprint 범위에서 구현하지 않음 — 다음
+   Sprint 후보로 기록.
+4. **Failure Isolation (Backup/Dashboard 외)** — Collector/History
+   Filter/Scheduler/Late Update 4단계 각각에 대해 예기치 못한 예외가
+   이후 단계를 막는지 확인. Scheduler/Daily·Late Update·Monthly·Dashboard는
+   전부 자체 try/except로 격리돼 있음을 확인. Collector 앞단(mkdir 등)은
+   비격리이나 실제 손실 없이 다음 실행이 재시도하는 구조(A-18 수정으로
+   LAST RUN에 이미 가시화됨). History Filter는 A-20 그 자체(기존 SKIP,
+   신규 아님). **결함 없음.**
+
+   후속 확인(fork가 시간 내 못 끝낸 것 직접 확인): `scheduler_run_once()`
+   내부 `load_state()`가 State 파일 손상 시 `SchedulerStateError`를 던지고
+   이것이 `app/runner.py`를 통해 전체 실행을 중단시키는지 재확인 — **이미
+   BUG-3 (CEO 승인 A안)으로 명시적으로 결정된 사항**이었다
+   (`tests/test_runner_failure_paths.py::CorruptStateFilePathTests`,
+   "A안의 의도된 범위... Runner가 흡수하도록 하는 것은 병목 #3 B안이며
+   승인되지 않았다"). 새 발견이 아니라 이미 결정된 정책의 재확인.
+5. **Observability / 기술부채 / Architecture** (직접 수행) —
+   `compileall`, `git diff --check`, TODO/FIXME/HACK/XXX 전체 grep(0건),
+   bare `except:`/`except Exception: pass` 전체 grep(0건, 유일한
+   `except Exception:` 1건은 `notion/transport.py`의 의도된 best-effort
+   에러 상세 파싱으로 정상), C17이 추가한 import 정합성 확인. **신규
+   기술부채 없음.**
+
+### 전체 Regression
+
+코드 변경 없음. C17 이후 상태 그대로 재검증: **1466 passed, 0 failed**
+(2회 재실행, 동일 결과).
+
+---
+
+## C17. Production-Readiness Sweep
+
+승인 없이 진행하는 장시간 Sprint. Baseline 재검증 → A-20/E-9/A-18/A-19 순으로
+직접 감사 → Dashboard/Notion·Multi-Desktop은 읽기 전용 조사 fork 4개를 병렬로
+투입해 새 결함을 찾고, 발견된 것은 모두 직접 구현·테스트했다.
+
+### Baseline: Python 3.9.7 환경 드리프트로 인한 Regression
+
+이전 Sprint 기록("이 머신, Python 3.13")과 달리 현재 기본 `python`은 Anaconda의
+3.9.7이다. `tests/test_agent_fault_injection.py::SecretLeakTests`가
+`Path.parents[1:]` 슬라이싱(3.10+ 전용)을 써서 `TypeError`로 실패하고 있었다.
+`list(path.parents)[1:]`로 교체 — 검사 의도는 그대로, Python 버전 호환성만
+수정. 저장소 전체에서 `.parents[슬라이스]` 패턴은 이 한 곳뿐임을 확인했다
+(`grep -rn "\.parents\["`, 나머지는 전부 정수 인덱스라 3.9에서도 안전).
+
+### A-20 — 동시 실행 중 오탐(false positive) 신규 발견 및 수정
+
+`find_orphaned_events()`는 순수 함수이고 Lock을 전혀 모른다. 그런데
+`app/runner.py`의 실제 흐름은 Collector가 배치 전체를 `processed/`로 옮긴
+**뒤에야** History Filter 루프가 시작해 Candidate를 하나씩 쓴다(4→5단계).
+즉 대량 Catch-up 도중 `ops_status.py`를 동시에 실행하면 — 문서가 명시적으로
+안전하다고 보장하는 바로 그 사용법 — 아직 Candidate 차례가 오지 않은,
+정상적으로 처리 중인 Event가 A-20 Orphan으로 잘못 보고될 수 있다. 재현하지
+않고 코드 경로 분석만으로 확인(재현에는 실제 대량 배치 타이밍이 필요해
+결정적 재현이 어려움 — 대신 로직 자체가 이 취약점을 구조적으로 갖고 있음을
+`app/runner.py` 597-625행과 `collector/runtime.py`의 배치 완료 시점 비교로 확정).
+
+**수정(탐지/관측성 강화, 수정이 아닌 추가):** `scheduler/lock.py`에
+읽기 전용 `is_locked()` 신설 — `try_acquire_lock()`과 달리 Lock을 만들거나
+가져가지 않고 "지금 살아있는 프로세스가 쥐고 있는가"만 답한다.
+`ops_status.py::_print_history()`가 Orphan을 보고할 때 Lock이 잡혀 있으면
+"Runner 실행 중 — 완료 후 재확인 권장" 문구를 **덧붙인다** — Orphan 목록 자체는
+줄이거나 숨기지 않는다(진짜 유실을 가리면 안 되므로). 테스트:
+`tests/test_lock_atomicity.py::IsLockedTests`(5건),
+`tests/test_observability.py::ReconciliationLockAwarenessTests`(4건).
+
+### A-18 — `_print_last_run()` 테스트 커버리지 0건 + 도달 못한 단계가 안 보임
+
+fork 조사로 확인: `ops_status.py::_print_last_run()`는 저장소 전체에서
+직접 테스트하는 곳이 하나도 없었다(`_print_company`/`_print_agent`/
+`_print_history`는 각각 전용 테스트 클래스가 있음). 또한 이 함수는
+`summary.components`에 **있는** 것만 순회하므로, Backup 실패로 실행이
+중단돼 `recorder.begin(C_DASHBOARD)`조차 호출되지 못한 경우 Dashboard
+행이 통째로 사라진 사실이 LAST RUN 화면에 전혀 나타나지 않았다(SKIPPED와
+구분 불가 — SKIPPED는 명시적으로 출력되지만 "도달 못함"은 침묵).
+
+**수정:** `_EXPECTED_COMPONENT_ORDER`(9개 Component 고정 순서, `app/runner.py`의
+실제 `recorder.begin()` 호출부와 대조해 전부 무조건 도달함을 확인)를
+`ops_status.py`에 추가. `summary.components`에 없는 이름을 계산해
+"! 시작되지 못한 단계: dashboard" 및 ATTENTION 문구로 보고. Exit
+Code·Severity·Retryability 등 Run Contract(docs/14)의 의미는 전혀 바꾸지
+않음 — 순수 표시 추가. 테스트: `tests/test_observability.py::LastRunViewTests`
+(7건, `_print_last_run()`의 첫 테스트 커버리지).
+
+### Dashboard/Notion — OPS_RUNS 중복 행 + Pending 실패 사유 누락 (둘 다 실제 결함, 수정함)
+
+fork 조사로 두 가지 실결함 확인, 둘 다 정책 결정 없이 수정 가능:
+
+1. **`record_run()`과 `drain_pending()`이 find-before-create 없이
+   `create_project()`를 무조건 호출.** `notion/dashboard_pending.py`의
+   모듈 docstring은 "한 Runner 실행은 OPS_RUNS 행을 두 개 만들 수 없다"고
+   **이미 약속**하고 있었는데 코드가 지키지 않았다 — `notion.sync.
+   ExecutionPlanSync`는 동일 이유로 이미 `find_project()`를 먼저 부른다.
+   재현: `create_page`가 Notion 쪽에는 실제로 쓰였지만 응답이 유실돼
+   예외로 보이는 경우(`_FalseNegativeCreateTransport`), 재시도가 두 번째
+   행을 만든다 — 기존 특성화 테스트(`RecordRunRetryDuplicationTests`)가
+   스스로 "이 테스트가 실패하기 시작하면 find-before-create가 추가된
+   것"이라고 적어 두고 있었다.
+
+   수정: `NotionClient.find_by_title()` / `find_or_create_by_title()` 신설
+   (title Property 기준 조회 — OPS_RUNS의 `Run ID`는 rich_text가 아니라
+   title이라 기존 `find_project()`를 재사용할 수 없음). `record_run()`과
+   `drain_pending()` 둘 다 이걸 통해서만 행을 만들도록 교체.
+   `InMemoryNotionTransport.query_database()`를 "Project ID rich_text"
+   하드코딩에서 property명+filter타입 범용으로 일반화.
+   `RecordRunRetryDuplicationTests`를 특성화에서 보증으로 재작성(fork의
+   docstring 예고대로).
+
+2. **`drain_pending()`의 실패 사유가 어디에도 안 남음.** `except
+   Exception:`이 예외 텍스트를 통째로 버려서, 영구히 실패하는 오염된
+   레코드(예: Notion이 거부하는 Select 값)가 `attempt_count`만 늘며
+   원인 없이 영원히 재큐잉됐다 — BUG-13/C10이 Notion Sync에 이미 고친
+   것과 같은 진단 공백이 Dashboard Pending Queue에는 남아 있었다.
+
+   수정: `DrainPendingResult`(tuple 서브클래스, 기존
+   `recorded, still_pending = drain_pending(...)` 2-tuple unpack을 그대로
+   보존하면서 `.last_reason`만 추가 — `runsummary.RunResult`가 5-tuple에
+   `.summary`를 더한 것과 같은 기법, C12) 신설. `app/runner.py`가
+   `DRAIN_PENDING ... REASON <이유>`로 로그(bounded, 기존 REASON 로깅과
+   동일 패턴).
+
+   테스트: `tests/test_notion_client.py::NotionClientTitleLookupTests`(5건),
+   `tests/test_notion_dashboard.py`의 신규/수정 테스트(4건),
+   `tests/test_architecture_invariants.py::test_only_ops_runs_has_a_writer`
+   갱신(호출부가 `create_project`→`find_or_create_by_title`로 바뀐 사실 반영).
+   기존 `test_runner_failure_paths.py::DrainPendingPartialSuccessTests`의
+   Fake Client 2종이 `create_project`만 구현하고 있어 함께 갱신(BUG-50
+   특성화 자체는 변경 없음 — 여전히 BaseException은 새지 않음이 아니라
+   샌다는 특성화가 유지됨, 재확인).
+
+### Multi-Desktop — 미래 날짜 State가 영구 무음 정지를 만들고 탐지되지 않음
+
+fork 조사로 확인: `agent.run_once()`는 `last_successful_collection_date`를
+`now` 이후로 절대 쓰지 않지만(항상 `now` 상한), 시계 오차나 잘못된 백업
+복원으로 미래 날짜가 State 파일에 들어갈 수 있다. `catchup.pending_dates()`는
+이미 안전하게 처리한다(start > end → 빈 목록, 날짜를 건너뛰지 않음 —
+`test_a_future_state_date_never_walks_backwards`). 그러나
+`agent/status.py::needs_attention()`은 이 경우를 전혀 확인하지 않아서,
+그런 State를 가진 Desktop은 `last_run`도 최근, outbox도 0, pending_dates도
+0으로 **완벽하게 건강해 보인다** — 실제로는 시계가 그 미래 날짜에 도달할
+때까지(몇 년이 걸릴 수도 있음) 다시는 수집하지 않는데도.
+
+**수정(탐지 전용, `scheduler/consistency.py`·`history/reconciliation.py`와
+같은 절제):** `needs_attention()`에
+`last_successful_collection_date > now.date()` 확인 추가, ATTENTION 사유로
+보고. `pending_dates()`의 안전한 방향(날짜를 건너뛰지 않음)은 전혀 건드리지
+않음 — 여전히 아무것도 재처리·수정하지 않는다. 테스트:
+`tests/test_observability.py`에 2건 추가(미래 날짜 신규 탐지 +
+오늘 날짜는 오탐 아님 확인).
+
+### 확인했으나 신규 결함 없음
+
+- **A-19 보안 재감사** (Path Traversal, Hardlink, Log Injection, Secret
+  노출, malicious event_id, Git Command Injection): fork로 `src/` 전체
+  재확인, 기존 Sanitizer(`safe_event_filename`/`safe_candidate_filename`)와
+  `oplog.append_line()` 단일 지점 escape+redact가 모든 경로를 덮고 있음을
+  재확인. Junction(A-19 본항목)은 여전히 배포 정책 결정이라 **SKIP 유지**.
+- **E-9/E-9b**: `agent/delivery.py`의 4종 탐지(EMPTY/NOT_A_FILE/UNREADABLE/
+  DIFFERENT_EVENT)와 A-20류 동시성 오탐 가능성을 직접 코드 분석 — `send()`가
+  sync 폴더에 원자적으로 쓴 **뒤에만** `sent/`로 옮기므로(A-20과 달리 배치
+  전체 완료를 기다리지 않음) 동시 실행 시 오탐 창이 없음을 확인. 신규 결함 없음.
+- **A-18 Backup/Dashboard 격리**: `finally`의 Lock 해제, Manifest 기록 순서
+  재확인 — 기존 특성화(Dashboard row 유실, 재시도 큐 미도달)가 정확함을 재확인,
+  이중 실패(Backup+Dashboard 동시) 경로도 도달 불가능함을 확인(Backup이 먼저
+  중단시키므로 Dashboard 자체가 시작되지 않음 — 두 개의 독립 결함이 아니라
+  하나의 순서 사실).
+- **TODO/FIXME/HACK/XXX**: `src/`, 루트 스크립트, `scripts/` 전체 grep — 0건.
+- **Recovery/DR 나머지 항목**: Working Copy 전체 파괴는 이미 완전히
+  테스트됨(`WorkingCopyDestroyedTests`, Local Master 무손상 확인). Monthly
+  History는 `monthly_history_state.json` 손실 시에도
+  `generate_or_update_monthly()`가 상태가 아니라 **파일 존재 여부**로
+  덮어쓰기를 막으므로 안전(`monthly/generator.py`) — 유일한 부작용은
+  `dirty_months`도 함께 사라져 재생성이 다음 Late Event까지 지연되는 것뿐,
+  데이터 손상 아님. State+대응 데이터 동시 손실은 `scheduler/consistency.py`의
+  "state 없음 = 확인할 것 없음" 처리가 신규 설치와 같은 경로로 흡수함.
+
+### Performance 재측정 (이 머신, Python 3.9.7)
+
+C16이 Python 3.13에서 측정한 것과 같은 스레드풀(16) 구현을 그대로 재측정.
+정확성 회귀 없음, 성능도 이전 기록과 동등하거나 더 빠름(디스크/캐시 차이로
+추정 — 알고리즘은 변경하지 않았으므로 코드 개선이 아니라 환경 차이):
+
+| n | reconcile (C16, py3.13) | reconcile (지금, py3.9.7) | delivery (C16) | delivery (지금) |
+|---|---|---|---|---|
+| 1,000 | 0.86s | 0.22s | 0.29s | 0.21s |
+| 5,000 | 3.95s | 1.09s | 3.66s | 1.04s |
+| 20,000 | 18.26s | 4.79s | 18.98s | 4.48s |
+
+`test_agent_outbox_stress.py`를 `COMPANY_OPS_STRESS_N=5000`으로 재실행 —
+11개 테스트 전체 통과, 정확성 단언 전부 유지(중복 0, 유실 0). 안전한 추가
+최적화가 필요한 병목은 발견되지 않았다.
+
+### Recovery/DR — Lock PID 재사용으로 인한 영구 정지 가능성 (탐지 신설)
+
+두 번째 읽기 전용 조사 fork(Recovery/DR/E2E)로 신규 발견. `_is_process_running()`
+(`scheduler/lock.py`)은 "지금 이 PID를 가진 프로세스가 있는가"만 확인하고
+"그것이 Lock을 쓴 바로 그 프로세스인가"는 확인하지 않는다 — Lock 파일
+payload에는 `process_id`/`created_at`만 있고 그 이상의 식별 정보가 없다.
+
+**재현 시나리오:** 진짜 정전 등으로 Runner가 Lock을 쥔 채 죽으면 죽은
+프로세스의 PID가 Lock 파일에 영구히 남는다. 재부팅 후 Windows가 그 숫자를
+무관한 다른 프로세스에 재할당하면 `_is_process_running(dead_pid)`가 True를
+반환해 `try_acquire_lock()`이 "다른 Runner가 실행 중"으로 오판 — docs/07
+§27("경과 시간만으로 판단 안 함")을 지키는 한 사람이 Lock 파일을 수동
+삭제할 때까지 **영구히** 모든 실행이 조용히 건너뛰어진다.
+
+**왜 Lock 판별 로직 자체는 고치지 않았는가:** `LockFileContractTests`가
+Lock 파일의 온디스크 형태를 정확히 `process_id`/`created_at` 두 필드로
+고정해 둔 계약이고("다른 코드와 운영자가 의존하는 형태"), 식별 정확도를
+높이려면 이 형태를 넓혀야 한다 — 계약 변경. 또한 `_is_process_running()`의
+불확실 시 판정 방향(§27 관련, `ProcessProbeFailureTests`의 BUG-54: probe
+실패 시 "죽었다고 가정"하는 관대한 방향)은 이미 "함께 결정해야 한다"고
+문서화된 별개의 정책 트레이드오프다. 이 둘을 건드리지 않고는 진짜 수정이
+불가능하므로 판별 로직 자체는 **SKIP**.
+
+**대신 구현한 것(탐지/관측성, 계약 변경 없음):** `scheduler/lock.py`에
+읽기 전용 `lock_held_since()` 신설 — Lock 파일의 **기존** `created_at`
+필드만 읽어(새 필드 추가 없음) 살아있는 프로세스가 잡고 있는 Lock의 획득
+시각을 반환한다. `ops_status.py::_print_last_run()`이 이를 이용해 Lock이
+2시간(`LOCK_STUCK_AFTER_HOURS` — D절 측정상 20,000건 배치도 수 초, git
+subprocess timeout도 300초이므로 충분히 넉넉한 값) 이상 잡혀 있으면
+ATTENTION에 보고한다. Staleness를 판정하거나 Lock을 가져가지 않는다 —
+진짜 장시간 실행이든 PID 재사용 오탐이든 "확인이 필요하다"는 사실만 알린다.
+테스트: `tests/test_lock_atomicity.py::LockHeldSinceTests`(5건),
+`tests/test_observability.py::LastRunLockStuckTests`(5건).
+
+### 전체 Regression
+
+수정 5건 + 신규/갱신 테스트 37건 반영 후 전체 스위트: **1466 passed, 0
+failed** (수정 전 baseline 1430 passed / 1 failed — Python 버전 드리프트).
 
 ---
 
@@ -1819,3 +2089,19 @@ B절이 "실제 OneDrive 클라이언트 고유 동작"을 미검증으로 남�
 완화되어 있는 점: 배달 내용이 **틀리는** 경우는 C11이 없앴다. 남은 것은
 "배달되지 않았는데 성공 보고"이며, `ops_status.py`의 도착 추적이 침묵을
 드러낸다(단, 원인까지는 말하지 못한다 — A-11c).
+
+### E-10. `IntakeBacklog`의 Desktop별 귀속 부재 (Observability) — 승인 없이 가능, 작음
+
+C18의 Multi-Desktop 상호작용 감사에서 발견. `app/desktop_activity.py`의
+`IntakeBacklog.rejected`/`awaiting_intake`는 전체 Desktop 합산 카운트이고
+어느 Desktop이 원인인지 귀속하지 않는다. 여러 Desktop이 동시에 Signal을
+거부당하는 상황에서 운영자는 "총 N건 거부"까지만 보고, 어느 Desktop인지는
+`runtime/events/rejected/` 또는 각 Desktop의 `signals_rejected/`를 직접
+열어야 안다.
+
+버그가 아니다 — 파일 자체는 검사 가능하고 데이터 유실도 없다. 정책 결정도
+필요 없다(순수 집계 방식 변경). 구현하지 않은 이유는 순수 우선순위: 이번
+Sprint의 병렬 감사 5건이 전부 "결함 없음"으로 끝난 뒤 남은 유일한 개선
+후보이고, `rejected/` 파일들이 항상 `source`를 파싱 가능한 형태로 담고
+있는지(완전히 손상된 JSON은 못 열 수도 있음) 확인이 먼저 필요하다.
+다음 Sprint에서 가장 먼저 볼 만한 작은 항목.
