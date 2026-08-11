@@ -542,6 +542,7 @@ class ConcurrentProcessMutualExclusionTests(unittest.TestCase):
             "    collector_log_path=root / 'logs' / 'collector.log',\n"
             "    late_update_log_path=root / 'logs' / 'daily_late_update.log',\n"
             "    monthly_state_path=root / 'state' / 'monthly_history_state.json',\n"
+            "    run_summary_path=root / 'runs' / 'last_run.json',\n"
             "    collector_state_path=root / 'state' / 'collector_state.json',\n"
             "    keep_dir=root / 'keep',\n"
             "    review_dir=root / 'review',\n"
@@ -1188,43 +1189,39 @@ class TestDoubleFidelityTests(unittest.TestCase):
 
 
 class ExitCodeContractTests(unittest.TestCase):
-    """BUG-36 (NOT FIXED — the exit-code contract is a decision).
+    """BUG-36 — RESOLVED. The exit-code contract now exists, so this is a
+    guard on it rather than a record of its absence.
 
-    CHARACTERIZATION: asserts today's behaviour.
+    What it was: `main()` had exactly two return statements and both
+    returned 0. It printed every failure it knew about and acted on none of
+    them. That is not hypothetical — planting a `.env` under the History
+    directory trips the Secret Scan, giving `BACKUP_FAILED` with
+    `push_result = "secret files detected: .env"`, and main() still returned
+    0. The Runner is launched by Windows Task Scheduler, whose only
+    automatic health signal is the exit code, and stdout is not captured by
+    default. Combined with what the Observability Audit measured — a
+    lock-skipped run writes no artifact, a Candidate lost to a crash writes
+    none — that closed the last automatic channel: nothing told anyone.
 
-    `run_company_ops.py:main()` has exactly two return statements and both
-    return 0. It prints every failure it knows about and acts on none of them:
-    `backup_entry.final_status`, `scheduler_result.status`,
-    `collector_summary.failed` and each `SyncResult.error` all appear in the
-    output, and none appears in a condition.
+    Worse, the one nonzero exit was an *uncaught exception*. So the failures
+    handled gracefully were exactly the invisible ones, while an unhandled
+    crash was the only thing that reported.
 
-    So the process exits 0 when the Backup FAILED. That is not hypothetical —
-    the Secret Scan gate produces it: planting a `.env` under Local Master
-    gives `BACKUP_FAILED` with `push_result = "secret files detected: .env"`,
-    and main() still returns 0.
+    What it is now (`runsummary`): every component's failure is classified
+    by severity, folded into one Overall Status, and mapped to an exit code.
 
-    The Runner is designed to be launched by Windows Task Scheduler, whose
-    only automatic health signal is the process exit code ("Last Run Result").
-    A run that failed therefore reports 0x0 / success.
+        SUCCESS   0
+        DEGRADED  3   something needs a person; Company History is intact
+        FAILED    2   a CRITICAL component failed
 
-    Combined with what the Observability Audit already measured — a
-    lock-skipped run writes NO artifact at all, and a History Candidate lost
-    to a crash writes none either — this closes the last automatic channel:
-    stdout is not captured by Task Scheduler by default, no log records the
-    failure, and the exit code says success. Nothing tells anyone.
-
-    The one nonzero exit was an uncaught exception (SystemExit via
-    traceback), which means the failures that ARE handled gracefully are
-    exactly the ones that become invisible, while an unhandled crash is the
-    only thing that reports. A later Sprint gave that one case a defined
-    code (2) and a readable message instead of a traceback — the same
-    condition, reported better. Which OTHER conditions deserve a nonzero
-    exit is still the open decision below.
-
-    Not fixed: which conditions deserve a nonzero exit is a policy call. A
-    non-zero code on `collector_summary.failed > 0` would make an ordinary
-    malformed Event look like a system failure; one on BACKUP_FAILED probably
-    should alert. That is the CEO's call, not a cleanup.
+    Three values rather than two, because this pipeline's whole design is
+    that most failures are neither fine nor fatal (README RULE 5/9). The
+    open question the previous version of this docstring named — "a non-zero
+    code on `collector_summary.failed > 0` would make an ordinary malformed
+    Event look like a system failure" — is answered by that middle value
+    plus severity: a malformed Event is a *metric* on the collector
+    component, not a component failure, so it does not change the exit code
+    at all.
     """
 
     def _function(self, name):
@@ -1239,11 +1236,10 @@ class ExitCodeContractTests(unittest.TestCase):
     def _main_function(self):
         return self._function("main")
 
-    def test_the_reporting_path_returns_zero_whatever_it_printed(self):
-        """`main()` was split into `_print_result()` (the run completed) and
-        `_report_backup_failure()` (Backup raised). The characterized
-        property lives in the first: it prints every failure signal it knows
-        about and still returns 0."""
+    def test_the_reporting_path_derives_its_exit_code_from_the_summary(self):
+        """The inversion of the old property: `_print_result()` used to
+        return a literal 0 on every path. It must now return whatever the
+        Run Summary's classification says, and must not hardcode a code."""
         returns = [
             ast.unparse(node.value) if node.value else "None"
             for node in ast.walk(self._function("_print_result"))
@@ -1251,24 +1247,126 @@ class ExitCodeContractTests(unittest.TestCase):
         ]
 
         self.assertTrue(returns, "_print_result() has no return statement")
-        self.assertEqual(set(returns), {"0"})
+        self.assertIn("_report_run_summary(result)", returns)
+        self.assertNotIn("2", returns, "an exit code is hardcoded here")
+        self.assertNotIn("3", returns, "an exit code is hardcoded here")
 
-    def test_no_failure_status_is_ever_tested_in_a_condition(self):
-        reporter = self._function("_print_result")
-        conditions = " ".join(
-            ast.unparse(node.test) for node in ast.walk(reporter) if isinstance(node, ast.If)
+    def test_every_overall_status_maps_to_exactly_one_exit_code(self):
+        """The mapping is total and injective — no status can fall through
+        to an accidental 0, and no two statuses can be confused."""
+        from runsummary import OverallStatus, exit_code_for
+
+        codes = {status: exit_code_for(status) for status in OverallStatus}
+
+        self.assertEqual(len(set(codes.values())), len(OverallStatus))
+        self.assertEqual(codes[OverallStatus.SUCCESS], 0)
+
+    def test_the_degraded_code_agrees_with_ops_status(self):
+        """Both entrypoints report to the same operator. `ops_status.py`
+        already used 3 for "something needs a person"; the Runner must not
+        pick a different number for the same meaning."""
+        from runsummary import EXIT_DEGRADED
+
+        ops_status = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        self.assertEqual(EXIT_DEGRADED, 3)
+        self.assertIn("3   at least one thing needs a person", ops_status)
+
+    def test_the_config_error_code_is_not_reused_by_the_run_contract(self):
+        """1 means "the run never started". Reusing it for a run that
+        finished would make a scheduled task's history unreadable."""
+        from runsummary import OverallStatus, exit_code_for
+
+        self.assertNotIn(1, {exit_code_for(s) for s in OverallStatus})
+
+    def test_an_ordinary_malformed_event_does_not_change_the_exit_code(self):
+        """The question the old docstring left open, now answered in code.
+
+        `collector_summary.failed > 0` means one Event file could not be
+        processed — docs/03 §53 makes that per-file isolation by design. It
+        is recorded as a *metric* on a SUCCESS component, so it cannot make
+        an ordinary day look like a system failure.
+        """
+        from runsummary import ComponentResult, ComponentStatus, OverallStatus, overall_status
+
+        collector = ComponentResult(
+            name="collector",
+            status=ComponentStatus.SUCCESS,
+            metrics={"accepted": 3, "failed": 1},
         )
 
-        for signal in (
-            "final_status",
-            "scheduler_result.status",
-            "collector_summary.failed",
-        ):
-            with self.subTest(signal=signal):
-                # Printed...
-                self.assertIn(signal, ast.unparse(reporter))
-                # ...but never branched on.
-                self.assertNotIn(signal, conditions)
+        self.assertEqual(overall_status([collector]), OverallStatus.SUCCESS)
+
+    def test_the_scheduler_failure_detail_prints_in_report_order(self):
+        """Executes `_print_result()` instead of parsing it.
+
+        Every other test in this class reads the function with `ast`, and
+        that is what let a real defect through: the failure detail was first
+        written to stderr, and because Python flushes the two streams
+        independently, it appeared ABOVE the "Daily History (Scheduler):
+        FAILED" line it explains — an explanation detached from the thing
+        explained. AST analysis cannot see stream ordering; running it can.
+
+        Two properties, both of which the bug broke or nearly broke:
+        the detail follows its own line, and the exit code is still 0
+        (this run completed — `_report_backup_failure()` is the aborted
+        case, and that one does belong on stderr).
+        """
+        import io
+        import contextlib
+        import importlib
+
+        from backup.log import BackupLogEntry
+        from backup.result import BackupStatus
+        from collector.runtime import RuntimeSummary
+        from scheduler.result import SchedulerRunResult, SchedulerStatus
+
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            run_company_ops = importlib.import_module("run_company_ops")
+        finally:
+            sys.path.remove(str(REPO_ROOT))
+
+        now = datetime(2026, 8, 11, 11, 0).astimezone()
+        result = (
+            type("Intake", (), {"moved": ()})(),
+            RuntimeSummary(accepted=1, duplicate=0, rejected=0, failed=0, files=()),
+            SchedulerRunResult(
+                status=SchedulerStatus.FAILED,
+                generated_dates=(),
+                failed_date=date(2026, 8, 7),
+                error="PermissionError: daily/2026-08-07.md",
+            ),
+            BackupLogEntry(
+                run_id="RUN-1",
+                backup_start=now,
+                source="local_master",
+                changed_files=(),
+                deleted_files=(),
+                commit_hash=None,
+                push_result=None,
+                backup_end=now,
+                final_status=BackupStatus.NOT_REQUIRED,
+            ),
+            (),
+        )
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = run_company_ops._print_result(result)
+
+        self.assertEqual(code, 0, "a completed run must still exit 0")
+
+        lines = out.getvalue().splitlines()
+        status_at = next(i for i, ln in enumerate(lines) if "Scheduler): FAILED" in ln)
+        detail_at = next(i for i, ln in enumerate(lines) if "실패 날짜" in ln)
+        self.assertGreater(
+            detail_at, status_at, "the explanation printed before the line it explains"
+        )
+        self.assertIn("2026-08-07", lines[detail_at])
+        self.assertIn("PermissionError", "\n".join(lines))
+        # One stream, so redirection and ordering stay predictable.
+        self.assertEqual(err.getvalue(), "")
 
     def test_a_raised_backup_failure_exits_nonzero_with_an_explanation(self):
         """NOT a change to the exit-code policy this class characterizes.
@@ -1281,15 +1379,21 @@ class ExitCodeContractTests(unittest.TestCase):
         `collector_summary.failed` — are still printed and still ignored, on
         the `_print_result()` path above.
         """
-        reporter = self._function("_report_backup_failure")
-        returns = {
-            ast.unparse(node.value) if node.value else "None"
-            for node in ast.walk(reporter)
-            if isinstance(node, ast.Return)
-        }
+        reporter = ast.unparse(self._function("_report_backup_failure"))
 
-        self.assertEqual(returns, {"2"})
-        self.assertIn("is_authentication_failure", ast.unparse(reporter))
+        # It still exits nonzero and still explains itself...
+        self.assertIn("is_authentication_failure", reporter)
+        self.assertIn("return 2", reporter)
+        # ...but 2 is now only the FALLBACK. The code the process actually
+        # returns comes from the Run Manifest, which `run_once()` writes in
+        # its `finally` and which has already classified this failure.
+        #
+        # Measured before this change, against a real broken git remote: the
+        # manifest said DEGRADED/exit 3 while the process exited 2. Two
+        # answers to "how bad was this run", and the scheduled task only
+        # ever sees the process one.
+        self.assertIn("summary.exit_code", reporter)
+        self.assertIn("read_summary", reporter)
 
     def test_a_backup_failure_is_reachable_and_would_exit_zero(self):
         """The failure really happens — the Secret Scan gate produces it."""
@@ -1335,6 +1439,7 @@ class ExitCodeContractTests(unittest.TestCase):
             collector_log_path=root / "collector.log",
             late_update_log_path=root / "daily_late_update.log",
             monthly_state_path=root / "monthly_history_state.json",
+            run_summary_path=root / "last_run.json",
             collector_state_path=root / "collector_state.json",
             keep_dir=root / "keep",
             review_dir=root / "review",
@@ -1370,42 +1475,33 @@ def _force_rmtree_if_present(path: Path) -> None:
 
 
 class ResultFieldConsumptionTests(unittest.TestCase):
-    """BUG-39: the Runner computes far more than it reports, and the rest is
-    discarded at process exit.
-
-    CHARACTERIZATION: asserts today's behaviour.
+    """BUG-39 — RESOLVED. Kept as the guard that it stays resolved.
 
     Each pipeline stage returns a result object. Measured across the two
-    consumers (app/runner.py and run_company_ops.py), only 9 of 23 fields are
-    ever read:
+    consumers (`app/runner.py` and `run_company_ops.py`), only 9 of 23
+    fields were ever read; the other 14 were computed correctly and then
+    discarded at process exit. They were not incidental — they were the
+    diagnostics:
 
-        RuntimeSummary       5/5   (fully used)
-        IntakeSummary        1/5   moved only
-        SchedulerRunResult   2/4   status, generated_dates
-        BackupLogEntry       1/9   final_status
-
-    The 14 unread fields are not incidental — they are the diagnostics:
-
-        IntakeSummary.failed / skipped_not_stable / skipped_invalid
-            which Events did not make it in, and why (BUG-30's blind half)
-        SchedulerRunResult.failed_date / error
-            which date the Daily Close died on, and the reason
+        IntakeSummary.failed / skipped_*        which Events did not make
+                                                it in, and why (BUG-30)
+        SchedulerRunResult.failed_date / error  where the Daily Close died
         BackupLogEntry.push_result / commit_hash / changed_files / ...
-            docs/08 section 68's entire Backup Log (BUG-37)
+                                                docs/08 section 68's Backup Log
+                                                (BUG-37)
 
-    So this is one cause behind several separately-found symptoms: the
-    information needed to diagnose a failed run IS computed, correctly, and
-    then thrown away because nothing writes it down. BUG-37 (no Backup Log
-    file) and BUG-30's invisibility are both instances of it, and BUG-36
-    (always exit 0) is the same shape at the process boundary.
+    That framing is what made the fix one change instead of several: this
+    was never several missing features, it was **one missing sink**. Adding
+    the Run Summary consumed all of them at once.
 
-    That framing matters for the fix: this is not several missing features,
-    it is one missing sink. A single run-summary artifact would consume all
-    14 fields at once.
+    Now 19 of 23. The four exceptions are deliberate and named in
+    `test_the_backup_diagnostics_are_now_consumed`: they duplicate fields
+    the manifest already carries at run level, and copying them down into a
+    component would let the manifest disagree with itself.
 
-    Not fixed: what to write, where, and in what format is a decision — and
-    docs/08 section 69 already specifies a location for one of the four, which
-    a general solution would have to respect.
+    Still open, and a different problem: BUG-36 (the process exit code) was
+    the same shape at the process boundary. It is addressed by
+    `runsummary.exit_code_for()` — see `ExitCodeContractTests`.
     """
 
     CONSUMERS = ("src/app/runner.py", "run_company_ops.py")
@@ -1431,33 +1527,60 @@ class ResultFieldConsumptionTests(unittest.TestCase):
 
         self.assertEqual(self._unread_fields(RuntimeSummary, "collector_summary"), [])
 
-    def test_the_backup_log_entry_is_almost_entirely_discarded(self):
+    def test_the_backup_diagnostics_are_now_consumed(self):
+        """docs/08 section 68's Backup Log content (BUG-37), which existed on
+        the entry and reached no artifact.
+
+        The four still unread are not diagnostics — `run_id`, `backup_start`
+        and `backup_end` are carried by the Run Summary itself (its own
+        `run_id` / `started_at` / `finished_at`), and `source` is constant
+        for this pipeline. Copying them into a component's metrics would
+        make the manifest disagree with itself the first time they drifted.
+        """
         from backup.log import BackupLogEntry
 
         unread = self._unread_fields(BackupLogEntry, "backup_entry")
 
-        self.assertIn("push_result", unread)
-        self.assertIn("commit_hash", unread)
-        self.assertEqual(len(unread), 8)
+        for diagnostic in ("push_result", "commit_hash", "changed_files", "deleted_files"):
+            with self.subTest(field=diagnostic):
+                self.assertNotIn(diagnostic, unread)
+        self.assertEqual(sorted(unread), ["backup_end", "backup_start", "run_id", "source"])
 
-    def test_the_intake_summary_reports_only_what_succeeded(self):
+    def test_the_intake_summary_is_fully_consumed(self):
+        """BUG-30's blind half: which Events did not make it in, and why.
+
+        Read by direct attribute access rather than `getattr(..., default)`,
+        which is what this test can actually see — and the reason to prefer
+        it: a default would report 0 skipped files forever on the day a
+        field is renamed, instead of failing.
+        """
         from transport.intake import IntakeSummary
 
-        unread = self._unread_fields(IntakeSummary, "intake_summary")
+        self.assertEqual(self._unread_fields(IntakeSummary, "intake_summary"), [])
 
-        self.assertIn("failed", unread)
-        self.assertIn("skipped_not_stable", unread)
+    def test_the_scheduler_failure_detail_is_now_consumed(self):
+        """FIXED — this was the sharpest instance of BUG-39.
 
-    def test_the_scheduler_failure_detail_is_discarded(self):
+        `failed_date` and `error` were populated on every failed Daily Close
+        and read by nobody, so the operator saw `FAILED, generated=[]` and
+        nothing more. Scheduler stops at the first failing date, which means
+        that date and every later one still have no Daily file — the two
+        discarded fields were the only record of where the next run must
+        resume.
+
+        Both consumers now read them: `app/runner.py` writes a
+        `SCHEDULER_FAILED date=... <reason>` line to daily_late_update.log
+        (where Monthly failures already go), and `run_company_ops.py` prints
+        them to stderr. No new artifact, no new format — BUG-39's general
+        "one run-summary sink" is still open, and still a decision.
+        """
         from scheduler.result import SchedulerRunResult
 
-        unread = self._unread_fields(SchedulerRunResult, "scheduler_result")
+        self.assertEqual(self._unread_fields(SchedulerRunResult, "scheduler_result"), [])
 
-        self.assertIn("failed_date", unread)
-        self.assertIn("error", unread)
-
-    def test_the_scheduler_sets_the_fields_nobody_reads(self):
-        """They are populated, so the gap is in consumption, not production."""
+    def test_the_scheduler_still_sets_the_fields_its_consumers_read(self):
+        """The producing half of the same contract: if scheduler.py stopped
+        populating these, both consumers would silently print "unknown"."""
         scheduler_source = (SRC / "scheduler" / "scheduler.py").read_text(encoding="utf-8")
 
         self.assertIn("failed_date=", scheduler_source)
@@ -1926,6 +2049,7 @@ class ConcurrentRunnerDataLossTests(unittest.TestCase):
             "        collector_log_path=root / 'logs' / 'collector.log',\n"
             "        late_update_log_path=root / 'logs' / 'daily_late_update.log',\n"
             "        monthly_state_path=root / 'state' / 'monthly_history_state.json',\n"
+            "        run_summary_path=root / 'runs' / 'last_run.json',\n"
             "        collector_state_path=root / 'state' / 'collector_state.json',\n"
             "        keep_dir=root / 'keep', review_dir=root / 'review',\n"
             "        scheduler_state_path=root / 'state' / 'daily_history_state.json',\n"
@@ -2178,3 +2302,161 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
             source.index("mark_month_dirty("),
             source.index("monthly_run_once("),
         )
+
+
+class LayeringInvariantTests(unittest.TestCase):
+    """The whole dependency graph in one place, derived from disk.
+
+    Eight test files carry a near-identical pair of boundary tests ("package
+    X must not import Y", "no hardcoded absolute paths"). Each covers exactly
+    one package, and each was written when that package was written — so the
+    rule a new package must obey is enforced only if somebody remembers to
+    copy the pair into a new file. Nothing failed when `oplog.py` was added.
+
+    Two properties those per-package tests structurally cannot give:
+
+      * **completeness** — every package is checked, because the package list
+        comes from `SRC.iterdir()` rather than from whichever files exist;
+      * **acyclicity** — a cycle is a property of the graph, not of any one
+        package, so no per-package test can see one.
+
+    The allowed-edge table below is the layering this project already has,
+    written down. It is deliberately a table of what each package MAY import
+    rather than what it may not: a forbidden-list silently permits anything
+    nobody thought to forbid, which is how a new package would slip in.
+    """
+
+    # package -> packages it is allowed to import. Leaf packages map to an
+    # empty set. `app` is the composition root and may use anything.
+    ALLOWED = {
+        "events": set(),
+        "oplog": set(),
+        # Like `oplog`: vocabulary and arithmetic, no project imports. It
+        # must stay a leaf for the same reason — `app` is its only consumer
+        # today, but the Run Contract is meant to be readable by
+        # `ops_status.py` and anything else that reports on a run, and a
+        # module those can all import must sit below all of them.
+        "runsummary": set(),
+        "transport": {"events"},
+        "reporter": {"events", "transport"},
+        "history": {"events"},
+        "notion": {"events"},
+        "collector": {"events", "oplog"},
+        "daily": {"events", "history"},
+        "scheduler": {"daily", "history"},
+        "monthly": set(),
+        "backup": set(),
+        "agent": {"events", "oplog", "reporter", "scheduler", "transport"},
+        "review_cli": {"history"},
+        "app": None,  # composition root: unrestricted
+    }
+
+    def _packages(self):
+        names = {
+            p.name for p in SRC.iterdir() if p.is_dir() and p.name != "__pycache__"
+        }
+        names |= {p.stem for p in SRC.glob("*.py") if not p.stem.startswith("__")}
+        return names
+
+    def _sources(self, package):
+        target = SRC / package
+        return sorted(target.rglob("*.py")) if target.is_dir() else [SRC / f"{package}.py"]
+
+    def _edges(self):
+        """package -> set of sibling packages it imports."""
+        packages = self._packages()
+        edges = {}
+        for package in packages:
+            imported = set()
+            for path in self._sources(package):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        names = [a.name.split(".")[0] for a in node.names]
+                    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                        names = [node.module.split(".")[0]]
+                    else:
+                        continue
+                    imported |= {n for n in names if n in packages and n != package}
+            edges[package] = imported
+        return edges
+
+    def test_every_package_on_disk_has_a_declared_layer(self):
+        """The completeness property. A package added without a row here
+        fails immediately, instead of being the one package no boundary test
+        covers."""
+        self.assertEqual(
+            self._packages() - set(self.ALLOWED),
+            set(),
+            "a package under src/ has no entry in ALLOWED — declare its layer",
+        )
+
+    def test_no_declared_layer_refers_to_a_package_that_is_gone(self):
+        """The other direction: a stale row would quietly permit nothing."""
+        self.assertEqual(
+            set(self.ALLOWED) - self._packages(),
+            set(),
+            "ALLOWED names a package that no longer exists",
+        )
+
+    def test_no_package_imports_outside_its_declared_layer(self):
+        edges = self._edges()
+        for package, allowed in sorted(self.ALLOWED.items()):
+            if allowed is None:
+                continue
+            with self.subTest(package=package):
+                self.assertEqual(
+                    edges.get(package, set()) - allowed,
+                    set(),
+                    f"src/{package} imports outside its declared layer",
+                )
+
+    def test_the_declared_layers_are_not_wider_than_reality(self):
+        """An entry nobody uses is a permission granted for no reason, and it
+        would silently authorise the import the day someone adds it."""
+        edges = self._edges()
+        for package, allowed in sorted(self.ALLOWED.items()):
+            if allowed is None:
+                continue
+            with self.subTest(package=package):
+                self.assertEqual(
+                    allowed - edges.get(package, set()),
+                    set(),
+                    f"src/{package} is allowed imports it does not make",
+                )
+
+    def test_the_dependency_graph_is_acyclic(self):
+        """Not visible to any per-package test: a cycle is a property of the
+        graph. Reported as a concrete path so it can be acted on."""
+        edges = self._edges()
+        state = {}
+        cycles = []
+
+        def visit(node, stack):
+            state[node] = "open"
+            stack.append(node)
+            for nxt in sorted(edges.get(node, ())):
+                if state.get(nxt) == "open":
+                    cycles.append(" -> ".join(stack[stack.index(nxt):] + [nxt]))
+                elif state.get(nxt) is None:
+                    visit(nxt, stack)
+            stack.pop()
+            state[node] = "closed"
+
+        for package in sorted(self._packages()):
+            if state.get(package) is None:
+                visit(package, [])
+
+        self.assertEqual(cycles, [], f"import cycle(s): {cycles}")
+
+    def test_the_shared_log_writer_sits_below_everything(self):
+        """`oplog` is imported by `collector`, `agent` and `app`, and `app`
+        depends on the other two — so it has to be a leaf or it closes a
+        cycle. Stated separately because it is the reason the module is
+        top-level rather than inside any package."""
+        edges = self._edges()
+
+        self.assertEqual(edges["oplog"], set())
+        for consumer in ("collector", "agent", "app"):
+            with self.subTest(consumer=consumer):
+                self.assertIn("oplog", edges[consumer])

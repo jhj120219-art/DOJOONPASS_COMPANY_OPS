@@ -40,6 +40,7 @@ from history import HistoryDecision, HistoryFilter  # noqa: E402
 from notion import (  # noqa: E402
     ExecutionPlanSync,
     InMemoryNotionTransport,
+    NotionAPIError,
     NotionClient,
     SyncStatus,
 )
@@ -133,6 +134,7 @@ class OperationsScenarioTestCase(unittest.TestCase):
             notion_sync_log_path=self.notion_sync_log_path,
             late_update_log_path=self.logs_dir / "daily_late_update.log",
             monthly_state_path=self.logs_dir / "monthly_history_state.json",
+            run_summary_path=self.logs_dir / "last_run.json",
             notion_retry_queue_path=self.notion_retry_queue_path,
             keep_dir=self.keep_dir,
             review_dir=self.review_dir,
@@ -571,6 +573,53 @@ class OperationalObservabilityTests(OperationsScenarioTestCase):
         self.assertIn("NOTION_RESULT NOTION_CREATED", line)
         for secret_marker in ("Bearer", "ntn_", "secret_", "NOTION_API_TOKEN"):
             self.assertNotIn(secret_marker, line)
+
+    def test_a_failed_sync_logs_the_reason_without_leaking_a_credential(self):
+        """§56 on the path that actually writes free-form text.
+
+        The test above covers a *successful* sync, whose log line is built
+        entirely from closed values (an event_id, a project_id, an enum) —
+        there is nothing there that could carry a secret. A failed sync now
+        appends ` REASON <text>`, and that text originates outside this
+        system: it is the remote response body, truncated to 400 chars by
+        `notion/transport.py::_error_detail()`.
+
+        Normally that is Notion's own JSON, which cannot contain the token
+        (the token travels in a *request* header). The case worth pinning is
+        the one the transport already anticipates in its comments — a proxy
+        or captive portal answering instead of Notion, which is free to echo
+        request headers back. That is the only realistic way a credential
+        could reach this log, so it is what the probe imitates.
+        """
+        token = "ntn_" + "A1b2C3d4E5f6G7h8"
+
+        class ProxyEchoTransport(InMemoryNotionTransport):
+            def query_database(self, database_id, filter_):
+                raise NotionAPIError(
+                    "Notion API returned 502: Bad Gateway | "
+                    "<html><body>Proxy denied the upstream request<br>"
+                    f"Authorization: Bearer {token}</body></html>",
+                    status_code=502,
+                )
+
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=ProxyEchoTransport(), database_id="DB-1")
+        )
+        self._deliver(event_id="OPS-OBS-004")
+        self._run(notion_sync=sync)
+
+        log = self.notion_sync_log_path.read_text(encoding="utf-8")
+
+        # The diagnosis still reaches the operator — that is the whole point
+        # of the REASON field, and a redaction that removed it would be a
+        # different bug.
+        self.assertIn("NOTION_RESULT NOTION_RETRY_REQUIRED", log)
+        self.assertIn("502", log)
+
+        # But the credential does not.
+        self.assertNotIn(token, log)
+        for secret_marker in ("ntn_", "Bearer", "secret_", "NOTION_API_TOKEN"):
+            self.assertNotIn(secret_marker, log)
 
 
 class LateEventGuardCharacterizationTests(unittest.TestCase):

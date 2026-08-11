@@ -50,9 +50,17 @@ class EncodingSafetyTests(unittest.TestCase):
         self.assertIn("Notion", result.stdout)
 
     def test_the_module_reconfigures_stdout_and_stderr_to_utf8(self):
-        """The structural fix, so a refactor cannot silently drop it."""
+        """The structural fix, so a refactor cannot silently drop it.
+
+        Matched on the encoding argument rather than the whole call: the
+        same reconfigure() now also sets `line_buffering=True`, for an
+        unrelated operator-facing defect (stderr overtaking stdout in a
+        captured log). Pinning the exact call text made this test fail for a
+        change that did not touch encoding at all — a test that breaks on
+        the wrong axis stops being evidence about its own subject.
+        """
         source = (REPO_ROOT / "run_company_ops.py").read_text(encoding="utf-8")
-        self.assertIn('sys.stdout.reconfigure(encoding="utf-8")', source)
+        self.assertIn('sys.stdout.reconfigure(encoding="utf-8"', source)
         self.assertIn('sys.stderr.reconfigure(encoding="utf-8")', source)
 
     def test_init_notion_also_reconfigures_stdout_and_stderr_to_utf8(self):

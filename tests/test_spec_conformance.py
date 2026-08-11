@@ -1871,5 +1871,56 @@ class EmptySummaryRenderingTests(unittest.TestCase):
                     self._event(role=role)
 
 
+class RoleDisplayTableCoverageTests(unittest.TestCase):
+    """Two role->display-name tables exist, and that is correct:
+
+        daily/markdown.py::_ROLE_DISPLAY_NAMES     docs/06 Daily History
+        notion/properties.py::ROLE_DISPLAY_NAMES   docs/04 section 11
+
+    They are identical today, but they answer to different specs, so merging
+    them would invent a coupling neither doc asked for — docs/04 could rename
+    a Notion Owner label without docs/06 changing one character of a
+    Markdown heading. What they must NOT do is silently fall behind
+    `events.ROLES`, which is the one table both derive from.
+
+    That is a live risk rather than a hypothetical: BACKLOG A-1 (Desktop 3 =
+    ROLE=OTHER) is an open request to add a fifth role, and it names these
+    two tables plus `events.schema.ROLES` as the set to change together. The
+    failure is quiet — `_display_role()` falls back to `.get(role, role)`, so
+    a missed role renders as the raw `CTO_BACKEND` in Company History rather
+    than raising — which is exactly the kind of defect a test has to catch
+    because no run ever will.
+
+    `ROLE_ORDER` in daily/role_summary.py already has this guard
+    (test_daily_role_summary.py); these two did not.
+    """
+
+    def test_every_role_has_a_daily_history_display_name(self):
+        import daily.markdown as markdown
+        from events import ROLES
+
+        self.assertEqual(set(markdown._ROLE_DISPLAY_NAMES), set(ROLES))
+
+    def test_every_role_has_a_notion_display_name(self):
+        import notion.properties as properties
+        from events import ROLES
+
+        self.assertEqual(set(properties.ROLE_DISPLAY_NAMES), set(ROLES))
+
+    def test_no_display_name_is_empty(self):
+        """An empty label is worse than the raw role: it renders as a blank
+        Owner rather than something an operator can search for."""
+        import daily.markdown as markdown
+        import notion.properties as properties
+
+        for table_name, table in (
+            ("daily.markdown", markdown._ROLE_DISPLAY_NAMES),
+            ("notion.properties", properties.ROLE_DISPLAY_NAMES),
+        ):
+            for role, display in table.items():
+                with self.subTest(table=table_name, role=role):
+                    self.assertTrue(display and display.strip())
+
+
 if __name__ == "__main__":
     unittest.main()

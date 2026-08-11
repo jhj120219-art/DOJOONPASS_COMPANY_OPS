@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import sys
 from datetime import date, datetime
+from typing import Any
 from pathlib import Path
 
 # src/app/runner.py 기준으로 src/를 sys.path에 추가한다.
@@ -55,6 +56,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_NOTION_SYNC_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "notion_sync.log"
 DEFAULT_LATE_UPDATE_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "daily_late_update.log"
 
+from backup.git_ops import GitOperationError, is_authentication_failure  # noqa: E402
+from backup.result import BackupStatus  # noqa: E402
 from backup.runner import run_once as backup_run_once  # noqa: E402  (backup/__init__.py 없음 — 서브모듈 직접 import)
 from collector import (  # noqa: E402
     Collector,
@@ -90,47 +93,236 @@ from notion.dashboard_pending import (  # noqa: E402
     drain_pending,
     save_pending,
 )
-from scheduler import run_once as scheduler_run_once  # noqa: E402
+from oplog import (  # noqa: E402
+    MAX_LOG_ERROR as _MAX_LOG_ERROR,
+    append_line as _append_log_line,
+    bounded as _bounded,
+    bounded_error as _bounded_error,
+    one_line as _one_line,
+)
+from runsummary import (  # noqa: E402
+    ComponentResult,
+    ComponentStatus,
+    Failure,
+    Retryability,
+    RunSummary,
+    Severity,
+    now_iso,
+    write_summary,
+)
+from scheduler import SchedulerStatus, run_once as scheduler_run_once  # noqa: E402
 from scheduler.lock import release_lock, try_acquire_lock  # noqa: E402  (scheduler/__init__.py가 재노출하지 않음)
 from transport import run_intake  # noqa: E402
 
+
+PROJECT_ROOT_RUN_SUMMARY_DIR = PROJECT_ROOT / "runtime" / "runs"
+DEFAULT_RUN_SUMMARY_PATH = PROJECT_ROOT_RUN_SUMMARY_DIR / "last_run.json"
+
+# Component names used in the Run Summary. Fixed strings rather than the
+# step numbers in the comments below, because the numbers are a reading aid
+# that has already been renumbered twice (6.5, 6.7, 9b) while these are a
+# contract `ops_status.py` and the Dashboard read.
+C_TRANSPORT = "transport"
+C_COLLECTOR = "collector"
+C_NOTION_SYNC = "notion_sync"
+C_HISTORY_FILTER = "history_filter"
+C_DAILY = "daily"
+C_LATE_UPDATE = "late_update"
+C_MONTHLY = "monthly"
+C_BACKUP = "backup"
+C_DASHBOARD = "dashboard"
+
+# Severity per component — the codification of README RULE 5/9, not a new
+# judgement. A step that records or protects Company History is CRITICAL; a
+# step that projects it somewhere else is not, because the pipeline is
+# explicitly designed to keep recording while those are down.
+_SEVERITY = {
+    C_TRANSPORT: Severity.CRITICAL,
+    C_COLLECTOR: Severity.CRITICAL,
+    C_HISTORY_FILTER: Severity.CRITICAL,
+    C_DAILY: Severity.CRITICAL,
+    C_BACKUP: Severity.CRITICAL,
+    C_NOTION_SYNC: Severity.DEGRADED,
+    C_LATE_UPDATE: Severity.DEGRADED,
+    C_MONTHLY: Severity.DEGRADED,
+    C_DASHBOARD: Severity.DEGRADED,
+}
+
+
+class _Recorder:
+    """Collects `ComponentResult`s as the run proceeds.
+
+    Kept as a plain accumulator with no knowledge of the pipeline: the
+    Runner decides what each step's outcome means, this only remembers it
+    and knows which step is currently in flight so that an exception
+    escaping any step can still be attributed to it (see `run_once`'s
+    `finally`).
+    """
+
+    def __init__(self) -> None:
+        self.components: list[ComponentResult] = []
+        self.current: str | None = None
+
+    def begin(self, name: str) -> None:
+        self.current = name
+
+    def ok(self, name: str, **metrics: Any) -> None:
+        self._add(name, ComponentStatus.SUCCESS, metrics=metrics)
+
+    def skipped(self, name: str, **metrics: Any) -> None:
+        self._add(name, ComponentStatus.SKIPPED, metrics=metrics)
+
+    def failed(
+        self,
+        name: str,
+        *,
+        classification: str,
+        reason: str,
+        retryability: Retryability,
+        severity: Severity | None = None,
+        **metrics: Any,
+    ) -> None:
+        self._add(
+            name,
+            ComponentStatus.FAILED,
+            failure=Failure(
+                classification=classification,
+                severity=severity or _SEVERITY.get(name, Severity.DEGRADED),
+                retryability=retryability,
+                reason=_bounded(reason),
+            ),
+            metrics=metrics,
+        )
+
+    def _add(self, name, status, *, failure=None, metrics=None) -> None:
+        refs = _ARTIFACT_REFS.get(name, ())
+        self.components.append(
+            ComponentResult(
+                name=name,
+                status=status,
+                failure=failure,
+                metrics={k: v for k, v in (metrics or {}).items() if v is not None},
+                artifact_refs=refs,
+            )
+        )
+        if self.current == name:
+            self.current = None
+
+
+# Artifact Taxonomy, as measured rather than invented: every entry below is
+# a path this pipeline already wrote before this module existed. Nothing new
+# was created to satisfy the manifest — the manifest points at what was
+# already there, which is what makes it a summary rather than a second log.
+#
+#   Execution Evidence   logs/ and events/  — proof of what a run did
+#   Company Repository   daily/ and monthly/ — Policy / Knowledge truth
+#   Operational State    state/ and locks/  — resumption points, not evidence
+#
+# Relative to the runtime root so a manifest stays readable when the
+# repository moves, and so no absolute machine path is copied into an
+# artifact that may be read on another machine.
+_ARTIFACT_REFS = {
+    C_TRANSPORT: ("events/transport/", "events/incoming/"),
+    C_COLLECTOR: ("logs/collector.log", "events/processed/", "events/rejected/"),
+    C_NOTION_SYNC: ("logs/notion_sync.log", "state/notion_retry_queue.json"),
+    C_HISTORY_FILTER: ("history_candidates/keep/", "history_candidates/review/"),
+    C_DAILY: ("daily/", "state/daily_history_state.json"),
+    C_LATE_UPDATE: ("logs/daily_late_update.log",),
+    C_MONTHLY: ("monthly/", "state/monthly_history_state.json"),
+    C_BACKUP: ("backup_working_copy/", "state/backup_state.json"),
+    C_DASHBOARD: ("logs/notion_sync.log", "state/dashboard_pending.json"),
+}
+
+
+class RunResult(tuple):
+    """The Runner's return value.
+
+    Subclasses `tuple` so every existing consumer keeps working unchanged —
+    measured: 219 call sites, many doing five-way unpacking
+    (`a, b, c, d, e = result`) and index access (`result[3]`). Adding a
+    sixth element would have broken all of them, and adding a parallel
+    return path would have created two contracts to keep in step.
+
+    `.summary` is the addition: the Run Manifest for this execution.
+
+    No `__slots__`: a tuple subclass that declares it cannot carry the
+    instance attribute this class exists to add.
+    """
+
+    def __new__(cls, values, summary: RunSummary):
+        self = super().__new__(cls, values)
+        self._summary = summary  # type: ignore[attr-defined]
+        return self
+
+    @property
+    def summary(self) -> RunSummary:
+        return self._summary  # type: ignore[attr-defined]
+
+
+_FAILED_SYNC_STATUSES = (SyncStatus.NOTION_RETRY_REQUIRED, SyncStatus.NOTION_FAILED)
 
 def _log_notion_sync(log_path: Path, sync_result: SyncResult) -> None:
     """docs/04_NOTION_SYNC_SPEC.md §55: event_id / project_id / sync
     timestamp / result을 최소 기록한다. §56에 따라 NOTION_API_TOKEN 등
     민감정보는 절대 기록하지 않는다 — SyncResult에 애초에 그런 값이 담기지
-    않으므로(§56) 여기서 별도로 걸러낼 것이 없다. 형식은
-    collector/runtime.py `_log()`와 동일한 관례(타임스탬프 접두 1줄)를 따른다.
+    않으므로(§56) 여기서 별도로 걸러낼 것이 없다.
+
+    §55는 "최소"를 정한다. 실패한 Sync는 그 최소만으로는 진단할 수 없어서
+    `REASON`을 덧붙인다: `NOTION_RETRY_REQUIRED`는 재시도하면 되는 장애와
+    영원히 실패할 400을 같은 한 단어로 보고하며(BUG-13), 그 둘을 가르는
+    문장은 `SyncResult.error`에만 있었다. 그 값은 `run_company_ops.py`의
+    stdout과 반환 tuple에는 닿지만 로그에는 닿지 않았다 — 즉 Runner가
+    스케줄러 뒤에서 돌 때, 다시 말해 운영 중 실제로 도는 방식일 때는
+    사라졌다. Retry Queue가 같은 Event를 매 실행 재전송하는 것을 보면서도
+    이유를 알 수 없던 것이 이 누락이다.
+
+    실패에만 붙인다: 성공한 Sync의 `error`는 None이고, 매 줄에 빈 필드를
+    더하면 §55의 형식만 흐려진다.
     """
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        line = (
-            f"{timestamp} EVENT {sync_result.event_id} "
-            f"PROJECT {sync_result.project_id} "
-            f"NOTION_RESULT {sync_result.status.value}\n"
-        )
-        with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(line)
-    except OSError:
-        pass
+    suffix = ""
+    if sync_result.status in _FAILED_SYNC_STATUSES and sync_result.error:
+        # 줄바꿈은 `_append_log_line()`이 escape하고, 길이는 `_bounded()`가
+        # 막는다. 보통은 `_error_detail()`이 이미 400자로 자른 뒤라 이 상한에
+        # 닿지 않는다 — 닿는 것은 아무 층도 자르지 않은 문자열뿐이다.
+        suffix = f" REASON {_bounded(sync_result.error)}"
+
+    _append_log_line(
+        log_path,
+        f"EVENT {sync_result.event_id} "
+        f"PROJECT {sync_result.project_id} "
+        f"NOTION_RESULT {sync_result.status.value}{suffix}",
+    )
 
 
 def _log_late_update(log_path: Path, message: str) -> None:
     """docs/06 §41: a History update failure must be recorded, not swallowed.
 
-    Same one-line, timestamp-prefixed convention as `_log_notion_sync()` and
-    `collector/runtime.py::_log()`, and the same rule: logging must never be
-    the thing that fails a run. Only dates, counts, and event_ids are
-    written — no Event content, no path outside this project.
+    Only dates, counts, and event_ids are written — no Event content, no
+    path outside this project.
     """
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(f"{timestamp} LATE_UPDATE {message}\n")
-    except OSError:
-        pass
+    _append_log_line(log_path, f"LATE_UPDATE {message}")
+
+
+def _log_dashboard(log_path: Path, message: str) -> None:
+    """CEO Decision ④ Operations Dashboard 단계의 진단 기록.
+
+    The Dashboard is this system's metrics sink, and it was the one step
+    whose failures reached no sink at all: `record_run()` returning FAILED
+    was answered only by a silent re-queue, and an unexpected exception was
+    answered by a bare `pass`. Both are deliberately non-fatal (④: Dashboard
+    실패가 Runtime을 막지 않는다) — but non-fatal is not the same as
+    invisible. An operator watching a Dashboard that has stopped updating
+    had no way to tell "Notion is down" from "the recording code is
+    broken", because neither left a trace anywhere: not stdout, not the
+    return tuple, not a log.
+
+    Written to notion_sync.log rather than a new file: the Dashboard is a
+    Notion-side concern, and §55's log already carries every other Notion
+    step's outcome. The `DASHBOARD` prefix keeps the two apart for grep,
+    exactly as `LATE_UPDATE` does in its own log. Same §56 rule applies —
+    nothing here carries a credential.
+    """
+    _append_log_line(log_path, f"DASHBOARD {message}")
 
 
 def run_once(
@@ -158,6 +350,7 @@ def run_once(
     scheduler_state_path: Path | None = None,
     backup_state_path: Path | None = None,
     run_id: str | None = None,
+    run_summary_path: Path | None = None,
 ):
     """Runner 1회 실행. 반환값은 각 단계가 이미 반환하는 기존 객체들의 tuple이다
     (IntakeSummary, RuntimeSummary, SchedulerRunResult, BackupLogEntry,
@@ -181,18 +374,50 @@ def run_once(
     if not try_acquire_lock(runner_lock_path, now=now):
         return None
 
+    # Run Contract bookkeeping. `recorder` accumulates one ComponentResult
+    # per step; the `finally` below turns whatever it holds into a Run
+    # Summary — including on the abort paths, which is the point. A run that
+    # dies in step 5 previously left the manifest-shaped question "what did
+    # the first four steps do?" answerable only from logs.
+    recorder = _Recorder()
+    resolved_run_summary_path = (
+        Path(run_summary_path) if run_summary_path is not None else DEFAULT_RUN_SUMMARY_PATH
+    )
+    resolved_manifest_run_id = run_id or now_iso(now)
+    run_summary: RunSummary | None = None
+
     try:
         # 2. Transport — docs/07 §9(Collector 실행 이전 수신측 promotion),
         #    docs/12 §5.2 Transport 책임, §7 Runtime Sequence
+        recorder.begin(C_TRANSPORT)
         intake_summary = run_intake(
             transport_dir=transport_dir,
             incoming_dir=incoming_dir,
             processed_dir=processed_dir,
             rejected_dir=rejected_dir,
         )
+        # BUG-39: `failed` / `skipped_not_stable` / `skipped_invalid` were
+        # computed here and read by nobody. They are the record of which
+        # Events did not make it in, which is exactly what an operator asks
+        # after a quiet day.
+        # Direct attribute access, not `getattr(..., default)`: every field
+        # below is declared on `IntakeSummary`, so a default would only be
+        # able to hide the day one is renamed — reporting 0 skipped files
+        # forever instead of failing. It would also make the consumption
+        # invisible to `ResultFieldConsumptionTests`, which reads this file
+        # as text to check that BUG-39's discarded fields are now read.
+        recorder.ok(
+            C_TRANSPORT,
+            moved=len(intake_summary.moved),
+            failed=len(intake_summary.failed),
+            skipped_not_stable=len(intake_summary.skipped_not_stable),
+            skipped_already_present=len(intake_summary.skipped_already_present),
+            skipped_invalid=len(intake_summary.skipped_invalid),
+        )
 
         # 3. Collector — docs/07 §9 "Collector 실행" + "Pending Event 처리"
         #    (incoming/ 전량 소진이 곧 Pending 처리, docs/03 §7 기본 처리 Pipeline)
+        recorder.begin(C_COLLECTOR)
         seen_store = PersistentSeenEventStore(state_path=collector_state_path)
         collector_instance = Collector(seen_store=seen_store)
         collector_summary = collector_run_once(
@@ -203,6 +428,18 @@ def run_once(
             log_path=collector_log_path,
         )
         seen_store.record_run(now.isoformat(timespec="seconds"))
+        # `failed` counts Event files this run could not process. It is not a
+        # component failure: docs/03 §53 makes per-file isolation the design,
+        # and one malformed Event must not make an ordinary run look broken
+        # (the same reasoning the exit-code decision below rests on). It is
+        # recorded as a metric so it is visible without being alarming.
+        recorder.ok(
+            C_COLLECTOR,
+            accepted=collector_summary.accepted,
+            duplicate=collector_summary.duplicate,
+            rejected=collector_summary.rejected,
+            failed=collector_summary.failed,
+        )
 
         # 4. Notion Sync — docs/04_NOTION_SYNC_SPEC.md §3, §6, §29-37, §55
         #    (Notion Runtime Integration Phase 2에서 연결; Retry Queue는
@@ -220,12 +457,16 @@ def run_once(
         #    Backup)를 막지 않도록 여기서도 방어적으로 잡아 NOTION_FAILED로 기록한다
         #    (collector_runtime.run_once가 이미 쓰는 것과 동일한 방식, docs/03 §53).
         notion_sync_results: list[SyncResult] = []
+        # Resolved outside the `if` because step 9b (Operations Dashboard)
+        # logs here too, and `dashboard_client` is independent of
+        # `notion_sync` — run_once()'s contract allows one without the other.
+        # Resolution is pure (no file is created until something is logged).
+        resolved_notion_sync_log_path = (
+            Path(notion_sync_log_path)
+            if notion_sync_log_path is not None
+            else DEFAULT_NOTION_SYNC_LOG_PATH
+        )
         if notion_sync is not None:
-            resolved_notion_sync_log_path = (
-                Path(notion_sync_log_path)
-                if notion_sync_log_path is not None
-                else DEFAULT_NOTION_SYNC_LOG_PATH
-            )
             resolved_retry_queue_path = (
                 Path(notion_retry_queue_path)
                 if notion_retry_queue_path is not None
@@ -265,7 +506,7 @@ def run_once(
                         status=SyncStatus.NOTION_FAILED,
                         event_id=event.event_id,
                         project_id=event.project_id,
-                        error=str(exc),
+                        error=_bounded_error(exc),
                     )
                 _log_notion_sync(resolved_notion_sync_log_path, sync_result)
                 # CEO Policy Decision (Notion Retry Architecture Plan A):
@@ -273,7 +514,7 @@ def run_once(
                 # duplicated — dedup is by event_id); any non-error result
                 # clears it from the queue, whether it arrived there via the
                 # queue itself or fresh this run.
-                if sync_result.status in (SyncStatus.NOTION_RETRY_REQUIRED, SyncStatus.NOTION_FAILED):
+                if sync_result.status in _FAILED_SYNC_STATUSES:
                     retry_queue_upsert(queue_entries, event, now=now, index=queue_index)
                     queue_dirty = True
                 elif retry_queue_remove(queue_entries, event.event_id, index=queue_index):
@@ -321,10 +562,43 @@ def run_once(
                         if save_exc.__context__ is None:
                             raise
 
+            # Notion Sync's component verdict. Per-Event, not per-call: a run
+            # that synced nine Events and queued one is not a failed sync
+            # step, it is a step that did its job and left one for the retry
+            # queue — so `failed` counts Events, and the step is FAILED only
+            # if at least one could not be applied.
+            #
+            # Retryability comes from the status the sync itself reported,
+            # which is the distinction BUG-13 is about: NOTION_FAILED is the
+            # unexpected-exception path (unknown — it may never clear), while
+            # NOTION_RETRY_REQUIRED is what the queue exists for.
+            queued = [r for r in notion_sync_results if r.status in _FAILED_SYNC_STATUSES]
+            if queued:
+                unknown = any(r.status is SyncStatus.NOTION_FAILED for r in queued)
+                recorder.failed(
+                    C_NOTION_SYNC,
+                    classification="NOTION_SYNC_INCOMPLETE",
+                    reason=queued[0].error or "",
+                    retryability=(
+                        Retryability.UNKNOWN if unknown else Retryability.RETRYABLE
+                    ),
+                    processed=len(notion_sync_results),
+                    queued=len(queued),
+                )
+            else:
+                recorder.ok(C_NOTION_SYNC, processed=len(notion_sync_results))
+        else:
+            # Not a fault. docs/04's own contract makes `notion_sync=None` a
+            # supported deployment, and README RULE 9 keeps Company History
+            # recording before Notion is ever configured. Reporting this as
+            # FAILED would make every pre-Notion install look broken.
+            recorder.skipped(C_NOTION_SYNC)
+
         # 5. History Filter — docs/07 §37 step 6 "History Pipeline",
         #    docs/05 §2 Event -> History Filter -> Candidate
         #    (ACCEPTED만 대상. DUPLICATE/REJECTED/FAILED는 History 대상이 아니다.
         #    processed_dir 재스캔이 아니라 이번 실행의 반환값만 사용한다 — Gap 3.)
+        recorder.begin(C_HISTORY_FILTER)
         history_filter = HistoryFilter()
         repository = FileHistoryRepository(keep_dir=keep_dir, review_dir=review_dir)
         # 이번 실행에서 KEEP Candidate가 새로 생긴 날짜들. 6.5단계(Late Event
@@ -348,6 +622,7 @@ def run_once(
                 # tests/test_architecture_invariants.py)을 코드 텍스트상으로
                 # 흐리게 만들 뿐 실제로 바뀌는 것은 없다.
                 kept_dates.add(datetime.fromisoformat(event.timestamp).date())
+        recorder.ok(C_HISTORY_FILTER, kept_dates=len(kept_dates))
 
         # 6. Daily History — docs/07 §37 steps 7-8
         #    "Missing Daily Date 계산" + "Daily Catch-up"
@@ -362,6 +637,61 @@ def run_once(
             daily_output_dir=local_master_dir / "daily",
             already_locked=True,
         )
+
+        resolved_late_update_log_path = (
+            Path(late_update_log_path)
+            if late_update_log_path is not None
+            else DEFAULT_LATE_UPDATE_LOG_PATH
+        )
+
+        # 6b. Daily Close 실패 진단 (BUG-39의 한 조각).
+        #     `SchedulerRunResult`는 어느 날짜에서 멈췄는지(`failed_date`)와
+        #     왜 멈췄는지(`error`)를 이미 채워서 돌려준다. 두 값 모두 읽는
+        #     곳이 없었다 — `run_company_ops.py`는 `status`와
+        #     `generated_dates`만 출력하므로, Daily Close가 실패하면 운영자가
+        #     보는 것은 `FAILED, generated=[]` 한 줄뿐이었다. 그 다음에 할 수
+        #     있는 일이 없는 메시지다.
+        #
+        #     Scheduler는 첫 실패 날짜에서 멈추므로(`scheduler.py`) 그 날짜와
+        #     그 이후 날짜는 아직 Daily 파일이 없다. 즉 이것은 무시해도 되는
+        #     실패가 아니라 다음 실행이 반드시 다시 시도해야 하는 지점이고,
+        #     그 지점을 아는 유일한 방법이 이 두 필드다.
+        #
+        #     기록 위치는 Monthly 실패와 같은 daily_late_update.log다 — Daily
+        #     History 도메인의 실패는 이미 전부 그 파일에 모인다. BUG-39가
+        #     말하는 "종합 run summary artifact"를 만드는 것이 아니다(그건
+        #     형식·위치 결정이 필요한 별건이다). 이미 있는 sink에, 이미 있는
+        #     형식으로, 지금 버려지는 실패 정보만 흘려보낸다.
+        if scheduler_result.status is SchedulerStatus.FAILED:
+            _log_late_update(
+                resolved_late_update_log_path,
+                f"SCHEDULER_FAILED date="
+                f"{scheduler_result.failed_date.isoformat() if scheduler_result.failed_date else 'unknown'} "
+                f"{_bounded(scheduler_result.error or '')}",
+            )
+            # CRITICAL: this is the step that writes Company History. Its
+            # failure is the one this pipeline exists to prevent, and it is
+            # retryable — Scheduler stops at the first failing date and the
+            # next run resumes from exactly there, which is why the manifest
+            # carries `failed_date` rather than only a status.
+            recorder.failed(
+                C_DAILY,
+                classification="DAILY_CLOSE_FAILED",
+                reason=scheduler_result.error or "",
+                retryability=Retryability.RETRYABLE,
+                failed_date=(
+                    scheduler_result.failed_date.isoformat()
+                    if scheduler_result.failed_date
+                    else None
+                ),
+                generated_days=len(scheduler_result.generated_dates),
+            )
+        else:
+            recorder.ok(
+                C_DAILY,
+                status=scheduler_result.status.value,
+                generated_days=len(scheduler_result.generated_dates),
+            )
 
         # 6.5. Late Event Update — docs/06 §36-40.
         #     Audit BUG-17(P0) 해소. 이미 Daily Close가 끝난 날짜의 Event가
@@ -388,12 +718,9 @@ def run_once(
         #     "언제 수정됐는지 추적 가능"은 갱신된 Daily 파일 자신의
         #     `Last Updated At` / `Late Events Added`가 담당한다. 다만 실패는
         #     그 파일에 남지 않으므로(§41 "오류 기록") 로그로 남긴다.
-        resolved_late_update_log_path = (
-            Path(late_update_log_path)
-            if late_update_log_path is not None
-            else DEFAULT_LATE_UPDATE_LOG_PATH
-        )
+        recorder.begin(C_LATE_UPDATE)
         late_updated_dates: list[date] = []
+        late_update_failures: list[str] = []
         for kept_date in sorted(kept_dates):
             late_result = update_daily_history(
                 repository,
@@ -410,10 +737,28 @@ def run_once(
                     f"events={','.join(late_result.added_event_ids)}",
                 )
             elif late_result.outcome is LateUpdateOutcome.FAILED:
+                late_update_failures.append(late_result.error or kept_date.isoformat())
                 _log_late_update(
                     resolved_late_update_log_path,
-                    f"FAILED {kept_date.isoformat()} {late_result.error}",
+                    f"FAILED {kept_date.isoformat()} {_bounded(late_result.error or '')}",
                 )
+
+        # DEGRADED rather than CRITICAL: a Late Event that fails to merge is
+        # not lost. Its Candidate is already durable in history_candidates/
+        # (step 5 ran first, and that ordering is why this is recoverable at
+        # all), so the next run retries the same date. docs/06 §41 asks for
+        # the failure to be recorded, which is what this is.
+        if late_update_failures:
+            recorder.failed(
+                C_LATE_UPDATE,
+                classification="LATE_EVENT_MERGE_FAILED",
+                reason=late_update_failures[0],
+                retryability=Retryability.RETRYABLE,
+                updated=len(late_updated_dates),
+                failed=len(late_update_failures),
+            )
+        else:
+            recorder.ok(C_LATE_UPDATE, updated=len(late_updated_dates))
 
         # 6.7. Monthly Consolidation — docs/09 §50-51.
         #      docs/09 §50이 정한 순서 그대로다: Daily Catch-up 다음, Backup
@@ -435,6 +780,9 @@ def run_once(
             if monthly_state_path is not None
             else DEFAULT_MONTHLY_STATE_PATH
         )
+        recorder.begin(C_MONTHLY)
+        monthly_failures: list[str] = []
+        monthly_done = 0
         try:
             for updated_date in late_updated_dates:
                 mark_month_dirty(resolved_monthly_state_path, updated_date)
@@ -451,6 +799,7 @@ def run_once(
                     MonthlyStatus.MONTHLY_GENERATED,
                     MonthlyStatus.MONTHLY_UPDATED,
                 ):
+                    monthly_done += 1
                     _log_late_update(
                         resolved_late_update_log_path,
                         f"{month_result.status.value} {month_result.key} "
@@ -460,10 +809,16 @@ def run_once(
                     MonthlyStatus.MONTHLY_PENDING,
                     MonthlyStatus.MONTHLY_FAILED,
                 ):
+                    # PENDING is not a failure: docs/09 §10 declines to build
+                    # a month whose Daily set has a hole, on purpose, and the
+                    # next run builds it once Daily Catch-up fills the gap.
+                    # Only FAILED is recorded as one.
+                    if month_result.status is MonthlyStatus.MONTHLY_FAILED:
+                        monthly_failures.append(month_result.error or month_result.key)
                     _log_late_update(
                         resolved_late_update_log_path,
                         f"{month_result.status.value} {month_result.key} "
-                        f"{month_result.error}",
+                        f"{_bounded(month_result.error or '')}",
                     )
         except Exception as monthly_exc:  # noqa: BLE001  (§74: Monthly 실패가 Runtime을 막지 않는다)
             # 삼키되, 흔적 없이 삼키지는 않는다. monthly_run_once()가 스스로
@@ -474,17 +829,105 @@ def run_once(
             # 정하고 있으므로, 여기서 막지 않는 것과 기록하는 것은 양립한다.
             _log_late_update(
                 resolved_late_update_log_path,
-                f"MONTHLY_FAILED (unexpected) {type(monthly_exc).__name__}: {monthly_exc}",
+                f"MONTHLY_FAILED (unexpected) {_bounded_error(monthly_exc)}",
             )
+            monthly_failures.append(_bounded_error(monthly_exc))
+
+        if monthly_failures:
+            recorder.failed(
+                C_MONTHLY,
+                classification="MONTHLY_CONSOLIDATION_FAILED",
+                reason=monthly_failures[0],
+                retryability=Retryability.RETRYABLE,
+                consolidated=monthly_done,
+                failed=len(monthly_failures),
+            )
+        else:
+            recorder.ok(C_MONTHLY, consolidated=monthly_done)
 
         # 7. Backup — docs/07 §37 step 9 "Backup Pending 처리", docs/08 §14-15
-        backup_entry = backup_run_once(
-            local_master_dir,
-            backup_working_copy_dir,
-            state_path=backup_state_path,
-            now=now,
-            run_id=run_id,
-        )
+        recorder.begin(C_BACKUP)
+        try:
+            backup_entry = backup_run_once(
+                local_master_dir,
+                backup_working_copy_dir,
+                state_path=backup_state_path,
+                now=now,
+                run_id=run_id,
+            )
+        except GitOperationError as exc:
+            # Classify, then re-raise unchanged.
+            #
+            # Measured against a real broken remote: without this, the
+            # manifest recorded `STEP_ABORTED [CRITICAL/UNKNOWN]` from the
+            # generic `finally` fallback — while `backup_state.json` said
+            # BACKUP_PENDING and `run_company_ops.py` told the operator "다음
+            # Runner 실행이 자동으로 다시 push합니다". The manifest was the
+            # least precise account of a failure the rest of the system had
+            # already classified correctly, and it is the account
+            # `ops_status.py` reads.
+            #
+            # That mattered concretely: ATTENTION only surfaces PERMANENT
+            # failures, so a genuinely permanent credential failure arriving
+            # by this path would have been filed as UNKNOWN and never
+            # surfaced. `is_authentication_failure()` is docs/08 §21's own
+            # rule and is what `run_company_ops.py` already uses — reused
+            # here rather than restated, so the two cannot disagree.
+            #
+            # Re-raised because whether run_once() should absorb a Backup
+            # failure is BUG-4, a contract decision (BACKLOG A-18). This
+            # changes what the run *records*, not what it does.
+            permanent = is_authentication_failure(str(exc))
+            recorder.failed(
+                C_BACKUP,
+                classification="BACKUP_FAILED" if permanent else "BACKUP_PENDING",
+                reason=str(exc),
+                retryability=(
+                    Retryability.PERMANENT if permanent else Retryability.RETRYABLE
+                ),
+                severity=Severity.CRITICAL if permanent else Severity.DEGRADED,
+            )
+            raise
+        # docs/08 §19/§21 already classify these two; the manifest carries
+        # that classification rather than inventing one.
+        #
+        #   PENDING  a transient push failure. The commit exists locally and
+        #            the next run re-pushes it — routine, so DEGRADED.
+        #   FAILED   credential/permission. §62 forbids retrying it forever;
+        #            it needs a person, so CRITICAL.
+        #
+        # This is precisely the distinction that makes DEGRADED worth having:
+        # collapsing both into "backup broke" would page someone for the
+        # ordinary case, and collapsing both into success would hide the one
+        # that never clears. BUG-39: `push_result` and `commit_hash` reach an
+        # artifact here for the first time.
+        if backup_entry.final_status is BackupStatus.PENDING:
+            recorder.failed(
+                C_BACKUP,
+                classification="BACKUP_PENDING",
+                reason=backup_entry.push_result or "",
+                retryability=Retryability.RETRYABLE,
+                severity=Severity.DEGRADED,
+                commit_hash=backup_entry.commit_hash,
+                changed_files=len(backup_entry.changed_files),
+            )
+        elif backup_entry.final_status is BackupStatus.FAILED:
+            recorder.failed(
+                C_BACKUP,
+                classification="BACKUP_FAILED",
+                reason=backup_entry.push_result or "",
+                retryability=Retryability.PERMANENT,
+                commit_hash=backup_entry.commit_hash,
+                changed_files=len(backup_entry.changed_files),
+            )
+        else:
+            recorder.ok(
+                C_BACKUP,
+                status=backup_entry.final_status.value,
+                commit_hash=backup_entry.commit_hash,
+                changed_files=len(backup_entry.changed_files),
+                deleted_files=len(backup_entry.deleted_files),
+            )
 
         # 8. State — docs/07 §37 step 10 "State Save 확인"
         #    Collector(collector_state.json) / Scheduler(daily_history_state.json) /
@@ -519,6 +962,7 @@ def run_once(
         #     감싸는 것과 다른 처리였다. 이미 History/Backup까지 전부 성공한
         #     실행 결과가 Dashboard 기록 단계의 예기치 못한 회귀 하나로 유실되지
         #     않도록, 같은 파일의 기존 방어 패턴과 동일하게 여기서도 감싼다.
+        recorder.begin(C_DASHBOARD)
         if dashboard_client is not None:
             try:
                 resolved_dashboard_pending_path = (
@@ -529,7 +973,18 @@ def run_once(
                 resolved_run_id = run_id or now.isoformat(timespec="seconds")
 
                 # 밀린 기록 먼저 재시도한다(Retry Queue와 동일한 "먼저 처리" 원칙).
-                drain_pending(resolved_dashboard_pending_path, dashboard_client)
+                drained, still_pending = drain_pending(
+                    resolved_dashboard_pending_path, dashboard_client
+                )
+                # drain_pending()'s return value was previously discarded, so a
+                # backlog that kept failing every run was invisible: the queue
+                # grew on disk and nothing said so. Logged only when there was
+                # actually a backlog — a healthy run stays silent.
+                if drained or still_pending:
+                    _log_dashboard(
+                        resolved_notion_sync_log_path,
+                        f"DRAIN_PENDING drained={drained} still_pending={still_pending}",
+                    )
 
                 dashboard_result = dashboard_record_run(
                     dashboard_client,
@@ -541,27 +996,100 @@ def run_once(
                     backup_entry=backup_entry,
                     notion_sync_results=notion_sync_results,
                 )
-                if (
-                    dashboard_result.outcome is DashboardOutcome.FAILED
-                    and dashboard_result.properties is not None
-                ):
-                    save_pending(
-                        resolved_dashboard_pending_path,
-                        run_id=resolved_run_id,
-                        properties=dashboard_result.properties,
-                        now=now,
+                if dashboard_result.outcome is DashboardOutcome.FAILED:
+                    _log_dashboard(
+                        resolved_notion_sync_log_path,
+                        f"FAILED run_id={resolved_run_id} {_bounded(dashboard_result.error or '')}",
                     )
-            except Exception:  # noqa: BLE001  (CEO ④: Dashboard 실패가 Runtime을 막지 않는다)
-                pass
+                    if dashboard_result.properties is not None:
+                        save_pending(
+                            resolved_dashboard_pending_path,
+                            run_id=resolved_run_id,
+                            properties=dashboard_result.properties,
+                            now=now,
+                        )
+                    recorder.failed(
+                        C_DASHBOARD,
+                        classification="DASHBOARD_RECORD_FAILED",
+                        reason=dashboard_result.error or "",
+                        retryability=Retryability.RETRYABLE,
+                        still_pending=still_pending,
+                    )
+                elif dashboard_result.outcome is DashboardOutcome.SKIPPED_NOT_CONFIGURED:
+                    recorder.skipped(C_DASHBOARD)
+                else:
+                    recorder.ok(
+                        C_DASHBOARD, drained=drained, still_pending=still_pending
+                    )
+            except Exception as dashboard_exc:  # noqa: BLE001  (CEO ④: Dashboard 실패가 Runtime을 막지 않는다)
+                # 삼키되, 흔적 없이 삼키지는 않는다 — 6.7단계 Monthly와 같은
+                # 처리다. `pass`였을 때는 이 경로로 빠진 실행이 Dashboard를
+                # 갱신하지 않은 이유를 어디에서도 알 수 없었다.
+                # `resolved_run_id`는 이 예외가 그 줄 이전에 발생했다면 아직
+                # 없으므로 `run_id`(호출자가 준 원본)를 쓴다.
+                _log_dashboard(
+                    resolved_notion_sync_log_path,
+                    f"FAILED (unexpected) run_id={run_id} "
+                    f"{_bounded_error(dashboard_exc)}",
+                )
+                recorder.failed(
+                    C_DASHBOARD,
+                    classification="DASHBOARD_UNEXPECTED_ERROR",
+                    reason=_bounded_error(dashboard_exc),
+                    retryability=Retryability.UNKNOWN,
+                )
+        else:
+            # CEO ④'s Dashboard is optional in exactly the way Notion Sync
+            # is. An unconfigured one is not a fault.
+            recorder.skipped(C_DASHBOARD)
 
-        return (
-            intake_summary,
-            collector_summary,
-            scheduler_result,
-            backup_entry,
-            tuple(notion_sync_results),
+        run_summary = RunSummary(
+            run_id=resolved_manifest_run_id,
+            started_at=now_iso(now),
+            finished_at=now_iso(datetime.now().astimezone()),
+            components=tuple(recorder.components),
+        )
+        return RunResult(
+            (
+                intake_summary,
+                collector_summary,
+                scheduler_result,
+                backup_entry,
+                tuple(notion_sync_results),
+            ),
+            run_summary,
         )
 
     finally:
         # 10. Runner Lock Release — docs/07 §37 step 12
         release_lock(runner_lock_path)
+
+        # Run Manifest — written on EVERY exit path, including the aborting
+        # ones. That is the property worth having: a run that dies in step 5
+        # used to leave the question "what did the first four steps do?"
+        # answerable only by reading logs, and `run_company_ops.py` printed
+        # nothing at all because it never reached its reporting code.
+        #
+        # The step that raised is attributed to whichever component was in
+        # flight (`recorder.current`) rather than guessed at, so a Backup
+        # GitOperationError shows up as a FAILED backup component with a
+        # classification — and the exception still propagates, unchanged.
+        # Whether run_once() should absorb it instead remains BUG-4, and is
+        # deliberately not decided here.
+        if run_summary is None:
+            in_flight = recorder.current
+            if in_flight is not None:
+                recorder.failed(
+                    in_flight,
+                    classification="STEP_ABORTED",
+                    reason="the run aborted inside this step",
+                    retryability=Retryability.UNKNOWN,
+                    severity=_SEVERITY.get(in_flight, Severity.CRITICAL),
+                )
+            run_summary = RunSummary(
+                run_id=resolved_manifest_run_id,
+                started_at=now_iso(now),
+                finished_at=now_iso(datetime.now().astimezone()),
+                components=tuple(recorder.components),
+            )
+        write_summary(resolved_run_summary_path, run_summary)

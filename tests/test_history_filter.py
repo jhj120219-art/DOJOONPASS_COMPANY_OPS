@@ -210,7 +210,12 @@ class HistoryFilterBoundaryTests(unittest.TestCase):
             re.compile(r"^\s*import\s+(collector|transport|reporter)\b", re.MULTILINE),
             re.compile(r"^\s*from\s+(collector|transport|reporter)\b", re.MULTILINE),
         )
-        for py_file in history_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(history_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {history_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for pattern in forbidden:
                 self.assertIsNone(
@@ -225,7 +230,12 @@ class HistoryFilterBoundaryTests(unittest.TestCase):
         # path itself.
         history_src = Path(__file__).resolve().parents[1] / "src" / "history"
         forbidden = ("C:\\Users", "D:\\", "OneDrive\\")
-        for py_file in history_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(history_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {history_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             code_without_docstrings = re.sub(r'""".*?"""', "", content, flags=re.DOTALL)
             for token in forbidden:

@@ -184,6 +184,7 @@ class MultiDesktopTestCase(unittest.TestCase):
             notion_sync_log_path=self.root / "notion_sync.log",
             late_update_log_path=self.root / "daily_late_update.log",
             monthly_state_path=self.root / "monthly_history_state.json",
+            run_summary_path=self.root / "last_run.json",
             notion_retry_queue_path=self.root / "notion_retry_queue.json",
             keep_dir=self.keep_dir,
             review_dir=self.review_dir,

@@ -97,5 +97,65 @@ class NotionClientProjectLookupTests(unittest.TestCase):
         self.assertEqual(found["properties"]["Status"]["select"]["name"], "BLOCKED")
 
 
+class InMemoryTransportDatabaseIsolationTests(unittest.TestCase):
+    """One transport, several databases — the way production wires it.
+
+    `run_company_ops.py` builds ONE transport and hands it to two
+    NotionClients: one bound to the PROJECTS database, one to OPS_RUNS. Real
+    Notion keeps those apart by database id.
+
+    `InMemoryNotionTransport` used to ignore `database_id` entirely and keep
+    every page in a single pool, so `query_database()` answered from all of
+    them. A test that mirrored the production wiring would therefore find an
+    OPS_RUNS run record when it asked PROJECTS for a project — and, because
+    the shapes overlap, would very likely *pass* while the real API returned
+    nothing.
+
+    A test double that is wrong in the direction of "everything is found" is
+    the dangerous direction: it hides missing writes rather than inventing
+    failures. These tests pin the isolation so it cannot regress quietly.
+    """
+
+    def _project_id(self, value):
+        return {"Project ID": {"rich_text": [{"text": {"content": value}}]}}
+
+    def test_a_row_in_one_database_is_not_visible_from_another(self):
+        transport = InMemoryNotionTransport()
+        projects = NotionClient(transport=transport, database_id="projects-db")
+        ops_runs = NotionClient(transport=transport, database_id="ops-runs-db")
+
+        ops_runs.create_project(self._project_id("SEARCH_FRONTEND"))
+
+        self.assertIsNone(projects.find_project("SEARCH_FRONTEND"))
+
+    def test_each_database_finds_its_own_row(self):
+        transport = InMemoryNotionTransport()
+        projects = NotionClient(transport=transport, database_id="projects-db")
+        ops_runs = NotionClient(transport=transport, database_id="ops-runs-db")
+
+        projects.create_project(self._project_id("SEARCH_FRONTEND"))
+        ops_runs.create_project(self._project_id("SEARCH_FRONTEND"))
+
+        in_projects = projects.find_project("SEARCH_FRONTEND")
+        in_ops_runs = ops_runs.find_project("SEARCH_FRONTEND")
+
+        self.assertIsNotNone(in_projects)
+        self.assertIsNotNone(in_ops_runs)
+        # Same Project ID, genuinely different rows — not one row seen twice.
+        self.assertNotEqual(in_projects["id"], in_ops_runs["id"])
+
+    def test_update_still_addresses_a_page_by_id_across_databases(self):
+        """Real Notion updates a page by page id, with no database in the
+        request — so isolation must apply to the query, not to the update."""
+        transport = InMemoryNotionTransport()
+        ops_runs = NotionClient(transport=transport, database_id="ops-runs-db")
+
+        page = ops_runs.create_project(self._project_id("SEARCH_FRONTEND"))
+        ops_runs.update_project(page["id"], {"Status": {"select": {"name": "BLOCKED"}}})
+
+        found = ops_runs.find_project("SEARCH_FRONTEND")
+        self.assertEqual(found["properties"]["Status"]["select"]["name"], "BLOCKED")
+
+
 if __name__ == "__main__":
     unittest.main()

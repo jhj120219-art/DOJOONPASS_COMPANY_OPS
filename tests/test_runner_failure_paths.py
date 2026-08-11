@@ -62,6 +62,7 @@ from notion import (  # noqa: E402
 from notion.retry_queue import RetryQueueError  # noqa: E402
 from notion.retry_queue import save_queue as save_retry_queue  # noqa: E402
 from notion.sync import SyncResult, SyncStatus  # noqa: E402
+from runsummary import read_summary  # noqa: E402
 from scheduler.state import SchedulerStateError  # noqa: E402
 from reporter import Reporter  # noqa: E402
 
@@ -151,6 +152,7 @@ class RunnerFailurePathTestCase(unittest.TestCase):
         self.notion_sync_log_path = self.root / "runtime" / "logs" / "notion_sync.log"
         self.notion_retry_queue_path = self.root / "runtime" / "state" / "notion_retry_queue.json"
         self.dashboard_pending_path = self.root / "runtime" / "state" / "dashboard_pending.json"
+        self.run_summary_path = self.root / "runtime" / "runs" / "last_run.json"
 
         self.reporter = Reporter(profile="DESKTOP_3")
 
@@ -212,6 +214,7 @@ class RunnerFailurePathTestCase(unittest.TestCase):
             notion_sync_log_path=self.notion_sync_log_path,
             late_update_log_path=self.notion_sync_log_path.parent / "daily_late_update.log",
             monthly_state_path=self.notion_sync_log_path.parent / "monthly_history_state.json",
+            run_summary_path=self.run_summary_path,
             notion_retry_queue_path=self.notion_retry_queue_path,
             dashboard_client=dashboard_client,
             dashboard_pending_path=self.dashboard_pending_path,
@@ -1571,9 +1574,12 @@ class BackupLogPersistenceTests(unittest.TestCase):
 
     def test_section_69_has_no_writer_anywhere_in_backup(self):
         backup_src = Path(__file__).resolve().parents[1] / "src" / "backup"
-        text = "\n".join(
-            p.read_text(encoding="utf-8") for p in backup_src.glob("*.py")
-        )
+        sources = sorted(backup_src.glob("*.py"))
+        # Every assertion below is an assertNotIn, so an empty glob makes all
+        # of them pass against an empty string — the test would report "no
+        # writer anywhere in backup" precisely because it read nothing.
+        self.assertTrue(sources, f"no sources under {backup_src}")
+        text = "\n".join(p.read_text(encoding="utf-8") for p in sources)
 
         self.assertNotIn("logs/backup", text)
         self.assertNotIn("logs\\\\backup", text)
@@ -2569,7 +2575,11 @@ class NotionConfigWhitespaceTests(unittest.TestCase):
     def test_nothing_in_the_project_loads_a_dotenv_file(self):
         """Why the raw OS value is what reaches the config unchanged."""
         src = Path(__file__).resolve().parents[1] / "src"
-        text = "\n".join(p.read_text(encoding="utf-8") for p in src.rglob("*.py"))
+        sources = sorted(src.rglob("*.py"))
+        # assertNotIn against an empty string always passes, so an empty
+        # rglob would report "nothing loads a .env file" without reading one.
+        self.assertTrue(sources, f"no sources under {src}")
+        text = "\n".join(p.read_text(encoding="utf-8") for p in sources)
 
         self.assertNotIn("dotenv", text)
         self.assertNotIn("load_dotenv", text)
@@ -3422,6 +3432,57 @@ class BackupJunctionTraversalTests(unittest.TestCase):
         self.assertIn("path.is_file()", source)
         self.assertNotIn("follow_symlinks=False", source)
 
+    def test_no_walk_setting_would_have_prevented_the_descent(self):
+        """Re-measured: `os.walk(followlinks=False)` — the obvious "just turn
+        off link following" fix — still descends into a junction, because
+        `followlinks` governs POSIX symlinks only.
+
+        Pinned because it closes off a fix that looks free. Stopping the
+        descent requires a hand-written walk that tests each directory
+        before recursing, which is a larger change than it appears and is
+        gated on the policy question in this class's docstring, not on
+        finding the right flag.
+        """
+        outside = self.root / "outside_walk"
+        outside.mkdir()
+        (outside / "secret.md").write_text("s\n", encoding="utf-8")
+        holder = self.root / "holder"
+        (holder / "daily").mkdir(parents=True)
+        # `_make_junction` skips the test itself if the machine cannot make one.
+        self._make_junction(holder / "daily" / "linked", outside)
+
+        walked = [
+            os.path.join(dirpath, name)
+            for dirpath, _dirnames, filenames in os.walk(holder, followlinks=False)
+            for name in filenames
+        ]
+
+        self.assertTrue(
+            any("secret.md" in path for path in walked),
+            "premise changed: os.walk no longer descends into a junction",
+        )
+
+    def test_the_stdlib_can_identify_a_junction_even_though_is_symlink_cannot(self):
+        """The detection primitive exists — `os.path.isjunction()`, Python
+        3.12+ — so the reason this stays open is the policy question, not a
+        missing capability. Worth pinning separately: "we cannot detect it"
+        and "we have not decided whether to refuse it" are different
+        statements, and only the second one is true.
+        """
+        outside = self.root / "outside_detect"
+        outside.mkdir()
+        holder = self.root / "holder_detect"
+        holder.mkdir()
+        link = holder / "linked"
+        self._make_junction(link, outside)
+
+        self.assertFalse(link.is_symlink())
+        if hasattr(os.path, "isjunction"):
+            self.assertTrue(os.path.isjunction(link))
+        else:  # pragma: no cover - Python < 3.12
+            attributes = getattr(link.lstat(), "st_file_attributes", 0)
+            self.assertTrue(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
 
 class NotionErrorBodyTests(unittest.TestCase):
     """BUG-58 (NOT FIXED): Notion's explanation of a failure is discarded,
@@ -3905,5 +3966,526 @@ class MonthlyStepIsolationTests(RunnerFailurePathTestCase):
         self.assertNotIn("(unexpected)", self._late_update_log())
 
 
+class SchedulerFailureDiagnosticsTests(RunnerFailurePathTestCase):
+    """BUG-39's sharpest instance, fixed.
+
+    `SchedulerRunResult` always carried `failed_date` and `error`, and no
+    consumer read either. A failed Daily Close printed
+
+        Daily History (Scheduler): FAILED, generated=[]
+
+    and stopped there. Scheduler closes dates in order and stops at the first
+    failure (docs section 30, so as not to leave a gap in the sequence), which
+    means that date and every later one still have no Daily file. The two
+    discarded fields were the only record of where the next run resumes —
+    the single most useful thing to know, computed correctly and thrown away.
+
+    Now written to daily_late_update.log, where Monthly failures already go.
+    Deliberately NOT a new run-summary artifact: BUG-39's general fix needs a
+    format and location decision and stays open.
+    """
+
+    def _late_update_log(self) -> str:
+        path = self.notion_sync_log_path.parent / "daily_late_update.log"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def _break_daily_generation(self, exc):
+        """Make the Daily Close fail for a date the Scheduler will attempt."""
+        import scheduler.scheduler as scheduler_module
+
+        original = scheduler_module.generate_daily_history
+
+        def exploding(*args, **kwargs):
+            raise exc
+
+        scheduler_module.generate_daily_history = exploding
+        self.addCleanup(
+            setattr, scheduler_module, "generate_daily_history", original
+        )
+
+    def test_the_failing_date_and_reason_reach_the_log(self):
+        self._write_event(event_id="FAILPATH-SCHED-001")
+        self._break_daily_generation(RuntimeError("daily close blew up"))
+
+        result = self._run()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[2].status.value, "FAILED")
+
+        log = self._late_update_log()
+        self.assertIn("SCHEDULER_FAILED", log)
+        # The date the run must resume from — 2026-08-01 is history_start_date.
+        self.assertIn("date=2026-08-01", log)
+        self.assertIn("daily close blew up", log)
+
+    def test_the_run_still_completes_and_the_candidate_is_safe(self):
+        """The failure is recorded, not escalated.
+
+        History Filter (step 5) runs before the Daily Close, so the Candidate
+        is already durable when the close dies — which is why this failure is
+        recoverable at all: the next run regenerates the Daily file from it.
+        Backup reports NOT_REQUIRED rather than SUCCESS precisely because the
+        close produced no Daily file to commit; it ran, and correctly found
+        nothing.
+        """
+        self._write_event(event_id="FAILPATH-SCHED-002")
+        self._break_daily_generation(RuntimeError("daily close blew up"))
+
+        result = self._run()
+
+        self.assertIsNotNone(result)
+        self.assertTrue((self.keep_dir / "HIST-FAILPATH-SCHED-002.json").exists())
+        self.assertEqual(result[3].final_status, BackupStatus.NOT_REQUIRED)
+        # And the lock is not stranded by the failing step.
+        self.assertFalse(self.runner_lock_path.exists())
+
+    def test_a_successful_close_writes_no_scheduler_failure_line(self):
+        self._write_event(event_id="FAILPATH-SCHED-003")
+
+        self._run()
+
+        self.assertNotIn("SCHEDULER_FAILED", self._late_update_log())
+
+    def test_an_unbounded_scheduler_error_is_truncated(self):
+        """Same rule as the Notion path: an error string of unknown origin
+        does not get to choose how many bytes it writes, once per run."""
+        self._write_event(event_id="FAILPATH-SCHED-004")
+        self._break_daily_generation(RuntimeError("z" * 5000))
+
+        self._run()
+
+        line = next(
+            ln for ln in self._late_update_log().splitlines() if "SCHEDULER_FAILED" in ln
+        )
+        self.assertTrue(line.endswith("..."), "the scheduler error was not truncated")
+        self.assertLess(len(line), runner_module._MAX_LOG_ERROR + 200)
+
+    def test_a_scheduler_error_cannot_forge_a_log_line(self):
+        self._write_event(event_id="FAILPATH-SCHED-005")
+        self._break_daily_generation(
+            RuntimeError("\n2026-01-01T00:00:00+09:00 LATE_UPDATE FORGED")
+        )
+
+        self._run()
+
+        forged = [
+            ln
+            for ln in self._late_update_log().splitlines()
+            if ln.startswith("2026-01-01T00:00:00+09:00")
+        ]
+        self.assertEqual(forged, [], "a forged late-update line got through")
+
+
+class SyncFailureReasonLoggingTests(RunnerFailurePathTestCase):
+    """docs/04 §55 fixes the *minimum* a sync log line carries. For a failed
+    sync that minimum is not diagnosable.
+
+    `NOTION_RETRY_REQUIRED` is reported identically for a 503 that will clear
+    on its own and a 400 that never will (BUG-13) — the sentence separating
+    them lived only in `SyncResult.error`, which reaches `run_company_ops.py`'s
+    stdout and the return tuple but not the log. Under a scheduler, which is
+    how this Runner actually runs in production, both of those are gone: an
+    operator watching the Retry Queue re-send the same Event every run had no
+    way to learn why.
+    """
+
+    def _sync_log(self) -> str:
+        if not self.notion_sync_log_path.exists():
+            return ""
+        return self.notion_sync_log_path.read_text(encoding="utf-8")
+
+    # Event ids below deliberately avoid the substring "REASON": an id
+    # containing the field name would make `assertNotIn("REASON", log)` pass
+    # or fail for the wrong reason.
+    class _StatusTransport(InMemoryNotionTransport):
+        """Fails `query_database` with a caller-chosen status and message,
+        so a permanent 4xx and a transient 5xx can be told apart in a test
+        the way an operator must tell them apart in a log."""
+
+        def __init__(self, *, status_code, message):
+            super().__init__()
+            self._status_code = status_code
+            self._message = message
+
+        def query_database(self, database_id, filter_):
+            raise NotionAPIError(self._message, status_code=self._status_code)
+
+    def test_a_failed_sync_records_the_reason_not_only_the_status(self):
+        transport = InMemoryNotionTransport()
+        transport.fail_next_method = "query_database"
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=transport, database_id="DB-1")
+        )
+
+        self._write_event(event_id="FAILPATH-RSN-001")
+        self._run(notion_sync=sync)
+
+        log = self._sync_log()
+        self.assertIn("NOTION_RESULT NOTION_RETRY_REQUIRED", log)
+        self.assertIn("REASON", log)
+        self.assertIn("simulated Notion API failure", log)
+
+    def test_a_permanent_rejection_is_distinguishable_from_a_transient_one(self):
+        """The whole point of BUG-13: both are NOTION_RETRY_REQUIRED, so the
+        status alone cannot tell an operator to stop waiting and go fix the
+        payload. The reason can."""
+        permanent = ExecutionPlanSync(
+            client=NotionClient(
+                transport=self._StatusTransport(
+                    status_code=400,
+                    message=(
+                        "Notion API returned 400: Bad Request | "
+                        '{"message":"body.properties.Status is not a valid select"}'
+                    ),
+                ),
+                database_id="DB-1",
+            )
+        )
+        self._write_event(event_id="FAILPATH-PERM-001")
+        self._run(notion_sync=permanent)
+        after_permanent = self._sync_log()
+
+        transient = ExecutionPlanSync(
+            client=NotionClient(
+                transport=self._StatusTransport(
+                    status_code=503,
+                    message="Notion API returned 503: Service Unavailable",
+                ),
+                database_id="DB-1",
+            )
+        )
+        self._write_event(event_id="FAILPATH-TRAN-001")
+        self._run(notion_sync=transient)
+        # Second run's lines only. It logs three: the queued PERM-001 retried
+        # first (Retry Queue 우선 처리), then the fresh TRAN-001 — the queued
+        # one now failing against the *transient* transport, which is why this
+        # test reads each run's slice rather than counting the whole file.
+        after_transient = self._sync_log()[len(after_permanent) :]
+
+        # Same status for both — that is the defect the reason works around.
+        self.assertIn("NOTION_RESULT NOTION_RETRY_REQUIRED", after_permanent)
+        self.assertIn("NOTION_RESULT NOTION_RETRY_REQUIRED", after_transient)
+        # Different reasons — that is what makes them actionable.
+        self.assertIn("is not a valid select", after_permanent)
+        self.assertNotIn("503", after_permanent)
+        self.assertIn("503: Service Unavailable", after_transient)
+
+    def test_a_successful_sync_adds_no_reason_field(self):
+        """§55's format stays clean on the path that has nothing to explain."""
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=InMemoryNotionTransport(), database_id="DB-1")
+        )
+
+        self._write_event(event_id="FAILPATH-OK-001")
+        self._run(notion_sync=sync)
+
+        log = self._sync_log()
+        self.assertIn("NOTION_RESULT NOTION_CREATED", log)
+        self.assertNotIn("REASON", log)
+
+    def test_an_unexpected_sync_exception_is_logged_and_bounded(self):
+        """The `except Exception` fallback is the one path whose message no
+        other layer has already truncated. It must not be able to write an
+        unbounded string to disk once per Event, per run, forever."""
+
+        class ExplodingSync:
+            def sync(self, event):
+                raise RuntimeError("boom " + "y" * 5000)
+
+        self._write_event(event_id="FAILPATH-REASON-004")
+        self._run(notion_sync=ExplodingSync())
+
+        line = self._sync_log().strip()
+        self.assertIn("NOTION_RESULT NOTION_FAILED", line)
+        self.assertIn("REASON RuntimeError: boom", line)
+        self.assertTrue(line.endswith("..."), f"reason was not truncated: {line[-80:]}")
+        # Derived from the bound, not a number copied next to it: a magic
+        # constant here would have to be re-tuned every time the bound moves,
+        # and would pass for the wrong reason if it were ever raised.
+        self.assertLess(
+            len(line),
+            runner_module._MAX_LOG_ERROR + 200,
+            "an unbounded exception reached the log",
+        )
+
+    def test_a_reason_containing_a_newline_cannot_forge_a_line(self):
+        """The reason is the newest untrusted-ish field on this line — a
+        Notion error body is echoed back from a remote server. It goes
+        through the same single escaping point as every other field."""
+
+        class ForgingSync:
+            def sync(self, event):
+                raise RuntimeError(
+                    "\n2026-01-01T00:00:00+09:00 EVENT FORGED PROJECT P "
+                    "NOTION_RESULT NOTION_CREATED"
+                )
+
+        self._write_event(event_id="FAILPATH-REASON-005")
+        self._run(notion_sync=ForgingSync())
+
+        lines = self._sync_log().splitlines()
+        self.assertEqual(len(lines), 1, f"a forged line got through: {lines}")
+        self.assertIn("\\n2026-01-01T00:00:00+09:00 EVENT FORGED", lines[0])
+
+
+class DashboardStepDiagnosticsTests(RunnerFailurePathTestCase):
+    """CEO Decision ④ keeps a Dashboard failure non-fatal. It did not ask
+    for it to be *invisible*, which is what the step actually was.
+
+    The Dashboard is this system's metrics sink, so it is the one step whose
+    silence is self-concealing: when it stops recording, the place an
+    operator would look to notice that is the very thing that stopped. Three
+    paths reached no sink at all — not stdout, not the return tuple, not a
+    log:
+
+        record_run() -> FAILED        answered only by a silent re-queue
+        an unexpected exception       answered by a bare `pass`
+        a growing pending backlog     drain_pending()'s counts discarded
+
+    Same treatment the Monthly step above already got: still absorbed, now
+    recorded. Written to notion_sync.log under a `DASHBOARD` prefix — the
+    Dashboard is a Notion-side concern and docs/04 §55's log already carries
+    every other Notion step's outcome.
+    """
+
+    def _dashboard_log_lines(self) -> list[str]:
+        if not self.notion_sync_log_path.exists():
+            return []
+        return [
+            line
+            for line in self.notion_sync_log_path.read_text(encoding="utf-8").splitlines()
+            if " DASHBOARD " in line
+        ]
+
+    def _client(self, transport=None) -> NotionClient:
+        return NotionClient(
+            transport=transport or InMemoryNotionTransport(), database_id="ops-runs-db"
+        )
+
+    def test_a_failed_record_run_is_logged_not_only_requeued(self):
+        """The failure an operator most needs to see: Notion rejected the
+        row. Before, the only trace was a line silently appended to
+        dashboard_pending.json."""
+        transport = InMemoryNotionTransport()
+        transport.fail_next_method = "create_page"
+
+        self._write_event(event_id="FAILPATH-DASHLOG-001")
+        result = self._run(
+            dashboard_client=self._client(transport), run_id="RUN-DASHLOG-1"
+        )
+
+        # Absorbed: the run still finished and Backup still succeeded.
+        self.assertIsNotNone(result)
+        self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+
+        lines = self._dashboard_log_lines()
+        self.assertTrue(lines, "the Dashboard failure left no trace at all")
+        self.assertIn("FAILED run_id=RUN-DASHLOG-1", lines[-1])
+        self.assertIn("simulated Notion API failure", lines[-1])
+
+        # And it is still queued for retry — logging replaces nothing.
+        self.assertTrue(self.dashboard_pending_path.exists())
+
+    def test_an_unexpected_dashboard_exception_is_logged_not_swallowed(self):
+        """The `except Exception: pass` path. `record_run()` documents
+        "Never raises", so reaching here means that contract itself
+        regressed — precisely the case where a silent `pass` is worst."""
+        import app.runner as runner_module
+
+        original = runner_module.dashboard_record_run
+
+        def exploding(*args, **kwargs):
+            raise RuntimeError("dashboard blew up")
+
+        runner_module.dashboard_record_run = exploding
+        self.addCleanup(setattr, runner_module, "dashboard_record_run", original)
+
+        self._write_event(event_id="FAILPATH-DASHLOG-002")
+        result = self._run(dashboard_client=self._client(), run_id="RUN-DASHLOG-2")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+
+        joined = "\n".join(self._dashboard_log_lines())
+        self.assertIn("FAILED (unexpected)", joined)
+        self.assertIn("RuntimeError", joined)
+        self.assertIn("dashboard blew up", joined)
+        self.assertIn("run_id=RUN-DASHLOG-2", joined)
+
+    def test_a_pending_backlog_is_reported_instead_of_growing_unseen(self):
+        """drain_pending() already returned (recorded, still_pending); the
+        Runner discarded both. A backlog that fails every run is exactly the
+        condition those counts exist to surface."""
+        from notion.dashboard_pending import save_pending as save_dashboard_pending
+
+        save_dashboard_pending(
+            self.dashboard_pending_path,
+            run_id="RUN-OLD-1",
+            properties={"Run ID": {"title": [{"text": {"content": "RUN-OLD-1"}}]}},
+        )
+
+        transport = InMemoryNotionTransport()
+        transport.fail_next_method = "create_page"  # fails the drained record
+
+        self._write_event(event_id="FAILPATH-DASHLOG-003")
+        self._run(dashboard_client=self._client(transport), run_id="RUN-DASHLOG-3")
+
+        joined = "\n".join(self._dashboard_log_lines())
+        self.assertIn("DRAIN_PENDING drained=0 still_pending=1", joined)
+
+    def test_a_successful_drain_is_reported_too(self):
+        """Recovery is as worth seeing as failure: it tells an operator the
+        backlog they were watching is gone."""
+        from notion.dashboard_pending import save_pending as save_dashboard_pending
+
+        save_dashboard_pending(
+            self.dashboard_pending_path,
+            run_id="RUN-OLD-2",
+            properties={"Run ID": {"title": [{"text": {"content": "RUN-OLD-2"}}]}},
+        )
+
+        self._write_event(event_id="FAILPATH-DASHLOG-004")
+        self._run(dashboard_client=self._client(), run_id="RUN-DASHLOG-4")
+
+        joined = "\n".join(self._dashboard_log_lines())
+        self.assertIn("DRAIN_PENDING drained=1 still_pending=0", joined)
+
+    def test_a_healthy_run_writes_no_dashboard_lines(self):
+        """The log must stay a signal. A run where the Dashboard worked and
+        nothing was queued says nothing — otherwise every run would add
+        noise and the failure lines above would stop standing out."""
+        self._write_event(event_id="FAILPATH-DASHLOG-005")
+
+        self._run(dashboard_client=self._client(), run_id="RUN-DASHLOG-5")
+
+        self.assertEqual(self._dashboard_log_lines(), [])
+
+    def test_dashboard_logging_survives_an_unwritable_log_path(self):
+        """Logging must never be the thing that fails a run — the rule
+        `_append_log_line()` inherits from collector/runtime.py::_log().
+        Here the log path is a *directory*, so opening it raises OSError."""
+        self.notion_sync_log_path.mkdir(parents=True, exist_ok=True)
+
+        transport = InMemoryNotionTransport()
+        transport.fail_next_method = "create_page"
+
+        self._write_event(event_id="FAILPATH-DASHLOG-006")
+        result = self._run(
+            dashboard_client=self._client(transport), run_id="RUN-DASHLOG-6"
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConsumedEventWithoutCandidateTests(RunnerFailurePathTestCase):
+    """BUG-20's loss mechanism, reachable with NO concurrency (NOT FIXED).
+
+    CHARACTERIZATION: asserts today's behaviour.
+
+    BUG-20 measured 36% of History Candidates permanently lost under three
+    concurrent Runners, and named three composing defects. Two of them —
+    BUG-18/BUG-19's lock race — were fixed by O_EXCL lock atomicity, and
+    that fix holds. But the third link in the chain is a property of the
+    pipeline's ordering, not of concurrency:
+
+        Collector marks the event_id seen and moves the file to processed/
+        ...
+        step 5 writes the History Candidate
+
+    Anything that ends the run between those two points loses the Event
+    from Company History permanently. BUG-20 reached that window through a
+    lock race. Measured here by crashing `HistoryFilter.evaluate()` on a
+    single Runner with an empty lock directory:
+
+        processed/fi-crash.json          exists   (Event survived)
+        history_candidates/keep/         empty    (Candidate never written)
+        next run: accepted=0                      (never reconsidered)
+        Daily History                    absent   (permanently)
+
+    So "BUG-20 is fixed" is true of the concurrency trigger and false of the
+    loss window. The Run Manifest does report the run as FAILED with the
+    aborting component named, so an operator is told *that* something broke
+    — but nothing names which Event was consumed without being recorded, and
+    re-running does not recover it.
+
+    Why not fixed here: closing it means either persisting the Candidate
+    before/atomically with `mark_seen()` (a Collector contract change) or
+    adding a reconciliation pass over `processed/` for Events with no
+    Candidate (a new recovery mechanism, i.e. new architecture). Both are
+    decisions, not cleanups. Recorded in BACKLOG as A-20.
+
+    This test exists so the claim "데이터 유실 0" is qualified by the one
+    window where it is not true, rather than resting on a fixed trigger.
+    """
+
+    def _crash_history_filter(self):
+        original = runner_module.HistoryFilter
+
+        class Exploding(original):
+            def evaluate(self, event):
+                raise RuntimeError("history filter crashed mid-pipeline")
+
+        runner_module.HistoryFilter = Exploding
+        self.addCleanup(setattr, runner_module, "HistoryFilter", original)
+
+    def test_the_event_is_consumed_before_the_candidate_is_written(self):
+        """The ordering that creates the window, stated directly."""
+        self._write_event(event_id="LOSS-WINDOW-1")
+        self._crash_history_filter()
+
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+        # Consumed: the file left incoming/ and reached processed/.
+        self.assertEqual(list(self.incoming_dir.glob("*.json")), [])
+        self.assertEqual(len(list(self.processed_dir.glob("*.json"))), 1)
+        # But no Candidate exists for it.
+        self.assertFalse((self.keep_dir / "HIST-LOSS-WINDOW-1.json").exists())
+
+    def test_a_later_run_does_not_reconsider_it(self):
+        """The reason the loss is permanent rather than merely delayed: the
+        event_id is already in the seen store, so the Event is never
+        re-collected even though nothing was built from it."""
+        self._write_event(event_id="LOSS-WINDOW-2")
+        self._crash_history_filter()
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+        runner_module.HistoryFilter = runner_module.HistoryFilter.__mro__[1]
+        result = self._run()
+
+        self.assertEqual(result[1].accepted, 0)
+        self.assertFalse((self.keep_dir / "HIST-LOSS-WINDOW-2.json").exists())
+
+    def test_the_run_manifest_does_report_the_failure(self):
+        """The mitigation that does exist. The operator is told the run
+        failed and which component aborted — they are not told which Event
+        went missing, which is the gap A-20 is about."""
+        self._write_event(event_id="LOSS-WINDOW-3")
+        self._crash_history_filter()
+
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+        summary = read_summary(self.run_summary_path)
+        self.assertEqual(summary.overall_status.value, "FAILED")
+        self.assertEqual(
+            summary.component("history_filter").failure.classification, "STEP_ABORTED"
+        )
+        # Nothing in the manifest names the lost Event.
+        self.assertNotIn("LOSS-WINDOW-3", summary.to_json())
+
+    def test_the_lock_is_not_stranded_by_the_crash(self):
+        """A stranded lock would turn one lost Event into a stopped system."""
+        self._write_event(event_id="LOSS-WINDOW-4")
+        self._crash_history_filter()
+
+        with self.assertRaises(RuntimeError):
+            self._run()
+
+        self.assertFalse(self.runner_lock_path.exists())

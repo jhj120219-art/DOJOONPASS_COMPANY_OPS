@@ -132,7 +132,29 @@ $action = New-ScheduledTaskAction `
 # to $null and threw PropertyNotFound. That happened before
 # Register-ScheduledTask was ever reached, which means the installer could
 # never have registered anything on any machine.
-$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+# `-User` is not optional here, for two independent reasons.
+#
+# Correctness: without it, `-AtLogOn` means "when ANY user logs on". The
+# Agent reads COMPANY_OPS_PROFILE, COMPANY_OPS_AGENT_SYNC_FOLDER and
+# COMPANY_OPS_AGENT_START_DATE from the *user* environment (set above), and
+# writes into that user's OneDrive folder. Firing it at a different
+# account's logon would run this Desktop's Agent under an identity that has
+# none of that configuration.
+#
+# Registrability: an any-user logon trigger is machine-wide, so Windows
+# requires elevation to create it. Measured on a non-elevated session:
+#
+#     New-ScheduledTaskTrigger -AtLogOn                -> Access is denied
+#     New-ScheduledTaskTrigger -AtLogOn -User <me>     -> registers
+#     New-ScheduledTaskTrigger -Daily -At 09:00        -> registers
+#     New-ScheduledTaskTrigger -AtStartup              -> Access is denied
+#
+# That single missing argument is why this installer had never registered a
+# task on any non-administrator machine — and why the failure was recorded
+# as "this environment cannot register tasks at all", which is not true:
+# every other trigger shape registers fine in the very same session.
+$currentUser = "$env:USERDOMAIN\$env:USERNAME"
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $logonTrigger.Delay = "PT$($DelayMinutes)M"
 
 $triggers = @($logonTrigger)
@@ -164,24 +186,41 @@ if ($PSCmdlet.ShouldProcess($taskName, 'Register scheduled task')) {
     }
     catch {
         # Register-ScheduledTask reports a bare, localised "Access is denied"
-        # here and nothing else. Verified reproducible: on a restricted shell
-        # even `Register-ScheduledTask -TaskName X -Action (cmd.exe /c exit)`
-        # fails the same way, with and without an explicit -User or
-        # -Principal. So the failure is about *where the task is being
-        # written*, not about anything in this script's arguments -- and an
-        # operator staring at three Korean words has no way to know that.
+        # and nothing else, so this block has to supply the diagnosis.
+        #
+        # The previous version of this message was WRONG, and wrong in the
+        # expensive direction: it asserted that even a bare
+        # `Register-ScheduledTask -TaskName X -Action (cmd.exe /c exit)`
+        # fails identically, concluded the problem was "where the task is
+        # being written", and sent the operator to find an administrator.
+        # Re-measured on a non-elevated session: that bare call *succeeds*,
+        # and so does every trigger shape except a machine-wide one. The
+        # real cause was one missing argument on this script's own trigger
+        # (see the -User note above), and elevation was never required.
+        #
+        # An operator who followed the old advice would have gone looking
+        # for admin rights they did not need, to fix a bug that was in this
+        # file. So the ordering below now puts the checks that are actually
+        # likely first, and no longer claims to know the answer.
         throw @"
 Scheduled task registration was refused by Windows: $($_.Exception.Message)
 
-The task itself is fine; Windows would not let this session write it.
-Things to try, in order:
+The task's definition is valid; Windows refused to write it. Note that a
+non-administrator CAN normally register a per-user task on Windows, so this
+is usually a policy or scope problem rather than a missing privilege.
 
-  1. Run this script from an elevated PowerShell
-     (right-click Windows PowerShell -> Run as administrator).
-  2. Confirm the Task Scheduler service is running:
+Things to check, in order:
+
+  1. Task Scheduler service is running:
      Get-Service Schedule
-  3. Confirm your account may create tasks -- some managed or hardened
-     machines restrict the root task folder to administrators.
+  2. Your account may create tasks in the root folder -- some managed or
+     hardened machines restrict it. Test with a throwaway task:
+     Register-ScheduledTask -TaskName Probe1 ``
+       -Action (New-ScheduledTaskAction -Execute cmd.exe -Argument '/c exit') ``
+       -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(1))
+     If that succeeds, the restriction is not a blanket one and this
+     script's trigger scope is the thing to look at.
+  3. Only if both of the above are fine: run from an elevated PowerShell.
 
 Nothing was registered. The COMPANY_OPS_* environment variables were set
 before this point and are harmless on their own; re-running the script

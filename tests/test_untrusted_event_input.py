@@ -717,14 +717,25 @@ class MarkdownInjectionTests(unittest.TestCase):
 
 
 class LogInjectionTests(unittest.TestCase):
-    """BUG-6: app/runner.py's `_log_notion_sync()` writes one line per sync as
+    """BUG-6 FIXED. `app/runner.py` writes one line per sync as
     `<timestamp> EVENT <event_id> PROJECT <project_id> NOTION_RESULT <status>`.
-    A newline inside event_id therefore produces a second, attacker-authored
-    line that is indistinguishable from a genuine one.
+    A newline inside event_id used to produce a second, attacker-authored
+    line indistinguishable from a genuine one — a false statement about what
+    the system did, in the file an operator reads to decide whether it is
+    healthy. The Event arrives over the OneDrive transport from another
+    Desktop and `Event.from_json()` does not constrain `event_id` to one
+    line, so the input is genuinely untrusted.
 
-    BUG-5 rides along: on Windows the same event_id is not a legal filename,
-    so History Filter (step 5, after the log write at step 4) raises OSError
-    and the whole run aborts — after the forged line is already on disk.
+    Now every field is escaped at the single write point
+    (`app.runner._one_line()`), so the injected text lands inside the real
+    line as `\\n...` and no second line exists. The Event is still accepted
+    and still logged — escaping preserves docs/04 §55's "event_id를
+    기록한다" while removing the forgery. Rejecting such an event_id
+    outright is an Event Schema contract decision and remains out of scope.
+
+    BUG-5 still rides along: on Windows the same event_id is not a legal
+    filename, so History Filter (step 5, after the log write at step 4)
+    raises OSError and the run aborts. That is unchanged and separate.
     """
 
     def setUp(self):
@@ -732,7 +743,7 @@ class LogInjectionTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
 
-    def test_a_newline_in_event_id_forges_a_second_log_line(self):
+    def test_a_newline_in_event_id_no_longer_forges_a_second_log_line(self):
         import subprocess
 
         from app.runner import run_once
@@ -787,6 +798,7 @@ class LogInjectionTests(unittest.TestCase):
                 notion_sync_log_path=log_path,
                 late_update_log_path=log_path.parent / "daily_late_update.log",
                 monthly_state_path=log_path.parent / "monthly_history_state.json",
+                run_summary_path=log_path.parent / "last_run.json",
                 notion_retry_queue_path=self.root / "state" / "notion_retry_queue.json",
                 keep_dir=self.root / "keep",
                 review_dir=self.root / "review",
@@ -799,16 +811,57 @@ class LogInjectionTests(unittest.TestCase):
             pass
 
         self.assertTrue(log_path.exists())
-        lines = log_path.read_text(encoding="utf-8").splitlines()
+        raw = log_path.read_text(encoding="utf-8")
+        lines = raw.splitlines()
+
+        # No line the attacker authored. `splitlines()` on purpose: it is how
+        # this repository and an operator's tooling read the file back, and it
+        # breaks on more than "\n" — so this also pins that the escaping covers
+        # \v, \f, \x1c-\x1e, \x85, \u2028, \u2029, not just newline.
         forged = [ln for ln in lines if ln.startswith("2026-01-01T00:00:00+09:00 EVENT FORGED")]
-        self.assertEqual(len(forged), 1, f"expected one forged line, got: {lines}")
+        self.assertEqual(forged, [], f"a forged line survived: {lines}")
+
+        # Exactly one genuine line, and the injected text is inside it.
+        self.assertEqual(len(lines), 1, f"expected a single log line, got: {lines}")
+        self.assertIn("EVENT X\\n2026-01-01T00:00:00+09:00 EVENT FORGED", lines[0])
+        # The line is still a real record of the sync — escaping did not
+        # cost docs/04 section 55's required fields.
+        self.assertIn("NOTION_RESULT NOTION_CREATED", lines[0])
+
+    def test_the_runner_uses_the_shared_escaping_writer(self):
+        """The unit-level properties of the escaping now live with the code,
+        in `tests/test_oplog.py`. What belongs *here* is that this Runner
+        path is wired to it — the end-to-end test above proves the behaviour,
+        and this proves it is not a second, private implementation that could
+        drift from the one `collector/runtime.py` and `agent/agent.py` use.
+        """
+        import app.runner as runner
+        import oplog
+
+        self.assertIs(runner._one_line, oplog.one_line)
+        self.assertIs(runner._append_log_line, oplog.append_line)
 
 
 class OneDriveExistenceShortCircuitTests(unittest.TestCase):
-    """BUG-47 (NOT FIXED): `send()` reports success without delivering, and in
-    one case delivers the WRONG content.
+    """BUG-47 — the outgoing/ half is FIXED; the sync-folder half is not.
 
-    CHARACTERIZATION: asserts today's behaviour.
+    The two halves share one wrong assumption, "a file already at this path
+    must be ours and must be identical", but they differ in the only respect
+    that decides whether it is safe to act on: who else touches the
+    directory.
+
+        outgoing/     this transport's own staging buffer.  FIXED.
+        sync folder   managed by the OneDrive client.       still open.
+
+    Nothing outside this class writes, reads, or even scans outgoing/, so the
+    race that justified skipping there did not exist — while the cost was the
+    worst facet of all: wrong data delivered to Desktop 4 and reported as
+    success. The sync-folder facets below are unchanged and still
+    characterized, because narrowing that skip is a decision about a real
+    race (Phase 5.15), not a cleanup.
+
+    CHARACTERIZATION for everything still marked open below: asserts today's
+    behaviour.
 
     `transport/onedrive._write_atomic()` short-circuits on
 
@@ -900,8 +953,20 @@ class OneDriveExistenceShortCircuitTests(unittest.TestCase):
             "not an event at all",
         )
 
-    def test_a_stale_outgoing_entry_is_delivered_instead_of_the_event(self):
-        """The worst facet: wrong data reaches Desktop 4, reported as success."""
+    def test_a_stale_outgoing_entry_is_no_longer_delivered(self):
+        """BUG-47's worst facet — FIXED.
+
+        `send()` used to stage the Event into outgoing/, then re-read that
+        file and copy *it* to the sync folder. A stale entry short-circuited
+        the staging write, so its content went to Desktop 4 in the Event's
+        place, and `send()` still returned None — the Agent recorded a
+        successful delivery and advanced its date past an Event that was
+        never actually sent.
+
+        Fixed without touching the sync-folder skip: the race that justified
+        skipping is about the directory OneDrive manages, and outgoing/ is
+        neither managed nor even read by anything else.
+        """
         (self.outgoing / "OD-PROBE.json").write_text(
             '{"stale": "left over from an earlier failure"}', encoding="utf-8"
         )
@@ -909,8 +974,59 @@ class OneDriveExistenceShortCircuitTests(unittest.TestCase):
         self._send()
 
         delivered = (self.sync / "OD-PROBE.json").read_text(encoding="utf-8")
-        self.assertIn("stale", delivered)
-        self.assertNotIn("the real payload", delivered)
+        self.assertIn("the real payload", delivered)
+        self.assertNotIn("stale", delivered)
+
+    def test_a_stale_outgoing_entry_is_also_replaced_not_just_bypassed(self):
+        """The staging copy is corrected too, not merely stepped around.
+
+        Nothing scans outgoing/ (see the test below), so residue there was
+        previously cleared by nothing, ever — it simply waited for the next
+        send of the same event_id to be delivered again.
+        """
+        (self.outgoing / "OD-PROBE.json").write_text(
+            '{"stale": "left over"}', encoding="utf-8"
+        )
+
+        self._send()
+
+        staged = (self.outgoing / "OD-PROBE.json").read_text(encoding="utf-8")
+        self.assertIn("the real payload", staged)
+        self.assertNotIn("stale", staged)
+
+    def test_the_staged_and_delivered_bytes_are_identical(self):
+        """Both writes take the same in-memory payload, so the staging copy
+        is a true record of what was sent rather than a second rendering."""
+        self._send()
+
+        self.assertEqual(
+            (self.outgoing / "OD-PROBE.json").read_text(encoding="utf-8"),
+            (self.sync / "OD-PROBE.json").read_text(encoding="utf-8"),
+        )
+
+    def test_the_sync_folder_is_still_never_overwritten(self):
+        """The half deliberately NOT changed. Rewriting a file the OneDrive
+        client may be mid-upload is the race the staging buffer exists to
+        avoid, so narrowing this skip stays a decision, not a cleanup."""
+        (self.sync / "OD-PROBE.json").write_text("pre-existing", encoding="utf-8")
+
+        self._send()
+
+        self.assertEqual(
+            (self.sync / "OD-PROBE.json").read_text(encoding="utf-8"), "pre-existing"
+        )
+
+    def test_a_resend_after_a_partial_failure_delivers_the_event(self):
+        """The scenario the fix is actually for, end to end: an earlier send
+        staged something and died before publishing; the retry must deliver
+        the real Event."""
+        (self.outgoing / "OD-PROBE.json").write_text("{}", encoding="utf-8")
+
+        self._send()  # first retry
+        self._send()  # and again — idempotent
+
+        delivered = (self.sync / "OD-PROBE.json").read_text(encoding="utf-8")
+        self.assertIn("the real payload", delivered)
 
     def test_send_reports_nothing_in_any_of_these_cases(self):
         """Why none of it is detectable by the caller: no return value, no
@@ -928,7 +1044,11 @@ class OneDriveExistenceShortCircuitTests(unittest.TestCase):
     def test_nothing_ever_scans_the_outgoing_directory(self):
         """So a stranded file is never re-sent by any recovery pass."""
         src = Path(__file__).resolve().parents[1] / "src"
-        text = "\n".join(p.read_text(encoding="utf-8") for p in src.rglob("*.py"))
+        sources = sorted(src.rglob("*.py"))
+        # Same vacuity trap as the other src-wide scans: every assertion here
+        # is an assertNotIn, which an empty read would satisfy trivially.
+        self.assertTrue(sources, f"no sources under {src}")
+        text = "\n".join(p.read_text(encoding="utf-8") for p in sources)
 
         for scan in ("outgoing_dir.glob", "outgoing_dir.iterdir", "outgoing_dir.rglob"):
             self.assertNotIn(scan, text)

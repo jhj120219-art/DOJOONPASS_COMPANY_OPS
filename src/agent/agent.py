@@ -58,6 +58,7 @@ from datetime import datetime, time
 from pathlib import Path
 
 from events import EventValidationError
+from oplog import append_line
 from reporter import Reporter
 from reporter.profiles import DesktopProfile, resolve_profile
 from scheduler.lock import release_lock, try_acquire_lock
@@ -164,9 +165,8 @@ def _default_timestamp(target_date: date_type) -> str:
 
 
 def _log(log_path: Path, message: str) -> None:
-    """Append one timestamped line. Identical idiom to
-    `collector/runtime.py::_log()`, including "logging must never be the
-    thing that fails a run".
+    """Append one timestamped line — now via `oplog.append_line()`, the same
+    writer `collector/runtime.py` and `app/runner.py` use.
 
     Only identifiers, counts, and outcomes are ever written — never a
     Signal's text. `signals.py` already refuses secret-shaped content, and
@@ -174,14 +174,17 @@ def _log(log_path: Path, message: str) -> None:
     nothing needs. The one operator-chosen value that does reach a log line
     is a Signal's filename, and every caller passes it through
     `signals.redact()` first.
+
+    That last sentence is why this writer was audited and found *not* to be
+    forgeable today: a filename is the only free-form value here, `redact()`
+    handles secrets, and no filesystem this system runs on admits a newline
+    in a filename. The switch is therefore defence in depth rather than a
+    fix — but the two properties it buys are worth having in one place
+    rather than three. `redact()` guards against a secret in the value;
+    `one_line()` guards against a second line being made out of it, and
+    nothing but the filesystem was providing the second guarantee.
     """
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(f"{timestamp} {message}\n")
-    except OSError:
-        pass
+    append_line(log_path, message)
 
 
 def _reject_signal(path: Path, rejected_dir: Path, target_date: date_type) -> str:

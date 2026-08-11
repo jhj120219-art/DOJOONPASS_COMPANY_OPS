@@ -212,7 +212,12 @@ class CollectorBoundaryTests(unittest.TestCase):
             re.compile(r"^\s*import\s+reporter\b", re.MULTILINE),
             re.compile(r"^\s*from\s+reporter\b", re.MULTILINE),
         )
-        for py_file in collector_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(collector_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {collector_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for pattern in forbidden:
                 self.assertIsNone(
@@ -223,7 +228,12 @@ class CollectorBoundaryTests(unittest.TestCase):
     def test_no_hardcoded_absolute_windows_paths_in_source(self):
         collector_src = Path(__file__).resolve().parents[1] / "src" / "collector"
         forbidden = ("C:\\Users", "D:\\", "OneDrive\\")
-        for py_file in collector_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(collector_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {collector_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, content, f"{token} found in {py_file}")

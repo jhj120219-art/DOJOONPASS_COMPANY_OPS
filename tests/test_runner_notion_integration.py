@@ -126,6 +126,7 @@ class RunnerNotionIntegrationTests(unittest.TestCase):
             notion_sync_log_path=self.notion_sync_log_path,
             late_update_log_path=self.notion_sync_log_path.parent / "daily_late_update.log",
             monthly_state_path=self.notion_sync_log_path.parent / "monthly_history_state.json",
+            run_summary_path=self.notion_sync_log_path.parent / "last_run.json",
             notion_retry_queue_path=self.notion_retry_queue_path,
             keep_dir=self.keep_dir,
             review_dir=self.review_dir,

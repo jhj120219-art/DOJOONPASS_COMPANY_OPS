@@ -48,13 +48,21 @@ from pathlib import Path
 # are Korean and Windows' console defaults to the system's legacy codepage,
 # under which printing an em dash raises UnicodeEncodeError and kills the
 # process. Forcing UTF-8 keeps the output honest on any console.
+# `line_buffering=True` keeps this script's own output in the order it was
+# written. Python block-buffers stdout when it is not a terminal and leaves
+# stderr unbuffered, so under the redirection a scheduled task actually uses
+# (`>log 2>&1`) every stderr line overtakes the stdout lines around it.
+# Measured: a failure message printed above the context line explaining it.
+# That is the one reading an operator gets from a captured log, and it makes
+# a report look like it describes the wrong thing.
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from agent import AgentStatus, DateOutcome, run_once  # noqa: E402
+from agent.state import AgentStateError  # noqa: E402
 from reporter.profiles import ReporterConfigError, resolve_profile  # noqa: E402
 from transport import OneDriveTransport  # noqa: E402
 
@@ -119,18 +127,45 @@ def main() -> int:
         sync_folder=sync_folder, outgoing_dir=agent_dir / "outgoing"
     )
 
-    result = run_once(
-        transport=transport,
-        agent_start_date=start_date,
-        profile=profile,
-        signals_dir=agent_dir / "signals",
-        rejected_signals_dir=agent_dir / "signals_rejected",
-        outbox_dir=agent_dir / "outbox",
-        sent_dir=agent_dir / "sent",
-        state_path=agent_dir / "state" / "agent_state.json",
-        lock_path=agent_dir / "locks" / "agent.lock",
-        log_path=agent_dir / "logs" / "agent.log",
-    )
+    try:
+        result = run_once(
+            transport=transport,
+            agent_start_date=start_date,
+            profile=profile,
+            signals_dir=agent_dir / "signals",
+            rejected_signals_dir=agent_dir / "signals_rejected",
+            outbox_dir=agent_dir / "outbox",
+            sent_dir=agent_dir / "sent",
+            state_path=agent_dir / "state" / "agent_state.json",
+            lock_path=agent_dir / "locks" / "agent.lock",
+            log_path=agent_dir / "logs" / "agent.log",
+        )
+    except AgentStateError as exc:
+        # A raw traceback for an expected operational condition reads like
+        # the system broke. This one is not exotic: `install_agent_task.ps1`
+        # writes COMPANY_OPS_PROFILE into the user environment, and its own
+        # documentation warns that previewing an install with the wrong
+        # -DesktopId used to repoint a machine's identity. Re-running it with
+        # the wrong ID and then letting the scheduled task fire is exactly
+        # how an operator reaches this.
+        #
+        # Reported, never auto-resolved. `state.ensure_desktop()` refuses the
+        # mismatch precisely because silently accepting it would let one
+        # Desktop inherit another's `last_successful_collection_date` and
+        # skip every date up to it — losing those Events with no error
+        # anywhere. Deleting or rewriting the file here would be that same
+        # data loss, performed helpfully.
+        print(f"[FAILED] {exc}", file=sys.stderr)
+        print(
+            "\n이 머신의 Agent state는 위 Desktop에 묶여 있습니다. 둘 중 하나입니다:\n"
+            "  - COMPANY_OPS_PROFILE이 잘못 설정됐다 → 원래 Desktop ID로 되돌린다.\n"
+            "  - 이 머신의 역할이 실제로 바뀌었다 → 기존 state 파일을 사람이\n"
+            "    확인한 뒤 옮기거나 보관한다.\n"
+            "state 파일은 자동으로 지우거나 고치지 않습니다 — 그렇게 하면 아직\n"
+            "수집되지 않은 날짜가 조용히 건너뛰어질 수 있습니다.",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"Agent: {result.desktop_id} ({result.role}) -> {result.status.value}")
 

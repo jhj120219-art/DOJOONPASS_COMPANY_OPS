@@ -49,8 +49,15 @@ from pathlib import Path
 # safe and non-fatal ("Notion 때문에 전체 Deployment를 중단하지 않는다").
 # Forcing UTF-8 here makes that guarantee hold regardless of the console's
 # codepage, without touching what any message actually says.
+# `line_buffering=True` keeps this script's own output in the order it was
+# written. Python block-buffers stdout when it is not a terminal and leaves
+# stderr unbuffered, so under the redirection a scheduled task actually uses
+# (`>log 2>&1`) every stderr line overtakes the stdout lines around it.
+# Measured: a failure message printed above the context line explaining it.
+# That is the one reading an operator gets from a captured log, and it makes
+# a report look like it describes the wrong thing.
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
@@ -64,6 +71,9 @@ from notion import (  # noqa: E402
     NotionConfigError,
     RealNotionTransport,
 )
+from app.runner import DEFAULT_RUN_SUMMARY_PATH  # noqa: E402
+from runsummary import RunSummaryError, read_summary  # noqa: E402
+from scheduler import SchedulerStatus  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -162,13 +172,24 @@ def main() -> int:
         # traceback for an expected condition reads like the system broke,
         # when in fact Backup runs last and everything before it is already
         # durable on disk.
-        return _report_backup_failure(exc)
+        return _report_backup_failure(exc, DEFAULT_RUN_SUMMARY_PATH)
 
     return _print_result(result)
 
 
-def _report_backup_failure(exc: "GitOperationError") -> int:
-    """Explain a failed Backup in terms of what is and is not at risk."""
+def _report_backup_failure(
+    exc: "GitOperationError", run_summary_path: Path | None = None
+) -> int:
+    """Explain a failed Backup in terms of what is and is not at risk.
+
+    `run_summary_path` is a parameter rather than a module-level default
+    because the exit code is now read from that file. Reaching for the
+    default inside here made this function depend on a path its caller never
+    named: measured, a test calling it directly picked up the repository's
+    own live manifest — which said SUCCESS — and got exit 0 for a Backup
+    failure. The one thing this function exists to report, decided by an
+    unrelated file.
+    """
     permanent = is_authentication_failure(str(exc))
 
     print(f"[FAILED] Backup: {exc}", file=sys.stderr)
@@ -193,7 +214,28 @@ def _report_backup_failure(exc: "GitOperationError") -> int:
             file=sys.stderr,
         )
     print("\n현재 상태는 `python ops_status.py`로 확인할 수 있습니다.", file=sys.stderr)
-    return 2
+
+    # Exit code from the Run Manifest, not from a literal here.
+    #
+    # `run_once()` writes the manifest in its `finally`, so it exists even
+    # though the run aborted — and it has already classified this exact
+    # failure (BACKUP_PENDING/RETRYABLE vs BACKUP_FAILED/PERMANENT, by
+    # docs/08 §21's own rule). Returning a hardcoded 2 here made the process
+    # disagree with its own manifest: measured against a broken remote, the
+    # manifest said DEGRADED/exit 3 while the process exited 2. Two answers
+    # to "how bad was this run" is one too many, and the scheduled task only
+    # ever sees this one.
+    #
+    # Falls back to 2 if the manifest cannot be read: a Backup failure with
+    # no manifest is genuinely unclassified, and 2 is the conservative
+    # reading of an unclassified failure.
+    if run_summary_path is None:
+        return 2
+    try:
+        summary = read_summary(run_summary_path)
+    except RunSummaryError:
+        return 2
+    return summary.exit_code if summary is not None else 2
 
 
 def _print_result(result) -> int:
@@ -218,9 +260,88 @@ def _print_result(result) -> int:
         f"Daily History (Scheduler): {scheduler_result.status.value}, "
         f"generated={scheduler_result.generated_dates}"
     )
+    # A failed Daily Close used to print as "FAILED, generated=[]" and nothing
+    # else, even though the result object carries which date died and why
+    # (BUG-39). Scheduler stops at the first failing date, so that date and
+    # every later one still have no Daily file — this is the line that says
+    # where the next run has to resume from.
+    #
+    # stdout, not stderr, and deliberately so: this run *completed* (main()
+    # returns 0), so these lines are part of the run report rather than a
+    # process error, and `_report_backup_failure()` — which does use stderr —
+    # is the opposite case, an aborted run whose every line goes there.
+    # Mixing the two streams here also reordered the output: Python flushes
+    # them independently, so the explanation printed above the "Daily History
+    # (Scheduler): FAILED" line it explains. Verified by running it.
+    if scheduler_result.status is SchedulerStatus.FAILED:
+        failed_date = (
+            scheduler_result.failed_date.isoformat()
+            if scheduler_result.failed_date
+            else "알 수 없음"
+        )
+        print(
+            f"  실패 날짜: {failed_date}\n"
+            f"  원인: {scheduler_result.error}\n"
+            f"  이 날짜와 이후 날짜의 Daily History는 아직 없습니다. 원인을 해결하면\n"
+            f"  다음 실행이 같은 날짜부터 이어서 생성합니다."
+        )
     print(f"Backup: {backup_entry.final_status.value}")
 
-    return 0
+    return _report_run_summary(result)
+
+
+def _report_run_summary(result) -> int:
+    """The Run Contract's last link: Overall Status -> Exit Code.
+
+    Before this, `main()` returned 0 whatever it printed. The Runner is
+    launched by Windows Task Scheduler, whose only automatic health signal
+    is the exit code ("Last Run Result") — stdout is not captured by
+    default. So a run whose Backup failed the Secret Scan reported 0x0 /
+    success, and the failures that were handled *gracefully* were exactly
+    the ones that became invisible.
+
+    Three values, because two are not enough for this pipeline. README RULE
+    5 puts Notion off the History critical path and RULE 9 keeps Company
+    History recording while everything downstream is down — so most failures
+    here are genuinely neither "fine" nor "broken". Collapsing DEGRADED into
+    SUCCESS hides real breakage; collapsing it into FAILED cries wolf until
+    nobody looks at either.
+
+        SUCCESS   0
+        DEGRADED  3   something needs a person, History is intact
+        FAILED    2   a critical component failed
+
+    3 matches `ops_status.py`'s existing "something needs a person", so the
+    two entrypoints agree on what a 3 means. 1 stays reserved for a
+    configuration error, which happens before a run exists to summarise.
+    """
+    summary = getattr(result, "summary", None)
+    if summary is None:
+        # A caller that predates the Run Contract. Nothing to classify, so
+        # keep the old behaviour rather than guess.
+        return 0
+
+    status = summary.overall_status
+    failures = summary.failures()
+
+    if failures:
+        print()
+        print(f"실행 상태: {status.value}")
+        for component in failures:
+            failure = component.failure
+            print(
+                f"  [{component.name}] {failure.classification} "
+                f"(severity={failure.severity.value}, "
+                f"retry={failure.retryability.value})"
+            )
+            if failure.reason:
+                print(f"      {failure.reason}")
+            if component.artifact_refs:
+                # The Run Summary is a manifest, not a log: it names where
+                # the detail is rather than reproducing it.
+                print(f"      evidence: {', '.join(component.artifact_refs)}")
+
+    return summary.exit_code
 
 
 if __name__ == "__main__":

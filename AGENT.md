@@ -85,6 +85,44 @@ Catch-up으로 복구한다. 켜질 때마다 1회 실행되어 마지막 성공
 
 ---
 
+## 2b. Task Scheduler 등록 (실제 검증됨 — 관리자 권한 불필요)
+
+```powershell
+.\scripts\install_agent_task.ps1 `
+  -DesktopId DESKTOP_1 `
+  -SyncFolder "C:\Users\<you>\OneDrive\CompanyOpsEvents" `
+  -StartDate 2026-08-10
+```
+
+**관리자 권한은 필요 없다.** 이전 안내는 필요하다고 했는데 **틀렸다** —
+실제 원인은 이 스크립트의 트리거에 `-User`가 빠져 있던 것이었고(C13에서 수정),
+비관리자 세션에서 등록 → 실행 → Event 전달 → 수집까지 전부 확인했다.
+
+`-WhatIf`를 붙이면 아무것도 바꾸지 않고 무엇이 등록될지만 보여준다.
+
+확인:
+
+```powershell
+Get-ScheduledTask     -TaskName DOJOONPASS_COMPANY_OPS_AGENT_*
+Get-ScheduledTaskInfo -TaskName DOJOONPASS_COMPANY_OPS_AGENT_<ID>   # LastTaskResult 0 = 정상
+Start-ScheduledTask   -TaskName DOJOONPASS_COMPANY_OPS_AGENT_<ID>   # 지금 1회 실행
+```
+
+**PC가 계속 켜져 있을 필요는 없다.** 트리거는 로그온 2분 뒤 1회이며
+`StartWhenAvailable`이 켜져 있어 놓친 트리거는 다음 기회에 발화한다. 그것마저
+놓쳐도 Catch-up이 안전장치다 — 검증에서 밀린 6일치가 한 번의 실행으로
+따라잡혔다.
+
+등록이 거부되면 메시지가 판별 절차를 알려준다. **elevation은 마지막 후보다** —
+대부분의 경우 원인이 아니다.
+
+`COMPANY_OPS_PROFILE`을 잘못 넣고 등록했다면 그 머신의 Agent state가 다른
+Desktop에 묶여 있을 수 있다. 그때 Agent는 실행을 거부하고 무엇이 어긋났는지
+알려준다. **state 파일을 직접 지우지 말 것** — 아직 수집되지 않은 날짜가
+조용히 건너뛰어질 수 있다.
+
+---
+
 ## 3. Signal 작성
 
 Agent는 무엇이 "의미 있는 작업"인지 **추론하지 않는다**(README RULE 4).
@@ -254,6 +292,45 @@ Get-Content runtime\logs\daily_late_update.log        # Desktop 4: 늦게 도착
 
 `run_agent.py` 종료 코드: `0` 정상/skip, `1` 설정 오류, `2` 전송 실패(유실
 아님 — outbox에 남아 있고 다음 실행에서 같은 날짜부터 재시도).
+
+### 6a. Desktop 4 로그에서 실패를 찾는 법
+
+Runner는 실패해도 대부분 **멈추지 않는다** — Notion이 죽어도, Monthly가
+깨져도, Dashboard가 안 되어도 Company History는 계속 기록된다(README RULE 5,
+RULE 9). 그래서 "돌긴 돌았는데 뭔가 안 됐다"를 알아내려면 로그를 봐야 한다.
+Runner가 Task Scheduler 뒤에서 돌면 stdout은 아무도 보지 않으므로, 실패는
+전부 아래 두 파일에 남는다.
+
+```powershell
+Select-String FAILED runtime\logs\daily_late_update.log
+Select-String "DASHBOARD|REASON" runtime\logs\notion_sync.log
+```
+
+`daily_late_update.log` — Daily / Monthly 계열
+
+| 줄 | 뜻 | 할 일 |
+|---|---|---|
+| `LATE_UPDATE UPDATED_LATE_EVENT <날짜>` | 늦게 온 Event를 그날 History에 추가함 | 없음(정상) |
+| `LATE_UPDATE FAILED <날짜>` | 그 날짜 History 갱신 실패 | 원인 확인. Candidate는 남아 있음 |
+| `LATE_UPDATE SCHEDULER_FAILED date=<날짜>` | **그 날짜에서 Daily Close가 멈춤** | 그 날짜와 이후 Daily가 아직 없음. 원인 해결 후 재실행하면 이어서 생성 |
+| `LATE_UPDATE MONTHLY_FAILED <달>` | 월간 통합 실패 | 다음 실행이 재시도 |
+
+`notion_sync.log` — Notion 계열
+
+| 줄 | 뜻 | 할 일 |
+|---|---|---|
+| `NOTION_RESULT NOTION_CREATED/UPDATED` | 정상 | 없음 |
+| `NOTION_RESULT NOTION_RETRY_REQUIRED ... REASON <이유>` | 실패, 큐에 남음 | **REASON을 볼 것** — 아래 참고 |
+| `NOTION_RESULT NOTION_FAILED ... REASON <이유>` | 예기치 못한 실패 | REASON 확인 |
+| `DASHBOARD DRAIN_PENDING drained=N still_pending=M` | 밀린 Dashboard 기록 처리 결과 | `still_pending`이 계속 늘면 확인 |
+| `DASHBOARD FAILED ...` | Dashboard 기록 실패 | Company History에는 영향 없음 |
+
+`REASON`이 중요한 이유: `NOTION_RETRY_REQUIRED`는 **저절로 나을 실패와 영원히
+안 나을 실패를 같은 단어로 보고한다.** `503`이면 기다리면 되고, `400`이면
+기다려도 소용없다 — 매 실행 재전송만 반복한다. 그 둘을 가르는 문장이 REASON이다.
+
+Company History 자체가 위험한 경우는 이 표에 없다. Notion·Dashboard·Monthly는
+전부 History가 이미 디스크에 저장된 **뒤에** 일어나는 단계다.
 
 ---
 

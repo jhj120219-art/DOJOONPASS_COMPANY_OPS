@@ -1097,3 +1097,74 @@ class LoadSignalsTests(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentEntrypointStateMismatchTests(unittest.TestCase):
+    """`run_agent.py` must report a Desktop-identity mismatch, not traceback.
+
+    `state.ensure_desktop()` refuses to run an Agent against another
+    Desktop's state file, and that refusal is load-bearing: accepting it
+    would let this Desktop inherit the other's
+    `last_successful_collection_date` and skip every date up to it, losing
+    those Events with no error anywhere.
+
+    But the entrypoint caught only `ConfigurationError` and
+    `ReporterConfigError`, so the refusal surfaced as a raw Python
+    traceback. That is not an exotic path: `install_agent_task.ps1` writes
+    COMPANY_OPS_PROFILE into the *user* environment, and its own docs warn
+    that previewing an install with the wrong -DesktopId used to repoint a
+    machine's identity for real. Re-running the installer with the wrong ID
+    and letting the scheduled task fire is exactly how an operator gets
+    here — and a traceback tells them the system broke rather than that
+    they set one variable wrong.
+
+    Found by running it, not by reading it.
+    """
+
+    def _entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "run_agent.py"
+        spec = importlib.util.spec_from_file_location("run_agent_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_entrypoint_handles_the_mismatch_error(self):
+        import inspect
+
+        module = self._entrypoint()
+        source = inspect.getsource(module.main)
+
+        self.assertIn("AgentStateError", source)
+        self.assertIn("return 1", source)
+
+    def test_the_message_names_both_desktop_ids(self):
+        """An operator needs to know which identity the file holds and which
+        one was asked for — one of the two is the mistake."""
+        from agent.state import AgentState, AgentStateError, ensure_desktop
+
+        with self.assertRaises(AgentStateError) as caught:
+            ensure_desktop(
+                AgentState(desktop_id="DESKTOP_4"),
+                "DESKTOP_1",
+                state_path=Path("agent_state.json"),
+            )
+
+        message = str(caught.exception)
+        self.assertIn("DESKTOP_4", message)
+        self.assertIn("DESKTOP_1", message)
+        self.assertIn("agent_state.json", message)
+
+    def test_the_entrypoint_never_repairs_the_state_file(self):
+        """The dangerous 'helpful' fix. Rewriting or deleting the state file
+        to make the run proceed is the very data loss `ensure_desktop()`
+        exists to prevent, performed on purpose."""
+        import inspect
+
+        source = inspect.getsource(self._entrypoint().main)
+        after_catch = source[source.index("AgentStateError"):]
+
+        for repair in ("unlink(", "save_state(", "write_text(", "remove("):
+            with self.subTest(repair=repair):
+                self.assertNotIn(repair, after_catch)

@@ -180,6 +180,102 @@ class LoggingTests(CollectorRuntimeTestCase):
         self.assertIn("COLLECTOR FINISHED", log_contents)
 
 
+class LogInjectionTests(CollectorRuntimeTestCase):
+    """collector.log was forgeable through `event_id` — reproduced, then fixed.
+
+    Same untrusted input as BUG-6 in `app/runner.py`: the Event file crosses
+    the OneDrive transport from another Desktop, and `Event.from_json()` puts
+    no single-line constraint on `event_id`. Two call sites here interpolate
+    it raw:
+
+        _log(log_path, f"ACCEPTED {result.event.event_id}")
+        _log(log_path, f"DUPLICATE {result.event.event_id}")
+
+    This log is worse to forge than the Runner's, because the forged line is
+    an *outcome claim*. The reproduction put
+
+        2026-01-01T00:00:00+09:00 ACCEPTED EVT-TOTALLY-FINE
+
+    into collector.log — a byte-for-byte plausible record of an Event that
+    never existed, in the file an operator reads to decide whether collection
+    is healthy.
+
+    Fixed at the writer (`oplog.append_line`), not at the two call sites, so
+    a third interpolation added later cannot reintroduce it.
+    """
+
+    FORGED_ID = "X\n2026-01-01T00:00:00+09:00 ACCEPTED EVT-TOTALLY-FINE"
+
+    def _write_forged(self, filename="forged.json"):
+        event = sample_event_dict()
+        event["event_id"] = self.FORGED_ID
+        return self._write_incoming(filename, json.dumps(event, ensure_ascii=False))
+
+    def _log_lines(self):
+        return self.log_path.read_text(encoding="utf-8").splitlines()
+
+    def test_a_newline_in_event_id_does_not_forge_an_accepted_line(self):
+        self._write_forged()
+
+        summary = self._run()
+
+        # The Event is still accepted and still logged — escaping removes the
+        # forgery without removing the record.
+        self.assertEqual(summary.accepted, 1)
+        forged = [
+            ln for ln in self._log_lines() if ln.startswith("2026-01-01T00:00:00+09:00")
+        ]
+        self.assertEqual(forged, [], f"a forged line survived: {self._log_lines()}")
+
+    def test_the_injected_text_is_kept_inline_and_recoverable(self):
+        self._write_forged()
+
+        self._run()
+
+        accepted = [ln for ln in self._log_lines() if " ACCEPTED " in ln]
+        self.assertEqual(len(accepted), 1)
+        self.assertIn("ACCEPTED X\\n2026-01-01T00:00:00+09:00", accepted[0])
+
+    def test_a_duplicate_of_a_forged_id_is_also_safe(self):
+        """The second raw-`event_id` call site. The same Event twice is a
+        DUPLICATE, which takes a different branch to a different log line."""
+        self._write_forged("first.json")
+        self._run()
+        self._write_forged("second.json")
+
+        summary = self._run()
+
+        self.assertEqual(summary.duplicate, 1)
+        forged = [
+            ln for ln in self._log_lines() if ln.startswith("2026-01-01T00:00:00+09:00")
+        ]
+        self.assertEqual(forged, [])
+
+    def test_every_line_is_one_record(self):
+        """The property that actually matters, stated directly: however many
+        Events were processed, the log has exactly as many lines as records
+        written — no Event can add an extra one."""
+        self._write_forged()
+
+        self._run()
+
+        lines = self._log_lines()
+        # START + PROCESSING + ACCEPTED + FINISHED
+        self.assertEqual(len(lines), 4, f"unexpected line count: {lines}")
+        for line in lines:
+            self.assertRegex(line, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+    def test_an_ordinary_event_id_is_written_unchanged(self):
+        """Escaping must not make the common case unreadable."""
+        self._write_incoming(
+            "TEST-MILESTONE-001.json", json.dumps(sample_event_dict(), ensure_ascii=False)
+        )
+
+        self._run()
+
+        self.assertIn("ACCEPTED TEST-MILESTONE-001", "\n".join(self._log_lines()))
+
+
 class RuntimePathSafetyTests(unittest.TestCase):
     def test_no_hardcoded_absolute_windows_paths_in_source(self):
         runtime_module = Path(__file__).resolve().parents[1] / "src" / "collector" / "runtime.py"

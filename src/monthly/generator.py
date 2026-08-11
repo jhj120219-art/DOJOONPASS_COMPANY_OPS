@@ -37,7 +37,6 @@ from .markdown import MonthlyItem, render_monthly_markdown
 from .parser import DailyParseError, read_daily_document
 from .state import (
     DEFAULT_STATE_PATH,
-    MonthlyState,
     load_state,
     month_key,
     parse_month_key,

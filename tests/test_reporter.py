@@ -255,7 +255,12 @@ class ReporterPathSafetyTests(unittest.TestCase):
     def test_no_hardcoded_absolute_windows_paths_in_source(self):
         reporter_src = Path(__file__).resolve().parents[1] / "src" / "reporter"
         forbidden = ("C:\\Users", "D:\\", "OneDrive")
-        for py_file in reporter_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(reporter_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {reporter_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, content, f"{token} found in {py_file}")

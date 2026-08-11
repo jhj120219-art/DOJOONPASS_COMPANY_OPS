@@ -75,6 +75,7 @@ from datetime import datetime
 from pathlib import Path
 
 from events import SOURCES
+from transport.intake import _is_parseable_json  # reuse intake's own test
 
 # Measured on a cold cache at 5,000 files: 8 workers -> 4.7 s, 16 -> 3.3 s,
 # 32 and 64 -> 3.3 s. The plateau is at 16, so there is nothing to gain from
@@ -169,14 +170,35 @@ class IntakeBacklog:
     yet; `awaiting_collection` has been promoted but not collected. Both
     being non-zero right after a run means something stopped the Runner
     partway; both being zero is the steady state.
+
+    `unparseable` is counted separately, and that separation is the point.
+    `transport.run_intake()` leaves a file it cannot parse where it is —
+    never promoted, never moved, never deleted — and re-judges it on every
+    run. Counting those as "awaiting intake" made the sentence above false:
+    measured, a single 0-byte file (the shape OneDrive Files On-Demand
+    produces) held `awaiting_intake` at 1 across four consecutive clean
+    runs, so ATTENTION reported "수집되지 않고 남은 Event" forever with
+    nothing wrong and nothing an operator could do to clear it.
+
+    An alert that cannot clear is worse than no alert: ATTENTION is where
+    real problems appear, and a permanent entry trains people to skim past
+    it. Such a file still needs a human — it is simply a different message,
+    the one `rejected` already gets.
     """
 
     awaiting_intake: int = 0
     awaiting_collection: int = 0
     rejected: int = 0
+    unparseable: int = 0
 
     @property
     def is_clear(self) -> bool:
+        """Nothing is in flight.
+
+        `unparseable` is deliberately excluded: those files are not in
+        flight, they are parked. Including them would make `is_clear`
+        permanently False for a condition no run can resolve.
+        """
         return not (self.awaiting_intake or self.awaiting_collection)
 
 
@@ -244,6 +266,25 @@ def _count(directory: Path) -> int:
     if not path.is_dir():
         return 0
     return sum(1 for _ in path.glob("*.json"))
+
+
+def _count_transport(directory: Path) -> tuple[int, int]:
+    """(promotable, unparseable) for the transport directory.
+
+    Applies `transport.run_intake()`'s own parse test rather than a second
+    opinion about what "valid" means, so this view cannot disagree with the
+    step it is reporting on.
+    """
+    path = Path(directory)
+    if not path.is_dir():
+        return (0, 0)
+    promotable = unparseable = 0
+    for entry in path.glob("*.json"):
+        if _is_parseable_json(entry):
+            promotable += 1
+        else:
+            unparseable += 1
+    return (promotable, unparseable)
 
 
 def read_company_activity(
@@ -322,10 +363,12 @@ def read_company_activity(
         for source in sorted(SOURCES)
     )
 
+    promotable, unparseable = _count_transport(transport_dir)
     return CompanyActivitySnapshot(
         desktops=desktops,
         backlog=IntakeBacklog(
-            awaiting_intake=_count(transport_dir),
+            awaiting_intake=promotable,
+            unparseable=unparseable,
             awaiting_collection=_count(incoming_dir),
             rejected=_count(rejected_dir),
         ),

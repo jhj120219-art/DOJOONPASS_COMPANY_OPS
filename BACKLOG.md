@@ -7,7 +7,8 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-08-10 (Partial-Failure Sprint — Dashboard bootstrap 중복 생성 방지, Monthly 예외 기록. src/ 전 모듈 감사 완료)
+마지막 갱신: 2026-08-11 (C16 Delivery Integrity — E-9b 탐지기 신설(수정 아님),
+탐지 정확도 실측 0/0, 신규 탐지기 2종 성능 6배 개선)
 
 ---
 
@@ -223,6 +224,206 @@ Agent는 Signal을 **읽어서** 전달할 뿐, 무엇이 "의미 있는 작업"
 Signal을 어떤 시점에 어떤 기준으로 생성할지는 역할별 워크플로 정책이다.
 **SKIP.**
 
+### A-15. `event_id`에 개행이 들어간 Event를 거부할 것인가 (C10에서 발견)
+
+C10이 로그 위조(BUG-6)를 **로그 쓰기 지점의 escape**로 막았다. 위조는 이제
+불가능하지만, 그런 `event_id`를 가진 Event는 여전히 **정상 수집된다.**
+
+더 깊은 수정은 `events.schema`가 `event_id`를 한 줄로 제한하는 것이다. 그것은
+Collector가 무엇을 받아들이는지를 바꾸는 **Event Schema 계약 변경**이다
+(docs/02). 지금까지 수집된 Event 중 이 제한에 걸리는 것이 있으면 재수집 시
+동작이 달라진다. **SKIP.**
+
+부수 사실 하나가 결정에 필요하다: Windows에서 그런 `event_id`는 적법한
+파일명이 아니므로 History Filter가 `OSError`로 **실행 전체를 중단시킨다**
+(BUG-5, 미해결·특성화됨). 즉 지금은 "받아들이지만 나중에 터진다"이고,
+스키마에서 거부하면 "받는 순간 REJECTED"가 된다. 후자가 낫지만 그 판단은
+docs/02 소관이다.
+
+### A-17. `local_master` 이름 변경 (C12에서 발견)
+
+Operational Data Model이 이 저장소를 **Company Repository**로 부르기로 했고
+운영자에게 보이는 문자열은 전부 바꿨다(`ops_status.py`). 그러나 다음은 남았다.
+
+| 대상 | 규모 | 왜 남겼나 |
+|---|---|---|
+| `run_once(local_master_dir=...)` | 공개 API, 호출부 219곳 | **Breaking Contract** |
+| `runtime/local_master/` 디렉터리 | 실 데이터 존재 | 이동은 마이그레이션 |
+| docs/04~12의 "Local Master" | 13개 spec | **문서가 계약이다**(README §13) |
+| 코드 docstring ~40곳 | spec 조항을 인용 중 | 바꾸면 인용과 원문이 어긋난다 |
+
+셋 다 같은 결정 하나에 걸려 있다: **spec 문서의 용어를 바꿀 것인가.** 바꾸면
+13개 문서와 공개 API와 디스크 레이아웃을 함께 옮겨야 하고, 안 바꾸면 코드는
+spec 용어를, 운영자 화면은 새 용어를 쓰는 현 상태가 유지된다. **SKIP.**
+
+현 상태가 위험하지는 않다 — 두 이름이 같은 것을 가리킨다는 사실이
+docs/14 §2에 명시돼 있다.
+
+### E-9b. BUG-47 sync facet — C15 운영 수준 재측정 (여전히 SKIP)
+
+기존 특성화는 `OneDriveTransport.send()` 단위였다. C15는 **실제 Agent로**
+끝까지 돌려 운영자에게 무엇이 보이는지 측정했다. 목적지에 0바이트 placeholder
+(OneDrive Files On-Demand의 형태)를 미리 심고 Agent 실행:
+
+| 신호 | 값 |
+|---|---|
+| sync 폴더 파일 | **여전히 0바이트** — 배달 안 됨 |
+| Agent `sent/` | event_id **존재** — 배달된 것으로 기록 |
+| `last_successful_collection_date` | 배달 안 된 날짜를 **지나 전진** |
+| Agent 종료 코드 / 로그 | `0` / `COLLECTED events=1` |
+| 어디든 경고 | **없음** |
+
+즉 `sent/`와 sync 폴더가 **서로 다른 말을 하고 그 불일치가 조용하다.**
+A-20과 같은 부류("완료로 기록됐지만 실제로는 아님")이며 **발신 측** 버전이다.
+
+**왜 여전히 SKIP:** 고치려면 sync 폴더의 기존 항목을 덮어써야 하는데, 그것은
+"OneDrive가 읽는 중일 수 있는 파일을 언제 덮어써도 되는가"라는 race 정책
+결정이다(Phase 5.15의 staging buffer가 존재하는 이유).
+
+**완화되어 있는 것:** 배달 내용이 **틀리는** 경우는 C11이 없앴다(staging
+overwrite + `event.to_json()` 직접 전달). 남은 것은 "배달 안 됐는데 성공
+보고"뿐이고, `ops_status.py`의 Desktop 침묵 추적이 결과적으로 드러낸다 —
+단, 원인까지는 말하지 못한다.
+
+**다음에 필요한 조건:** sync 폴더 덮어쓰기 정책 결정. 결정되면 구현은 작다
+(`_write_atomic(..., overwrite=)`가 이미 있다).
+
+### A-20. Collector와 Candidate 저장 사이의 유실 창 (BUG-20 잔여분) — C14 신규
+
+**항목:** Collector가 event_id를 seen으로 기록하고 파일을 `processed/`로 옮긴
+뒤, 5단계가 History Candidate를 쓰기 **전에** 실행이 끝나면 그 Event는 Company
+History에서 **영구히 사라진다.**
+
+**왜 새로운가:** BUG-20은 "3개 동시 Runner에서 Candidate 36% 유실"로 측정되고
+Lock 원자성(O_EXCL)으로 **닫혔다.** 그 수정은 유효하다. 그러나 BUG-20이 지목한
+세 결함 중 셋째는 동시성이 아니라 **파이프라인 순서의 성질**이다.
+
+C14에서 **동시성 없이** 재현했다 — Runner 1개, lock 경합 0, `HistoryFilter.
+evaluate()`만 크래시시킴:
+
+| 확인 | 결과 |
+|---|---|
+| `processed/fi-crash.json` | 존재 (Event 파일은 살아남음) |
+| `history_candidates/keep/` | 비어 있음 (Candidate 미작성) |
+| 다음 실행 | `accepted=0` — 재검토되지 않음 |
+| Daily History | 없음, 영구적으로 |
+
+즉 **"BUG-20 fixed"는 트리거에 대해서는 참이고 유실 창에 대해서는 거짓이다.**
+`README RULE 7`("Event와 History가 영구 손실되어서는 안 된다")에 걸린다.
+
+**완화되어 있는 것:** Run Manifest가 실행을 FAILED로 보고하고 어느 Component가
+중단됐는지 이름을 댄다(C12/C13). 운영자는 *무언가* 깨졌다는 것은 안다.
+**모르는 것은 어느 Event가 사라졌는지**이고, 재실행으로 복구되지 않는다.
+
+**왜 승인 필요:** 닫으려면 둘 중 하나다.
+1. Candidate를 `mark_seen()` 이전에 또는 원자적으로 저장 → **Collector 계약 변경**
+2. `processed/` 중 Candidate 없는 Event를 찾는 정합성 패스 → **새 복구 메커니즘**
+
+둘 다 결정이지 정리가 아니다. **SKIP.**
+
+**다음에 필요한 조건:** "Event 소비와 Candidate 저장의 원자성을 어디서
+보장할 것인가"에 대한 결정.
+
+**Evidence:** `tests/test_runner_failure_paths.py::ConsumedEventWithoutCandidateTests`
+4건이 현 동작을 고정한다.
+
+### A-19. Directory Junction Traversal (BUG-57) — C14 재측정, **여전히 SKIP**
+
+**항목:** `daily/` 아래 directory junction이 Local Master 바깥 내용을 Working
+Copy로 복사해 원격에 push한다.
+
+**이유(승인 필요):** 리다이렉트된 `daily/`를 백업할 것인가 말 것인가는
+**배포 정책 결정**이다. 거부하면 정당한 저장소 레이아웃(디스크 공간 때문에
+`daily/`를 다른 드라이브로 junction)이 깨진다. 이 경계는 이전 Sprint가
+명시적으로 그어 뒀다 — 단일 파일 링크는 정당한 용도가 없어 거부했고,
+폴더 통째 리다이렉트는 있으므로 남겨 뒀다.
+
+**C14에서 확인된 사실(신규):**
+
+| 측정 | 결과 |
+|---|---|
+| junction 생성 권한 | **불필요** (`mklink /J`가 일반 사용자로 성공) |
+| symlink 생성 권한 | 필요 — 이 세션에서 `WinError 1314`로 실패 |
+| `os.walk(followlinks=False)` | **여전히 junction 안으로 내려간다** (`followlinks`는 symlink 전용) |
+| `os.path.isjunction()` | **존재한다** (Python 3.12+), junction을 정확히 True로 판별 |
+
+두 가지가 새로 분명해졌다. 첫째, **막을 수 없어서가 아니라 결정하지 않아서
+열려 있다** — 탐지 수단은 표준 라이브러리에 있다. "탐지 불가"와 "거부할지
+미정"은 다른 진술이고 참인 것은 후자뿐이다. 둘째, **"링크 추적 끄기" 같은
+값싼 수정은 없다** — 하강을 멈추려면 디렉터리마다 검사하는 수동 walk가 필요하다.
+
+**다음에 필요한 조건:** "리다이렉트된 History 디렉터리를 백업 대상으로
+인정하는가"에 대한 결정. 인정한다면 현 동작이 맞고, 인정하지 않는다면
+`_is_link_like()` + 비하강 walk로 구현은 작다.
+
+**C14 중 시도했다가 되돌린 것:** 이 Sprint에서 junction 거부를 실제로
+구현했고 유출이 막히는 것까지 확인했다(`BACKUP_FAILED: secret files detected:
+daily\\linked`, 원격에 유출 0). 그러나 그 변경은 **정당한 레이아웃을 거부하는
+정책 변경**이므로 되돌렸다. 좁은 수정이 가능한지도 확인했다 — junction은
+디렉터리 전용이고 hardlink는 일반 파일과 구별 불가(내용이 실제로 그 자리에
+있다)이므로, 정책을 건드리지 않고 고칠 수 있는 형태는 **없다.**
+
+### A-18. `run_once()`가 Backup 예외를 흡수해야 하는가 (BUG-4) — C15 영향 범위 실측
+
+결정에 필요한 것은 "무엇을 잃는가"인데 그동안 측정된 적이 없었다. C15에서
+Dashboard client를 실제로 붙이고 remote를 깨뜨려 측정했다.
+
+Backup 호출 뒤에 남은 단계는 넷이고, 그중 셋은 잃을 것이 없다:
+
+| 단계 | 실제 내용 | 예외 시 |
+|---|---|---|
+| 8. State | 주석뿐 — 각 단계가 이미 자체 저장 | 손실 없음 |
+| 9. Log | 주석뿐 — 이미 기록됨 | 손실 없음 |
+| **9b. Operations Dashboard** | 유일한 실제 작업 | **유실** |
+| 10. Lock Release | `finally` | 정상 실행 |
+
+실측 결과:
+
+```
+GitOperationError propagated
+dashboard rows written : 0
+dashboard pending file : ABSENT   <- 재시도 큐에도 안 들어감
+manifest written       : DEGRADED exit 3, 8 components
+history candidate saved: True
+```
+
+**핵심 발견:** Dashboard 실패를 견디려고 만든 pending 재시도 메커니즘이
+**아예 도달되지 않는다.** 그래서 그 실행의 Dashboard row는 다음 실행에서
+복구되지 않고 **영구히 비어 있다.** Manifest에도 `dashboard` component가
+없다(9개가 아니라 8개) — 건너뛰었다는 사실조차 기록되지 않는다.
+
+**손실 규모:** Operations Projection의 row 1개. **데이터는 안전하다** —
+History Candidate는 저장되고 Manifest도 기록된다(RULE 5: Notion/Dashboard는
+History critical path 밖).
+
+**여전히 SKIP:** 흡수는 반환 계약 변경이고 특성화 테스트 4건이 현 동작을
+고정하고 있다. 다만 이제 결정에 필요한 숫자가 있다 — 잃는 것은 데이터가
+아니라 투영 1행이며, 그것도 재시도되지 않는다.
+
+### A-18b. `run_once()`가 Backup 예외를 흡수해야 하는가 (BUG-4, C12 재확인)
+
+C12가 Manifest를 `finally`에 쓰면서 **증거 측면은 해소됐다** — 중단된 실행도
+이제 분류된 Component 기록을 남긴다. 남은 것은 제어 흐름이다:
+`GitOperationError`가 `run_once()` 밖으로 전파되어 이후 단계(Dashboard)가
+실행되지 않는다.
+
+흡수하면 반환 계약이 "Backup 실패"를 표현해야 하는데, Manifest가 이미 그것을
+표현하므로 **이전보다 결정하기 쉬워졌다.** 다만 여전히 계약 변경이고
+특성화 테스트 4건이 현 동작을 고정하고 있다. **SKIP.**
+
+### A-16. Dashboard Database 4종이 영구히 비어 있다 (GAP-11, C10 재확인)
+
+`bootstrap_dashboard_databases()`는 Database 5개를 만드는데 `record_run()`은
+`OPS_RUNS` 하나에만 쓴다. `build_ops_backup_properties()`는 구현·export까지
+돼 있으나 **호출자가 없고**, `OPS_NOTION_SYNC` / `OPS_RISK` / `OPS_READINESS`는
+builder조차 없다.
+
+C10이 여기를 건드리지 않은 이유: 어느 Database에 무엇을 쓸지는 docs/04 §53
+("Notion 데이터 과잉 방지")이 걸린 **정책 결정**이지 정리 작업이 아니다.
+`OPS_BACKUP`을 연결하는 것은 실행마다 Notion 쓰기를 1회 더 늘리는 일이다.
+**SKIP.** (스키마가 나중 Sprint를 위한 의도적 준비라면 그렇다고 적어 두는
+것만으로도 충분하다 — 지금은 아무 문서도 그 말을 하지 않는다.)
+
 ---
 
 ## B. 승인 없이 가능한 다음 작업
@@ -232,16 +433,38 @@ Signal을 어떤 시점에 어떤 기준으로 생성할지는 역할별 워크�
 
 ### 환경 의존 (코드 검증은 최대한 끝냈다)
 
-1. **Windows Task Scheduler 실제 등록 1회** — 이 환경에서는 **불가능함이
-   확인됐다**(C5). 등록을 실제로 시도했고 `Register-ScheduledTask`가
-   `액세스가 거부되었습니다`로 거부한다. 최소 재현(`cmd.exe /c exit`만 하는
-   빈 Task, `-User`/`-Principal` 변형 포함)으로 스크립트 인자 문제가 아니라
-   권한 문제임을 확인했다 — 비관리자 세션이다.
+1. **Windows Task Scheduler 실제 등록 — 완료 (C13).** 이전 기록은 **틀렸다.**
 
-   스크립트 쪽에서 할 수 있는 것은 다 했다: `-WhatIf` 실동작 검증, 등록 실패
-   시 원인·조치·머신 상태를 알려주는 메시지, 등록 직후 `Get-ScheduledTask`
-   실재 확인. 남은 것은 **관리자 권한 세션에서 1회 등록 후 로그아웃/로그인**
-   해 트리거가 실제로 도는지 보는 것뿐이다.
+   C5는 "이 환경에서는 등록이 불가능하다(비관리자 세션)"고 기록했고, 그 근거로
+   "빈 Task조차 `-User`/`-Principal` 변형을 포함해 똑같이 거부된다"를 들었다.
+   같은 머신에서 다시 측정한 결과:
+
+   | 시도 | 결과 |
+   |---|---|
+   | `cmd.exe /c exit` + Once 트리거 | **등록됨** |
+   | + SettingsSet / `-Force` / `-Description` | **등록됨** |
+   | `Daily -At 09:00` | **등록됨** |
+   | `AtLogOn -User <me>` | **등록됨** |
+   | `AtLogOn` (`-User` 없음) | Access is denied |
+   | `AtStartup` | Access is denied |
+
+   거부되는 것은 **machine-wide 트리거뿐**이다. Installer는 `-User` 없는
+   `-AtLogOn`을 쓰고 있었으므로 **어떤 비관리자 머신에서도 등록에 성공한 적이
+   없다.** 인자 하나가 빠진 것이었고, 권한 문제가 아니었다.
+
+   고친 뒤 실제로 등록·실행·검증했다(비관리자 세션):
+   Task 등록 → `Start-ScheduledTask` → LastTaskResult=0 → Agent 실행 →
+   6개 밀린 날짜 Catch-up → Event 전달 → Runner 수집 → Late Event 병합 →
+   Backup commit → Run Manifest SUCCESS.
+
+   `-User` 스코프는 등록 문제만 푸는 것이 아니다. 스코프 없는 `-AtLogOn`은
+   **아무 사용자나 로그온할 때** 발화하는데, Agent는 자기 identity와 sync
+   폴더를 **user** 환경변수에서 읽는다 — 다른 계정 로그온에 발화하면 설정이
+   전혀 없는 상태로 도는 셈이었다.
+
+   **교훈:** "불가능함이 확인됐다"로 기록된 측정은 근거보다 오래 살아남는다.
+   이제 트리거 스코프와 정정된 메시지를 테스트가 매 실행 재검증한다.
+
 2. **Symlink 실환경 검증** — 거부 분기 자체는 이번 Sprint에 테스트로
    덮었다(`SymlinkRefusalBranchTests` 5건 — 실제 디렉터리·실제 파일·실제
    `load_signals()`를 쓰고 `Path.is_symlink`의 답만 바꾼다). 실제 symlink를
@@ -288,6 +511,655 @@ C8(도달 불가 확인 후 특성화), `bootstrap_dashboard_databases()` → C9
    사용자 환경변수로 영구 저장해 실질적으로 우회하고 있다. 이번 Sprint에
    문서와 코드가 어긋나지 않도록 양방향 계약 테스트를 붙였으므로(C5),
    현 구조가 유지되는 한 드리프트는 더 이상 발생하지 않는다.
+
+---
+
+## C16. Delivery Integrity Sprint
+
+### E-9b — `sent/`가 무엇을 의미하는지 코드로 확정
+
+브리프의 질문은 *"'sent'가 실제 전달 성공을 의미하는가"*였다. 코드가 답한다:
+
+```python
+transport.send(event)      # 예외 안 나면
+os.replace(path, sent_dir) # sent/로 이동
+```
+
+**`sent/`는 "`send()`가 raise하지 않았다"만 뜻한다.** 그리고
+`OneDriveTransport.send()`는 목적지가 **어떤 형태로든** 이미 있으면 쓰지
+않고 반환한다(`_write_atomic`의 `exists()` short-circuit). OneDrive
+클라이언트는 그런 형태를 스스로 만든다 — Files On-Demand placeholder는
+0바이트, 중단된 전송은 잘리고, 충돌 처리는 잔재를 남긴다.
+
+### 탐지 가능성 — 결정적 발견은 "부재"의 취급
+
+수정(sync 덮어쓰기)은 race 정책이라 SKIP. 그런데 **탐지는 가능한가**가
+관건이었고, 답은 목적지의 형태에 달려 있었다. 6종을 실측:
+
+| 목적지 상태 | `send()` | 판정 |
+|---|---|---|
+| 0바이트 | 통과 | **UNDELIVERED** (EMPTY) |
+| 디렉터리 | 통과 | **UNDELIVERED** (NOT_A_FILE) |
+| 무관한 내용 | 통과 | **UNDELIVERED** (UNREADABLE) |
+| 다른 Event | 통과 | **UNDELIVERED** (DIFFERENT_EVENT) |
+| 올바른 내용 | 통과 | clean |
+| **부재** | 통과 | **clean — 보고하지 않음** |
+
+**부재를 보고하지 않는 것이 설계의 핵심이다.** Desktop 4가 파일을 수거하면
+목적지는 정당하게 사라지며 그것이 정상 상태다. 부재를 실패로 세면 건강한
+배포마다 영구 경보가 뜨고, 정상 상황에 울리는 검사는 하루 만에 꺼진다.
+
+`src/agent/delivery.py` 신설(탐지 전용) + `ops_status.py` 노출. 실 Agent로
+E-9b를 재현해 끝까지 확인했다:
+
+```
+전달 정합성 : UNDELIVERED (확인 4건, 이미 수거됨 2건)
+            ! d9b014f0-... [EMPTY]
+ATTENTION: 전송 완료로 기록됐지만 sync 폴더에 도착하지 않은 Event 1건
+```
+
+### 탐지 정확도 — false positive 0 / false negative 0
+
+실 runtime의 `sent/` 4건을 ground truth와 대조:
+
+```
+checked=4 absent=2 undelivered=1 clean=1
+ARITHMETIC EXACT: True
+```
+
+2건은 실제로 수거됨(보고 안 함 — 정답), 1건은 실제로 0바이트(보고함 — 정답),
+1건은 실제로 정상 배달(보고 안 함 — 정답).
+
+### 신규 탐지기가 status 뷰를 망가뜨릴 뻔했다
+
+`ops_status.py`는 "먼저 이것부터"라고 문서화된 뷰인데, C15/C16이 거기에
+전체 디렉터리 스캔 **2개**를 추가했다. 측정:
+
+| n | reconcile | delivery |
+|---|---|---|
+| 1,000 | 6.05s | 6.05s |
+| 20,000 | **116.35s** | **117.67s** |
+
+항목당 5.3ms이고 거의 전부 **파일 열기** 비용이다 — D절이 COO 상태 조회에
+대해 이미 측정한 것과 같은 수치. 그때 채택한 해법(스레드 풀 16)을 같은
+모양의 코드에 적용했다:
+
+| n | reconcile | delivery |
+|---|---|---|
+| 1,000 | 0.86s | 0.29s |
+| 5,000 | 3.95s | 3.66s |
+| 10,000 | 8.57s | 9.16s |
+| 20,000 | **18.26s** | **18.98s** |
+
+**약 6배**, 그리고 20,000건 18초는 D절의 기존 기록과 일치한다. 실 runtime의
+`ops_status` 전체 실행은 **0.23초**.
+
+읽기 전용 경로에만 적용했다 — `outbox.drain()`/`run_intake()`는 순서와
+파일별 실패 격리가 계약이라 직렬로 남긴 것과 같은 구분이다. 최적화가
+정확성 검사 위에 얹히는 것이므로 **직렬 구현과 결과가 완전히 같은지**
+비교하는 테스트를 양쪽에 붙였다(D절의 기존 선례와 동일한 가드).
+
+---
+
+## C15. Blast-Radius Sprint
+
+승인이 필요한 항목들이 남았는데 결정에 필요한 **숫자가 없었다.** 이번
+Sprint는 그 숫자를 만들었다 — 고치지 않고, 무엇을 잃는지 측정했다.
+
+### A-20 — 실 runtime에서 유실 1건 탐지, 그리고 가시화
+
+가설이 아니라 **이 저장소의 실제 runtime**에서 확인했다:
+
+```
+processed=17  keep=14  review=0
+ORPHAN FI-CRASH-1 [KEEP] -> expected HIST-FI-CRASH-1.json
+```
+
+C14가 주입한 Event 하나가 그대로 남아 있었다 — `processed/`에 있고,
+decision은 KEEP이고, Candidate는 없고, 재실행해도 복구되지 않는다.
+
+**중요한 발견: 잔재가 사후 탐지 가능하다.** A-20의 *수정*은 계약 결정이지만
+*탐지*는 아니다. `scheduler/consistency.py`가 정확히 같은 자세의 선례다 —
+탐지만 하고 절대 고치지 않으며, 그 절제의 이유가 "무엇을 할지는 운영자
+결정"이라고 그 모듈 docstring에 적혀 있다.
+
+`src/history/reconciliation.py` 신설(탐지 전용) + `ops_status.py` 노출:
+
+```
+Candidate 정합성    : ORPHANED_EVENT (Event 17건 확인)
+                      ! FI-CRASH-1 [KEEP]
+ATTENTION: 수집됐지만 History에 들어가지 못한 Event 1건: FI-CRASH-1
+           — 재실행으로 복구되지 않는다(BACKLOG A-20)
+```
+
+A-20이 "모르는 것"으로 기록한 **어느 Event가 사라졌는지**가 이제 답해진다.
+유실 창 자체는 그대로 열려 있다(SKIP). 재처리·재수집·seen store 수정·파일
+이동을 하지 않는다는 것을 테스트가 소스 수준에서 고정한다.
+
+DROP은 원래 Candidate가 없으므로 보고하지 않는다 — 그러지 않으면 정상
+상황이 고장으로 보이고, 그것이 이 검사를 무시하게 만드는 가장 빠른 길이다.
+
+### E-9b / A-18 — 영향 범위 실측
+
+둘 다 정책 결정이라 손대지 않았고, **잃는 것의 크기**만 쟀다. 상세는 각
+항목 참조. 요약:
+
+- **E-9b**: 실 Agent로 재현 — sync 파일 0바이트 그대로, `sent/`는 배달됨으로
+  기록, state는 전진, 종료 코드 0, **경고 없음.** A-20과 같은 부류의 발신 측.
+- **A-18**: Backup 예외로 실제 잃는 것은 **Dashboard row 1개뿐**이고,
+  **재시도 큐에도 안 들어간다.** 데이터는 안전(Candidate 저장됨, Manifest
+  기록됨). Manifest에 `dashboard` component가 아예 없어 건너뛴 사실조차 남지
+  않는다(9개가 아니라 8개).
+
+### 보존 정책 — 정확성은 안전, 비용은 성능
+
+20,000 id에서 중복 판정 **정확**(false hit/miss 0), 비용은 5.7 ms/op.
+무한 증가는 **정확성 문제가 아니라 성능 문제**이며, 하루 수십 건 규모에서
+결정을 압박하는 요인은 없다.
+
+### A-16 / A-17
+
+재측정만: Dashboard DB 5종 중 write되는 것은 여전히 `OPS_RUNS` 하나,
+`local_master`는 코드 3파일 12곳 + spec 12개 문서. 둘 다 변화 없음, SKIP 유지.
+
+---
+
+## C14. Re-verification Sprint
+
+이전 Sprint의 결론을 **다시 측정**하는 것이 이번 주제였다. 세 종류가 나왔다:
+참인 것, 거짓인 것, 그리고 참이지만 범위가 좁았던 것.
+
+### 재측정 결과
+
+| 이전 기록 | 재측정 |
+|---|---|
+| "Symlink 생성 불가(권한)" | **참** — `WinError 1314`로 실제 실패 |
+| "Task 등록 불가" (C13에서 이미 반증) | 거짓이었음 |
+| "BUG-20 유실 = 동시성 문제, 수정됨" | **범위가 좁았다** — 동시성 없이 재현됨 |
+
+### 신규 A-20 — 동시성 없는 데이터 유실 창
+
+BUG-20은 "3 Runner 동시 실행 시 Candidate 36% 유실"로 측정되고 Lock
+원자성으로 닫혔다. 그 수정은 유효하다. 그러나 BUG-20이 지목한 셋째 결함은
+**동시성이 아니라 파이프라인 순서의 성질**이다.
+
+Runner 1개, lock 경합 0으로 재현: Collector가 event_id를 seen 처리하고
+`processed/`로 옮긴 뒤 5단계 이전에 실행이 끝나면
+
+```
+processed/fi-crash.json      존재  (Event 파일은 살아남음)
+history_candidates/keep/     비어 있음
+다음 실행                     accepted=0  — 재검토 안 함
+Daily History                없음, 영구적으로
+```
+
+**"BUG-20 fixed"는 트리거에 대해 참이고 유실 창에 대해 거짓이다.**
+Run Manifest가 FAILED와 중단 Component는 알려주지만 **어느 Event가 사라졌는지는
+말하지 않는다.** 닫으려면 Collector 계약 변경 또는 새 정합성 패스가 필요하므로
+**SKIP**, characterization 4건으로 고정.
+
+### 신규 A-19 — junction은 무권한으로 가능
+
+BUG-57(junction traversal)은 "배포 정책 결정"이라 미수정으로 남아 있었다.
+그 판단은 유지하되, 새 사실 두 가지를 측정해 붙였다:
+
+- `os.walk(followlinks=False)`도 junction 안으로 **내려간다**(`followlinks`는
+  symlink 전용) → "링크 추적 끄기" 같은 값싼 수정은 없다
+- `os.path.isjunction()`이 **존재한다**(3.12+) → **탐지 불가라서가 아니라
+  결정하지 않아서 열려 있다**
+
+이 Sprint에서 실제로 거부를 구현해 유출이 막히는 것까지 확인했으나
+(`BACKUP_FAILED`, 원격 유출 0), **정당한 저장소 레이아웃을 거부하는 정책
+변경**이므로 되돌렸다. 좁은 수정이 가능한지도 확인했다 — junction은 디렉터리
+전용이고 hardlink는 일반 파일과 구별 불가이므로 **없다.**
+
+### 수정 — 지워지지 않는 거짓 ATTENTION
+
+`transport.run_intake()`는 파싱 불가 파일을 **그 자리에 영원히 둔다** —
+승격도 이동도 삭제도 하지 않고 매 실행 다시 판정한다. 그런데 backlog 뷰는
+`transport/`의 모든 `*.json`을 세고 있었다.
+
+0바이트 파일 1개(OneDrive Files On-Demand placeholder의 형태)로 측정:
+
+```
+run 1..4   transport metrics {'skipped_invalid': 1}   매 실행
+ATTENTION  "수집되지 않고 남은 Event: transport=1"     영구히
+```
+
+그 문장은 "Event가 수집을 기다린다"는 뜻인데 거짓이다 — 판정이 끝났고
+영원히 수집되지 않는다. **어떤 실행으로도 지워지지 않는 알림은 알림이
+없는 것보다 나쁘다.** ATTENTION은 진짜 문제가 뜨는 곳이고, 상시 항목 하나가
+그 절 전체를 흘려보게 만든다.
+
+`unparseable`을 분리해 세고, 맞는 문장으로 보고한다. 판정은 `run_intake()`
+자신의 파싱 테스트를 재사용한다 — 두 번째 의견을 만들면 뷰와 그 뷰가 보고하는
+단계가 서로 어긋날 수 있고, 그것이 이번 Sprint가 찾으라고 지시받은 모순의
+부류다.
+
+### 장애주입 (신규 5종)
+
+Monthly 실패(`MONTHLY_CONSOLIDATION_FAILED [DEGRADED/RETRYABLE]`, exit 3,
+**History는 정상 기록**), Manifest 쓰기 실패(삼켜짐, 실행 정상 완료),
+Manifest 실패 + Backup 실패 동시(보수적 fallback exit 2), State 불일치
+(`STATE_INCONSISTENCY` + 파일 경로까지 ATTENTION에 표시, exit 3),
+중간 Crash(4 component 기록 + `STEP_ABORTED [CRITICAL/UNKNOWN]`,
+lock 정상 해제, exit 2).
+
+첫 Crash 주입은 **vacuous**했다 — ACCEPTED Event가 없어 `evaluate()`가
+호출되지 않았다. 주입이 실제로 도달했는지 확인하지 않으면 장애주입도
+통과하는 것처럼 보인다.
+
+---
+
+## C13. Production Verification Sprint
+
+코드가 아니라 **머신**을 검증했다. 결과적으로 이번 Sprint의 가장 큰 수확은
+**기록된 사실 하나가 틀렸다는 것**이었다.
+
+### 결함 1 — Installer는 어떤 비관리자 머신에서도 등록에 성공한 적이 없다
+
+B-1은 "이 환경에서는 Task 등록이 불가능하다(비관리자 세션)"로 닫혀 있었고,
+근거는 "빈 Task조차 `-User`/`-Principal` 변형 포함 똑같이 거부된다"였다.
+**같은 머신에서 다시 측정하니 그 근거가 거짓이었다.**
+
+| 시도 | 결과 |
+|---|---|
+| `cmd.exe /c exit` + Once / SettingsSet / `-Force` / `-Description` | **전부 등록됨** |
+| `Daily -At 09:00` | **등록됨** |
+| `AtLogOn -User <me>` | **등록됨** |
+| `AtLogOn` (`-User` 없음) | Access is denied |
+| `AtStartup` | Access is denied |
+
+거부되는 것은 **machine-wide 트리거뿐**이다. Installer는 `-User` 없는
+`-AtLogOn`을 썼다 — 인자 하나. 권한 문제가 아니었다.
+
+`-User`는 등록 문제만 푸는 것이 아니다. 스코프 없는 `-AtLogOn`은 **아무
+사용자나 로그온할 때** 발화하는데, Agent는 identity와 sync 폴더를 **user**
+환경변수에서 읽는다. 다른 계정 로그온에 발화하면 설정이 하나도 없는 상태로
+도는 것이었다 — **잠재 결함이 두 개였다.**
+
+Installer의 진단 메시지도 틀렸다. "elevation이 1순위"라고 안내했으므로,
+그 말을 따른 운영자는 **필요 없는 관리자 권한을 찾아다니며 이 파일의 버그를
+고치려 했을 것이다.** 메시지를 정정하고, 순서를 바꾸고, 판별용 probe 명령을
+넣었다.
+
+**교훈: "불가능함이 확인됐다"로 기록된 측정은 근거보다 오래 산다.**
+이제 트리거 스코프와 정정된 메시지를 테스트가 매 실행 재검증한다.
+
+### 결함 2 — Manifest가 시스템의 나머지보다 부정확했다 (C12 자체 결함)
+
+실제로 깨진 remote에 대고 돌려 보니, Manifest는 `STEP_ABORTED
+[CRITICAL/UNKNOWN]`(generic fallback)을 기록하는데 `backup_state.json`은
+BACKUP_PENDING, 운영자 메시지는 "다음 실행이 자동 재시도"라고 말하고 있었다.
+**셋 중 Manifest가 가장 부정확했고, 그것이 `ops_status.py`가 읽는 것이다.**
+
+ATTENTION은 `PERMANENT`만 올리므로, 이 경로로 들어온 **진짜 영구 인증 실패는
+UNKNOWN으로 분류되어 영원히 아무에게도 안 보였을 것이다.**
+`is_authentication_failure()`(docs/08 §21 규칙, `run_company_ops.py`가 이미
+쓰는 것)를 재사용해 분류하고 그대로 re-raise한다.
+
+### 결함 3 — 종료 코드가 Manifest와 불일치했다
+
+위를 고치자 드러났다: Manifest는 DEGRADED/exit 3인데 프로세스는 2를 반환했다.
+`_report_backup_failure()`가 2를 하드코딩하고 있었기 때문이다. **"이 실행이
+얼마나 나빴는가"에 대한 답이 두 개였고, Task Scheduler는 그중 하나만 본다.**
+Manifest에서 읽도록 바꿨다.
+
+그 과정에서 파생 결함 하나 더: 그 함수가 **호출자가 지정하지 않은** 전역
+경로를 읽고 있었다. 테스트에서 직접 호출하니 저장소의 **실제** Manifest
+(SUCCESS)를 읽어 Backup 실패에 exit 0을 돌려줬다. 경로를 인자로 바꿨다.
+
+### 결함 4 — Desktop identity 불일치가 traceback으로 나왔다
+
+`COMPANY_OPS_PROFILE`을 바꾼 뒤 Agent를 돌리면 `AgentStateError`가 raw
+traceback으로 나온다. Installer 자신의 문서가 "잘못된 -DesktopId로 preview하면
+identity가 바뀐다"고 경고하는 바로 그 시나리오다. 예상된 운영 상황인데 화면은
+시스템이 깨진 것처럼 보인다(C8이 Backup에 대해 고친 것과 같은 부류).
+**state 파일은 절대 자동 수정하지 않는다** — 그렇게 하면 `ensure_desktop()`이
+막으려는 바로 그 데이터 유실을 친절하게 수행하는 셈이다.
+
+### 결함 5 — 캡처된 로그에서 stderr가 stdout을 추월했다
+
+Python은 터미널이 아닐 때 stdout을 블록 버퍼링하고 stderr은 하지 않는다.
+Task Scheduler가 실제로 쓰는 `>log 2>&1` 형태에서 **실패 메시지가 그것을
+설명하는 문맥 줄보다 위에 찍힌다.** 3회 목격 후 격리 재현했고, 세 진입점
+전부 `line_buffering=True`를 적용했다.
+
+### 실환경 검증 결과
+
+| 단계 | 결과 |
+|---|---|
+| Task Scheduler 등록 (비관리자) | **성공** — IgnoreNew, StartWhenAvailable, delay PT2M, user 스코프 |
+| `Start-ScheduledTask` 실행 | **LastTaskResult=0** |
+| Agent 실행 | DESKTOP_4/COO, 밀린 6개 날짜 Catch-up |
+| Event 전달 | sync 폴더에 결정적 event_id로 도착 |
+| 작업일/도착일 분리 | Signal 날짜(08-08) 유지, 실행일(08-11) 아님 |
+| Transport 안정성 가드 | 방금 쓴 파일은 `skipped_not_stable` |
+| Late Event 병합 | 이미 닫힌 08-08에 `## Late Events`로 추가, 원본 무변경 |
+| Backup | commit + push, 무변경 3회 실행 시 **중복 commit 0** |
+| Run Manifest | 9 component, SUCCESS/exit 0 |
+| ops_status LAST RUN | 표시 확인 |
+| **DR 복구** | bare remote clone → 6개 Daily 파일 **byte-for-byte 동일** |
+
+### 장애주입 11종 — 전부 통과
+
+중복(transport층 `skipped_already_present`, collector층 `duplicate`),
+0바이트, 부분 파일, 잘못된 role/source, OneDrive 충돌 사본, push 실패(일시),
+push 실패(영구=Secret Scan), transport 실패, Desktop identity 불일치,
+동시 Runner 4개, 순서 역전.
+
+- **데이터 유실 0, 중복 History 0, 크래시 0**
+- 거부된 파일은 전부 `rejected/`에 사유와 함께 보존
+- 동시 4개 중 1개만 작업, 3개 SKIPPED(exit 0), lock 정상 해제
+- Outbox: 전송 실패 시 Event 보존 + `last_successful_collection_date`
+  **전진 안 함** → 복구 후 재전송 → outbox 비워짐
+- 순서 역전: 늦게 배달된 오래된 날짜 Event도 **자기 작업일** 파일로 감
+
+---
+
+## C12. Run Contract Sprint
+
+C10이 "삼킨 실패가 로그에 남지 않는다"를, C11이 "이 경로에 있는 것은 우리
+것이다"를 다뤘다. 이번 것은 그 둘이 계속 부딪히던 벽이다: **실행 결과를 담을
+그릇이 없었다.**
+
+BUG-39(23개 필드 중 14개가 계산된 뒤 버려짐)와 BUG-36(무엇을 출력했든 항상
+exit 0)은 따로 발견된 두 결함이 아니라 **같은 빈자리의 두 증상**이었다.
+Run Manifest 하나가 둘을 동시에 없앤다.
+
+### 먼저 실측했다
+
+새 폴더를 만들기 전에 기존 산출물을 전수 조사했다. 신설한 것은
+`runtime/runs/last_run.json` **하나뿐**이고, 나머지는 전부 파이프라인이 이미
+쓰고 있던 경로를 `artifact_ref`로 가리킨다.
+
+| 분류 | 실측된 경로 |
+|---|---|
+| Company Repository | `local_master/daily|monthly/`, `backup_working_copy/` |
+| Execution Evidence | `logs/*.log`, `agent/logs/`, `events/*/`, `history_candidates/*/` |
+| Operational State | `state/*.json`, `locks/` |
+| Operational Projection | Notion PROJECTS / OPS_RUNS |
+| **Run Manifest** | `runs/last_run.json` ← 신설 |
+
+### Component / Overall Status
+
+`SKIPPED`가 실패가 아니라는 것이 설계의 핵심이다. Notion 미설정은 지원되는
+배포 형태이므로(docs/04), 실패로 보고하면 **Notion 도입 전의 모든 설치가
+영원히 고장난 것으로 보인다.**
+
+`DEGRADED`는 없던 값이다. 그것이 없으면 모든 실행이 "정상 아니면 고장"인데,
+이 파이프라인의 설계 자체가 대부분의 실패는 둘 다 아니라는 것이다(RULE 5·9).
+SUCCESS로 접으면 실제 고장이 숨고, FAILED로 접으면 아무도 안 보게 된다.
+
+### Failure -> Classification -> Severity/Retryability -> Overall -> Exit
+
+Severity와 Retryability를 **분리**했다. 서로 다른 질문에 답하기 때문이다 —
+Severity는 Exit Code를, Retryability는 "운영자가 지금 움직여야 하는가"를
+정한다. 둘을 합치면 BUG-13이 된다.
+
+| Exit | 뜻 |
+|---|---|
+| `0` | SUCCESS |
+| `2` | FAILED — CRITICAL Component 실패 |
+| `3` | DEGRADED — 사람이 확인해야 함 (`ops_status.py`와 같은 뜻) |
+| `1` | 설정 오류 전용, Run Contract가 쓰지 않는다 |
+
+이전 docstring이 열어 두었던 질문 — "`collector_summary.failed > 0`에 non-zero를
+주면 평범한 malformed Event가 시스템 장애로 보인다" — 은 중간값과 Severity가
+함께 답한다. malformed Event는 SUCCESS Component의 **metric**이므로 Exit Code를
+전혀 바꾸지 않는다.
+
+### 반환 계약을 깨지 않았다
+
+`run_once()`의 반환값을 5-tuple에서 늘리면 **219개 호출부**가 깨진다(실측).
+`RunResult(tuple)`로 만들어 5-way unpacking과 index 접근을 그대로 두고
+`.summary`만 더했다.
+
+### 중단된 실행에도 Manifest가 남는다
+
+`finally`에서 쓴다. 5단계에서 죽은 실행은 이전에 `run_company_ops.py`가 보고
+코드에 **도달하지도 못해 아무것도 출력하지 않았다.** 예외를 던진 단계는
+추측하지 않고 `recorder.current`로 귀속시키며, 예외는 그대로 전파된다 —
+`run_once()`가 흡수해야 하는지는 BUG-4이고 여기서 결정하지 않았다.
+
+Lock 미획득 실행은 Manifest를 쓰지 않는다. 한 일이 없고, 실제로 일한 직전
+실행의 기록을 빈 것으로 덮어쓰면 안 되기 때문이다.
+
+### Event Contract는 그대로다
+
+두 반쪽을 함께 고정했다(`EventContractPreservationTests`): 스키마는 개행
+`event_id`를 **계속 받아들이고**, 로그는 **계속 escape한다.** 로그 서식 문제를
+"받아들이는 것을 바꿔서" 푸는 것은 비용을 이미 보낸 Desktop 쪽으로 미루는 것이다.
+
+### 가드가 스스로 일했다
+
+이번 Sprint에 **내가 지난 Sprint에 만든 가드 3개가 내 변경을 잡았다.**
+
+| 가드 | 잡은 것 |
+|---|---|
+| `LayeringInvariantTests` | 새 `runsummary` 패키지에 계층 선언 없음 |
+| `RunnerDrivingTestGuard` | 8개 테스트 모듈이 저장소의 **진짜** `runtime/runs/`에 기록 |
+| README 문서 목록 가드 | `docs/14` 미등록 |
+
+세 번째는 C11에서 "기록"을 "가드"로 바꿔 둔 것이 바로 이번에 값을 했다.
+두 번째는 실제로 오염이 발생한 뒤 잡았다 — 정리하고 8개 모듈 전부 리다이렉트했다.
+
+### 신설/변경
+
+- `src/runsummary.py` — 어휘와 계산. `oplog`처럼 project import 0개인 leaf.
+- `src/app/runner.py` — 9개 Component 기록, Manifest 작성.
+- `ops_status.py` — `LAST RUN` 절 신설. 마지막 실행이 무엇을 했는지 볼 곳이
+  이전에는 없었다. `PERMANENT` 실패만 ATTENTION에 올린다 — `RETRYABLE`을
+  올리면 스스로 사라지는 상시 항목이 되어 그 절을 무시하게 만든다.
+- `docs/14_RUN_CONTRACT.md` — 계약 문서.
+
+---
+
+## C11. Trust-Boundary Sprint
+
+C10의 후속. 주제는 **"이 경로에 이미 있는 것은 우리 것이다"라는 가정**이다.
+세 곳에서 그 가정이 틀렸고, 세 곳 모두 조용히 틀렸다.
+
+- **collector.log도 위조 가능했다 — 재현 후 수정.** C10은 `app/runner.py`만
+  고쳤고, 같은 결함이 남았는지는 "확인 자체가 다음 작업"으로 남겨 뒀었다.
+  확인했더니 남아 있었고, **더 나빴다.**
+
+  ```
+  2026-08-11T13:40:02+09:00 ACCEPTED X
+  2026-01-01T00:00:00+09:00 ACCEPTED EVT-TOTALLY-FINE     <- 위조된 줄
+  ```
+
+  Runner 쪽 위조가 "동기화 결과"를 꾸며냈다면 이쪽은 **수집 결과 자체를**
+  꾸며낸다 — 존재한 적 없는 Event가 ACCEPTED로 기록된다. 원인도 같다:
+  `_log(log_path, f"ACCEPTED {result.event.event_id}")`가 raw `event_id`를
+  그대로 넣는다.
+
+  옆줄인 `REJECTED`는 이미 안전했지만 **우연히** 그랬다 —
+  `events/schema.py`가 `{value!r}`로 포맷하고 `repr()`이 개행을 escape한다.
+  앞으로 추가될 모든 필드가 그렇게 포맷되기를 기대하는 것을 그만두는 것이
+  이번 변경이다.
+
+- **로그 writer 3벌 → `src/oplog.py` 1벌.** `collector/runtime.py`,
+  `agent/agent.py`, `app/runner.py`가 같은 6줄을 각자 갖고 있었고 escape는
+  그중 **하나에만** 있었다. 최상위 모듈인 이유는 계층 때문이다: `collector`와
+  `agent`가 쓰고 `app`이 그 둘에 의존하므로, 어느 패키지 안에 두든 cycle이
+  생기거나 `collector`가 `app`을 import해야 한다. `oplog`는 project import가
+  0개인 leaf이며, 그 사실을 subprocess로 검증한다(`test_oplog.py`).
+  `review_cli.py`가 최상위 모듈의 기존 선례다.
+
+- **BUG-47의 최악 facet 수정 — 잘못된 데이터가 Desktop 4로 갔다.**
+  `send()`는 Event를 `outgoing/`에 stage한 뒤 **그 파일을 다시 읽어** sync
+  폴더로 복사했다. `outgoing/`에 이전 실패의 잔재가 있으면 stage 쓰기가
+  short-circuit되어 **잔재가 Event 대신 배달**됐고, `send()`는 None을 반환하며
+  예외도 없으므로 Agent는 성공으로 기록하고 날짜를 넘겼다.
+
+  이전 Sprint가 미수정으로 둔 이유는 "재전송이 OneDrive가 읽는 중인 파일을
+  덮어쓰는 race"였다. 그 논리는 **sync 폴더에만** 적용된다. `outgoing/`은 이
+  코드가 만들고, OneDrive가 건드리지 않고, **아무것도 스캔하지 않는다**(그들
+  자신의 테스트가 단언한다). 즉 race가 존재하지 않는 디렉터리에 race 논리를
+  적용하고 있었다.
+
+  수정: staging은 overwrite하고, sync에는 `event.to_json()`을 직접 쓴다.
+  **sync 폴더 skip은 건드리지 않았다** — 나머지 facet(디렉터리·0바이트
+  placeholder·무관한 내용이 목적지에 있는 경우)은 그대로 특성화돼 있고,
+  그 skip을 좁히는 것은 race에 대한 결정이지 정리가 아니다.
+
+- **C10이 만든 §56 위반을 발견하고 막았다 — 실제 유출 재현.**
+  C10이 추가한 ` REASON <이유>`는 **원격 응답 본문**이다. Notion 자신의 JSON은
+  토큰을 담을 수 없지만(토큰은 *요청* 헤더로 간다), Notion 대신 응답하는
+  프록시/캡티브 포털은 요청 헤더를 되돌려줄 수 있다 — `notion/transport.py`가
+  다른 맥락에서 이미 상정하는 상황이다.
+
+  기존 §56 테스트는 **성공** 경로만 검사했고(닫힌 값만 들어가는 줄), 새 필드는
+  **실패** 경로에만 쓰인다. 즉 보장이 필요해진 바로 그 지점이 미검증이었다.
+  실패 경로 테스트를 쓰자마자 유출이 재현됐다:
+
+  ```
+  ... NOTION_RESULT NOTION_RETRY_REQUIRED REASON Notion API returned 502:
+  Bad Gateway | <html>...Authorization: Bearer ntn_***</html>
+  ```
+
+  범위 한정: `runtime/logs/`는 gitignore되고 Backup은 `local_master`만 다루므로
+  **GitHub까지 가지는 않는다.** 로컬 평문 파일에 자격증명이 남는 문제다.
+
+  수정: `append_line()`이 escape 다음에 redact한다 — escape와 같은 논리로
+  쓰기 지점 1곳에 둔다("나중에 추가될 필드가 잊을 수 없도록"). 비밀 패턴은
+  `agent/signals.py`에서 `oplog.py`로 내렸다. 소비자가 둘이 됐기 때문이고
+  (Signal *내용* 거부 / 로그 *출력* 제거), `agent`는 이미 `oplog`를 import하므로
+  edge가 늘지 않는다 — 반대 방향이면 cycle이 된다. `agent.signals`가 원래
+  이름으로 재노출하므로 Signal 검증 계약은 한 글자도 바뀌지 않았다.
+
+  부수 확인: 저장소 hygiene 가드가 **내 새 테스트 파일을 잡았다** — fixture가
+  진짜 자격증명처럼 생겼기 때문이다. 가드가 옳다(스캐너에게도, diff를 읽는
+  사람에게도 구별되지 않는다). 기존 관례대로 문자열 연결로 바꿨다.
+
+- **Vacuous-pass 16건 수정.** `for py_file in <pkg>_src.glob("*.py"):` 형태의
+  경계 테스트가 8개 파일에 복제돼 있는데, **glob이 비면 규칙을 0개 파일에
+  적용하고 통과한다.** 패키지 이름만 바꿔 실증했다: "files actually checked: 0,
+  verdict: PASS". `assertNotIn`으로 텍스트를 검사하는 3건도 같다 — 빈 문자열은
+  모든 `assertNotIn`을 만족시킨다. 전부 비어있지 않음을 먼저 단언하도록 고쳤고,
+  가드가 실제로 실패를 일으키는지 패키지를 가짜 이름으로 바꿔 확인했다.
+
+- **`LayeringInvariantTests` 신설** — 위 경계 테스트들이 구조적으로 줄 수 없는
+  두 가지 때문이다.
+
+  | 성질 | 패키지별 테스트 | 신규 |
+  |---|---|---|
+  | 완전성 | 파일을 만든 사람이 복사했을 때만 | `SRC.iterdir()`에서 유도 |
+  | 비순환성 | 불가능(그래프의 성질) | 경로까지 보고 |
+
+  허용 목록을 "금지"가 아니라 **"허용"** 표로 적었다. 금지 목록은 아무도
+  금지할 생각을 못 한 것을 조용히 허용하며, 그것이 새 패키지가 빠져나가는
+  방식이다. 실제로 `oplog.py`가 추가됐을 때 아무것도 실패하지 않았다.
+  표가 실제보다 **넓지도** 않은지도 검사한다 — 쓰이지 않는 허용은 이유 없이
+  준 권한이고 누군가 그 import를 추가하는 날 조용히 승인한다.
+
+- **`DependencyGuardTests.LOCAL_PACKAGES` 하드코딩 제거.** 서드파티 import를
+  잡는 가드가 first-party 목록을 손으로 관리하고 있었고, `oplog.py` 추가 시
+  정확히 그 방식으로 실패했다. 디스크에서 유도한다 — `src/` 아래 있는 것은
+  정의상 first-party이므로 오래된 목록은 가드를 엄격하게 만들 수 없고 틀리게만
+  만든다.
+
+- 감사 결과 **결함 없음**으로 확인된 것: `src/` 전체에 dead parameter 0건
+  (유일한 후보 `SeenEventStore.is_seen(event_id)`는 abstractmethod —
+  탐지기의 false positive), assertion 없는 테스트 6건은 전부 "raise하지
+  않는 것"이 단언인 정당한 형태.
+
+---
+
+## C10. Runner Diagnostics Sprint
+
+주제 하나로 묶인다: **실패를 삼키는 것과 실패를 감추는 것은 다르다.** 이
+시스템은 의도적으로 대부분의 실패를 삼킨다(README RULE 5·9 — Notion이 죽어도
+Company History는 계속 기록된다). 그런데 삼킨 실패가 **어디에도 남지 않는**
+곳이 여러 군데 남아 있었다. Runner는 Task Scheduler 뒤에서 도는 것이
+정상이므로 stdout은 아무도 보지 않고, 반환값은 프로세스 종료와 함께 사라진다.
+로그에 없으면 존재하지 않은 것과 같다.
+
+- **Daily Close 실패 지점이 계산되고 버려졌다 (BUG-39의 가장 날카로운 조각).**
+  `SchedulerRunResult`는 어느 날짜에서 멈췄는지(`failed_date`)와 왜
+  멈췄는지(`error`)를 항상 채워서 돌려주는데 **읽는 곳이 하나도 없었다.**
+  운영자가 보는 것은 `FAILED, generated=[]` 한 줄뿐 — 그 다음에 할 수 있는
+  일이 없는 메시지다.
+
+  Scheduler는 첫 실패 날짜에서 멈추므로(docs §30, 순서에 구멍을 내지 않기
+  위해) 그 날짜와 이후 날짜는 아직 Daily 파일이 없다. 즉 버려진 두 필드가
+  **다음 실행이 어디서부터 이어야 하는지를 아는 유일한 근거**였다.
+
+  `app/runner.py`가 `daily_late_update.log`에 `SCHEDULER_FAILED date=...`로
+  기록하고, `run_company_ops.py`가 stderr에 출력한다. 새 artifact도 새 형식도
+  만들지 않았다 — BUG-39가 말하는 "통합 run summary sink"는 형식·위치 결정이
+  필요한 별건이고 **여전히 열려 있다.**
+
+- **Dashboard(= 이 시스템의 metrics sink) 실패가 통째로 사라졌다.**
+  `except Exception: pass`. 게다가 Dashboard는 실패해도 조용한 것이
+  자기은폐적이다 — "기록이 멈춘 것을 알아차릴 곳"이 바로 멈춘 그것이기
+  때문이다. 세 경로가 아무 sink에도 닿지 않았다.
+
+  | 경로 | 이전 | 지금 |
+  |---|---|---|
+  | `record_run()` → FAILED | 조용히 재큐잉만 | `DASHBOARD FAILED run_id=...` |
+  | 예기치 못한 예외 | `pass` | `DASHBOARD FAILED (unexpected) ...` |
+  | pending backlog 누적 | `drain_pending()` 반환값 폐기 | `DASHBOARD DRAIN_PENDING drained=N still_pending=M` |
+
+  정상 실행은 한 줄도 쓰지 않는다 — 매 실행 잡음을 더하면 위 세 줄이 눈에
+  띄지 않게 된다.
+
+- **Notion Sync 실패 이유가 로그에 없었다.** `NOTION_RETRY_REQUIRED`는
+  **저절로 나을 503과 영원히 안 나을 400을 같은 한 단어로 보고한다**(BUG-13).
+  그 둘을 가르는 문장은 `SyncResult.error`에만 있었고, 그 값은 stdout과
+  반환 tuple에는 닿지만 로그에는 닿지 않았다. 즉 스케줄러 뒤에서 도는
+  **실제 운영 방식일 때만 사라졌다.** Retry Queue가 같은 Event를 매 실행
+  재전송하는 것을 보면서도 이유를 알 수 없던 것이 이 누락이다.
+  실패한 Sync에만 ` REASON <이유>`를 덧붙인다(docs/04 §55는 "최소"를 정한다).
+
+- **로그 주입 (BUG-6) — 특성화만 되어 있던 것을 고쳤다.** `event_id`에 개행을
+  넣으면 진짜와 구별할 수 없는 **두 번째 로그 줄이 만들어졌다.** Event는
+  OneDrive를 건너 다른 Desktop이 쓰는 파일이고 `Event.from_json()`은
+  `event_id`를 한 줄로 제한하지 않으므로 실제로 신뢰할 수 없는 입력이다.
+  로그는 운영자가 "시스템이 정상인가"를 판단하는 기록이므로 위조된 줄은
+  장식이 아니라 **시스템이 한 일에 대한 거짓 진술**이다.
+
+  쓰기 지점 한 곳(`_one_line()`)에서 escape한다. 개행만이 아니라
+  `str.splitlines()`가 끊는 문자 전부다 — `\v \f \x1c-\x1e \x85  
+   ` 7종을 빼면 같은 위조를 하는 다른 방법이 그대로 남는다. 역슬래시는
+  일부러 이중화하지 않았다(Windows 경로가 오류 문자열에 상시 등장한다).
+  Event를 아예 거부하는 쪽이 더 깊은 수정이지만 그것은 Event Schema 계약
+  변경이라 **범위 밖**이다.
+
+- **로그에 쓰는 오류 문자열에 상한이 없었다.** `except Exception` 경로의
+  `str(exc)`는 어떤 층도 자르지 않는다. 이제 규칙이 하나다: *이 모듈이 로그에
+  쓰는 문자열 중 무한한 것은 없다*(`_MAX_LOG_ERROR = 600`).
+  `notion/transport.py`의 400자 본문 상한보다 **크게** 잡았다 — 같거나 작으면
+  다른 층이 이미 자른 문자열을 다시 잘라 어느 쪽이 잘랐는지 알 수 없게 된다.
+
+- **테스트 double이 실제 API보다 관대했다.** `InMemoryNotionTransport`가
+  `database_id`를 완전히 무시해 모든 page를 한 통에 담았다. 그런데 운영은
+  transport **하나**를 PROJECTS와 OPS_RUNS 두 Client가 공유한다
+  (`run_company_ops.py`) — 실제 Notion은 id로 격리하지만 이 double은 하지
+  않았다. 즉 **운영 배선을 그대로 흉내 낸 테스트**(가장 자연스럽게 쓸 법한
+  테스트)가 OPS_RUNS 행을 PROJECTS 조회 결과로 받고도 **조용히 통과**한다.
+  "모든 것이 발견되는" 방향으로 틀린 double은 누락된 쓰기를 감추는 쪽이라
+  위험하다. 지금은 격리하며, 오늘 그 함정을 밟는 테스트는 없었다(확인함) —
+  그래서 지금 고칠 가치가 있었다.
+
+- 잔가지: `monthly/generator.py`의 미사용 import 1건(`MonthlyState` —
+  패키지는 `.state`에서 따로 재노출한다), `_FAILED_SYNC_STATUSES` 중복 튜플,
+  로그 기록 함수 3벌 → `_append_log_line()` 1벌.
+
+- 드리프트 가드 2건 추가: 역할 표시명 표 2벌(`daily/markdown.py`,
+  `notion/properties.py`)이 `events.ROLES`를 덮는지. 둘은 서로 다른 Spec에
+  답하므로 **합치지 않았다** — docs/04가 Notion Owner 라벨을 바꿔도 docs/06의
+  Markdown 제목은 그대로여야 한다. 합치면 두 문서가 요구한 적 없는 결합을
+  만든다. 위험한 것은 두 표가 서로 달라지는 것이 아니라 **둘 다 `ROLES`에서
+  뒤처지는 것**이고(`.get(role, role)` fallback이라 조용히 원문이 렌더된다),
+  A-1(다섯 번째 Role 요청)이 열려 있으므로 가설이 아니다.
+
+- 문서: README §12 문서 목록이 실재하는 spec 2개를 빠뜨리고 있었다(BUG-12의
+  일부). 목록은 규칙이 아니라 디스크 상태 서술이므로 채웠고, 테스트를
+  "빠져 있다"는 기록에서 `docs/*.md` 전수 대조 **가드**로 바꿨다.
+  AGENT.md에 §6a "Desktop 4 로그에서 실패를 찾는 법"을 추가했다 — 위에서
+  추가한 줄들이 각각 무슨 뜻이고 무엇을 해야 하는지의 표.
 
 ---
 
@@ -762,6 +1634,57 @@ C8(도달 불가 확인 후 특성화), `bootstrap_dashboard_databases()` → C9
 `tests/test_agent_outbox_stress.py`의 정확성 단언은 N=300(기본), 1,000,
 5,000, 10,000 전부에서 동일하게 통과했다.
 
+### 보존 정책 안전성 (C15 측정)
+
+`processed/`·`transport/`·`sent/`·`collector_state.json`이 무한히 커진다는
+것은 기록돼 있었으나(A절 6번), **커지면 무엇이 깨지는가**는 측정된 적이
+없었다. 정책 결정에 필요한 것은 그것이다.
+
+현재 규모(이 저장소의 검증 runtime):
+
+| 저장소 | 파일 | 크기 |
+|---|---|---|
+| `processed/` | 17 | 6.8 KiB |
+| `rejected/` | 4 | 0.3 KiB |
+| `agent/sent/` | 3 | 1.3 KiB |
+| `collector_state.json` | id 16개 | 0.5 KiB |
+
+seen-store를 20,000 id까지 키워 **정확성**을 확인했다:
+
+```
+20000 mark_seen : 114.35s  (5717 us/op)
+lookups         : 정확 — hit 전부 맞고 miss도 맞음
+state size      : 371 KiB
+```
+
+**결론: 무한 증가는 정확성 문제가 아니라 성능 문제다.** 20,000건에서도
+중복 판정은 정확했고 false hit/miss가 없었다. 비용은 쓰기 시간이며 A-6b의
+초선형 쓰기 증폭이 재확인된다. 하루 수십 건 규모에서 20,000건에 닿으려면
+수십 년이 걸리므로 **보존 정책 결정을 압박하는 요인은 없다.**
+
+### 로그 쓰기 비용 (C10 측정, C11 갱신)
+
+Body 168자(실제 `NOTION_RESULT ... REASON ...` 줄) 기준.
+
+| 대상 | C10 | C11 |
+|---|---|---|
+| `one_line()` (위조 방지 escape) | 25.7µs | 23.2µs |
+| `redact()` (§56 비밀 제거) | — | **74.7µs** |
+| `append_line()` 전체 (+ open/write/close) | 252.1µs | **305.3µs** |
+
+**C11이 로그 쓰기를 21% 느리게 만들었다.** 숨기지 않고 적는다. redaction은
+7개 대안을 가진 대소문자 무시 정규식이라 escape보다 3배 비싸고, 로그 쓰기의
+24.5%를 차지한다.
+
+받아들인 이유는 절대값이다. 코드가 최악으로 명시하는 "Notion 장애로 800건이
+큐에 밀린 실행" 기준 로그 쓰기 총합이 202ms → 244ms다. Runner 1회 실행은 초
+단위이고, 비용은 여전히 파일 I/O가 지배한다. 42ms를 아끼려고 §56 위반 가능성을
+남기는 거래는 성립하지 않는다.
+
+최적화(사전 필터 등)를 넣지 않았다 — 측정이 문제를 보여주지 않았고, 이 저장소는
+측정 없는 최적화를 하지 않는다. 이 표는 나중에 로그량이 크게 늘면 다시 볼 지점이
+어디인지 기록해 두는 용도다.
+
 ### Monthly Consolidation (이번 Sprint 추가 측정)
 
 | 대상 | 결과 |
@@ -851,3 +1774,48 @@ Installer는 정적 테스트 22건을 통과하면서도 어떤 머신에서도
 없는 상태였다. 실행해 볼 방법이 있는 코드는 — `-WhatIf`처럼 안전한 모드가
 있다면 — 반드시 실행해 보는 쪽으로 판단해야 한다. 남은 환경 의존 항목들도
 같은 눈으로 다시 볼 가치가 있다.
+
+### E-7. Run Summary Artifact — **완료 (C12)**
+
+승인된 설계로 구현했다. BUG-39의 12개 잔여 필드 중 8개가 Manifest에 들어갔고,
+나머지 4개(`run_id`/`backup_start`/`backup_end`/`source`)는 Manifest가 run
+수준에서 이미 갖고 있어 **일부러** 복사하지 않았다 — 내려 적으면 두 값이
+어긋나는 날 Manifest가 자기 자신과 불일치한다.
+
+종료 코드 결정(BUG-36)도 함께 해소됐다. 남은 관련 항목은 A-18(BUG-4)뿐이다.
+
+### E-8. 승인 없이 가능한 후속 (작음)
+
+C11에서 처리 완료: `_one_line()`을 collector·agent에 적용(위조 재현 후 수정,
+`src/oplog.py`로 통합).
+
+남은 것:
+
+- `humanize_project_id()` / `_display_project_name()`이 같은 한 줄
+  (`project_id.replace("_", " ").title()`)의 두 벌이다. 역할 표시명 표와 같은
+  이유로 합치지 않았고(서로 다른 Spec에 답한다), 표와 달리 드리프트해도 조용히
+  틀리지 않는다(표시용 문자열뿐). 우선순위 낮음.
+- 패키지별 경계 테스트 8쌍이 `LayeringInvariantTests`와 상당 부분 겹친다.
+  C11은 **지우지 않았다** — vacuous-pass만 고쳤다. 지우는 것은 커버리지
+  근거를 줄이는 변경이라 별도 판단이 필요하고, 파일별 지역성에도 값이 있다.
+
+### E-9. BUG-47 sync 폴더 facet (Reliability) — 승인 필요
+
+C11이 `outgoing/` 쪽(race 없음)을 고쳤다. sync 폴더 쪽은 남아 있다.
+
+| 목적지 상태 | 현재 동작 |
+|---|---|
+| 디렉터리 | 배달된 것으로 간주, 성공 보고 |
+| 0바이트 placeholder (OneDrive Files On-Demand) | 위와 같음 |
+| 무관한 내용 | 위와 같음, 내용 보존 |
+
+**왜 승인이 필요한가:** skip을 좁히려면 "OneDrive가 읽는 중일 수 있는 파일을
+언제 덮어써도 되는가"를 정해야 한다(Phase 5.15의 staging buffer가 존재하는
+이유). `is_file()`+크기 확인, 내용 비교, 또는 conflict-copy 규약 중 무엇을
+택할지가 결정이고, 셋 다 실환경 OneDrive 동작에 대한 가정을 포함한다 —
+B절이 "실제 OneDrive 클라이언트 고유 동작"을 미검증으로 남겨 둔 바로 그
+부분이다.
+
+완화되어 있는 점: 배달 내용이 **틀리는** 경우는 C11이 없앴다. 남은 것은
+"배달되지 않았는데 성공 보고"이며, `ops_status.py`의 도착 추적이 침묵을
+드러낸다(단, 원인까지는 말하지 못한다 — A-11c).

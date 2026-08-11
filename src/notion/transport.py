@@ -265,6 +265,24 @@ class InMemoryNotionTransport(NotionTransport):
         # been shared with the integration.
         self.searchable_pages: list[dict[str, Any]] = []
         self._pages: dict[str, dict] = {}
+        # Which database each page was created in. Kept beside `_pages`
+        # rather than inside the page dict so that what `create_page()` /
+        # `update_page()` hand back stays byte-for-byte what Notion returns.
+        #
+        # Why it has to exist at all: one transport instance can serve
+        # several databases, because that is how production wires it —
+        # `run_company_ops.py` builds ONE RealNotionTransport and hands it to
+        # two NotionClients, one bound to PROJECTS and one to OPS_RUNS. Real
+        # Notion keeps those apart by database id; this double used to ignore
+        # the id completely, so every page lived in one undifferentiated pool
+        # and `query_database()` would happily return an OPS_RUNS run record
+        # as the answer to "find the PROJECTS row for project X".
+        #
+        # No test does that today (checked), which is exactly why it was
+        # worth fixing now: the trap only springs for a test that mirrors the
+        # production wiring — the most natural test anyone would write next —
+        # and it springs as a silent pass, not a failure.
+        self._page_database: dict[str, str] = {}
         self._next_id = 1
         self._next_database_id = 1
         # Databases created via create_database(), keyed by the id handed
@@ -327,8 +345,10 @@ class InMemoryNotionTransport(NotionTransport):
         target = filter_.get("rich_text", {}).get("equals")
         matches = [
             page
-            for page in self._pages.values()
-            if _rich_text_value(page["properties"].get("Project ID")) == target
+            for page_id, page in self._pages.items()
+            # Scoped to the database being queried, like the real API.
+            if self._page_database.get(page_id) == database_id
+            and _rich_text_value(page["properties"].get("Project ID")) == target
         ]
         return {"results": matches}
 
@@ -340,6 +360,7 @@ class InMemoryNotionTransport(NotionTransport):
         self._next_id += 1
         page = {"id": page_id, "properties": dict(properties)}
         self._pages[page_id] = page
+        self._page_database[page_id] = database_id
         return page
 
     def update_page(

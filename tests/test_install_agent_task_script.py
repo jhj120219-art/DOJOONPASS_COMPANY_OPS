@@ -374,19 +374,37 @@ class SchedulerPolicyTests(unittest.TestCase):
 
 class RegistrationFailureHandlingTests(unittest.TestCase):
     """Registration is the one step that can fail on a healthy machine for
-    reasons the operator can act on, and it used to report nothing useful.
+    reasons the operator can act on, and it used to report the WRONG ones.
 
-    Verified reproducible on this machine: `Register-ScheduledTask` returns a
-    bare localised "Access is denied" for a non-elevated session — even for a
-    minimal `cmd.exe /c exit` task, with and without an explicit `-User` or
-    `-Principal`. So the refusal is about where the task is written, not
-    about anything this script passes, and three words in the system locale
-    give the operator no way to reach that conclusion.
+    The previous version of this docstring recorded, as verified fact, that
+    `Register-ScheduledTask` refuses everything from a non-elevated session
+    "even for a minimal `cmd.exe /c exit` task, with and without an explicit
+    -User or -Principal", and concluded the refusal was about where the task
+    is written. That was measured once and then trusted.
 
-    No test here performs a real registration. On a machine where it would
-    succeed, such a test would leave a scheduled task behind — the suite
-    must not change the machine it runs on. The reachable dynamic coverage
-    is the `-WhatIf` run above.
+    Re-measured on the same machine, non-elevated:
+
+        cmd.exe /c exit + Once trigger              registers
+        + full SettingsSet / -Force / -Description  registers
+        Daily -At 09:00                             registers
+        AtLogOn -User <me>                          registers
+        AtLogOn   (no -User)                        Access is denied
+        AtStartup                                   Access is denied
+
+    Only the machine-wide trigger shapes are refused. The installer used the
+    unscoped `-AtLogOn`, so it could never have registered on ANY
+    non-administrator machine — and the failure was filed as "this
+    environment cannot register tasks", which sent every subsequent reader
+    looking for an administrator instead of at one missing argument.
+
+    The lesson worth keeping: a measurement recorded as a conclusion
+    ("cannot") outlives the evidence it came from. This class now asserts
+    the trigger scope and the corrected message, so the claim is re-checked
+    on every run rather than remembered.
+
+    Registration itself is exercised for real outside the suite; no test
+    here registers anything, because a test that succeeded would leave a
+    scheduled task on the machine running it.
     """
 
     def test_registration_failure_is_explained_not_re_raised_bare(self):
@@ -399,9 +417,55 @@ class RegistrationFailureHandlingTests(unittest.TestCase):
 
     def test_the_explanation_names_concrete_next_steps(self):
         code = _script_code()
-        for hint in ("Run as administrator", "Get-Service Schedule"):
+        for hint in (
+            "Get-Service Schedule",
+            "elevated PowerShell",
+            # The throwaway-task probe. It is the step that distinguishes a
+            # blanket restriction from a trigger-scope problem, which is the
+            # distinction the old message got wrong.
+            "Register-ScheduledTask -TaskName Probe1",
+        ):
             with self.subTest(hint=hint):
                 self.assertIn(hint, code)
+
+    def test_the_explanation_no_longer_claims_elevation_is_the_first_answer(self):
+        """The previous message asserted that even a bare
+        `Register-ScheduledTask ... cmd.exe /c exit` fails identically for a
+        non-elevated session, concluded the cause was "where the task is
+        written", and put "run as administrator" first.
+
+        Re-measured on a real non-elevated session: that bare call
+        *succeeds*, and so does every trigger shape except a machine-wide
+        one. The actual cause was this script's own trigger missing `-User`
+        — an operator following the old advice would have gone hunting for
+        admin rights they did not need, to fix a bug in this file.
+
+        So elevation must still be offered, but last.
+        """
+        code = _script_code()
+        elevated_at = code.index("elevated PowerShell")
+        service_at = code.index("Get-Service Schedule")
+
+        self.assertLess(service_at, elevated_at, "elevation is still suggested first")
+        self.assertIn("non-administrator CAN normally register", code)
+
+    def test_the_logon_trigger_is_scoped_to_the_invoking_user(self):
+        """Two independent reasons, both load-bearing.
+
+        Correctness: an unscoped `-AtLogOn` fires at ANY user's logon, and
+        the Agent reads its identity and sync folder from the *user*
+        environment this script writes. Firing under another account would
+        run this Desktop's Agent with none of its configuration.
+
+        Registrability: an any-user logon trigger is machine-wide, so
+        Windows refuses it without elevation. Measured — this single missing
+        argument is why the installer had never registered a task on any
+        non-administrator machine.
+        """
+        code = _script_code()
+
+        self.assertIn("New-ScheduledTaskTrigger -AtLogOn -User $currentUser", code)
+        self.assertIn(r'$currentUser = "$env:USERDOMAIN\$env:USERNAME"', code)
 
     def test_the_explanation_says_what_was_and_was_not_done(self):
         """An operator who has just seen a failure needs to know whether the

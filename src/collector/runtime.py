@@ -20,8 +20,9 @@ from __future__ import annotations
 import enum
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+
+from oplog import append_line
 
 from .collector import Collector
 from .result import CollectorStatus
@@ -58,13 +59,31 @@ class RuntimeSummary:
 
 
 def _log(log_path: Path, message: str) -> None:
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(f"{timestamp} {message}\n")
-    except OSError:
-        pass
+    """One timestamped line — now via `oplog.append_line()`.
+
+    The body used to be written verbatim, and two of this module's call
+    sites interpolate a raw `event_id`:
+
+        _log(log_path, f"ACCEPTED {result.event.event_id}")
+        _log(log_path, f"DUPLICATE {result.event.event_id}")
+
+    That value crosses the OneDrive transport from another Desktop and
+    `Event.from_json()` does not constrain it to one line, so a newline
+    inside it forged a second line indistinguishable from a genuine one.
+    Reproduced: an Event whose id began `"X\\n2026-01-01T00:00:00+09:00
+    ACCEPTED EVT-TOTALLY-FINE"` put exactly that line in collector.log,
+    claiming an Event was accepted that never existed.
+
+    The neighbouring `REJECTED` line was already safe, but only by
+    accident — `events/schema.py` formats its messages with `{value!r}`,
+    and `repr()` escapes newlines. Relying on every future field being
+    formatted that way is what this change stops relying on.
+
+    Same defect as BUG-6 in `app/runner.py`, same fix, and now literally
+    the same code — see `oplog.py` for why it lives at the write point
+    rather than at each call site.
+    """
+    append_line(log_path, message)
 
 
 def run_once(

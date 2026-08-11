@@ -513,7 +513,12 @@ class DailyPathSafetyTests(unittest.TestCase):
             re.compile(r"^\s*import\s+(collector|transport|reporter)\b", re.MULTILINE),
             re.compile(r"^\s*from\s+(collector|transport|reporter)\b", re.MULTILINE),
         )
-        for py_file in daily_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(daily_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {daily_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for pattern in forbidden:
                 self.assertIsNone(
@@ -523,7 +528,12 @@ class DailyPathSafetyTests(unittest.TestCase):
     def test_no_hardcoded_absolute_windows_paths_in_source(self):
         daily_src = Path(__file__).resolve().parents[1] / "src" / "daily"
         forbidden = ("C:\\Users", "D:\\", "OneDrive\\")
-        for py_file in daily_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(daily_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {daily_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             code_without_docstrings = re.sub(r'""".*?"""', "", content, flags=re.DOTALL)
             for token in forbidden:

@@ -795,3 +795,82 @@ class StatusEntrypointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnparseableTransportFileTests(CompanyActivityTestCase):
+    """A file `transport.run_intake()` cannot parse must not be reported as
+    "awaiting collection" — it is never going to be collected.
+
+    `run_intake()` leaves an unparseable file exactly where it is: never
+    promoted, never moved, never deleted, and re-judged on every run. The
+    backlog view counted every `*.json` in `transport/`, so one such file
+    held `awaiting_intake` at 1 permanently.
+
+    Measured on the real runtime with a single 0-byte file — the shape
+    OneDrive Files On-Demand produces for a not-yet-downloaded placeholder:
+
+        run 1..4   transport metrics {'skipped_invalid': 1}   every run
+        ops_status ATTENTION: "수집되지 않고 남은 Event: transport=1"
+
+    That sentence says an Event is queued for collection. It was not; it had
+    been judged and parked. **An alert no run can clear is worse than no
+    alert** — ATTENTION is where real problems surface, and a permanent
+    entry teaches an operator to skim past the section. The file does still
+    need a human; it needs a different sentence.
+    """
+
+    def _write(self, name, content):
+        self.transport.mkdir(parents=True, exist_ok=True)
+        (self.transport / name).write_text(content, encoding="utf-8")
+
+    def test_an_unparseable_file_is_not_counted_as_awaiting_intake(self):
+        self._write("zero.json", "")
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_intake, 0)
+        self.assertEqual(backlog.unparseable, 1)
+
+    def test_a_valid_pending_file_is_still_counted_as_awaiting_intake(self):
+        """The guard must not hide real backlog — that would be the opposite
+        defect, and a worse one."""
+        self._write("good.json", '{"event_id": "E-1"}')
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_intake, 1)
+        self.assertEqual(backlog.unparseable, 0)
+
+    def test_the_two_are_counted_independently(self):
+        self._write("good.json", '{"event_id": "E-1"}')
+        self._write("zero.json", "")
+        self._write("truncated.json", '{"event_id": "E-2"')
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_intake, 1)
+        self.assertEqual(backlog.unparseable, 2)
+
+    def test_an_unparseable_file_alone_leaves_the_backlog_clear(self):
+        """`is_clear` means "nothing in flight". A parked file is not in
+        flight, and treating it as such made `is_clear` permanently False
+        for a condition no run could resolve."""
+        self._write("zero.json", "")
+
+        self.assertTrue(self.snapshot().backlog.is_clear)
+
+    def test_a_real_pending_file_does_make_the_backlog_unclear(self):
+        self._write("good.json", '{"event_id": "E-1"}')
+
+        self.assertFalse(self.snapshot().backlog.is_clear)
+
+    def test_the_view_uses_intake_s_own_parse_test(self):
+        """A second opinion about what "valid" means would let this view and
+        the step it reports on disagree — the class of contradiction this
+        Sprint was told to hunt for."""
+        import inspect
+
+        import app.desktop_activity as activity
+
+        source = inspect.getsource(activity._count_transport)
+        self.assertIn("_is_parseable_json", source)

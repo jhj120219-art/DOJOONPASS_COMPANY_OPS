@@ -49,6 +49,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from oplog import SECRET_PATTERNS, SECRET_RE
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SIGNALS_DIR = PROJECT_ROOT / "runtime" / "agent" / "signals"
 
@@ -76,29 +78,12 @@ REQUIRED_SIGNAL_FIELDS = ("project_id", "event_type", "status", "summary")
 # neither should look like a successful collection.
 FORBIDDEN_SIGNAL_FIELDS = frozenset({"source", "role", "event_id", "schema_version"})
 
-# Secret-shaped content. The first three patterns are byte-for-byte the ones
-# tests/test_repository_hygiene.py::test_no_secret_material_in_any_tracked_file
-# already enforces over tracked files; a test asserts the two lists stay in
-# step. The rest cover the shapes most likely to be pasted into a work note:
-# a private key block, a GitHub token, and an `.env`-style assignment.
-_SECRET_PATTERNS = (
-    r"\bntn_[A-Za-z0-9]{10,}",
-    r"\bsecret_[A-Za-z0-9]{10,}",
-    r"Bearer\s+[A-Za-z0-9._-]{20,}",
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-    r"\bgh[pousr]_[A-Za-z0-9]{20,}",
-    # No leading `\b`: the realistic shape is `NOTION_API_TOKEN=...`, and `_`
-    # is a word character, so `\bAPI` never matches inside it. The optional
-    # `[A-Za-z0-9_]*` prefix is what lets a namespaced variable name match.
-    r"[A-Za-z0-9_]*(?:API|ACCESS|AUTH|SECRET)[_-]?(?:KEY|TOKEN)\s*[=:]\s*\S+",
-    r"[A-Za-z0-9_]*(?:PASSWORD|PASSWD|CLIENT[_-]?SECRET)\s*[=:]\s*\S+",
-)
-# These two deliberately over-match: a work note reading "auth token: rotated"
-# is refused even though it carries no secret. A refusal is visible, names its
-# reason, leaves the Signal on disk, and costs one rephrase; the opposite
-# error writes a credential into Company History and a GitHub backup, where it
-# is permanent. The asymmetry is the point.
-_SECRET_RE = re.compile("|".join(_SECRET_PATTERNS), re.IGNORECASE)
+# Secret-shaped content now lives in `oplog.py`, which needs the same
+# patterns to redact log output. Re-exported under the original private
+# names so this module's callers and tests are unchanged: nothing about
+# what a Signal may contain has moved or been relaxed.
+_SECRET_PATTERNS = SECRET_PATTERNS
+_SECRET_RE = SECRET_RE
 
 
 class SignalError(ValueError):

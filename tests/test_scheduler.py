@@ -375,7 +375,12 @@ class SchedulerPathSafetyTests(unittest.TestCase):
             re.compile(r"^\s*import\s+(collector|transport|reporter)\b", re.MULTILINE),
             re.compile(r"^\s*from\s+(collector|transport|reporter)\b", re.MULTILINE),
         )
-        for py_file in scheduler_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(scheduler_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {scheduler_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for pattern in forbidden:
                 self.assertIsNone(
@@ -385,7 +390,12 @@ class SchedulerPathSafetyTests(unittest.TestCase):
     def test_no_hardcoded_absolute_windows_paths_in_source(self):
         scheduler_src = Path(__file__).resolve().parents[1] / "src" / "scheduler"
         forbidden = ("C:\\Users", "D:\\", "OneDrive\\")
-        for py_file in scheduler_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(scheduler_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {scheduler_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             code_without_docstrings = re.sub(r'""".*?"""', "", content, flags=re.DOTALL)
             for token in forbidden:
@@ -396,7 +406,12 @@ class SchedulerPathSafetyTests(unittest.TestCase):
     def test_no_thread_or_sleep_usage(self):
         scheduler_src = Path(__file__).resolve().parents[1] / "src" / "scheduler"
         forbidden = ("threading", "time.sleep", "while True", "asyncio")
-        for py_file in scheduler_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(scheduler_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {scheduler_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, content, f"{token} found in {py_file}")

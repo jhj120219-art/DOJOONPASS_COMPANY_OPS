@@ -93,7 +93,12 @@ class TransportPathSafetyTests(unittest.TestCase):
         # candidate name to mention in comments (see Event Transport analysis).
         # Only literal path-shaped usage would indicate a hardcoded path.
         forbidden = ("C:\\Users", "D:\\", "OneDrive\\")
-        for py_file in transport_src.glob("*.py"):
+        # Materialised and asserted non-empty first: an empty glob (a renamed
+        # or moved package) would make every assertion below run zero times and
+        # the test pass while enforcing nothing.
+        sources = sorted(transport_src.glob("*.py"))
+        self.assertTrue(sources, f"no sources under {transport_src}")
+        for py_file in sources:
             content = py_file.read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, content, f"{token} found in {py_file}")

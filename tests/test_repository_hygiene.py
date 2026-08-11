@@ -27,6 +27,7 @@ import ast
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -139,10 +140,28 @@ class DependencyGuardTests(unittest.TestCase):
     keeping — it is why `python -m pytest` works with no install step at all
     (docs/11 section 101's Release Environment Check)."""
 
-    LOCAL_PACKAGES = {
-        "agent", "app", "backup", "collector", "daily", "events", "history",
-        "monthly", "notion", "reporter", "scheduler", "transport", "review_cli",
-    }
+    @property
+    def LOCAL_PACKAGES(self):
+        """Everything importable from `src/`, read from disk.
+
+        This was a hand-maintained literal, which made it a table that had to
+        be edited every time a module was added — and it failed exactly that
+        way when `oplog.py` arrived. A stale entry here cannot make the guard
+        stricter, only wrong: the guard's job is to catch a *third-party*
+        import, and anything living under `src/` is local by definition.
+        Deriving it keeps the guard honest and removes the edit.
+        """
+        return {p.name for p in SRC.iterdir() if p.is_dir() and p.name != "__pycache__"} | {
+            p.stem for p in SRC.glob("*.py") if not p.stem.startswith("__")
+        }
+
+    def test_the_local_package_set_is_derived_not_hardcoded(self):
+        """Guards the guard: if this ever shrinks to a literal again, a new
+        module silently becomes indistinguishable from a third-party one."""
+        self.assertIn("oplog", self.LOCAL_PACKAGES)
+        self.assertIn("review_cli", self.LOCAL_PACKAGES)
+        self.assertIn("collector", self.LOCAL_PACKAGES)
+        self.assertNotIn("__pycache__", self.LOCAL_PACKAGES)
 
     def test_src_imports_only_the_standard_library(self):
         # sys.stdlib_module_names was added in Python 3.10; fall back to
@@ -214,18 +233,31 @@ class DocumentationGapCharacterizationTests(unittest.TestCase):
     Fixing them should make these tests fail and be rewritten as guards.
     """
 
-    def test_docs_directory_contains_fourteen_specs(self):
+    def test_docs_directory_contains_the_expected_specs(self):
+        """The count is asserted so a spec cannot be *deleted* unnoticed —
+        the README cross-check above already catches an added one."""
         names = sorted(p.name for p in DOCS.glob("*.md"))
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 15)
         self.assertIn("12_APPLICATION_FLOW_SPEC.md", names)
         self.assertIn("13_NOTION_ENVIRONMENT_SETUP.md", names)
+        self.assertIn("14_RUN_CONTRACT.md", names)
 
-    def test_readme_document_list_is_missing_the_last_two_specs(self):
-        """README section 12 stops at 11_DEPLOYMENT_RUNBOOK.md."""
+    def test_readme_document_list_names_every_spec_that_exists(self):
+        """FIXED — and now a guard rather than a record of the gap.
+
+        README section 12 is a directory listing, not a rule: it stopped at
+        `11_DEPLOYMENT_RUNBOOK.md` while `docs/` held two more. Completing a
+        list of what is on disk states no new policy and reorders no
+        priority (section 13 is what does that, and it is untouched), so it
+        is the one part of BUG-12 that needed no spec decision.
+
+        Written against `docs/*.md` rather than a hardcoded pair, so the next
+        spec added has to be listed too.
+        """
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("11_DEPLOYMENT_RUNBOOK.md", readme)
-        self.assertNotIn("12_APPLICATION_FLOW_SPEC.md", readme)
-        self.assertNotIn("13_NOTION_ENVIRONMENT_SETUP.md", readme)
+
+        missing = [p.name for p in sorted(DOCS.glob("*.md")) if p.name not in readme]
+        self.assertEqual(missing, [], "README section 12 does not list every spec")
 
     def test_spec_headers_still_carry_a_stale_absolute_path(self):
         """The repository lives at C:\\Users\\user\\Desktop\\DOJOONPASS_COMPANY_OPS,
@@ -326,6 +358,11 @@ class TestIsolationGuardTests(unittest.TestCase):
         "collector_log_path",
         "late_update_log_path",
         "monthly_state_path",
+        # The Run Manifest is written on EVERY exit path, including the
+        # aborting ones — so it is the most unconditional of the four, and a
+        # test module that omits it overwrites the repository's real
+        # runtime/runs/last_run.json on every single test.
+        "run_summary_path",
     )
     # Only written when a Notion Sync is actually configured.
     NOTION_LOG_PARAM = "notion_sync_log_path"
@@ -481,3 +518,62 @@ class EnvironmentContractTests(unittest.TestCase):
         for name in self.ENTRYPOINTS:
             with self.subTest(entrypoint=name):
                 self.assertIn(name, text)
+
+
+class EntrypointOutputOrderingTests(unittest.TestCase):
+    """Every entrypoint's captured output must read in the order it was written.
+
+    Python block-buffers stdout when it is not a terminal and leaves stderr
+    unbuffered. Under `>log 2>&1` — which is how a scheduled task captures a
+    run — that reorders the two streams against each other. Measured before
+    the fix, with the entrypoints' own reconfigure() in place:
+
+        1  stderr: the failure
+        2  stdout: the context line explaining it
+        3  stdout: trailing summary
+
+    The failure printed above the thing it referred to. That is the only
+    reading an operator gets from a captured log, and it makes a report
+    describe the wrong event.
+
+    All three entrypoints already reconfigure stdout for UTF-8 (a separate
+    defect, also operator-facing); line buffering belongs on the same call.
+    """
+
+    ENTRYPOINTS = ("run_company_ops.py", "run_agent.py", "ops_status.py")
+
+    def test_every_entrypoint_line_buffers_stdout(self):
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                text = (REPO_ROOT / name).read_text(encoding="utf-8")
+                self.assertIn(
+                    'sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)',
+                    text,
+                    f"{name} block-buffers stdout; stderr will overtake it in a "
+                    f"captured log",
+                )
+
+    def test_the_ordering_actually_holds_when_redirected(self):
+        """Asserted by running it, because the property only appears when
+        stdout is not a terminal — which is exactly the case no interactive
+        check ever covers."""
+        script = (
+            "import sys\n"
+            'sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)\n'
+            'sys.stderr.reconfigure(encoding="utf-8")\n'
+            'print("first-stdout")\n'
+            'print("second-stderr", file=sys.stderr)\n'
+            'print("third-stdout")\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "captured.log"
+            with open(log, "w", encoding="utf-8") as handle:
+                subprocess.run(
+                    [sys.executable, "-c", script],
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+            lines = log.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(lines, ["first-stdout", "second-stderr", "third-stdout"])
