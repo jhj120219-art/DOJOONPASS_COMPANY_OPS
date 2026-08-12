@@ -228,18 +228,34 @@ class KeepCandidatesParameterTests(DailyGeneratorTestCase):
         self.assertEqual(spy.list_calls, 0)
 
     def test_output_matches_between_prefetched_and_self_fetched(self):
+        """Passing `keep_candidates` must change nothing about the output.
+
+        `generated_at` is pinned for both calls. Left to its default it is
+        `datetime.now()` at one-second resolution, so the two documents
+        differed whenever the pair straddled a second boundary — observed
+        once in a full-suite run, and never in isolation, which is the worst
+        shape a failure can have. The clock was never what this test is
+        about: the claim is that the pre-fetched path and the self-fetching
+        path produce the same document, and pinning the one field that is
+        deliberately non-deterministic is what lets it actually assert that.
+        """
         event = sample_event(event_id="TEST-PREFETCH-002")
         self.repo.save(self.filter.evaluate(event).candidate)
         prefetched = self.repo.list(decision=HistoryDecision.KEEP)
+        generated_at = "2026-08-05T11:00:00+09:00"
 
         path_a = generate_daily_history(
-            self.repo, date(2026, 8, 5), output_dir=self.daily_dir / "a"
+            self.repo,
+            date(2026, 8, 5),
+            output_dir=self.daily_dir / "a",
+            generated_at=generated_at,
         )
         path_b = generate_daily_history(
             self.repo,
             date(2026, 8, 5),
             output_dir=self.daily_dir / "b",
             keep_candidates=prefetched,
+            generated_at=generated_at,
         )
 
         self.assertEqual(path_a.read_text(encoding="utf-8"), path_b.read_text(encoding="utf-8"))

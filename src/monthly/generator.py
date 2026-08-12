@@ -337,7 +337,19 @@ def run_once(
             # A month that was already on disk (UNCHANGED) still advances
             # the pointer: a crash between writing the file and saving state
             # must not leave that month re-processed forever.
-            state.clear_dirty(result.key)
+            #
+            # But only a month that was actually (re)built may have its DIRTY
+            # flag cleared. UNCHANGED means the file was NOT rebuilt — the
+            # existing one was left exactly as it was — so a DIRTY flag on it
+            # is still true, and clearing it here discarded the one signal
+            # that would have rebuilt it. Measured: a Monthly written by a run
+            # that died before saving state, then a Late Event for that month;
+            # this branch advanced the pointer and cleared DIRTY, and the
+            # Late Event stayed in Daily and never reached Monthly, with
+            # `last_successful_monthly_close` reporting the month as closed.
+            # The dirty loop below now sees it and rebuilds it in the same run.
+            if result.status is MonthlyStatus.MONTHLY_GENERATED:
+                state.clear_dirty(result.key)
             save_state(state_path, state)
             continue
 
@@ -346,8 +358,36 @@ def run_once(
         # nothing revisits.
         break
 
+    first_month = (history_start_date.year, history_start_date.month)
     for key in list(state.dirty_months):
         year, month = parse_month_key(key)
+
+        # §85-86: never invent a month that predates the system.
+        # `pending_months()` applies this to the catch-up; the dirty loop
+        # takes its months from the state file instead, so a hand-edited or
+        # restored state naming a pre-history month walked straight past the
+        # rule and wrote a Monthly for a month Company History does not
+        # cover. Coverage says "complete" for such a month — there are zero
+        # days to require — so nothing downstream refused it either.
+        #
+        # Reported rather than dropped, and the flag is deliberately left
+        # in place: no run can resolve this one, and silently forgetting it
+        # would hide a state file that needs a person.
+        if (year, month) < first_month:
+            results.append(
+                MonthlyResult(
+                    year=year,
+                    month=month,
+                    status=MonthlyStatus.MONTHLY_PENDING,
+                    error=(
+                        f"{key} predates the history start date "
+                        f"({history_start_date.isoformat()}); Company History does not "
+                        f"cover it and no run can consolidate it"
+                    ),
+                )
+            )
+            continue
+
         result = consolidate_month(
             year=year,
             month=month,
@@ -358,7 +398,15 @@ def run_once(
             allow_update=True,
         )
         results.append(result)
-        if result.status is MonthlyStatus.MONTHLY_UPDATED:
+        # UPDATED is the normal outcome; GENERATED means the file was not
+        # there and has just been built from scratch. Both leave a Monthly
+        # that reflects Daily as it stands right now, which is exactly what
+        # the DIRTY flag asks for, so both clear it. Only GENERATED was
+        # missing here, so a dirty month whose file had been lost was
+        # rebuilt correctly and then rebuilt again on every following run —
+        # harmless work that also left `dirty_months` permanently non-empty,
+        # which `ops_status.py` reports as "재생성 대기".
+        if result.status in (MonthlyStatus.MONTHLY_UPDATED, MonthlyStatus.MONTHLY_GENERATED):
             state.clear_dirty(key)
             save_state(state_path, state)
 
@@ -368,21 +416,45 @@ def run_once(
     )
 
 
-def mark_month_dirty(state_path: Path, day: date_type) -> bool:
+def mark_month_dirty(
+    state_path: Path, day: date_type, *, monthly_dir: Path | None = None
+) -> bool:
     """Record that `day`'s Daily History changed after its Monthly was written.
 
     Called when a Late Event updates a Daily file (docs/09 §54-56). A no-op
     when that month has not been consolidated yet — the pending catch-up
     will read the updated Daily anyway, and marking it would only cause a
     redundant rebuild.
+
+    "Not consolidated yet" has two indicators, and the state pointer is only
+    one of them. The other is whether the Monthly file is on disk, and where
+    they disagree the file wins — docs/10 §49's "History가 State보다
+    우선", applied here rather than only at the Daily level.
+
+    That disagreement is reachable: `run_once()` writes the Monthly file and
+    *then* saves state, so a run that dies between the two leaves a real
+    Monthly for a month the pointer says is still open. A Late Event landing
+    before the next consolidation was then judged by the pointer alone,
+    marked nothing, and the catch-up that followed found the file already
+    present and left it untouched (MONTHLY_UNCHANGED) while advancing the
+    pointer past it. Reproduced: the Late Event stayed in Daily, never
+    reached Monthly, and every state field reported a healthy closed month.
+
+    `monthly_dir=None` keeps the old state-only judgement, for callers that
+    have no Monthly directory to consult. `app/runner.py` passes it.
     """
     state_path = Path(state_path)
     state = load_state(state_path)
     key = month_key(day.year, day.month)
 
-    if state.last_successful_monthly_close is None:
-        return False
-    if key > state.last_successful_monthly_close:
+    consolidated = (
+        state.last_successful_monthly_close is not None
+        and key <= state.last_successful_monthly_close
+    )
+    if not consolidated and monthly_dir is not None:
+        consolidated = (Path(monthly_dir) / f"{key}.md").exists()
+
+    if not consolidated:
         return False
     if not state.mark_dirty(key):
         return False

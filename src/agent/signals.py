@@ -283,7 +283,16 @@ def load_signals(
             continue
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # `ValueError` covers `UnicodeDecodeError`. A Signal file written
+            # by the operator's own tool in a legacy codepage, or truncated
+            # mid-write, is not valid UTF-8 — and without this it escaped
+            # `load_signals()` and aborted the Agent's whole run for that
+            # date instead of rejecting the one Signal.
+            #
+            # That is the guarantee this loop exists to provide: one
+            # unusable Signal is quarantined for a human and the rest of the
+            # date proceeds.
             invalid.append((path, SignalError(path.name, f"could not read file ({exc})")))
             continue
         try:

@@ -50,7 +50,7 @@ class Collector:
         if isinstance(raw, (str, bytes)):
             try:
                 data = json.loads(raw)
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, RecursionError) as exc:
                 return CollectorResult(
                     status=CollectorStatus.REJECTED,
                     event=None,

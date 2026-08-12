@@ -18,6 +18,7 @@ lost, and no Event may reach Company History twice.
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -427,3 +428,135 @@ class SecretLeakTests(FaultTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeliveredButUnfiledTests(FaultTestCase):
+    """The send succeeded and the `sent/` move did not.
+
+    `test_a_failed_sent_move_keeps_the_event_for_the_next_run` above blocks
+    `sent/` by putting a *file* where the directory belongs, so
+    `sent_dir.mkdir()` fails at the top of `drain()` and it returns before
+    calling the Transport at all. That is a real fault and worth keeping —
+    but it is "nothing was delivered", not "delivered but unfiled", and the
+    branch that handles the latter had never executed:
+
+        failed.append((event.event_id, f"delivered but could not be filed: {exc}"))
+
+    That branch is the one with a downstream consequence. The Event really
+    is in the cloud, and it is also still in the outbox, so the next run
+    sends it a second time — the case `outbox.py`'s docstring calls safe
+    ("a duplicate delivery costs one redundant file copy and produces no
+    duplicate History"). Nothing had checked either half.
+
+    Injected by putting a non-empty directory exactly where the Event's file
+    must be written: `os.replace()` refuses it, and no mock is involved —
+    the send genuinely happens first.
+    """
+
+    def _blocking_directory_for(self, event):
+        from reporter.local_output import safe_event_filename
+
+        self.sent.mkdir(parents=True, exist_ok=True)
+        blocked = self.sent / safe_event_filename(event.event_id)
+        blocked.mkdir()
+        (blocked / "occupied.txt").write_text("in the way", encoding="utf-8")
+        return blocked
+
+    def _event(self, event_id="FAULT-UNFILED-001"):
+        return create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="P",
+            event_type="COMPLETED",
+            status="COMPLETED",
+            summary="delivered but unfiled",
+            history_candidate=True,
+            event_id=event_id,
+            timestamp="2026-08-08T10:00:00+09:00",
+        )
+
+    def test_the_event_is_delivered_and_then_reported_as_unfiled(self):
+        event = self._event()
+        stage(event, self.outbox)
+        self._blocking_directory_for(event)
+        transport = RecordingTransport()
+
+        summary = drain(transport, outbox_dir=self.outbox, sent_dir=self.sent)
+
+        # It really was delivered — that is what makes this branch different
+        # from the mkdir failure above.
+        self.assertEqual(transport.event_ids, [event.event_id])
+        self.assertFalse(summary.is_clear)
+        self.assertEqual(len(summary.failed), 1)
+        self.assertIn("delivered but could not be filed", summary.failed[0][1])
+        self.assertEqual(summary.sent, ())
+
+    def test_the_event_stays_in_the_outbox_rather_than_being_dropped(self):
+        """Losing it would lose Company History; re-sending costs a file
+        copy. `outbox.py` chooses re-sending, and this pins that choice."""
+        event = self._event()
+        stage(event, self.outbox)
+        self._blocking_directory_for(event)
+
+        drain(RecordingTransport(), outbox_dir=self.outbox, sent_dir=self.sent)
+
+        self.assertEqual(len(pending(self.outbox)), 1)
+
+    def test_the_next_run_delivers_it_again_once_the_obstruction_clears(self):
+        event = self._event()
+        stage(event, self.outbox)
+        blocked = self._blocking_directory_for(event)
+        transport = RecordingTransport()
+        drain(transport, outbox_dir=self.outbox, sent_dir=self.sent)
+
+        shutil.rmtree(blocked)
+        again = drain(transport, outbox_dir=self.outbox, sent_dir=self.sent)
+
+        self.assertEqual(again.sent, (event.event_id,))
+        self.assertEqual(pending(self.outbox), ())
+        # Twice on the wire, deliberately — the downstream layers dedup.
+        self.assertEqual(transport.event_ids, [event.event_id, event.event_id])
+
+    def test_one_unfiled_event_does_not_stop_the_rest_of_the_batch(self):
+        """Per-file isolation, the same rule `collector/runtime.py` applies:
+        the blocked Event must not take its neighbours with it."""
+        blocked_event = self._event("FAULT-UNFILED-BLOCKED")
+        other = self._event("FAULT-UNFILED-OTHER")
+        stage(blocked_event, self.outbox)
+        stage(other, self.outbox)
+        self._blocking_directory_for(blocked_event)
+        transport = RecordingTransport()
+
+        summary = drain(transport, outbox_dir=self.outbox, sent_dir=self.sent)
+
+        self.assertEqual(summary.sent, (other.event_id,))
+        self.assertEqual([f[0] for f in summary.failed], [blocked_event.event_id])
+        self.assertEqual(len(pending(self.outbox)), 1)
+
+    def test_the_agent_does_not_advance_its_date_past_an_unfiled_event(self):
+        """The invariant the outbox exists for: a date must not close while
+        its Events are still sitting locally."""
+        self.write_signal(date(2026, 8, 8), "a")
+        transport = RecordingTransport()
+        self.run_agent(transport, now=datetime(2026, 8, 9, 9, 0))
+        self.assertEqual(load_state(self.state_path).last_successful_collection_date,
+                         date(2026, 8, 8))
+
+        # Put the delivered Event back in the outbox and block its filing,
+        # the shape a crash-plus-obstruction leaves behind.
+        filed = list(self.sent.glob("*.json"))
+        self.assertEqual(len(filed), 1)
+        shutil.move(str(filed[0]), str(self.outbox / filed[0].name))
+        blocked = self.sent / filed[0].name
+        blocked.mkdir()
+        (blocked / "occupied.txt").write_text("in the way", encoding="utf-8")
+        save_state(
+            self.state_path,
+            AgentState(desktop_id="DESKTOP_1", last_successful_collection_date=None),
+        )
+
+        result = self.run_agent(transport, now=datetime(2026, 8, 9, 12, 0))
+
+        self.assertEqual(result.status, AgentStatus.FAILED)
+        self.assertIsNone(load_state(self.state_path).last_successful_collection_date)
+        self.assertEqual(len(pending(self.outbox)), 1)

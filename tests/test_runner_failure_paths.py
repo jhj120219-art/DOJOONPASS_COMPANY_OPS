@@ -27,6 +27,7 @@ Audit findings referenced below:
     BUG-17  a Daily History file already written is never updated
 """
 
+import ast
 import inspect
 import json
 import os
@@ -50,7 +51,13 @@ from backup.state import BackupStateError  # noqa: E402
 from collector import Collector, InMemorySeenEventStore, RuntimeOutcome  # noqa: E402
 from collector.runtime import run_once as collector_run_once  # noqa: E402
 from collector.state import CollectorStateError  # noqa: E402
-from daily import generate_daily_history  # noqa: E402
+from agent.delivery import DeliveryProblem, find_undelivered_events  # noqa: E402
+from agent.signals import load_signals  # noqa: E402
+from daily import (  # noqa: E402
+    LateUpdateOutcome,
+    generate_daily_history,
+    update_daily_history,
+)
 from history import FileHistoryRepository, HistoryCandidate, HistoryDecision  # noqa: E402
 from events import Event, create_event  # noqa: E402
 from notion import (  # noqa: E402
@@ -62,7 +69,7 @@ from notion import (  # noqa: E402
 from notion.retry_queue import RetryQueueError  # noqa: E402
 from notion.retry_queue import save_queue as save_retry_queue  # noqa: E402
 from notion.sync import SyncResult, SyncStatus  # noqa: E402
-from runsummary import read_summary  # noqa: E402
+from runsummary import ComponentStatus, read_summary  # noqa: E402
 from scheduler.state import SchedulerStateError  # noqa: E402
 from reporter import Reporter  # noqa: E402
 
@@ -1168,11 +1175,20 @@ class IntakeClockSkewTests(unittest.TestCase):
         mtime 1 year ahead   -> stalled ~1 year
 
     Nothing is lost — the file stays in transport/ and eventually arrives —
-    but the delay is unbounded and, crucially, INVISIBLE. run_company_ops.py
-    prints only `Transport: moved={len(intake_summary.moved)}`, so a stalled
-    Event reads as "moved=0", exactly like an idle run. `skipped_not_stable`
-    is carried in IntakeSummary and never displayed or logged anywhere, which
-    is the same blind spot the Observability Audit found for skipped runs.
+    but the delay is unbounded. It used to be invisible as well:
+    run_company_ops.py prints only
+    `Transport: moved={len(intake_summary.moved)}`, so a stalled Event reads
+    as "moved=0", exactly like an idle run, and while `skipped_not_stable`
+    does reach the Run Manifest, `_print_last_run()` prints only components
+    that are NOT SUCCESS — and transport succeeds.
+
+    C23 closed the visibility half only: `IntakeBacklog.future_dated` counts
+    files whose mtime is ahead of this clock and `ops_status.py` says so in
+    the same sentence that reports the backlog
+    (`test_observability.py::FutureDatedTransportFileTests`). The stall
+    itself is untouched, and the count is deliberately NOT subtracted from
+    `awaiting_intake` — whether such a file is "in flight" is exactly the
+    judgement below.
 
     Not fixed: clamping a future mtime, or treating it as stable immediately,
     or reading the clock differently are all judgement calls about how much to
@@ -1702,7 +1718,9 @@ class CorruptCandidateFileTests(unittest.TestCase):
 
 
 class IntakeRecursionErrorTests(unittest.TestCase):
-    """BUG-40 (NOT FIXED): one deeply-nested file permanently halts the Runner.
+    """BUG-40 — **FIXED in C22.** Kept as the guarantee it became.
+
+    Was: one deeply-nested file permanently halted the Runner.
 
     CHARACTERIZATION: asserts today's behaviour.
 
@@ -1793,25 +1811,38 @@ class IntakeRecursionErrorTests(unittest.TestCase):
 
         self.assertEqual(len(summary.skipped_invalid) + len(summary.moved), 1)
 
-    def test_deep_nesting_escapes_and_takes_the_whole_run_with_it(self):
+    def test_deep_nesting_is_skipped_and_the_rest_of_the_batch_proceeds(self):
+        """GUARANTEE (was CHARACTERIZATION): BUG-40 is closed.
+
+        This used to assert the opposite — that the `RecursionError` escaped
+        and took the run with it, leaving `incoming/` empty and the file in
+        place so the next run died identically. `json.loads()` raises
+        `RecursionError` on deeply nested input and it is a `RuntimeError`
+        subclass, so `except (OSError, ValueError)` never covered it.
+
+        `agent/signals.py` had already answered this for its own
+        `json.loads`, in a comment beside the catch. Naming `RecursionError`
+        here applies that decision where it was missing rather than making a
+        new one: this predicate's entire purpose is that "a file it cannot
+        parse is skipped rather than crashing the run".
+        """
         for i in range(3):
             self._stage_event(f"ZZ-OK-{i}")
-        # Sorts ahead of the healthy files, so nothing is intaken before it.
-        self._stage("AA-DEEP.json", b"[" * 5000 + b"]" * 5000)
+        # Sorts ahead of the healthy files, so it is reached first.
+        self._stage("AA-DEEP.json", b"[" * 200000 + b"]" * 200000)
 
-        with self.assertRaises(RecursionError):
-            self._intake()
+        summary = self._intake()
 
-        self.assertEqual(list((self.root / "incoming").glob("*.json")), [])
-        # Still there, so the next run dies in exactly the same place.
+        self.assertEqual(summary.skipped_invalid, ("AA-DEEP.json",))
+        self.assertEqual(len(summary.moved), 3)
+        # Never promoted, never deleted — left for a human, re-judged next run.
         self.assertTrue((self.transport_dir / "AA-DEEP.json").exists())
 
-    def test_the_guard_does_not_catch_recursion_error(self):
-        """The structural cause, so a refactor cannot lose the finding."""
+    def test_the_guard_now_names_recursion_error(self):
+        """The structural half, so a refactor cannot quietly undo it."""
         source = inspect.getsource(sys.modules["transport.intake"]._is_parseable_json)
 
-        self.assertIn("except (OSError, ValueError)", source)
-        self.assertNotIn("RecursionError", source)
+        self.assertIn("RecursionError", source)
 
 
 class BackupFailedStatusClearingTests(RunnerFailurePathTestCase):
@@ -1928,9 +1959,20 @@ class StateLossVersusProcessedFilesTests(unittest.TestCase):
     converts silent loss into a visible, repeating failure. The missing piece
     is that nothing reconciles the two notions of "already handled".
 
-    Unlike BUG-40 and BUG-42, this one is at least visible:
-    `collector_summary.failed` is printed by run_company_ops.py. The exit code
-    is still 0 (BUG-36), so nothing alerts.
+    Visibility, restated after measuring (C24). `collector_summary.failed`
+    is printed by run_company_ops.py — but to stdout, which Task Scheduler
+    does not capture, and the Run Manifest carries it as a *metric on a
+    SUCCESS component*, which `_print_last_run()` deliberately does not
+    print. BUG-36 has since been fixed and the exit code is still 0 here,
+    correctly: the collector component is SUCCESS by design (docs/03 §53
+    per-file isolation).
+
+    So the only operator-facing signal was `ops_status.py`'s
+    "수집되지 않고 남은 Event: incoming=1", which is accurate and stood
+    forever with no way to tell that no future run would clear it. C24 added
+    `IntakeBacklog.name_collision`, which names the reason in that same
+    sentence (`test_observability.py::NameCollisionInIncomingTests`). The
+    stuck loop below is unchanged.
 
     Not fixed: reconciling them means either rebuilding state from processed/
     or treating a name collision as a duplicate rather than a failure. Both
@@ -2367,24 +2409,38 @@ class DrainPendingPartialSuccessTests(unittest.TestCase):
     is `except Exception`. That does not cover BaseException, so a
     KeyboardInterrupt or SystemExit from the client propagates — and it
     propagates from inside the loop, BEFORE `save_all()` runs. Records already
-    written to Notion in that same call therefore stay in the pending file and
-    are written again on the next run, producing duplicate Ops Runs rows.
+    written to Notion in that same call therefore stay in the pending file
+    and are attempted again on the next run.
 
     Same shape as BUG-25: the side effect happened, the state recording it did
-    not. Lower severity — Dashboard rows are a reporting artifact, so the cost
-    is duplicates rather than lost Company History.
+    not. Lower severity — Dashboard rows are a reporting artifact.
+
+    What the consequence *is* has since narrowed. This used to end "producing
+    duplicate Ops Runs rows"; the find-before-create guard added for the
+    duplicate-row defect means the re-attempt now finds the row it already
+    wrote and creates nothing. The lost-progress fact is unchanged and still
+    pinned below — only its blast radius shrank, from a wrong Dashboard to a
+    redundant lookup.
 
     Not fixed: catching BaseException to save progress conflicts with letting
     Ctrl+C actually interrupt, and which one wins is a decision.
     """
 
     class SelectiveClient:
-        """Fails for records whose properties['i'] is in `fail`."""
+        """Fails for records whose properties['i'] is in `fail`.
+
+        Implements `find_or_create_by_title()` rather than
+        `create_project()`: that is the call `drain_pending()` makes since
+        the find-before-create guard was added for the duplicate-row defect.
+        A double still offering only the old method would make every record
+        fail with AttributeError and quietly turn these partial-success
+        assertions into total-failure ones.
+        """
 
         def __init__(self, fail=()):
             self.fail = set(fail)
 
-        def create_project(self, properties):
+        def find_or_create_by_title(self, *, property_name, value, properties):
             if properties.get("i") in self.fail:
                 raise RuntimeError("simulated Notion outage")
             return {"id": "page-1"}
@@ -2443,7 +2499,7 @@ class DrainPendingPartialSuccessTests(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def create_project(self, properties):
+            def find_or_create_by_title(self, *, property_name, value, properties):
                 self.calls += 1
                 if self.calls == 1:
                     return {"id": "page-1"}  # this one really is recorded
@@ -2455,7 +2511,7 @@ class DrainPendingPartialSuccessTests(unittest.TestCase):
             drain_pending(self.path, Interrupting())
 
         # The first record WAS written to Notion, but all three are still
-        # queued — so it will be written a second time on the next run.
+        # queued — so it will be attempted a second time on the next run.
         self.assertEqual(len(self._remaining()), 3)
 
     def test_the_docstring_claims_it_never_raises(self):
@@ -2862,18 +2918,26 @@ class RunIdCorrelationTests(RunnerFailurePathTestCase):
 
     VERIFIED CORRECT.
 
-    Two modules derive the id independently, with identical code:
+    Two modules derive the id independently:
 
-        app/runner.py     resolved_run_id = run_id or now.isoformat(...)
+        app/runner.py     resolved_manifest_run_id = run_id or now_iso(now)
         backup/runner.py  resolved_run_id = run_id or now.isoformat(...)
 
     app/runner passes the RAW `run_id` down (`run_id=run_id`, normally None),
     not its own resolved value — so backup/runner really does compute its own.
     They agree only because app/runner also threads the same `now` through
-    (`now=now`). If either module called `datetime.now()` itself instead, the
-    two would drift and `BackupLogEntry.run_id` would no longer match the Ops
-    Runs "Run ID" for the same execution — the Backup Log (docs/08 section 68)
-    and the Dashboard could not be correlated, and nothing would fail loudly.
+    (`now=now`), and because `now_iso()` *is*
+    `isoformat(timespec="seconds")`. If either module called `datetime.now()`
+    itself instead, the two would drift and `BackupLogEntry.run_id` would no
+    longer match the Ops Runs "Run ID" for the same execution — the Backup
+    Log (docs/08 section 68) and the Dashboard could not be correlated, and
+    nothing would fail loudly.
+
+    One of the three used to be a *fourth* spelling of the same rule: the
+    Dashboard step recomputed `run_id or now.isoformat(timespec="seconds")`
+    of its own. It now reuses `resolved_manifest_run_id`, so the Dashboard
+    row and the manifest cannot drift at all. The remaining pair — app and
+    backup — still can, which is what these tests watch.
 
     Measured: with now = 2026-08-05T11:00:00+09:00, the BackupLogEntry's
     run_id is exactly that string.
@@ -2911,14 +2975,56 @@ class RunIdCorrelationTests(RunnerFailurePathTestCase):
         self.assertIn("run_id=run_id", call)
 
     def test_neither_module_calls_datetime_now_for_the_run_id(self):
-        for module_path in ("app/runner.py", "backup/runner.py"):
+        """The property, not the spelling.
+
+        This used to assert one exact source line in both modules, which
+        made it fail the moment the Dashboard step stopped re-deriving the
+        id and started reusing the manifest's — a change that strengthens
+        the very correlation this class exists to protect. What matters is
+        that each run_id comes from the threaded `now` (or an explicit
+        `run_id`) and never from a fresh clock reading.
+        """
+        src_root = Path(__file__).resolve().parents[1] / "src"
+
+        app_source = (src_root / "app" / "runner.py").read_text(encoding="utf-8")
+        self.assertIn("resolved_manifest_run_id = run_id or now_iso(now)", app_source)
+        # The Dashboard row is keyed by that same value, not a second one.
+        self.assertIn("resolved_run_id = resolved_manifest_run_id", app_source)
+
+        backup_source = (src_root / "backup" / "runner.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'resolved_run_id = run_id or now.isoformat(timespec="seconds")', backup_source
+        )
+
+        for module_path, source in (
+            ("app/runner.py", app_source),
+            ("backup/runner.py", backup_source),
+        ):
             with self.subTest(module=module_path):
-                source = (
-                    Path(__file__).resolve().parents[1] / "src" / module_path
-                ).read_text(encoding="utf-8")
-                self.assertIn(
-                    'resolved_run_id = run_id or now.isoformat(timespec="seconds")', source
-                )
+                for line in source.splitlines():
+                    if "resolved_run_id" in line or "resolved_manifest_run_id" in line:
+                        if line.lstrip().startswith("#"):
+                            continue
+                        self.assertNotIn("datetime.now(", line)
+
+    def test_the_backup_entry_and_the_manifest_carry_the_same_run_id(self):
+        """The correlation itself, end to end — the docstring above explains
+        why it holds, and nothing checked that it actually does."""
+        (self.local_master_dir / "daily").mkdir(parents=True, exist_ok=True)
+        (self.local_master_dir / "daily" / "2026-08-05.md").write_text("x", encoding="utf-8")
+
+        result = self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        self.assertEqual(result[3].run_id, result.summary.run_id)
+
+    def test_an_explicit_run_id_reaches_both_the_backup_entry_and_the_manifest(self):
+        (self.local_master_dir / "daily").mkdir(parents=True, exist_ok=True)
+        (self.local_master_dir / "daily" / "2026-08-05.md").write_text("x", encoding="utf-8")
+
+        result = self._run(run_id="EXPLICIT-RUN-ID")
+
+        self.assertEqual(result[3].run_id, "EXPLICIT-RUN-ID")
+        self.assertEqual(result.summary.run_id, "EXPLICIT-RUN-ID")
 
 
 class BackupScopeCaseSensitivityTests(unittest.TestCase):
@@ -4489,3 +4595,744 @@ class ConsumedEventWithoutCandidateTests(RunnerFailurePathTestCase):
             self._run()
 
         self.assertFalse(self.runner_lock_path.exists())
+
+
+# A file that exists and is readable at the OS level but is not valid UTF-8.
+# The same constant `test_monthly_history.py` already uses, for the same
+# reason: it is the shape a truncated write, a legacy-codepage editor, or an
+# interrupted OneDrive transfer actually produces — distinct from a *missing*
+# file and from an *empty* one, both of which decode fine.
+UNDECODABLE_BYTES = b"\xff\xfe\x00 not utf-8 \xff"
+
+
+class UndecodableFileIsolationTests(unittest.TestCase):
+    """`except OSError` around a decode lets `UnicodeDecodeError` through.
+
+    Found by tracing which lines of `src/` the suite never executes, then
+    scanning every `try` that decodes or parses for one that does not catch
+    `ValueError`. Four sites had it, in four modules, all with the same
+    consequence: a file that is not valid UTF-8 escaped a function whose
+    documented contract is to report the problem rather than raise.
+
+    `monthly/generator._existing_generated_at()` had already been fixed for
+    exactly this, and says so in its docstring ("it used to catch only
+    `OSError`, so a previous Monthly that was not valid UTF-8 raised
+    `UnicodeDecodeError` (a ValueError) out of here and failed the entire
+    rebuild"). The other four were the same bug, unfound.
+
+    Measured blast radius of the worst one, through the real Runner: an
+    undecodable Daily file made step 6.5 raise out of `run_once()`, so
+    Monthly, **Backup** and Dashboard never started — 6 of 9 components
+    recorded, no commit, no Dashboard row. A component docs/14 §5 classifies
+    DEGRADED was aborting one it classifies CRITICAL.
+
+    Each test below pins the *contract* the site already claimed, not a new
+    behaviour.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    # ---------------------------------------------- daily/generator.py
+
+    def test_an_undecodable_daily_is_reported_not_raised(self):
+        """`update_daily_history()`: "Never raises for an I/O or rendering
+        failure — docs/06 §41 requires that a History write failure leave
+        the existing History intact ... and be retried on the next run"."""
+        daily = self.root / "daily"
+        daily.mkdir(parents=True)
+        repo = FileHistoryRepository(
+            keep_dir=self.root / "keep", review_dir=self.root / "review"
+        )
+        repo.save(
+            HistoryCandidate(
+                history_id="HIST-LATE",
+                event_id="LATE",
+                timestamp="2026-08-05T10:00:00+09:00",
+                category="MILESTONE",
+                project_id="P",
+                role="COO",
+                summary="late work",
+                evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+        )
+        target = daily / "2026-08-05.md"
+        target.write_bytes(UNDECODABLE_BYTES)
+
+        result = update_daily_history(
+            repo,
+            date(2026, 8, 5),
+            output_dir=daily,
+            now=datetime(2026, 8, 7, 9, 0).astimezone(),
+        )
+
+        self.assertEqual(result.outcome, LateUpdateOutcome.FAILED)
+        self.assertIsNotNone(result.error)
+        # §41: the existing History is left exactly as it was.
+        self.assertEqual(target.read_bytes(), UNDECODABLE_BYTES)
+        # And the Candidate is untouched, so the next run retries the date.
+        self.assertEqual(len(repo.list(decision=HistoryDecision.KEEP)), 1)
+
+    # ---------------------------------------------- collector/runtime.py
+
+    def test_an_undecodable_incoming_file_does_not_stop_the_batch(self):
+        """docs/03 §53, which this module quotes as the reason
+        `collector.collect()` is wrapped. The read above it was the one step
+        in the loop that did not honour it."""
+        incoming = self.root / "incoming"
+        incoming.mkdir(parents=True)
+        good = create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="P",
+            event_type="MILESTONE_COMPLETED",
+            status="IN_PROGRESS",
+            summary="ok",
+            history_candidate=True,
+            event_id="GOOD-1",
+            timestamp="2026-08-05T10:00:00+09:00",
+        )
+        # Sorted first, so it is reached before the good one.
+        (incoming / "a-bad.json").write_bytes(UNDECODABLE_BYTES)
+        (incoming / "b-good.json").write_text(good.to_json(), encoding="utf-8")
+
+        summary = collector_run_once(
+            collector=Collector(seen_store=InMemorySeenEventStore()),
+            incoming_dir=incoming,
+            processed_dir=self.root / "processed",
+            rejected_dir=self.root / "rejected",
+            log_path=self.root / "collector.log",
+        )
+
+        self.assertEqual(summary.accepted, 1)
+        self.assertEqual(summary.failed, 1)
+        # The unreadable file stays in incoming/ for the next run, never
+        # deleted and never silently dropped.
+        self.assertTrue((incoming / "a-bad.json").exists())
+
+    # ---------------------------------------------- agent/signals.py
+
+    def test_an_undecodable_signal_is_rejected_not_fatal(self):
+        """One unusable Signal is quarantined for a human; the rest of the
+        date proceeds."""
+        day_dir = self.root / "signals" / "2026-08-05"
+        day_dir.mkdir(parents=True)
+        (day_dir / "good.json").write_text(
+            json.dumps(
+                {
+                    "project_id": "P",
+                    "event_type": "MILESTONE_COMPLETED",
+                    "status": "IN_PROGRESS",
+                    "summary": "ok",
+                    "history_candidate": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (day_dir / "bad.json").write_bytes(UNDECODABLE_BYTES)
+
+        valid, invalid = load_signals(self.root / "signals", date(2026, 8, 5))
+
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("could not read file", str(invalid[0][1]))
+
+    # ---------------------------------------------- agent/delivery.py
+
+    def test_an_undecodable_sync_destination_is_reported_as_unreadable(self):
+        """`UNREADABLE` is one of this module's four declared verdicts, and a
+        truncated transfer is one of the shapes its docstring lists as the
+        reason it exists. It simply did not classify undecodable as
+        unreadable."""
+        sent = self.root / "sent"
+        sync = self.root / "sync"
+        sent.mkdir()
+        sync.mkdir()
+        (sent / "E1.json").write_text(json.dumps({"event_id": "E1"}), encoding="utf-8")
+        (sync / "E1.json").write_bytes(UNDECODABLE_BYTES)
+
+        result = find_undelivered_events(sent_dir=sent, sync_folder=sync)
+
+        self.assertEqual(len(result.undelivered), 1)
+        self.assertEqual(result.undelivered[0].problem, DeliveryProblem.UNREADABLE)
+
+    def test_the_status_view_still_answers_when_a_destination_is_undecodable(self):
+        """The reason this one mattered: `ops_status.py` is the read-only
+        view whose whole contract is that it answers even when the evidence
+        is damaged. It crashed instead."""
+        sent = self.root / "sent"
+        sync = self.root / "sync"
+        sent.mkdir()
+        sync.mkdir()
+        for index in range(3):
+            (sent / f"E{index}.json").write_text(
+                json.dumps({"event_id": f"E{index}"}), encoding="utf-8"
+            )
+        (sync / "E0.json").write_bytes(UNDECODABLE_BYTES)
+        (sync / "E1.json").write_text(json.dumps({"event_id": "E1"}), encoding="utf-8")
+        # E2 has no destination — the normal consumed case.
+
+        result = find_undelivered_events(sent_dir=sent, sync_folder=sync)
+
+        self.assertEqual(result.checked, 3)
+        self.assertEqual(result.absent, 1)
+        self.assertEqual([u.event_id for u in result.undelivered], ["E0"])
+
+    # ---------------------------------------------- the family itself
+
+    def test_no_decode_site_catches_oserror_alone(self):
+        """The scan that found these, kept as a guard.
+
+        Any `try` whose body decodes or parses must catch `ValueError` too —
+        `UnicodeDecodeError` and `JSONDecodeError` are both `ValueError`
+        subclasses, and `OSError` does not cover either.
+        """
+        import ast
+
+        DECODERS = ("read_text", "read_bytes", "decode")
+        FORGIVING = {
+            "ValueError",
+            "UnicodeDecodeError",
+            "Exception",
+            "BaseException",
+            "<bare>",
+        }
+
+        def caught_by(handler):
+            node = handler.type
+            if node is None:
+                return {"<bare>"}
+            if isinstance(node, ast.Name):
+                return {node.id}
+            if isinstance(node, ast.Tuple):
+                return {e.id for e in node.elts if isinstance(e, ast.Name)}
+            return {ast.unparse(node)}
+
+        offenders = []
+        for path in sorted((Path(__file__).resolve().parents[1] / "src").rglob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+
+            # Innermost enclosing `try` per node. Walking every `Try` and
+            # asking "does my body mention a decode?" flags `run_once()`'s
+            # outer try/finally, whose body is the entire pipeline — the
+            # question is which handler would actually catch the decode, and
+            # that is the nearest one that has handlers at all.
+            enclosing = {}
+
+            def descend(node, current):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, ast.Try):
+                        inner = child if child.handlers else current
+                        for stmt in child.body:
+                            descend(stmt, inner)
+                        for handler in child.handlers:
+                            for stmt in handler.body:
+                                descend(stmt, current)
+                        for stmt in child.orelse + child.finalbody:
+                            descend(stmt, current)
+                        continue
+                    enclosing[child] = current
+                    descend(child, current)
+
+            descend(tree, None)
+
+            for node, guard in enclosing.items():
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name not in DECODERS:
+                    continue
+                if guard is None:
+                    # Unguarded entirely. Legitimate where the caller is the
+                    # one that converts (the scan's job is the mismatched
+                    # guard, not the absent one), so only a guard that exists
+                    # and is too narrow is reported.
+                    continue
+                caught = set()
+                for handler in guard.handlers:
+                    caught |= caught_by(handler)
+                if caught & FORGIVING:
+                    continue
+                offenders.append(
+                    f"{path.name}:{node.lineno} guarded at {guard.lineno} "
+                    f"catching {sorted(caught)}"
+                )
+
+        self.assertEqual(sorted(offenders), [])
+
+
+class NaiveAwareComparisonGuardTests(unittest.TestCase):
+    """Two `fromisoformat()` results compared without allowing for one of
+    them being naive.
+
+    `datetime` raises `TypeError`, not `ValueError`, for
+    "can't compare offset-naive and offset-aware datetimes", so a guard
+    written as `except ValueError` — the obvious one, since that is what a
+    bad *value* raises — lets it straight through. Two live sites had
+    exactly that:
+
+        notion/sync.py       §29-30's Late Event guard, against the
+                             `Last Updated` value Notion returns. Measured:
+                             `notion_sync` FAILED every run and the retry
+                             queue grew 1 -> 2 -> 3 without bound.
+        app/desktop_activity `_before()`, whose own docstring promises a
+                             corrupted Event "affects only its own ordering".
+                             Measured: one naive Event in `processed/` took
+                             the whole COMPANY view of `ops_status.py` down.
+
+    Both are fixed and pinned behaviourally
+    (`test_notion_sync.py::LateEventGuardTimezoneTests`,
+    `test_observability.py::NaiveTimestampInProcessedEventsTests`). This is
+    the structural half: the next one written gets caught at the shape.
+
+    A site is accepted when either the innermost enclosing `try` catches
+    `TypeError` (or something broader), or the surrounding function checks
+    `tzinfo` explicitly — which is how `agent/status.py` and
+    `history/result.py` handle it.
+    """
+
+    SRC = Path(__file__).resolve().parents[1] / "src"
+
+    def _innermost_guards(self, tree):
+        guards = {}
+
+        def descend(node, current):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.Try):
+                    inner = child if child.handlers else current
+                    for stmt in child.body:
+                        descend(stmt, inner)
+                    for handler in child.handlers:
+                        for stmt in handler.body:
+                            descend(stmt, current)
+                    for stmt in child.orelse + child.finalbody:
+                        descend(stmt, current)
+                    continue
+                guards[child] = current
+                descend(child, current)
+
+        descend(tree, None)
+        return guards
+
+    def _caught(self, try_node):
+        names = set()
+        for handler in try_node.handlers:
+            node = handler.type
+            if node is None:
+                names.add("<bare>")
+            elif isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Tuple):
+                names |= {e.id for e in node.elts if isinstance(e, ast.Name)}
+        return names
+
+    def _enclosing_function(self, tree, lineno):
+        best = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                end = getattr(node, "end_lineno", node.lineno)
+                if node.lineno <= lineno <= end:
+                    if best is None or node.lineno > best.lineno:
+                        best = node
+        return best
+
+    def test_no_timestamp_comparison_is_guarded_against_value_error_only(self):
+        FORGIVING = {"TypeError", "Exception", "BaseException", "<bare>"}
+        offenders = []
+
+        for path in sorted(self.SRC.rglob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, str(path))
+            guards = self._innermost_guards(tree)
+
+            for node, guard in guards.items():
+                comparison = isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.Lt, ast.Gt, ast.LtE, ast.GtE))
+                    for op in node.ops
+                )
+                subtraction = isinstance(node, ast.BinOp) and isinstance(
+                    node.op, ast.Sub
+                )
+                if not (comparison or subtraction):
+                    continue
+                if "fromisoformat" not in ast.unparse(node):
+                    continue
+
+                if guard is not None and self._caught(guard) & FORGIVING:
+                    continue
+                function = self._enclosing_function(tree, node.lineno)
+                if function is not None and "tzinfo" in ast.unparse(function):
+                    continue
+                offenders.append(path.name)
+
+        # BUG-29 is the one known, deliberately unfixed site:
+        # `NotionLastUpdatedParsingTests` above characterises it, and the
+        # fix is a decision about what to trust when Notion holds a value
+        # that cannot be compared (proceed? skip? refuse?) — every option
+        # is a judgement, so it stays in BACKLOG (E-19) rather than being
+        # chosen here. Listed by name so a SECOND site cannot hide behind
+        # it, and so this guard fails loudly the day BUG-29 is fixed and
+        # the entry becomes stale.
+        # Filename rather than line number: pinning the line would make
+        # this fail every time anything above it moves, which is churn for
+        # the wrong reason. A SECOND site in the same file still fails —
+        # the list would then read ["sync.py", "sync.py"].
+        self.assertEqual(sorted(offenders), ["sync.py"])
+
+    def test_the_fixed_site_still_handles_a_naive_value(self):
+        """The scan is structural, so it can be satisfied by a `try` that
+        happens to be there. This checks the behaviour it stands for.
+
+        Only `_before()` is asserted: it is the site whose own docstring
+        already states what "cannot be compared" must do ("falls back to
+        string order"), so widening its guard implements a written contract.
+        The Notion site (BUG-29) has no such written fallback — what to do
+        with an uncomparable stored value is the open decision — so it is
+        listed as known above rather than fixed here.
+        """
+        from app.desktop_activity import _before
+
+        # Naive on either side, and unparseable — none of these may raise.
+        self.assertIsInstance(_before("2026-08-05T10:00:00", "2026-08-06T10:00:00+09:00"), bool)
+        self.assertIsInstance(_before("2026-08-05T10:00:00+09:00", "2026-08-06T10:00:00"), bool)
+        self.assertIsInstance(_before("nope", "2026-08-06T10:00:00+09:00"), bool)
+        self.assertIsInstance(_before("", ""), bool)
+
+
+class LateUpdateBatchReadTests(RunnerFailurePathTestCase):
+    """Step 6.5 read the Candidate repository once per late date.
+
+    `scheduler.py` already solved this for its own per-date loop — CEO
+    Decision ② (History Repository Cache A안), quoted in its source: "이
+    배치에서 실제로 History 생성이 필요할 수 있는 경우에만,
+    repository.list()를 배치당 정확히 1회 호출". `update_daily_history()`
+    even takes `keep_candidates` for exactly that purpose, and says so in
+    its module docstring. Step 6.5 was the one caller that never passed it.
+
+    Measured with 3,000 stored Candidates and 7 late dates: 7 calls / 0.97 s
+    against 1 call / 0.17 s. The gap grows with both numbers, and `keep/` is
+    never pruned (BACKLOG B절 6번), so the backlog side only goes up.
+
+    The snapshot is safe for the Scheduler's reason: step 5 finished writing
+    every Candidate before this step begins, and nothing inside the loop
+    writes one.
+    """
+
+    def _counting_repository(self):
+        calls = []
+        original = runner_module.FileHistoryRepository
+
+        class Counting(original):
+            def list(self, decision=None):
+                calls.append(decision)
+                return super().list(decision=decision)
+
+        runner_module.FileHistoryRepository = Counting
+        self.addCleanup(setattr, runner_module, "FileHistoryRepository", original)
+        return calls
+
+    def _close_days_then_add_late_candidates(self, count):
+        """`count` already-written Daily files, each with a Candidate that
+        arrived after it was closed."""
+        from daily import generate_daily_history
+
+        repo = FileHistoryRepository(keep_dir=self.keep_dir, review_dir=self.review_dir)
+        daily_dir = self.local_master_dir / "daily"
+        days = [date(2026, 8, 1) + timedelta(days=i) for i in range(count)]
+        for day in days:
+            generate_daily_history(
+                repo, day, output_dir=daily_dir, generated_at="2026-08-20T11:00:00+09:00"
+            )
+        for index, day in enumerate(days):
+            self._write_event(
+                event_id=f"LATE-BATCH-{index}",
+                event_type="MILESTONE_COMPLETED",
+                milestone=f"M{index}",
+                timestamp=f"{day.isoformat()}T10:00:00+09:00",
+            )
+        return days
+
+    def test_the_step_reads_the_repository_once_however_many_dates_are_late(self):
+        days = self._close_days_then_add_late_candidates(5)
+        calls = self._counting_repository()
+
+        self._run(now=datetime(2026, 8, 20, 12, 0).astimezone())
+
+        # Scheduler's batch read is allowed one call; step 6.5 is allowed
+        # one more. Before the hoist this was 1 + 5.
+        self.assertLessEqual(
+            len(calls),
+            2,
+            f"one read per late date is back: {len(calls)} calls for {len(days)} dates",
+        )
+
+    def test_every_late_event_still_reaches_its_own_day(self):
+        """Speed must not cost correctness: the shared list spans many
+        dates, and each call still has to take only its own."""
+        days = self._close_days_then_add_late_candidates(5)
+
+        self._run(now=datetime(2026, 8, 20, 12, 0).astimezone())
+
+        daily_dir = self.local_master_dir / "daily"
+        for index, day in enumerate(days):
+            with self.subTest(day=day):
+                text = (daily_dir / f"{day.isoformat()}.md").read_text(encoding="utf-8")
+                self.assertIn(f"LATE-BATCH-{index}", text)
+                for other in range(5):
+                    if other != index:
+                        self.assertNotIn(f"LATE-BATCH-{other}", text)
+
+    def test_no_repository_read_happens_when_nothing_arrived_late(self):
+        """The same guard the Scheduler has: `if kept_dates` gates the read
+        entirely, so a run with no late Event pays nothing for it.
+
+        The Scheduler's own batch read still happens — it has pending dates
+        to close — so the bound is one, not zero. What is asserted is that
+        step 6.5 adds none.
+        """
+        calls = self._counting_repository()
+
+        self._run(now=datetime(2026, 8, 20, 12, 0).astimezone())
+
+        self.assertLessEqual(len(calls), 1)
+
+    def test_a_failing_repository_still_fails_per_date_rather_than_escaping(self):
+        """The fallback. Hoisting a call that used to live inside each
+        date's own try/except moves where the failure surfaces, so the
+        hoisted call falls back to `None` and every date behaves exactly as
+        it did before."""
+        self._close_days_then_add_late_candidates(3)
+        original = runner_module.FileHistoryRepository
+
+        class Failing(original):
+            def list(self, decision=None):
+                raise OSError("simulated: candidate directory unreadable")
+
+        runner_module.FileHistoryRepository = Failing
+        self.addCleanup(setattr, runner_module, "FileHistoryRepository", original)
+
+        result = self._run(now=datetime(2026, 8, 20, 12, 0).astimezone())
+
+        self.assertIsNotNone(result)
+        late = result.summary.component("late_update")
+        self.assertEqual(late.status, ComponentStatus.FAILED)
+        self.assertEqual(late.metrics.get("failed"), 3)
+        # And the run still completed every later stage.
+        self.assertEqual(len(result.summary.components), 9)
+
+
+# Deeply nested JSON. `json.loads()` answers this with `RecursionError`,
+# which is a `RuntimeError` subclass — so `except (OSError, ValueError)`,
+# the guard every one of these sites was written with, does not cover it.
+_DEEPLY_NESTED_JSON = "[" * 200_000 + "]" * 200_000
+
+
+class RecursionErrorIsUnparseableTests(unittest.TestCase):
+    """BUG-40's family, and the line between fixing it and deciding it.
+
+    `agent/signals.py` already answered this question for itself, in a
+    comment written beside the catch: "`json.loads` raises RecursionError,
+    not ValueError, on deeply nested input. Uncaught, one corrupt Signal
+    file would take down the entire Agent run instead of being rejected on
+    its own." Five other `json.loads` sites had the same shape and none of
+    them had the same guard.
+
+    Measured, before: `_is_parseable_json`, `run_intake`,
+    `read_company_activity`, `Collector.collect` and
+    `find_undelivered_events` all raised `RecursionError` out to their
+    caller. Four of them are fixed here; the fifth is not, and the
+    difference is the same test C21 used — does the function's own
+    documentation already say what "cannot be parsed" means for it?
+
+        _is_parseable_json      "exists precisely so an unparseable file is
+                                skipped rather than crashing the run"
+        _read_one               "Both failure kinds collapse to None on
+                                purpose ... this file cannot contribute"
+        _problem                UNREADABLE is one of its four declared verdicts
+        Collector.collect       already returns REJECTED "invalid JSON"
+        list()                  says nothing  <- BUG-38, stays a decision
+
+    `FileHistoryRepository.list()` therefore keeps raising, and BACKLOG
+    F-1/A-7 keeps the question (quarantine / skip / stop is a Data Safety
+    call). `test_a_candidate_repository_still_raises` pins that boundary so
+    it is a stated position rather than an omission.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def _deep_file(self, directory, name="deep.json"):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(_DEEPLY_NESTED_JSON, encoding="utf-8")
+        return path
+
+    def _backdate(self, path):
+        old = time.time() - 3600
+        os.utime(path, (old, old))
+
+    def test_intakes_parse_test_answers_false_instead_of_raising(self):
+        from transport.intake import _is_parseable_json
+
+        path = self._deep_file(self.root / "transport")
+
+        self.assertFalse(_is_parseable_json(path))
+
+    def test_intake_leaves_it_in_place_and_keeps_going(self):
+        """The Runner's step 2. A file it cannot parse is left in
+        `transport/` and re-judged next run — never promoted, never deleted,
+        and never allowed to stop the batch."""
+        from transport.intake import run_intake
+
+        transport = self.root / "transport"
+        deep = self._deep_file(transport)
+        good = transport / "good.json"
+        good.write_text(json.dumps({"event_id": "OK-1"}), encoding="utf-8")
+        for path in (deep, good):
+            self._backdate(path)
+
+        summary = run_intake(
+            transport_dir=transport,
+            incoming_dir=self.root / "incoming",
+            processed_dir=self.root / "processed",
+            rejected_dir=self.root / "rejected",
+        )
+
+        self.assertEqual(summary.skipped_invalid, ("deep.json",))
+        self.assertEqual(summary.moved, ("good.json",))
+        self.assertTrue(deep.exists())
+
+    def test_the_company_view_reports_it_rather_than_crashing(self):
+        from app.desktop_activity import read_company_activity
+
+        processed = self.root / "processed"
+        self._deep_file(processed)
+
+        snapshot = read_company_activity(
+            processed_dir=processed,
+            transport_dir=self.root / "t",
+            incoming_dir=self.root / "i",
+            rejected_dir=self.root / "r",
+        )
+
+        self.assertEqual(snapshot.unreadable_events, ("deep.json",))
+
+    def test_the_collector_rejects_it_as_invalid_json(self):
+        """It already classified unparseable input as REJECTED; a
+        `RecursionError` is the same condition reached by a different
+        route. Leaving it FAILED would park the file in `incoming/` to be
+        retried on every run forever."""
+        from collector.collector import Collector
+        from collector.result import CollectorStatus
+        from collector.seen_store import InMemorySeenEventStore
+
+        result = Collector(seen_store=InMemorySeenEventStore()).collect(
+            _DEEPLY_NESTED_JSON
+        )
+
+        self.assertEqual(result.status, CollectorStatus.REJECTED)
+
+    def test_the_collector_batch_survives_and_routes_it_to_rejected(self):
+        from collector.collector import Collector
+        from collector.runtime import run_once as collector_run_once
+        from collector.seen_store import InMemorySeenEventStore
+
+        incoming = self.root / "incoming"
+        self._deep_file(incoming, "a-deep.json")
+        good = create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="P",
+            event_type="MILESTONE_COMPLETED",
+            status="IN_PROGRESS",
+            summary="ok",
+            history_candidate=True,
+            event_id="DEEP-GOOD",
+            timestamp="2026-08-05T10:00:00+09:00",
+        )
+        (incoming / "b-good.json").write_text(good.to_json(), encoding="utf-8")
+
+        summary = collector_run_once(
+            collector=Collector(seen_store=InMemorySeenEventStore()),
+            incoming_dir=incoming,
+            processed_dir=self.root / "processed",
+            rejected_dir=self.root / "rejected",
+            log_path=self.root / "collector.log",
+        )
+
+        self.assertEqual(summary.accepted, 1)
+        self.assertEqual(summary.rejected, 1)
+        self.assertEqual(summary.failed, 0)
+        self.assertTrue((self.root / "rejected" / "a-deep.json").exists())
+
+    def test_delivery_reconciliation_reports_it_as_unreadable(self):
+        from agent.delivery import DeliveryProblem, find_undelivered_events
+
+        sent = self.root / "sent"
+        sync = self.root / "sync"
+        sent.mkdir()
+        sync.mkdir()
+        (sent / "E1.json").write_text(json.dumps({"event_id": "E1"}), encoding="utf-8")
+        self._deep_file(sync, "E1.json")
+
+        result = find_undelivered_events(sent_dir=sent, sync_folder=sync)
+
+        self.assertEqual(
+            [u.problem for u in result.undelivered], [DeliveryProblem.UNREADABLE]
+        )
+
+    def test_a_damaged_sent_record_is_skipped_rather_than_fatal(self):
+        """The other `json.loads` in the same function — the local record."""
+        from agent.delivery import find_undelivered_events
+
+        sent = self.root / "sent"
+        sync = self.root / "sync"
+        sent.mkdir()
+        sync.mkdir()
+        self._deep_file(sent, "E1.json")
+
+        result = find_undelivered_events(sent_dir=sent, sync_folder=sync)
+
+        self.assertEqual(result.checked, 0)
+        self.assertEqual(result.undelivered, ())
+
+    def test_a_candidate_repository_still_raises(self):
+        """CHARACTERIZATION — BUG-38 / BACKLOG F-1, deliberately unfixed.
+
+        `FileHistoryRepository.list()` has no documented per-file
+        tolerance, and choosing one (quarantine the file? skip it? stop the
+        day?) is the Data Safety decision A-7 records. Pinned so the
+        boundary is a position rather than an oversight, and so this test
+        fails the day that decision is taken.
+        """
+        keep = self.root / "keep"
+        self._deep_file(keep)
+
+        with self.assertRaises(RecursionError):
+            FileHistoryRepository(
+                keep_dir=keep, review_dir=self.root / "review"
+            ).list(decision=HistoryDecision.KEEP)
+
+    def test_the_signal_parser_already_handled_it(self):
+        """The precedent the four fixes follow, pinned so it cannot regress
+        into the shape the others were in."""
+        from agent.signals import SignalError, parse_signal
+
+        with self.assertRaises(SignalError) as caught:
+            parse_signal(
+                _DEEPLY_NESTED_JSON,
+                signal_id="s",
+                target_date=date(2026, 8, 5),
+                path=Path("s.json"),
+            )
+
+        self.assertIn("nested too deeply", str(caught.exception))

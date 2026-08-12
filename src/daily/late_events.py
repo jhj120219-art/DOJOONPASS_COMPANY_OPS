@@ -106,7 +106,9 @@ def select_late_candidates(
             continue
         seen.add(candidate.event_id)
         selected.append(candidate)
-    selected.sort(key=lambda candidate: candidate.timestamp)
+    # See `HistoryCandidate.chronological_key`: raw-string order is wrong
+    # whenever two Events on one day carry different UTC offsets.
+    selected.sort(key=lambda candidate: candidate.chronological_key)
     return tuple(selected)
 
 

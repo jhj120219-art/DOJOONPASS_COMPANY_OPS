@@ -50,6 +50,26 @@ class AgentStateError(ValueError):
     """
 
 
+class AgentStateMismatchError(AgentStateError):
+    """The state file is perfectly valid and belongs to another Desktop.
+
+    A subclass rather than a separate exception so every existing
+    `except AgentStateError` keeps catching it — nothing about the refusal
+    changes. What changes is that a caller can now tell the two apart, and
+    they need opposite things from an operator:
+
+        mismatch    the file is fine; the *identity* is wrong. Fix
+                    COMPANY_OPS_PROFILE, or move the file aside if this
+                    machine really did change role.
+        corruption  the identity is not the issue; the file is unreadable.
+                    Changing COMPANY_OPS_PROFILE does nothing at all.
+
+    `run_agent.py` gave the first message for both, so an operator whose
+    state file had been truncated by a power cut was told to go and check
+    an environment variable that was already correct.
+    """
+
+
 @dataclass
 class AgentState:
     desktop_id: str | None = None
@@ -103,7 +123,7 @@ def ensure_desktop(state: AgentState, desktop_id: str, *, state_path: Path) -> N
     losing those Events with no error anywhere.
     """
     if state.desktop_id is not None and state.desktop_id != desktop_id:
-        raise AgentStateError(
+        raise AgentStateMismatchError(
             f"agent state file belongs to {state.desktop_id!r}, not {desktop_id!r}: "
             f"{state_path}"
         )

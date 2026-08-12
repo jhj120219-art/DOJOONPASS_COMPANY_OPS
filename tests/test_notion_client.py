@@ -157,5 +157,91 @@ class InMemoryTransportDatabaseIsolationTests(unittest.TestCase):
         self.assertEqual(found["properties"]["Status"]["select"]["name"], "BLOCKED")
 
 
+class NotionClientTitleLookupTests(unittest.TestCase):
+    """`find_by_title()` / `find_or_create_by_title()`.
+
+    `find_project()` could not serve OPS_RUNS: it filters on a `rich_text`
+    property, and OPS_RUNS keys its rows by `Run ID`, which is the database's
+    *title* property — a different Notion type with a different filter key.
+    Without a title-aware lookup there was no way to ask "has this run
+    already been recorded?", which is why `record_run()` had no
+    find-before-create step and could duplicate a row.
+    """
+
+    def setUp(self):
+        self.transport = InMemoryNotionTransport()
+        self.client = NotionClient(transport=self.transport, database_id="ops-runs-db")
+
+    def _run_row(self, run_id, overall="OK"):
+        return {
+            "Run ID": {"title": [{"type": "text", "text": {"content": run_id}}]},
+            "Overall": {"select": {"name": overall}},
+        }
+
+    def test_a_missing_title_is_none_rather_than_an_error(self):
+        self.assertIsNone(self.client.find_by_title(property_name="Run ID", value="nope"))
+
+    def test_an_existing_row_is_found_by_its_title(self):
+        created = self.client.create_project(self._run_row("run-1"))
+
+        found = self.client.find_by_title(property_name="Run ID", value="run-1")
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], created["id"])
+
+    def test_find_or_create_creates_only_when_absent(self):
+        first = self.client.find_or_create_by_title(
+            property_name="Run ID", value="run-1", properties=self._run_row("run-1")
+        )
+        second = self.client.find_or_create_by_title(
+            property_name="Run ID", value="run-1", properties=self._run_row("run-1")
+        )
+
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(self.transport._pages), 1)
+
+    def test_find_or_create_does_not_overwrite_the_row_it_finds(self):
+        """It returns the existing row untouched. Updating it would be a
+        different operation with a different risk — this guard exists to
+        avoid a second row, not to re-state the first one."""
+        self.client.create_project(self._run_row("run-1", overall="FAIL"))
+
+        found = self.client.find_or_create_by_title(
+            property_name="Run ID", value="run-1", properties=self._run_row("run-1", overall="OK")
+        )
+
+        self.assertEqual(found["properties"]["Overall"]["select"]["name"], "FAIL")
+
+    def test_the_lookup_is_scoped_to_this_client_s_database(self):
+        """One transport serves several databases in production
+        (`run_company_ops.py` builds one and binds two clients to it), so a
+        run recorded in OPS_RUNS must not answer a lookup in PROJECTS."""
+        other = NotionClient(transport=self.transport, database_id="projects-db")
+        self.client.create_project(self._run_row("run-1"))
+
+        self.assertIsNone(other.find_by_title(property_name="Run ID", value="run-1"))
+
+    def test_a_rich_text_property_of_the_same_name_is_not_mistaken_for_a_title(self):
+        """The filter names both the property and its type. A row carrying
+        `Run ID` as rich_text — the shape OPS_NOTION_SYNC uses — must not
+        satisfy a title lookup, or the guard would find the wrong row and
+        skip a create that should have happened."""
+        self.client.create_project(
+            {"Run ID": {"rich_text": [{"type": "text", "text": {"content": "run-1"}}]}}
+        )
+
+        self.assertIsNone(self.client.find_by_title(property_name="Run ID", value="run-1"))
+
+    def test_find_project_still_works_for_rich_text(self):
+        """The generalised transport filter must not break the original
+        caller it was hard-coded for."""
+        self.client.create_project(
+            {"Project ID": {"rich_text": [{"type": "text", "text": {"content": "PRJ-1"}}]}}
+        )
+
+        self.assertIsNotNone(self.client.find_project("PRJ-1"))
+        self.assertIsNone(self.client.find_project("PRJ-2"))
+
+
 if __name__ == "__main__":
     unittest.main()

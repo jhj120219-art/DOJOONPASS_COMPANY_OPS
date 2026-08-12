@@ -62,7 +62,7 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from agent import AgentStatus, DateOutcome, run_once  # noqa: E402
-from agent.state import AgentStateError  # noqa: E402
+from agent.state import AgentStateError, AgentStateMismatchError  # noqa: E402
 from reporter.profiles import ReporterConfigError, resolve_profile  # noqa: E402
 from transport import OneDriveTransport  # noqa: E402
 
@@ -140,7 +140,7 @@ def main() -> int:
             lock_path=agent_dir / "locks" / "agent.lock",
             log_path=agent_dir / "logs" / "agent.log",
         )
-    except AgentStateError as exc:
+    except AgentStateMismatchError as exc:
         # A raw traceback for an expected operational condition reads like
         # the system broke. This one is not exotic: `install_agent_task.ps1`
         # writes COMPANY_OPS_PROFILE into the user environment, and its own
@@ -161,6 +161,31 @@ def main() -> int:
             "  - COMPANY_OPS_PROFILE이 잘못 설정됐다 → 원래 Desktop ID로 되돌린다.\n"
             "  - 이 머신의 역할이 실제로 바뀌었다 → 기존 state 파일을 사람이\n"
             "    확인한 뒤 옮기거나 보관한다.\n"
+            "state 파일은 자동으로 지우거나 고치지 않습니다 — 그렇게 하면 아직\n"
+            "수집되지 않은 날짜가 조용히 건너뛰어질 수 있습니다.",
+            file=sys.stderr,
+        )
+        return 1
+    except AgentStateError as exc:
+        # The other half of the same exception: the state file is damaged
+        # rather than pointed at the wrong Desktop (truncated by a power
+        # cut, a partially restored backup, an unparseable date field).
+        #
+        # This used to fall into the branch above and be answered with
+        # "COMPANY_OPS_PROFILE이 잘못 설정됐다" — advice about an environment
+        # variable that is already correct, for a file the operator has not
+        # been told is unreadable. Two different accidents, opposite fixes.
+        #
+        # Same restraint applies: the file is not deleted or rewritten here.
+        # It holds `last_successful_collection_date`, and guessing a
+        # replacement would silently skip every date up to the guess.
+        print(f"[FAILED] {exc}", file=sys.stderr)
+        print(
+            "\nAgent state 파일을 읽을 수 없습니다. Desktop 설정 문제가 아니므로\n"
+            "COMPANY_OPS_PROFILE을 바꿔도 해결되지 않습니다.\n"
+            "  - 파일 내용을 사람이 확인한다(마지막 수집 날짜가 들어 있다).\n"
+            "  - 복구할 수 없으면 파일을 옮겨 두고, 이 Desktop이 다시 수집해야 할\n"
+            "    첫 날짜를 COMPANY_OPS_AGENT_START_DATE로 지정해 다시 실행한다.\n"
             "state 파일은 자동으로 지우거나 고치지 않습니다 — 그렇게 하면 아직\n"
             "수집되지 않은 날짜가 조용히 건너뛰어질 수 있습니다.",
             file=sys.stderr,

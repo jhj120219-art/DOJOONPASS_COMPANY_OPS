@@ -26,6 +26,7 @@ same double every other E2E file here uses.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent import AgentStatus, DateOutcome  # noqa: E402
+from agent import AgentState, AgentStatus, DateOutcome, load_state, save_state  # noqa: E402
+from agent.state import AgentStateError  # noqa: E402
 from agent import run_once as agent_run_once  # noqa: E402
 from app.runner import run_once as company_ops_run_once  # noqa: E402
 from backup.result import BackupStatus  # noqa: E402
@@ -46,7 +48,7 @@ from notion import (  # noqa: E402
     InMemoryNotionTransport,
     NotionClient,
 )
-from transport import OneDriveTransport  # noqa: E402
+from transport import OneDriveTransport, Transport, TransportError  # noqa: E402
 
 # Assembled at runtime, never written out as one literal — see the same
 # constant in tests/test_agent.py for why
@@ -1172,3 +1174,607 @@ class AgentToCollectorContractTests(MultiDesktopTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FailingTransport(Transport):
+    """A Transport that refuses everything — one Desktop's network is down.
+
+    `TransportError` is what `OneDriveTransport` raises when the sync folder
+    is unreachable, so this is the shape the Agent already handles rather
+    than a new one invented for the test.
+    """
+
+    def __init__(self):
+        self.attempts = 0
+
+    def send(self, event) -> None:
+        self.attempts += 1
+        raise TransportError("simulated: the sync folder is unreachable")
+
+
+class DesktopFaultIsolationTests(MultiDesktopTestCase):
+    """One Desktop breaking must cost exactly one Desktop.
+
+    Four Agents share nothing but a cloud folder: no lock, no state file, no
+    process. That is the design, and these tests are the check that the
+    design actually holds once real faults are injected rather than
+    reasoned about — every case below breaks Desktop 2 in a different way
+    and then asserts that Desktops 1, 3 and 4 reach Company History for the
+    same date, unaffected, in the same run.
+
+    The second half of each test matters as much as the first: the broken
+    Desktop must be *contained*, not silently dropped. Its work stays on its
+    own disk, its state does not advance past what it delivered, and it
+    recovers on a later run.
+    """
+
+    DAY = date(2026, 8, 8)
+    RUN_AT = datetime(2026, 8, 9, 11, 0)
+    AGENT_AT = datetime(2026, 8, 9, 9, 0)
+
+    def _signals_everywhere(self):
+        for desktop_id, _, _ in DESKTOPS:
+            self.write_signal(desktop_id, self.DAY, "work")
+
+    def _run_the_healthy_three(self):
+        for desktop_id, _, _ in DESKTOPS:
+            if desktop_id == "DESKTOP_2":
+                continue
+            result = self.run_agent(
+                desktop_id, now=self.AGENT_AT, start_date=self.DAY
+            )
+            self.assertEqual(result.status, AgentStatus.COMPLETED, desktop_id)
+
+    def _assert_the_healthy_three_are_in_history(self):
+        markdown = self.daily(self.DAY)
+        for desktop_id, _, _ in DESKTOPS:
+            with self.subTest(desktop=desktop_id):
+                if desktop_id == "DESKTOP_2":
+                    self.assertNotIn(f"{desktop_id} work", markdown)
+                else:
+                    self.assertIn(f"{desktop_id} work", markdown)
+
+    def _agent_state(self, desktop_id):
+        return load_state(self.desktop_dir(desktop_id) / "state" / "agent_state.json")
+
+    # ------------------------------------------------------------------
+
+    def test_a_corrupt_outbox_on_one_desktop_holds_back_only_that_desktop(self):
+        """An Event file in `outbox/` that cannot be parsed is never sent and
+        never deleted (`drain()`'s `unreadable`). That Desktop must not
+        advance its collection date — and must not stop the other three."""
+        self._signals_everywhere()
+
+        outbox = self.desktop_dir("DESKTOP_2") / "outbox"
+        outbox.mkdir(parents=True, exist_ok=True)
+        (outbox / "corrupt.json").write_text("{not an event", encoding="utf-8")
+
+        broken = self.run_agent("DESKTOP_2", now=self.AGENT_AT, start_date=self.DAY)
+        self._run_the_healthy_three()
+
+        # Contained: the run stops before any date is even considered — the
+        # outbox is drained first, and a non-clear drain means "do not
+        # advance past work still sitting locally". So no date closed, no
+        # date was attempted, and the file is still there for a human.
+        self.assertEqual(broken.status, AgentStatus.FAILED)
+        self.assertEqual(broken.dates, ())
+        self.assertIsNone(broken.last_successful_collection_date)
+        self.assertEqual(len(broken.drain_summaries[0].unreadable), 1)
+        self.assertTrue((outbox / "corrupt.json").exists())
+
+        _, collector, _, backup, _ = self.deliver_and_collect(
+            now=self.RUN_AT, history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 3)
+        self.assertEqual(collector.failed, 0)
+        self.assertEqual(backup.final_status, BackupStatus.SUCCESS)
+        self._assert_the_healthy_three_are_in_history()
+
+    def test_a_network_failure_on_one_desktop_holds_back_only_that_desktop(self):
+        """Desktop 2's OneDrive folder is unreachable. Its Event stays in its
+        own outbox; nothing about the other three changes."""
+        self._signals_everywhere()
+
+        failing = _FailingTransport()
+        broken = self.run_agent(
+            "DESKTOP_2", now=self.AGENT_AT, start_date=self.DAY, transport=failing
+        )
+        self._run_the_healthy_three()
+
+        self.assertGreater(failing.attempts, 0)
+        self.assertEqual(broken.dates[0].outcome, DateOutcome.FAILED)
+        self.assertIsNone(broken.last_successful_collection_date)
+        self.assertEqual(
+            len(list((self.desktop_dir("DESKTOP_2") / "outbox").glob("*.json"))), 1
+        )
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=self.RUN_AT, history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 3)
+        self._assert_the_healthy_three_are_in_history()
+
+    def test_the_network_failed_desktop_recovers_on_its_next_run(self):
+        """Containment must not become loss: once the folder is back, the
+        held Event is delivered and reaches the same Daily file as a Late
+        Event."""
+        self._signals_everywhere()
+        self.run_agent(
+            "DESKTOP_2",
+            now=self.AGENT_AT,
+            start_date=self.DAY,
+            transport=_FailingTransport(),
+        )
+        self._run_the_healthy_three()
+        self.deliver_and_collect(now=self.RUN_AT, history_start_date=self.DAY)
+        self.assertNotIn("DESKTOP_2 work", self.daily(self.DAY))
+
+        recovered = self.run_agent(
+            "DESKTOP_2", now=datetime(2026, 8, 9, 15, 0), start_date=self.DAY
+        )
+
+        self.assertEqual(recovered.status, AgentStatus.COMPLETED)
+        self.assertEqual(recovered.last_successful_collection_date, self.DAY)
+        self.assertEqual(
+            len(list((self.desktop_dir("DESKTOP_2") / "outbox").glob("*.json"))), 0
+        )
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 16, 0), history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 1)
+        self.assertIn("DESKTOP_2 work", self.daily(self.DAY))
+
+    def test_a_rejected_signal_on_one_desktop_holds_back_only_that_signal(self):
+        """A Signal the Agent refuses is quarantined on its own machine. The
+        Desktop's *other* Signal for that date still ships, and the other
+        three Desktops are untouched."""
+        self._signals_everywhere()
+        self.write_signal(
+            "DESKTOP_2",
+            self.DAY,
+            "leaky",
+            summary="token " + SECRET_PREFIX + "ABCDEFGHIJKLMNOP1234",
+        )
+
+        broken = self.run_agent("DESKTOP_2", now=self.AGENT_AT, start_date=self.DAY)
+        self._run_the_healthy_three()
+
+        self.assertEqual(broken.status, AgentStatus.COMPLETED)
+        self.assertEqual(len(broken.dates[0].rejected_signals), 1)
+        self.assertEqual(len(broken.dates[0].event_ids), 1)
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=self.RUN_AT, history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 4)
+        self.assertEqual(collector.rejected, 0)
+        markdown = self.daily(self.DAY)
+        self.assertIn("DESKTOP_2 work", markdown)
+        self.assertNotIn(SECRET_PREFIX, markdown)
+
+    def test_a_corrupt_state_file_on_one_desktop_holds_back_only_that_desktop(self):
+        """The Agent refuses to run against a state it cannot trust — the
+        same stance `scheduler` takes (BUG-3). It must refuse locally."""
+        self._signals_everywhere()
+        state_path = self.desktop_dir("DESKTOP_2") / "state" / "agent_state.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text("{not json", encoding="utf-8")
+
+        # `load_state()` refuses a state it cannot parse, and `run_once()`
+        # lets that out rather than guessing — the same stance BUG-3 settled
+        # for the Scheduler. `run_agent.py` turns it into exit 1 with a
+        # message; what matters here is that it stays on this machine.
+        with self.assertRaises(AgentStateError):
+            self.run_agent("DESKTOP_2", now=self.AGENT_AT, start_date=self.DAY)
+        self._run_the_healthy_three()
+
+        # Nothing was deleted: the damaged file is still there for a human.
+        self.assertEqual(state_path.read_text(encoding="utf-8"), "{not json")
+        # And the refusing Agent released its lock, so it is not wedged.
+        self.assertFalse(
+            (self.desktop_dir("DESKTOP_2") / "locks" / "agent.lock").exists()
+        )
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=self.RUN_AT, history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 3)
+        self._assert_the_healthy_three_are_in_history()
+
+    def test_a_lock_left_by_a_live_process_on_one_desktop_isolates_that_desktop(self):
+        """Each Agent locks only its own machine. A Desktop whose previous
+        run is still going skips this one; the others never notice."""
+        self._signals_everywhere()
+        lock_path = self.desktop_dir("DESKTOP_2") / "locks" / "agent.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(
+            json.dumps(
+                {"process_id": os.getpid(), "created_at": self.AGENT_AT.isoformat()}
+            ),
+            encoding="utf-8",
+        )
+
+        broken = self.run_agent("DESKTOP_2", now=self.AGENT_AT, start_date=self.DAY)
+        self._run_the_healthy_three()
+
+        self.assertEqual(broken.status, AgentStatus.SKIPPED_ALREADY_RUNNING)
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=self.RUN_AT, history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 3)
+        self._assert_the_healthy_three_are_in_history()
+
+    def test_every_desktop_keeps_its_own_state_when_one_of_them_fails(self):
+        """The shared-nothing property stated as one assertion: a failure on
+        Desktop 2 leaves the other three's collection dates exactly where a
+        clean run would."""
+        self._signals_everywhere()
+        self.run_agent(
+            "DESKTOP_2",
+            now=self.AGENT_AT,
+            start_date=self.DAY,
+            transport=_FailingTransport(),
+        )
+        self._run_the_healthy_three()
+
+        for desktop_id, _, _ in DESKTOPS:
+            with self.subTest(desktop=desktop_id):
+                state = self._agent_state(desktop_id)
+                if desktop_id == "DESKTOP_2":
+                    self.assertIsNone(state.last_successful_collection_date)
+                else:
+                    self.assertEqual(state.last_successful_collection_date, self.DAY)
+                self.assertEqual(state.desktop_id, desktop_id)
+
+
+class MultiDesktopDateEdgeTests(MultiDesktopTestCase):
+    """Dates that are not "yesterday": the future, the distant past, and a
+    Desktop whose clock disagrees with everyone else's."""
+
+    def test_a_future_dated_signal_is_not_collected_and_affects_nobody(self):
+        """docs/07 §18: a day still in progress is not a finished day, and a
+        day that has not happened at all certainly is not. The Signal is
+        left where it is — not rejected, not deleted, not sent — and no
+        other Desktop is affected."""
+        day = date(2026, 8, 8)
+        future = date(2026, 12, 25)
+        for desktop_id, _, _ in DESKTOPS:
+            self.write_signal(desktop_id, day, "work")
+        self.write_signal("DESKTOP_2", future, "christmas")
+
+        for desktop_id, _, _ in DESKTOPS:
+            result = self.run_agent(
+                desktop_id, now=datetime(2026, 8, 9, 9, 0), start_date=day
+            )
+            self.assertEqual(result.status, AgentStatus.COMPLETED, desktop_id)
+
+        # Four Events, one per Desktop — the future Signal is not among them.
+        self.assertEqual(len(list(self.cloud.glob("*.json"))), 4)
+        future_signal = (
+            self.desktop_dir("DESKTOP_2") / "signals" / future.isoformat() / "christmas.json"
+        )
+        self.assertTrue(future_signal.exists(), "a future Signal must not be consumed")
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 11, 0), history_start_date=day
+        )
+
+        self.assertEqual(collector.accepted, 4)
+        self.assertNotIn("christmas", self.daily(day))
+
+    def test_a_desktop_ninety_days_behind_catches_up_without_touching_the_others(self):
+        """The long-outage case: one machine switched off for a quarter,
+        every other Desktop reporting daily throughout. Its catch-up must
+        produce one Event per missed date, in order, and must not disturb
+        the dates the others already closed."""
+        start = date(2026, 5, 1)
+        recent = date(2026, 7, 29)
+        now = datetime(2026, 7, 30, 9, 0)
+
+        # Desktops 1/3/4 are up to date.
+        for desktop_id, _, _ in DESKTOPS:
+            if desktop_id == "DESKTOP_2":
+                continue
+            self.write_signal(desktop_id, recent, "work")
+            state_path = self.desktop_dir(desktop_id) / "state" / "agent_state.json"
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            save_state(
+                state_path,
+                AgentState(
+                    desktop_id=desktop_id,
+                    last_successful_collection_date=recent - timedelta(days=1),
+                ),
+            )
+            self.run_agent(desktop_id, now=now, start_date=start)
+
+        # Desktop 2 has been off since the start date and has one Signal
+        # from early on plus one from last week.
+        self.write_signal("DESKTOP_2", date(2026, 5, 2), "before-the-outage")
+        self.write_signal("DESKTOP_2", date(2026, 7, 20), "just-before-return")
+
+        caught_up = self.run_agent("DESKTOP_2", now=now, start_date=start)
+
+        self.assertEqual(caught_up.status, AgentStatus.COMPLETED)
+        self.assertEqual(caught_up.last_successful_collection_date, date(2026, 7, 29))
+        # 90 calendar dates walked (05-01 .. 07-29), oldest first, no gaps.
+        walked = [d.date for d in caught_up.dates]
+        self.assertEqual(walked, sorted(walked))
+        self.assertEqual(walked[0], start)
+        self.assertEqual(walked[-1], date(2026, 7, 29))
+        self.assertEqual(len(walked), 90)
+        collected = [d for d in caught_up.dates if d.outcome is DateOutcome.COLLECTED]
+        self.assertEqual([d.date for d in collected], [date(2026, 5, 2), date(2026, 7, 20)])
+
+        # The three healthy Desktops still say exactly what they said before.
+        for desktop_id, _, _ in DESKTOPS:
+            if desktop_id == "DESKTOP_2":
+                continue
+            with self.subTest(desktop=desktop_id):
+                state = load_state(
+                    self.desktop_dir(desktop_id) / "state" / "agent_state.json"
+                )
+                self.assertEqual(state.last_successful_collection_date, recent)
+
+    def test_a_desktop_whose_clock_runs_ahead_does_not_skew_the_others(self):
+        """Clock skew between Desktops is real (four machines, no NTP
+        guarantee). An Agent run with a `now` a day ahead collects one extra
+        date — its own — and every other Desktop's dates are unchanged."""
+        day = date(2026, 8, 8)
+        for desktop_id, _, _ in DESKTOPS:
+            self.write_signal(desktop_id, day, "work")
+            self.write_signal(desktop_id, date(2026, 8, 9), "next-day")
+
+        ahead = self.run_agent(
+            "DESKTOP_2", now=datetime(2026, 8, 10, 9, 0), start_date=day
+        )
+        for desktop_id, _, _ in DESKTOPS:
+            if desktop_id == "DESKTOP_2":
+                continue
+            self.run_agent(desktop_id, now=datetime(2026, 8, 9, 9, 0), start_date=day)
+
+        self.assertEqual(ahead.last_successful_collection_date, date(2026, 8, 9))
+        for desktop_id, _, _ in DESKTOPS:
+            if desktop_id == "DESKTOP_2":
+                continue
+            with self.subTest(desktop=desktop_id):
+                state = load_state(
+                    self.desktop_dir(desktop_id) / "state" / "agent_state.json"
+                )
+                self.assertEqual(state.last_successful_collection_date, day)
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 10, 11, 0), history_start_date=day
+        )
+
+        # 4 for 08-08 plus Desktop 2's extra 08-09 — no loss, no duplicate.
+        self.assertEqual(collector.accepted, 5)
+        self.assertEqual(collector.duplicate, 0)
+        self.assertIn("DESKTOP_2 next-day", self.daily(date(2026, 8, 9)))
+
+
+class RepeatedDeliveryIsolationTests(MultiDesktopTestCase):
+    """Re-sending the same work, from the angles the existing duplicate
+    tests do not cover."""
+
+    def test_resending_after_desktop4_consumed_the_file_creates_no_duplicate(self):
+        """Desktop 4 moves a collected file out of the cloud folder's mirror,
+        so a re-sending Agent finds the destination absent and writes it
+        again. The Collector's seen-store is the layer that must catch
+        it — and it must not disturb the other Desktops' Events in the same
+        batch."""
+        day = date(2026, 8, 8)
+        for desktop_id, _, _ in DESKTOPS:
+            self.write_signal(desktop_id, day, "work")
+            self.run_agent(desktop_id, now=datetime(2026, 8, 9, 9, 0), start_date=day)
+
+        self.deliver_and_collect(now=datetime(2026, 8, 9, 11, 0), history_start_date=day)
+
+        # Desktop 2 re-sends: clear its `sent/` bookkeeping and re-run, the
+        # shape a restored-from-backup Agent directory produces.
+        sent_dir = self.desktop_dir("DESKTOP_2") / "sent"
+        for path in sent_dir.glob("*.json"):
+            path.unlink()
+        state_path = self.desktop_dir("DESKTOP_2") / "state" / "agent_state.json"
+        save_state(
+            state_path,
+            AgentState(desktop_id="DESKTOP_2", last_successful_collection_date=None),
+        )
+
+        again = self.run_agent("DESKTOP_2", now=datetime(2026, 8, 9, 13, 0), start_date=day)
+        self.assertEqual(again.status, AgentStatus.COMPLETED)
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 14, 0), history_start_date=day
+        )
+
+        self.assertEqual(collector.accepted, 0)
+        self.assertEqual(collector.rejected, 0)
+        self.assertEqual(collector.failed, 0)
+
+        # Still one entry per Desktop. Counted by Event ID rather than by
+        # summary text: docs/06's template prints a summary twice by design
+        # (once under Summary, once under Milestones), so counting the text
+        # would assert the template rather than the deduplication.
+        markdown = self.daily(day)
+        self.assertEqual(markdown.count("- Event ID:"), 4)
+        self.assertIn("Event Count: 4", markdown)
+
+    def test_two_desktops_resending_at_once_stay_independent(self):
+        day = date(2026, 8, 8)
+        for desktop_id, _, _ in DESKTOPS:
+            self.write_signal(desktop_id, day, "work")
+            self.run_agent(desktop_id, now=datetime(2026, 8, 9, 9, 0), start_date=day)
+        self.deliver_and_collect(now=datetime(2026, 8, 9, 11, 0), history_start_date=day)
+
+        for desktop_id in ("DESKTOP_1", "DESKTOP_3"):
+            for path in (self.desktop_dir(desktop_id) / "sent").glob("*.json"):
+                path.unlink()
+            save_state(
+                self.desktop_dir(desktop_id) / "state" / "agent_state.json",
+                AgentState(desktop_id=desktop_id, last_successful_collection_date=None),
+            )
+            self.run_agent(desktop_id, now=datetime(2026, 8, 9, 13, 0), start_date=day)
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 14, 0), history_start_date=day
+        )
+
+        self.assertEqual(collector.accepted, 0)
+        markdown = self.daily(day)
+        self.assertEqual(markdown.count("- Event ID:"), 4)
+        self.assertIn("Event Count: 4", markdown)
+        for desktop_id, _, _ in DESKTOPS:
+            with self.subTest(desktop=desktop_id):
+                self.assertIn(f"{desktop_id} work", markdown)
+
+
+class CrashPointRecoveryTests(MultiDesktopTestCase):
+    """A crash at each point in the Agent's commit sequence, replayed through
+    the real Desktop 4 pipeline.
+
+    `agent/outbox.py` writes the Event, sends it, then files it — three
+    steps, so two windows:
+
+        outbox/ written, send not yet made      already covered
+                                                (test_agent.py::CrashRecoveryTests)
+        send returned, sent/ move not yet made  <- here
+        sent/ filed, state not yet saved        <- here
+
+    The last two are covered as unit facts (`drain()` re-sends, `is_sent()`
+    skips) but the *claim* the outbox docstring makes is about what happens
+    downstream: "a duplicate delivery costs one redundant file copy and
+    produces no duplicate History and no duplicate Notion write". That
+    sentence can only be checked with the Collector, the History Filter, the
+    Daily renderer and Notion all actually running, which is what these do.
+
+    Each crash is reconstructed as the on-disk state it would leave, not
+    simulated with a mock — that is the only form the next run can tell
+    apart, and it is exactly what a killed process leaves behind.
+    """
+
+    DAY = date(2026, 8, 8)
+
+    def _deliver_everyone(self, *, now=datetime(2026, 8, 9, 9, 0)):
+        for desktop_id, _, _ in DESKTOPS:
+            self.write_signal(desktop_id, self.DAY, "work")
+            self.run_agent(desktop_id, now=now, start_date=self.DAY)
+
+    def _history_entries(self):
+        markdown = self.daily(self.DAY)
+        return markdown.count("- Event ID:")
+
+    def test_a_crash_between_send_and_filing_produces_no_duplicate_history(self):
+        """The Event reached the cloud; the local bookkeeping move did not.
+        The next run re-sends, and every dedup layer below has to absorb
+        it."""
+        self._deliver_everyone()
+
+        # The crash: the Event is back in outbox/ as if `os.replace` never ran.
+        agent_dir = self.desktop_dir("DESKTOP_2")
+        sent_files = list((agent_dir / "sent").glob("*.json"))
+        self.assertEqual(len(sent_files), 1)
+        shutil.move(str(sent_files[0]), str(agent_dir / "outbox" / sent_files[0].name))
+
+        replay = self.run_agent(
+            "DESKTOP_2", now=datetime(2026, 8, 9, 10, 0), start_date=self.DAY
+        )
+        self.assertEqual(replay.status, AgentStatus.COMPLETED)
+        # It really was sent a second time — this is not a no-op test.
+        self.assertEqual(len(replay.drain_summaries[0].sent), 1)
+
+        _, collector, _, backup, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 11, 0), history_start_date=self.DAY
+        )
+
+        # Desktop 4 sees four Events, one of them arriving twice.
+        self.assertEqual(collector.accepted + collector.duplicate, 4)
+        self.assertEqual(collector.failed, 0)
+        self.assertEqual(self._history_entries(), 4)
+        self.assertEqual(backup.final_status, BackupStatus.SUCCESS)
+
+    def test_a_crash_before_the_state_save_re_reads_the_date_without_resending(self):
+        """The Event is filed as sent but the date never closed. The next run
+        walks that date again and must recognise its own work — `is_sent()`
+        is the layer that stops a second Event being created at all."""
+        self._deliver_everyone()
+
+        state_path = self.desktop_dir("DESKTOP_2") / "state" / "agent_state.json"
+        save_state(
+            state_path,
+            AgentState(desktop_id="DESKTOP_2", last_successful_collection_date=None),
+        )
+
+        replay = self.run_agent(
+            "DESKTOP_2", now=datetime(2026, 8, 9, 10, 0), start_date=self.DAY
+        )
+
+        self.assertEqual(replay.status, AgentStatus.COMPLETED)
+        day_result = next(d for d in replay.dates if d.date == self.DAY)
+        self.assertEqual(len(day_result.already_sent), 1)
+        self.assertEqual(day_result.event_ids, ())
+        # Nothing new reached the cloud, so nothing new can reach History.
+        self.assertEqual(len(list(self.cloud.glob("*.json"))), 4)
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 11, 0), history_start_date=self.DAY
+        )
+        self.assertEqual(collector.accepted, 4)
+        self.assertEqual(self._history_entries(), 4)
+
+    def test_a_crash_after_delivery_but_before_desktop4_collected_loses_nothing(self):
+        """The other side of the same window: Desktop 4 dies after intake
+        promoted the files but before the Collector ran. The files are in
+        `incoming/`, and the next run picks them up."""
+        self._deliver_everyone()
+        self._sync_cloud()
+        self._age_transport_files()
+
+        # Intake only, then "crash" — no Collector, no History.
+        from transport import run_intake
+
+        intake = run_intake(
+            transport_dir=self.d4_transport_dir,
+            incoming_dir=self.incoming_dir,
+            processed_dir=self.processed_dir,
+            rejected_dir=self.rejected_dir,
+        )
+        self.assertEqual(len(intake.moved), 4)
+        self.assertEqual(len(list(self.incoming_dir.glob("*.json"))), 4)
+
+        _, collector, _, _, _ = self.run_company_ops(
+            now=datetime(2026, 8, 9, 11, 0), history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted, 4)
+        self.assertEqual(self._history_entries(), 4)
+
+    def test_replaying_every_desktop_at_once_still_yields_one_entry_each(self):
+        """The compound case: all four Desktops crashed in the same window
+        and all four re-send together."""
+        self._deliver_everyone()
+
+        for desktop_id, _, _ in DESKTOPS:
+            agent_dir = self.desktop_dir(desktop_id)
+            for path in list((agent_dir / "sent").glob("*.json")):
+                shutil.move(str(path), str(agent_dir / "outbox" / path.name))
+            self.run_agent(
+                desktop_id, now=datetime(2026, 8, 9, 10, 0), start_date=self.DAY
+            )
+
+        _, collector, _, _, _ = self.deliver_and_collect(
+            now=datetime(2026, 8, 9, 11, 0), history_start_date=self.DAY
+        )
+
+        self.assertEqual(collector.accepted + collector.duplicate, 4)
+        self.assertEqual(self._history_entries(), 4)
+        for desktop_id, _, _ in DESKTOPS:
+            with self.subTest(desktop=desktop_id):
+                self.assertIn(f"{desktop_id} work", self.daily(self.DAY))

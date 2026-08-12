@@ -33,7 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from scheduler.lock import (  # noqa: E402
     _read_lock,
     _take_over_stale,
+    is_locked,
+    lock_held_since,
     release_lock,
+    stale_lock_cannot_be_cleared,
     try_acquire_lock,
 )
 
@@ -260,8 +263,19 @@ class AcquireTests(LockTestCase):
 
 
 class ReadOnlyLockTests(LockTestCase):
-    """BUG-42 (NOT FIXED): a read-only stale lock stops the Runner forever,
-    and nothing anywhere says so.
+    """BUG-42 (behaviour NOT FIXED; the silence WAS fixed in C23).
+
+    A read-only stale lock still stops the Runner forever — everything below
+    asserts exactly that, unchanged. What is no longer true is the second
+    half of the original title, "and nothing anywhere says so":
+    `stale_lock_cannot_be_cleared()` now detects the condition and
+    `ops_status.py` reports it in ATTENTION
+    (`StaleLockCannotBeClearedTests` below, and
+    `test_observability.py::LastRunUnclearableLockTests`).
+
+    Detection was the one option that is neither of the two decisions this
+    docstring closes with — it strips no attribute and changes no return
+    contract.
 
     CHARACTERIZATION: asserts today's behaviour.
 
@@ -683,6 +697,223 @@ class LongPathHelperTests(unittest.TestCase):
             release_lock(lock_path)
         self.assertTrue(try_acquire_lock(lock_path, now=now))
         release_lock(lock_path)
+
+
+class IsLockedTests(LockTestCase):
+    """`is_locked()` — read-only "is a Runner working right now?".
+
+    Exists because the only way to ask before was `try_acquire_lock()`,
+    which *competes*: it creates the lock when free and can take over one it
+    judges stale. `ops_status.py` promises an operator it "아무것도 쓰지 않고
+    lock도 잡지 않는다", so it could not use that, and therefore could not
+    tell a real orphaned Event from one whose History Candidate turn has
+    simply not come yet during a large catch-up.
+    """
+
+    def test_no_lock_file_is_not_locked(self):
+        self.assertFalse(is_locked(self.lock_path))
+
+    def test_a_lock_held_by_this_live_process_is_locked(self):
+        self.assertTrue(try_acquire_lock(self.lock_path, now=NOW))
+
+        self.assertTrue(is_locked(self.lock_path))
+
+    def test_a_lock_from_a_dead_process_is_not_locked(self):
+        """Same judgement `try_acquire_lock()` makes under §27 — a lock whose
+        recorded process is gone is not held — reached without acting on
+        it."""
+        self._write_lock(self._stale_payload())
+
+        self.assertFalse(is_locked(self.lock_path))
+
+    def test_an_unparseable_lock_is_not_locked(self):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path.write_text("{not json", encoding="utf-8")
+
+        self.assertFalse(is_locked(self.lock_path))
+
+    def test_asking_neither_creates_nor_removes_the_lock(self):
+        """The property that makes this safe to call from a status view: a
+        Runner mid-run must not be disturbed by someone checking on it."""
+        self.assertFalse(self.lock_path.exists())
+        is_locked(self.lock_path)
+        self.assertFalse(self.lock_path.exists())
+
+        try_acquire_lock(self.lock_path, now=NOW)
+        before = self.lock_path.read_bytes()
+
+        is_locked(self.lock_path)
+
+        self.assertTrue(self.lock_path.exists())
+        self.assertEqual(self.lock_path.read_bytes(), before)
+
+    def test_a_stale_lock_is_reported_without_being_taken_over(self):
+        """`try_acquire_lock()` would delete this one. This must not."""
+        self._write_lock(self._stale_payload())
+
+        self.assertFalse(is_locked(self.lock_path))
+
+        self.assertTrue(self.lock_path.exists())
+        self.assertEqual(_read_lock(self.lock_path), self._stale_payload())
+
+
+class LockHeldSinceTests(LockTestCase):
+    """`lock_held_since()` — when the live holder took the lock.
+
+    Detection for a failure the lock logic itself cannot fix without a
+    contract change: `_is_process_running()` verifies that *a* process has
+    the recorded pid, never that it is the one that wrote the lock. A Runner
+    killed by a power cut leaves its pid behind, and once the OS reassigns
+    that number every later run is denied the lock and skips — silently and
+    permanently, since §27 forbids judging staleness by elapsed time alone.
+
+    Reads only the `created_at` field the lock file has always carried, so
+    `LockFileContractTests`' pinned on-disk shape is unchanged.
+    """
+
+    def test_no_lock_means_no_time(self):
+        self.assertIsNone(lock_held_since(self.lock_path))
+
+    def test_a_live_lock_reports_when_it_was_acquired(self):
+        try_acquire_lock(self.lock_path, now=NOW)
+
+        self.assertEqual(lock_held_since(self.lock_path), NOW)
+
+    def test_a_dead_holder_reports_nothing(self):
+        """Consistent with `is_locked()`: a lock nobody holds has no holding
+        time, and reporting one would put a permanent entry in ATTENTION for
+        a lock the next Runner will simply take over."""
+        self._write_lock(self._stale_payload())
+
+        self.assertIsNone(lock_held_since(self.lock_path))
+
+    def test_an_unparseable_created_at_reports_nothing(self):
+        self._write_lock({"process_id": os.getpid(), "created_at": "not-a-time"})
+
+        self.assertIsNone(lock_held_since(self.lock_path))
+
+    def test_a_missing_created_at_reports_nothing(self):
+        self._write_lock({"process_id": os.getpid()})
+
+        self.assertIsNone(lock_held_since(self.lock_path))
+
+    def test_it_reads_no_field_the_lock_file_does_not_already_have(self):
+        """The reason this could be added without a contract decision: the
+        on-disk shape is untouched."""
+        try_acquire_lock(self.lock_path, now=NOW)
+
+        self.assertEqual(set(_read_lock(self.lock_path)), {"process_id", "created_at"})
+
+    def test_asking_changes_nothing(self):
+        try_acquire_lock(self.lock_path, now=NOW)
+        before = self.lock_path.read_bytes()
+
+        lock_held_since(self.lock_path)
+
+        self.assertEqual(self.lock_path.read_bytes(), before)
+
+
+class StaleLockCannotBeClearedTests(LockTestCase):
+    """`stale_lock_cannot_be_cleared()` — the BUG-42 blind spot, detected.
+
+    A stale lock carrying the read-only attribute is the worst-shaped
+    failure this system has: `try_acquire_lock()` answers False, and False
+    downstream means "another run holds it", so the Runner treats a
+    permanent condition as routine contention and skips forever. A
+    lock-skipped run writes no manifest (docs/14 §7, deliberately), so
+    nothing else is left to notice.
+
+    Measured, and this is why a third detector was needed: **both existing
+    ones are blind to it.** `is_locked()` returns False and
+    `lock_held_since()` returns None, because each keys on a *live* process
+    and this lock's process is dead. Everything C19 added for stuck locks
+    looks straight past it.
+
+    The condition detected here is narrow and permanent by construction —
+    dead process, unwritable file — so it is never noise. Neither of BUG-42's
+    two candidate fixes is taken: nothing strips an attribute, and
+    `try_acquire_lock()`'s contract is untouched.
+    """
+
+    def _read_only(self, path):
+        os.chmod(path, stat.S_IREAD)
+        self.addCleanup(self._restore_writable, path)
+
+    @staticmethod
+    def _restore_writable(path):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+        except OSError:
+            pass
+
+    def test_no_lock_file_is_not_reported(self):
+        self.assertFalse(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_an_ordinary_stale_lock_is_not_reported(self):
+        """The next run takes this one over — that is §27 working, and
+        reporting it would be noise on every crash recovery."""
+        self._write_lock(self._stale_payload())
+
+        self.assertFalse(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_a_lock_held_by_a_live_process_is_not_reported(self):
+        try_acquire_lock(self.lock_path, now=NOW)
+
+        self.assertFalse(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_a_read_only_stale_lock_is_reported(self):
+        self._write_lock(self._stale_payload())
+        self._read_only(self.lock_path)
+
+        self.assertTrue(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_the_condition_is_exactly_the_one_that_blocks_takeover(self):
+        """Writability is the whole difference: the same stale lock is taken
+        over when it is writable and never when it is not."""
+        self._write_lock(self._stale_payload())
+        self._read_only(self.lock_path)
+
+        self.assertFalse(try_acquire_lock(self.lock_path, now=NOW))
+        self.assertFalse(try_acquire_lock(self.lock_path, now=NOW))
+        self.assertTrue(self.lock_path.exists())
+
+        self._restore_writable(self.lock_path)
+
+        self.assertTrue(try_acquire_lock(self.lock_path, now=NOW))
+        self.assertFalse(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_the_two_existing_detectors_really_are_blind_to_it(self):
+        """Pinned so nobody concludes the older detectors already cover this
+        and deletes the new one."""
+        self._write_lock(self._stale_payload())
+        self._read_only(self.lock_path)
+
+        self.assertFalse(is_locked(self.lock_path))
+        self.assertIsNone(lock_held_since(self.lock_path))
+        self.assertTrue(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_an_unparseable_read_only_lock_is_reported(self):
+        """`_read_lock()` returns None for junk, which §27 already treats as
+        stale — so an unremovable one is the same permanent condition."""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path.write_text("{not json", encoding="utf-8")
+        self._read_only(self.lock_path)
+
+        self.assertTrue(stale_lock_cannot_be_cleared(self.lock_path))
+
+    def test_asking_neither_removes_the_lock_nor_changes_its_attributes(self):
+        """Detection only — the restraint every other read-only helper here
+        keeps."""
+        self._write_lock(self._stale_payload())
+        self._read_only(self.lock_path)
+        before = self.lock_path.read_bytes()
+        writable_before = os.access(self.lock_path, os.W_OK)
+
+        stale_lock_cannot_be_cleared(self.lock_path)
+
+        self.assertTrue(self.lock_path.exists())
+        self.assertEqual(self.lock_path.read_bytes(), before)
+        self.assertEqual(os.access(self.lock_path, os.W_OK), writable_before)
 
 
 if __name__ == "__main__":

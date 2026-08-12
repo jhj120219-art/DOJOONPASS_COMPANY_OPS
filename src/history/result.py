@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 
@@ -56,6 +57,45 @@ class HistoryCandidate:
     expected_outcome: str | None = None
     actual_outcome: str | None = None
     lessons_learned: str | None = None
+
+    @property
+    def chronological_key(self) -> tuple:
+        """Sort key that orders candidates by the instant they describe.
+
+        Every place that renders Company History orders a day's items by
+        `timestamp`, and all of them used the raw string. That is only
+        correct while every Event carries the same UTC offset, and the
+        schema deliberately does not require one:
+        `tests/test_spec_conformance.py::test_the_schema_accepts_a_non_kst_offset`
+        pins `+00:00` / `-05:00` / `+05:30` as accepted, and a Signal may
+        state its own `timestamp`. `app/desktop_activity._before()` already
+        parses rather than string-compares, and says why; the three renderers
+        in `daily/` did not.
+
+        Measured: `2026-08-05T01:00:00+00:00` and `2026-08-05T09:00:00+09:00`
+        are 01:00 and 00:00 UTC, so the second happened first — and sorted as
+        strings the first one wins. Both fall on 2026-08-05 in their own
+        offsets, so both land in the same Daily file and are rendered in the
+        wrong order.
+
+        Two buckets rather than one comparison so the key is a total order.
+        A timestamp that cannot be parsed, or that carries no offset (only
+        reachable through a hand-edited Candidate file — `validate_event()`
+        requires one), has no instant to compare, so it sorts after
+        everything that does, by its raw text. Damaged records landing last
+        is deterministic; letting them silently reorder good ones is not.
+
+        Grouping is untouched: `_candidate_date()` still buckets by the
+        offset-local date, which is the day the work happened where it
+        happened (docs/06 §12). Only the order within a day changes.
+        """
+        try:
+            parsed = datetime.fromisoformat(self.timestamp)
+        except (TypeError, ValueError):
+            return (1, str(self.timestamp))
+        if parsed.tzinfo is None:
+            return (1, str(self.timestamp))
+        return (0, parsed.astimezone(timezone.utc).isoformat())
 
     def to_dict(self) -> dict:
         return {

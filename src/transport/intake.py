@@ -49,9 +49,24 @@ def _is_stable(path: Path, *, now: float, stable_after_seconds: float) -> bool:
 
 
 def _is_parseable_json(path: Path) -> bool:
+    """Can this file be read as JSON at all?
+
+    `RecursionError` is named alongside the rest because `json.loads()`
+    raises it — not `ValueError` — on deeply nested input, and it is a
+    `RuntimeError` subclass so no broader name here covers it. Without it
+    one such file escaped `run_intake()` and halted the Runner at step 2,
+    which is the opposite of this predicate's whole purpose: a file it
+    cannot parse must be left in `transport/` and skipped, never allowed to
+    stop the rest of the batch.
+
+    `agent/signals.py` already made exactly this call for `json.loads`, with
+    the same reasoning written beside it ("Uncaught, one corrupt Signal file
+    would take down the entire Agent run instead of being rejected on its
+    own"). This is that decision applied where it was missing, not a new one.
+    """
     try:
         json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return False
     return True
 

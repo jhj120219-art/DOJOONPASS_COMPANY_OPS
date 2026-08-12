@@ -22,7 +22,9 @@ Audit findings referenced below:
 """
 
 import inspect
+import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from backup.result import BackupStatus  # noqa: E402
 from backup.working_copy import scan_for_secrets  # noqa: E402
 from events import create_event, validate_event  # noqa: E402
 from history import (  # noqa: E402
@@ -466,13 +469,37 @@ class SecretScanCoverageTests(unittest.TestCase):
         for name in (".env", ".env.local", "id_rsa", "server.pem", "cert.key"):
             self.assertIn(name, detected)
 
+    def test_every_name_section_29_writes_down_is_detected(self):
+        """§29 gives three examples of what the scan must catch: `.env`,
+        `credentials.json`, `token.json`. Two of them were not in the list.
+
+        This used to be part of `test_other_common_secret_filenames_are_not_detected`
+        below, which lumped the spec's own examples together with names
+        nobody had asked for — so a spec requirement sat inside a test that
+        asserted it was fine to miss. Measured before the fix: a
+        `credentials.json` placed in `daily/`, which docs/08 §26 puts *in*
+        backup scope, was synced and would have been pushed.
+        """
+        for name in (".env", "credentials.json", "token.json"):
+            with self.subTest(name=name):
+                target = self.master / "daily" / name
+                target.write_text("NOTION_API_TOKEN=ntn_real", encoding="utf-8")
+                try:
+                    detected = scan_for_secrets(self.master)
+                    self.assertIn(str(Path("daily") / name), detected)
+                finally:
+                    target.unlink()
+
     def test_other_common_secret_filenames_are_not_detected(self):
-        for name in ("secrets.json", "credentials.json", "token.txt", "config.yaml"):
+        """Names the spec does NOT list. Still a real gap — pinned, not
+        closed, because picking which extra names to add is policy rather
+        than implementation (see `_SECRET_EXACT_NAMES`' comment)."""
+        for name in ("secrets.json", "credentials.yml", "token.txt", "config.yaml"):
             (self.master / name).write_text("NOTION_API_TOKEN=ntn_real", encoding="utf-8")
 
         detected = scan_for_secrets(self.master)
 
-        for name in ("secrets.json", "credentials.json", "token.txt", "config.yaml"):
+        for name in ("secrets.json", "credentials.yml", "token.txt", "config.yaml"):
             self.assertNotIn(name, detected)
 
     def test_a_token_inside_a_daily_history_body_is_not_detected(self):
@@ -1195,3 +1222,425 @@ class NotionPayloadBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkingCopyStrayFileTests(unittest.TestCase):
+    """CHARACTERIZATION (BACKLOG E-21): the Secret Scan looks at a different
+    directory from the one git commits.
+
+    Three facts, each defensible alone:
+
+        scan_for_secrets(master_dir)   scans **Local Master**
+        _relative_files()              is scope-filtered, so `sync_to_working_copy()`
+                                       never sees anything outside daily/ and monthly/
+        git_add_all()                  runs `git add -A` in the **Working Copy**,
+                                       which stages everything present there
+
+    Together they leave a file that reaches the Working Copy by any route
+    other than sync — an operator working in the directory, an editor swap
+    file, a tool writing a log — completely ungated. It is invisible to the
+    scan (wrong directory) and invisible to sync (out of scope), and
+    `git add -A` commits it.
+
+    Measured end to end against a real local remote: a `.env` holding a
+    token-shaped string, a `notes/id_rsa`, and a `scratch.log` were placed
+    in the Working Copy only. `backup.run_once()` returned BACKUP_SUCCESS
+    with `push_result="SUCCESS"`, and all three were in the pushed commit
+    alongside `daily/2026-08-05.md`.
+
+    docs/08 has two provisions that would each have caught it and neither is
+    in force: §28 asks the Backup Repo to carry a `.gitignore`
+    (`.env`, `.env.*`, `*.tmp`, `*.log`, ...) — the Working Copy has none,
+    and creating it is operator setup (§30, BACKLOG A-8) — and §29 requires
+    checking "알려진 Secret 파일이 **포함**되지 않았는지" before backup, where
+    what is *included* is what `git add -A` stages.
+
+    Not fixed, and the reason is the same one that keeps E-15 open: every
+    candidate move repoints or reshapes a security gate.
+
+        scan the Working Copy instead of Master   changes which directory the
+                                                  gate guards, in both
+                                                  directions (E-15's
+                                                  false positives disappear,
+                                                  new blocks appear)
+        `git add daily monthly` instead of -A     narrows what is committed and
+                                                  changes the approved command
+                                                  set that
+                                                  test_spec_conformance.py pins
+        write a .gitignore into the Working Copy  creates a file in a repository
+                                                  this code did not create
+
+    So this pins the boundary instead. It fails the day any of the three is
+    taken, and at that point it should be rewritten as the guarantee.
+    """
+
+    TOKEN = "ntn_" + "Z" * 40
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.master = self.root / "local_master"
+        (self.master / "daily").mkdir(parents=True)
+        (self.master / "daily" / "2026-08-05.md").write_text(
+            "# history\n", encoding="utf-8"
+        )
+        self.wc = self.root / "wc"
+        self.wc.mkdir()
+        self.bare = self.root / "remote.git"
+        self._git("init", "--bare", "-b", "main", str(self.bare), cwd=self.root)
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "test@example.invalid")
+        self._git("config", "user.name", "Stray File Test")
+        self._git("remote", "add", "origin", str(self.bare))
+        (self.wc / ".gitkeep").write_text("", encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-m", "init")
+        self._git("push", "-u", "origin", "main")
+
+    def _git(self, *args, cwd=None):
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd or self.wc,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def _plant_strays(self):
+        (self.wc / ".env").write_text(f"NOTION_API_TOKEN={self.TOKEN}\n", encoding="utf-8")
+        (self.wc / "scratch.log").write_text("debug\n", encoding="utf-8")
+        (self.wc / "notes").mkdir()
+        (self.wc / "notes" / "id_rsa").write_text("KEY\n", encoding="utf-8")
+
+    def _backup(self):
+        from backup.runner import run_once as backup_run_once
+
+        return backup_run_once(
+            self.master,
+            self.wc,
+            state_path=self.root / "backup_state.json",
+            now=datetime(2026, 8, 6, 11, 0).astimezone(),
+        )
+
+    def _committed_files(self):
+        return sorted(self._git("ls-tree", "-r", "--name-only", "HEAD").split())
+
+    def test_the_secret_scan_does_not_look_at_the_working_copy(self):
+        """The root fact. The gate is pointed at Local Master."""
+        self._plant_strays()
+
+        self.assertEqual(scan_for_secrets(self.master), ())
+        self.assertNotEqual(scan_for_secrets(self.wc), ())
+
+    def test_the_sync_never_sees_an_out_of_scope_stray(self):
+        """The second reason nothing catches it: `_relative_files()` is
+        scope-filtered, so these files are not added, modified or deleted as
+        far as sync is concerned."""
+        from backup.working_copy import sync_to_working_copy
+
+        self._plant_strays()
+
+        result = sync_to_working_copy(self.master, self.wc)
+
+        self.assertEqual(result.deleted, ())
+        for name in (".env", "scratch.log", "notes/id_rsa"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, result.added + result.modified)
+
+    def test_a_stray_env_is_committed_and_pushed(self):
+        self._plant_strays()
+
+        entry = self._backup()
+
+        self.assertEqual(entry.final_status, BackupStatus.SUCCESS)
+        committed = self._committed_files()
+        self.assertIn(".env", committed)
+        self.assertIn("notes/id_rsa", committed)
+        self.assertIn("scratch.log", committed)
+
+    def test_the_backup_reports_success_while_doing_it(self):
+        """The part that makes it dangerous rather than merely wrong: every
+        signal says the backup was clean."""
+        self._plant_strays()
+
+        entry = self._backup()
+
+        self.assertEqual(entry.final_status, BackupStatus.SUCCESS)
+        self.assertEqual(entry.push_result, "SUCCESS")
+
+    def test_the_same_file_in_master_is_caught(self):
+        """The gate does work — on the directory it watches. This is the
+        contrast that makes the finding a mis-pointed gate rather than an
+        absent one."""
+        (self.master / ".env").write_text(
+            f"NOTION_API_TOKEN={self.TOKEN}\n", encoding="utf-8"
+        )
+
+        entry = self._backup()
+
+        self.assertEqual(entry.final_status, BackupStatus.FAILED)
+        self.assertIn("secret files detected", entry.push_result)
+
+    def test_the_working_copy_carries_no_gitignore(self):
+        """docs/08 §28's second line of defence, absent. Creating it is
+        operator setup (§30 / BACKLOG A-8), which is why this is pinned
+        rather than closed."""
+        self.assertFalse((self.wc / ".gitignore").exists())
+
+    def test_git_add_all_is_still_the_approved_command(self):
+        """Narrowing to `git add daily monthly` is one of the candidate
+        fixes; it would change the command set
+        `test_spec_conformance.py::test_git_ops_runs_only_the_approved_command_set`
+        pins. Recorded here so the two move together."""
+        import inspect
+
+        from backup import git_ops
+
+        source = inspect.getsource(git_ops.git_add_all)
+        self.assertIn('"add"', source)
+        self.assertIn('"-A"', source)
+
+
+class StrayFileSurvivesAFailedPushTests(unittest.TestCase):
+    """CHARACTERIZATION (BACKLOG E-21): a failed backup has already committed
+    the stray, and the retry delivers it.
+
+    E-21 measured the leak on a clean run. This measures it across the
+    failure path, which is worse in one way and better in another.
+
+    Worse: `backup.run_once()` runs add -> commit -> push in one `try`, so a
+    push failure raises **after** the commit. The stray is durably in the
+    local history, the run is reported as failed, and the next run — which
+    reports BACKUP_SUCCESS — pushes it. Failing does not hold the leak back;
+    it only defers it.
+
+    Better: the deferral is a window. Between the failed run and the
+    successful one the file is still sitting in the Working Copy, so
+    `ops_status.py`'s C24 check names it *before* it leaves the machine.
+    That makes the C24 detection more than an after-the-fact notice for
+    exactly the case an unattended deployment is most likely to hit — an
+    offline or unreachable remote.
+
+    Nothing here changes behaviour. `run_once()`'s ordering is docs/08 §12's
+    Flow, and the commit-then-push sequence is what makes BACKUP_PENDING
+    retryable at all.
+    """
+
+    TOKEN = "ntn_" + "Q" * 40
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.master = self.runtime / "local_master"
+        (self.master / "daily").mkdir(parents=True)
+        (self.master / "daily" / "2026-08-05.md").write_text("# h\n", encoding="utf-8")
+        (self.runtime / "state").mkdir(parents=True)
+        self.wc = self.runtime / "backup_working_copy"
+        self.wc.mkdir()
+        self.bare = self.root / "remote.git"
+        self._git("init", "--bare", "-b", "main", str(self.bare), cwd=self.root)
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "test@example.invalid")
+        self._git("config", "user.name", "Retry Leak Test")
+        self._git("remote", "add", "origin", str(self.bare))
+        (self.wc / ".gitkeep").write_text("", encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-m", "init")
+        self._git("push", "-u", "origin", "main")
+
+    def _git(self, *args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd or self.wc,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def _backup(self, day):
+        from backup.runner import run_once as backup_run_once
+
+        return backup_run_once(
+            self.master,
+            self.wc,
+            state_path=self.root / "backup_state.json",
+            now=datetime(2026, 8, day, 11, 0).astimezone(),
+        )
+
+    def _local(self):
+        return sorted(self._git("ls-tree", "-r", "--name-only", "HEAD").stdout.split())
+
+    def _remote(self):
+        return sorted(
+            self._git("ls-tree", "-r", "--name-only", "origin/main").stdout.split()
+        )
+
+    def _break_remote(self):
+        self._git("remote", "set-url", "origin", str(self.root / "gone.git"))
+
+    def _restore_remote(self):
+        self._git("remote", "set-url", "origin", str(self.bare))
+
+    def _plant(self):
+        (self.wc / ".env").write_text(f"TOKEN={self.TOKEN}\n", encoding="utf-8")
+
+    def test_a_push_failure_still_leaves_the_stray_committed_locally(self):
+        from backup.git_ops import GitOperationError
+
+        self._plant()
+        self._break_remote()
+
+        with self.assertRaises(GitOperationError):
+            self._backup(6)
+
+        self.assertIn(".env", self._local())
+        self.assertNotIn(".env", self._remote())
+
+    def test_the_next_successful_run_pushes_it(self):
+        from backup.git_ops import GitOperationError
+
+        self._plant()
+        self._break_remote()
+        with self.assertRaises(GitOperationError):
+            self._backup(6)
+        self._restore_remote()
+
+        entry = self._backup(7)
+
+        self.assertEqual(entry.final_status, BackupStatus.SUCCESS)
+        self.assertIn(".env", self._remote())
+
+    def test_the_status_view_names_it_before_the_push_happens(self):
+        """The window. Between the failed run and the successful one the
+        file is still in the Working Copy, so the C24 check can name it
+        while it is still only local."""
+        import contextlib
+        import importlib.util
+
+        from backup.git_ops import GitOperationError
+
+        self._plant()
+        self._break_remote()
+        with self.assertRaises(GitOperationError):
+            self._backup(6)
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_retryleak", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(datetime(2026, 8, 6, 12, 0).astimezone())
+
+        warned = [item for item in attention if "Working Copy" in item]
+        self.assertTrue(warned, f"no warning before the push: {attention}")
+        self.assertIn(".env", warned[0])
+        # And it really has not left yet.
+        self.assertNotIn(".env", self._remote())
+
+    def test_removing_the_file_before_the_retry_still_leaves_the_local_commit(self):
+        """What an operator acting on that warning gets, stated honestly:
+        deleting the file stops the *content* going out only if the commit
+        is also undone — the stray is already in local history, and
+        `sync_to_working_copy()` never deletes anything out of scope."""
+        from backup.git_ops import GitOperationError
+
+        self._plant()
+        self._break_remote()
+        with self.assertRaises(GitOperationError):
+            self._backup(6)
+
+        (self.wc / ".env").unlink()
+        self._restore_remote()
+        self._backup(7)
+
+        # Gone from the tip, but still reachable in history.
+        self.assertNotIn(".env", self._remote())
+        older = self._git("log", "--all", "--name-only", "--format=").stdout.split()
+        self.assertIn(".env", older)
+
+
+class WorkingCopyJunctionExposureTests(unittest.TestCase):
+    """A junction inside the Working Copy is another route into the commit,
+    and the C24 detection reaches through it.
+
+    `git add -A` follows a Windows directory junction and stages what is on
+    the other side, so a junction placed in the Working Copy publishes an
+    external directory to the backup remote. Measured: a junction pointing
+    at a folder holding a `.env` produced a remote commit containing
+    `linked/.env`, with the backup reporting BACKUP_SUCCESS.
+
+    That is E-21 again rather than a separate defect — anything present in
+    the Working Copy is committed — but it is worth pinning separately,
+    because the detection's coverage of it is not obvious.
+    `scan_for_secrets()` walks with `rglob`, which descends into a junction
+    (BACKLOG A-19 measured exactly that, as a hazard), so here that
+    behaviour works in the operator's favour: the file is found and named
+    as `linked\\.env`.
+
+    Junction creation needs no elevation on Windows (A-19 measured that
+    too), which is why this is reachable at all. The test skips where the
+    filesystem will not make one.
+    """
+
+    TOKEN = "ntn_" + "W" * 40
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.wc = self.root / "wc"
+        self.wc.mkdir()
+        self.outside = self.root / "outside"
+        self.outside.mkdir()
+        (self.outside / ".env").write_text(f"TOKEN={self.TOKEN}\n", encoding="utf-8")
+
+    def _make_junction(self, link: Path, target: Path) -> bool:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        self.addCleanup(
+            lambda: subprocess.run(
+                ["cmd", "/c", "rmdir", str(link)], capture_output=True
+            )
+        )
+        return True
+
+    def test_the_secret_scan_reaches_through_a_junction(self):
+        if sys.platform != "win32":
+            self.skipTest("directory junctions are a Windows construct")
+        if not self._make_junction(self.wc / "linked", self.outside):
+            self.skipTest("this filesystem refused to create a junction")
+
+        found = scan_for_secrets(self.wc)
+
+        self.assertTrue(found, "a junction hid the file from the scan")
+        self.assertTrue(
+            any(name.endswith(".env") for name in found), f"unexpected: {found}"
+        )
+
+    def test_the_same_walk_that_makes_a_19_a_hazard_helps_here(self):
+        """`rglob` descending into a junction is the behaviour BACKLOG A-19
+        records as the Master-side risk. Pinned from this side so a future
+        change to A-19 is known to affect this detection too."""
+        if sys.platform != "win32":
+            self.skipTest("directory junctions are a Windows construct")
+        if not self._make_junction(self.wc / "linked", self.outside):
+            self.skipTest("this filesystem refused to create a junction")
+
+        reached = [p for p in self.wc.rglob("*") if p.name == ".env"]
+
+        self.assertEqual(len(reached), 1)

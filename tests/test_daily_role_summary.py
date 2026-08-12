@@ -8,6 +8,7 @@ omitted.
 """
 
 import sys
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from daily import ROLE_ORDER, build_role_summary, generate_daily_history  # noqa: E402
+from daily.late_events import select_late_candidates  # noqa: E402
 from events import ROLES  # noqa: E402
 from history import HistoryCandidate, HistoryDecision  # noqa: E402
 from history.file_repository import FileHistoryRepository  # noqa: E402
@@ -161,3 +163,172 @@ class AgreementWithTheDailyFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MixedOffsetOrderingTests(unittest.TestCase):
+    """Company History must be ordered by when things happened, not by how
+    the timestamp happens to spell.
+
+    Every renderer here orders a day's items by `timestamp`, and all three
+    used the raw string. That is correct only while every Event carries the
+    same UTC offset, and the schema deliberately does not require one —
+    `test_spec_conformance.py::test_the_schema_accepts_a_non_kst_offset`
+    pins `+00:00` / `-05:00` / `+05:30` as accepted, and a Signal may state
+    its own `timestamp`. `app/desktop_activity._before()` had already
+    stopped string-comparing this exact field, and said why; `daily/` had
+    not.
+
+        2026-08-05T01:00:00+00:00   01:00 UTC   happened second
+        2026-08-05T09:00:00+09:00   00:00 UTC   happened first
+
+    Both fall on 2026-08-05 in their own offsets, so both land in the same
+    Daily file, and as text the second one sorts first. The Source of Truth
+    document then lists the day's events in the wrong order.
+
+    Grouping is deliberately untouched: a candidate still belongs to the day
+    its own offset says (docs/06 §12 — the day the work happened where it
+    happened). Only the order within that day is fixed.
+    """
+
+    EARLIER = "2026-08-05T09:00:00+09:00"  # 00:00 UTC
+    LATER = "2026-08-05T01:00:00+00:00"  # 01:00 UTC
+
+    def _candidate(self, event_id, timestamp, role="CTO_BACKEND"):
+        return HistoryCandidate(
+            history_id=f"HIST-{event_id}",
+            event_id=event_id,
+            timestamp=timestamp,
+            category="MILESTONE",
+            project_id="SEARCH_BACKEND",
+            role=role,
+            summary=f"{event_id} work",
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def test_the_string_order_really_is_the_wrong_order(self):
+        """The premise, pinned so the fix cannot be mistaken for cosmetics."""
+        first = self._candidate("FIRST", self.EARLIER)
+        second = self._candidate("SECOND", self.LATER)
+
+        by_text = sorted([first, second], key=lambda c: c.timestamp)
+        by_instant = sorted([first, second], key=lambda c: c.chronological_key)
+
+        self.assertEqual([c.event_id for c in by_text], ["SECOND", "FIRST"])
+        self.assertEqual([c.event_id for c in by_instant], ["FIRST", "SECOND"])
+
+    def test_the_daily_file_lists_them_in_the_order_they_happened(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        repo = FileHistoryRepository(keep_dir=root / "keep", review_dir=root / "review")
+        repo.save(self._candidate("SECOND", self.LATER))
+        repo.save(self._candidate("FIRST", self.EARLIER))
+
+        path = generate_daily_history(
+            repo,
+            date(2026, 8, 5),
+            output_dir=root / "daily",
+            generated_at="2026-08-06T11:00:00+09:00",
+        )
+
+        text = path.read_text(encoding="utf-8")
+        self.assertLess(text.index("FIRST work"), text.index("SECOND work"))
+
+    def test_both_still_land_on_the_same_day(self):
+        """Grouping is by the offset-local date and must not change — a fix
+        that reordered the day by silently regrouping it would be worse than
+        the defect."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        repo = FileHistoryRepository(keep_dir=root / "keep", review_dir=root / "review")
+        repo.save(self._candidate("FIRST", self.EARLIER))
+        repo.save(self._candidate("SECOND", self.LATER))
+
+        path = generate_daily_history(
+            repo,
+            date(2026, 8, 5),
+            output_dir=root / "daily",
+            generated_at="2026-08-06T11:00:00+09:00",
+        )
+
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("Event Count: 2", text)
+
+    def test_late_events_are_appended_in_the_order_they_happened(self):
+        markdown = (
+            "# DOJOONPASS Company History — 2026-08-05\n\n"
+            "## Summary\n\nexisting\n\n"
+            "## Metadata\n\n"
+            "- History Date: 2026-08-05\n"
+            "- Generated At: 2026-08-06T11:00:00+09:00\n"
+            "- Event Count: 0\n"
+        )
+        candidates = [
+            self._candidate("SECOND", self.LATER),
+            self._candidate("FIRST", self.EARLIER),
+        ]
+
+        selected = select_late_candidates(markdown, candidates)
+
+        self.assertEqual([c.event_id for c in selected], ["FIRST", "SECOND"])
+
+    def test_the_role_summary_uses_the_same_order_as_the_file(self):
+        candidates = [
+            self._candidate("SECOND", self.LATER),
+            self._candidate("FIRST", self.EARLIER),
+        ]
+
+        summary = build_role_summary(candidates, date(2026, 8, 5))
+
+        backend = next(a for a in summary.roles if a.role == "CTO_BACKEND")
+        self.assertEqual([c.event_id for c in backend.candidates], ["FIRST", "SECOND"])
+
+    def test_an_unparseable_timestamp_sorts_last_and_never_raises(self):
+        """Only reachable through a hand-edited Candidate file, but a
+        renderer that raises on one damaged record loses the whole day."""
+        good = self._candidate("GOOD", self.EARLIER)
+        broken = self._candidate("BROKEN", "not-a-timestamp")
+
+        ordered = sorted([broken, good], key=lambda c: c.chronological_key)
+
+        self.assertEqual([c.event_id for c in ordered], ["GOOD", "BROKEN"])
+
+    def test_a_timestamp_with_no_offset_sorts_last_rather_than_being_guessed(self):
+        """`validate_event()` requires an offset, so this only arrives via a
+        hand-edited file. Assuming a timezone for it would silently place it
+        somewhere it may not belong."""
+        aware = self._candidate("AWARE", self.EARLIER)
+        naive = self._candidate("NAIVE", "2026-08-05T00:00:00")
+
+        ordered = sorted([naive, aware], key=lambda c: c.chronological_key)
+
+        self.assertEqual([c.event_id for c in ordered], ["AWARE", "NAIVE"])
+
+    def test_same_offset_ordering_is_unchanged(self):
+        """The overwhelmingly common case must be byte-identical to before."""
+        early = self._candidate("EARLY", "2026-08-05T09:00:00+09:00")
+        late = self._candidate("LATE", "2026-08-05T18:00:00+09:00")
+
+        self.assertEqual(
+            [c.event_id for c in sorted([late, early], key=lambda c: c.chronological_key)],
+            [c.event_id for c in sorted([late, early], key=lambda c: c.timestamp)],
+        )
+
+    def test_the_key_is_a_total_order_across_every_shape(self):
+        """A sort key that cannot compare two of its own values raises
+        mid-render, which is the one outcome a damaged record must not
+        cause."""
+        shapes = [
+            self.EARLIER,
+            self.LATER,
+            "2026-08-05T00:00:00",
+            "not-a-timestamp",
+            "",
+        ]
+        candidates = [self._candidate(f"E{i}", ts) for i, ts in enumerate(shapes)]
+
+        ordered = sorted(candidates, key=lambda c: c.chronological_key)
+
+        self.assertEqual(len(ordered), len(shapes))

@@ -11,12 +11,17 @@ stand in for a network/OneDrive that this environment cannot make fail on
 demand.
 """
 
+import contextlib
+import io
 import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
 from datetime import date, datetime, time
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -1168,3 +1173,119 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
         for repair in ("unlink(", "save_state(", "write_text(", "remove("):
             with self.subTest(repair=repair):
                 self.assertNotIn(repair, after_catch)
+
+
+class CorruptStateGuidanceTests(unittest.TestCase):
+    """A damaged state file and a state file belonging to another Desktop
+    are the same exception and need opposite fixes.
+
+    `run_agent.py` caught `AgentStateError` in one branch and answered every
+    instance of it with the identity-mismatch script:
+
+        - COMPANY_OPS_PROFILE이 잘못 설정됐다 → 원래 Desktop ID로 되돌린다.
+
+    For a state file truncated by a power cut that advice is simply wrong.
+    The variable is already correct, changing it fixes nothing, and the
+    operator is never told the file is unreadable — the one fact that would
+    have led them anywhere. Reached the same way as the mismatch case: by
+    running it rather than reading it.
+
+    `AgentStateMismatchError` subclasses `AgentStateError`, so every
+    existing `except AgentStateError` is unaffected and nothing about the
+    refusal itself changes.
+    """
+
+    def _run_entrypoint(self, state_text, *, profile="DESKTOP_1"):
+        import importlib.util
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        state_path = root / "runtime" / "agent" / "state" / "agent_state.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(state_text, encoding="utf-8")
+
+        path = Path(__file__).resolve().parents[1] / "run_agent.py"
+        spec = importlib.util.spec_from_file_location("run_agent_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = root / "runtime"
+
+        env = {
+            "COMPANY_OPS_PROFILE": profile,
+            "COMPANY_OPS_AGENT_SYNC_FOLDER": str(root / "cloud"),
+            "COMPANY_OPS_AGENT_START_DATE": "2026-08-01",
+        }
+        errors = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with contextlib.redirect_stderr(errors):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = module.main()
+        return code, errors.getvalue(), state_path
+
+    def test_a_mismatched_desktop_still_gets_the_identity_guidance(self):
+        code, errors, _ = self._run_entrypoint(
+            json.dumps({"desktop_id": "DESKTOP_4"}), profile="DESKTOP_1"
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("COMPANY_OPS_PROFILE", errors)
+        self.assertIn("DESKTOP_4", errors)
+
+    def test_a_corrupt_state_file_is_named_as_corrupt(self):
+        code, errors, _ = self._run_entrypoint("{not json")
+
+        self.assertEqual(code, 1)
+        self.assertIn("읽을 수 없습니다", errors)
+
+    def test_a_corrupt_state_file_is_not_blamed_on_the_profile_variable(self):
+        """The defect itself: advice about a variable that is already
+        correct sends an operator down the wrong path entirely."""
+        _code, errors, _ = self._run_entrypoint("{not json")
+
+        self.assertIn("COMPANY_OPS_PROFILE을 바꿔도 해결되지 않습니다", errors)
+        self.assertNotIn("원래 Desktop ID로 되돌린다", errors)
+
+    def test_an_unparseable_date_field_is_treated_as_corruption_not_identity(self):
+        """The subtler shape: valid JSON, correct Desktop, one bad field."""
+        _code, errors, _ = self._run_entrypoint(
+            json.dumps(
+                {"desktop_id": "DESKTOP_1", "last_successful_collection_date": "not-a-date"}
+            )
+        )
+
+        self.assertIn("읽을 수 없습니다", errors)
+        self.assertNotIn("원래 Desktop ID로 되돌린다", errors)
+
+    def test_neither_branch_repairs_the_state_file(self):
+        """The file holds `last_successful_collection_date`. Guessing a
+        replacement silently skips every date up to the guess — the data
+        loss `ensure_desktop()` exists to prevent, performed helpfully."""
+        for text in ("{not json", json.dumps({"desktop_id": "DESKTOP_4"})):
+            with self.subTest(state=text[:12]):
+                _code, _errors, state_path = self._run_entrypoint(text)
+                self.assertEqual(state_path.read_text(encoding="utf-8"), text)
+
+    def test_the_mismatch_error_is_still_an_agent_state_error(self):
+        """Existing callers catch the base class; the split must not change
+        what they catch."""
+        from agent.state import AgentState, AgentStateError, AgentStateMismatchError, ensure_desktop
+
+        self.assertTrue(issubclass(AgentStateMismatchError, AgentStateError))
+        with self.assertRaises(AgentStateError):
+            ensure_desktop(
+                AgentState(desktop_id="DESKTOP_4"),
+                "DESKTOP_1",
+                state_path=Path("agent_state.json"),
+            )
+
+    def test_corruption_does_not_raise_the_mismatch_subclass(self):
+        from agent.state import AgentStateMismatchError, load_state
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        path = root / "agent_state.json"
+        path.write_text("{not json", encoding="utf-8")
+
+        with self.assertRaises(Exception) as caught:
+            load_state(path)
+        self.assertNotIsInstance(caught.exception, AgentStateMismatchError)

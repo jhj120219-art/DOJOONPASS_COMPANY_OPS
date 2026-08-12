@@ -229,10 +229,22 @@ class RealNotionTransport(NotionTransport):
         return list(response.get("results") or [])
 
 
-def _rich_text_value(prop: Mapping[str, Any] | None) -> str | None:
+def _text_value(prop: Mapping[str, Any] | None, kind: str) -> str | None:
+    """The plain text of a `rich_text` or `title` property value.
+
+    Notion stores both as the same array of rich-text items under different
+    keys, so one reader serves both — which is the point: `query_database()`
+    below used to understand only `rich_text`, and OPS_RUNS keys its rows by
+    a `title` property.
+
+    Replaces `_rich_text_value()`, which this generalises and which had no
+    callers left once `query_database()` stopped hard-coding the type. Two
+    readers that differ only in which key they hard-code is the shape that
+    drifts.
+    """
     if not prop:
         return None
-    items = prop.get("rich_text") or []
+    items = prop.get(kind) or []
     if not items:
         return None
     return items[0].get("text", {}).get("content")
@@ -341,14 +353,25 @@ class InMemoryNotionTransport(NotionTransport):
     def query_database(
         self, database_id: str, filter_: Mapping[str, Any]
     ) -> Mapping[str, Any]:
+        """Match on whichever property the filter names, in either text type.
+
+        This used to hard-code `"Project ID"` and `rich_text`, which was the
+        only filter anything sent. It silently answered every other filter
+        with "no rows" — including a lookup by a `title` property, the shape
+        OPS_RUNS uses for its `Run ID`. A find-before-create built on that
+        would have found nothing, always, and duplicated every row while its
+        tests passed.
+        """
         self._maybe_fail("query_database")
-        target = filter_.get("rich_text", {}).get("equals")
+        property_name = filter_.get("property")
+        kind = "title" if "title" in filter_ else "rich_text"
+        target = (filter_.get(kind) or {}).get("equals")
         matches = [
             page
             for page_id, page in self._pages.items()
             # Scoped to the database being queried, like the real API.
             if self._page_database.get(page_id) == database_id
-            and _rich_text_value(page["properties"].get("Project ID")) == target
+            and _text_value(page["properties"].get(property_name), kind) == target
         ]
         return {"results": matches}
 

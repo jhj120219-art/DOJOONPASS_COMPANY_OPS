@@ -412,22 +412,29 @@ class _FalseNegativeCreateTransport(InMemoryNotionTransport):
 
 
 class RecordRunRetryDuplicationTests(unittest.TestCase):
-    """CHARACTERIZATION: pins today's behaviour, not the spec's claim.
+    """GUARANTEE (was CHARACTERIZATION): one execution, at most one row.
 
-    dashboard_pending.py's own docstring states "one Runner execution can
-    never produce two OPS_RUNS rows, whether it is recorded on the first
-    attempt or the tenth." Neither record_run() nor drain_pending() actually
-    enforces that — both call client.create_project() unconditionally, with
-    no find-before-create step (unlike notion.sync.ExecutionPlanSync, which
-    calls find_project() first for exactly this reason). A false-negative
-    network failure (the write reaches Notion, but the caller sees an
-    exception) followed by a successful retry therefore creates a second
-    page for the same run_id. If this test starts failing, a
-    find-before-create guard was added and dashboard_pending.py's docstring
-    claim became true — this test should then be rewritten as the
-    guarantee."""
+    `dashboard_pending.py`'s docstring has always stated "one Runner
+    execution can never produce two OPS_RUNS rows, whether it is recorded on
+    the first attempt or the tenth". Neither `record_run()` nor
+    `drain_pending()` enforced it — both called `client.create_project()`
+    unconditionally, with no find-before-create step, unlike
+    `notion.sync.ExecutionPlanSync`, which calls `find_project()` first for
+    exactly this reason.
 
-    def test_a_false_negative_failure_then_a_successful_retry_creates_two_rows(self):
+    The characterization this class used to hold said, in as many words, "if
+    this test starts failing, a find-before-create guard was added and the
+    docstring claim became true — rewrite it as the guarantee". That guard
+    is now in `NotionClient.find_or_create_by_title()`, so this is that
+    rewrite.
+
+    The scenario is the one that actually happens: the write reaches Notion
+    and the *response* is lost, so the caller sees an exception for a row
+    that exists. Nothing downstream can tell the resulting pair apart —
+    both rows are complete and both are plausible.
+    """
+
+    def test_a_false_negative_failure_then_a_successful_retry_makes_one_row(self):
         transport = _FalseNegativeCreateTransport()
         client = NotionClient(transport=transport, database_id="ops-runs-db")
 
@@ -452,9 +459,54 @@ class RecordRunRetryDuplicationTests(unittest.TestCase):
 
             recorded, still_pending = drain_pending(pending_path, client)
 
+            # Still reported as recorded — from the queue's point of view the
+            # record did reach Notion, which is the truth.
             self.assertEqual((recorded, still_pending), (1, 0))
-            # Two separate Notion pages now exist for the same run_id.
-            self.assertEqual(len(transport._pages), 2)
+            # And there is still exactly one row for run-dup.
+            self.assertEqual(len(transport._pages), 1)
+
+    def test_record_run_itself_is_idempotent_for_one_run_id(self):
+        """The same guarantee without the queue in the picture: a Runner
+        re-invoked with the same run_id (a manual re-run of a partially
+        failed execution) must not double the row either."""
+        transport = InMemoryNotionTransport()
+        client = NotionClient(transport=transport, database_id="ops-runs-db")
+
+        for _ in range(3):
+            result = record_run(
+                client,
+                run_id="run-same",
+                run_at=datetime(2026, 8, 8, 11, 0),
+                intake_summary=_FakeIntake(),
+                collector_summary=_FakeCollector(accepted=1),
+                scheduler_result=_FakeScheduler(),
+                backup_entry=_FakeBackup(),
+                notion_sync_results=(),
+            )
+            self.assertEqual(result.outcome, DashboardOutcome.RECORDED)
+
+        self.assertEqual(len(transport._pages), 1)
+
+    def test_two_different_runs_still_get_their_own_rows(self):
+        """The guard must not collapse distinct executions — that would be
+        the opposite defect and a worse one, since a missing run is
+        unrecoverable while a duplicate is merely confusing."""
+        transport = InMemoryNotionTransport()
+        client = NotionClient(transport=transport, database_id="ops-runs-db")
+
+        for run_id in ("run-a", "run-b", "run-c"):
+            record_run(
+                client,
+                run_id=run_id,
+                run_at=datetime(2026, 8, 8, 11, 0),
+                intake_summary=_FakeIntake(),
+                collector_summary=_FakeCollector(accepted=1),
+                scheduler_result=_FakeScheduler(),
+                backup_entry=_FakeBackup(),
+                notion_sync_results=(),
+            )
+
+        self.assertEqual(len(transport._pages), 3)
 
 
 class DashboardPendingTests(unittest.TestCase):
@@ -862,6 +914,90 @@ class PartialBootstrapTests(unittest.TestCase):
         self.assertEqual(sorted(result.created), sorted(DASHBOARD_DATABASES))
         for name in DASHBOARD_DATABASES:
             self.assertIsNotNone(result.database_id(name))
+
+
+class DrainPendingReasonTests(unittest.TestCase):
+    """Why a pending Dashboard record failed used to be discarded.
+
+    `drain_pending()`'s `except Exception:` swallowed the exception whole,
+    so a record Notion refuses permanently — a Select value it will not
+    accept, a deleted database — came back every run with nothing changed
+    but `attempt_count`, and no trace anywhere of what Notion said. An
+    operator watching the queue could see it never drained and could not see
+    why. That is the diagnostic blank BUG-13 closed for Notion Sync; the
+    Dashboard queue still had it.
+
+    `DrainPendingResult` is a tuple subclass so the existing
+    `recorded, still_pending = drain_pending(...)` call sites are untouched
+    (the same technique `app.runner.RunResult` uses).
+    """
+
+    class FailingClient:
+        def __init__(self, message="Notion says no"):
+            self.message = message
+
+        def find_or_create_by_title(self, *, property_name, value, properties):
+            raise RuntimeError(self.message)
+
+    class WorkingClient:
+        def find_or_create_by_title(self, *, property_name, value, properties):
+            return {"id": "page-1"}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "dashboard_pending.json"
+
+    def _seed(self, count=1):
+        for i in range(count):
+            save_pending(self.path, run_id=f"R-{i}", properties={"i": i})
+
+    def test_the_result_still_unpacks_as_the_old_two_tuple(self):
+        self._seed(2)
+
+        recorded, still_pending = drain_pending(self.path, self.WorkingClient())
+
+        self.assertEqual((recorded, still_pending), (2, 0))
+
+    def test_a_failure_reason_reaches_the_caller(self):
+        self._seed(1)
+
+        result = drain_pending(self.path, self.FailingClient("400 invalid select"))
+
+        self.assertEqual((result.recorded, result.still_pending), (0, 1))
+        self.assertIn("400 invalid select", result.last_reason)
+
+    def test_a_clean_drain_has_no_reason(self):
+        """A reason that is always present is one nobody reads."""
+        self._seed(2)
+
+        result = drain_pending(self.path, self.WorkingClient())
+
+        self.assertIsNone(result.last_reason)
+
+    def test_an_empty_queue_has_no_reason(self):
+        result = drain_pending(self.path, self.WorkingClient())
+
+        self.assertEqual((result.recorded, result.still_pending), (0, 0))
+        self.assertIsNone(result.last_reason)
+
+    def test_a_corrupt_queue_file_is_distinguishable_from_an_empty_one(self):
+        """Both report (0, 0) — the numbers cannot tell them apart, and one
+        of them means a file on disk needs a human."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not json", encoding="utf-8")
+
+        result = drain_pending(self.path, self.WorkingClient())
+
+        self.assertEqual((result.recorded, result.still_pending), (0, 0))
+        self.assertIn("corrupted", result.last_reason)
+
+    def test_it_still_never_raises_on_a_failing_client(self):
+        self._seed(3)
+
+        result = drain_pending(self.path, self.FailingClient())
+
+        self.assertEqual(result.still_pending, 3)
 
 
 if __name__ == "__main__":

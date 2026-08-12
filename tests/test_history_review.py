@@ -1,4 +1,7 @@
+import contextlib
+import io
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -12,7 +15,7 @@ from daily import (  # noqa: E402
     generate_daily_history,
     update_daily_history,
 )
-from events import Event  # noqa: E402
+from events import Event, create_event  # noqa: E402
 from history import (  # noqa: E402
     FileHistoryRepository,
     HistoryCandidate,
@@ -22,6 +25,9 @@ from history import (  # noqa: E402
     HistoryReviewError,
     RepositoryHistoryReviewer,
 )
+
+
+NOW = datetime(2026, 8, 10, 9, 0).astimezone()
 
 
 def sample_event(**overrides):
@@ -370,3 +376,368 @@ class ReviewedContextReachesNothingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewCandidatesReachNothingTests(unittest.TestCase):
+    """CHARACTERIZATION (BACKLOG E-20): a REVIEW candidate has no path into
+    Company History, and until now no counter either.
+
+    `HistoryFilter` sends BLOCKED / COMPLETED / CANCELLED to REVIEW —
+    docs/05 §24 names exactly those three, and the filter quotes it. What
+    happens to them afterwards is the gap:
+
+        generate_daily_history()   reads `decision=KEEP` only
+        submit_review()            writes the four Decision Context fields
+                                   and never touches `filter_result`
+        anything else              there is nothing else
+
+    So a candidate that lands in `review/` stays there. Measured end to end:
+    a COMPLETED Event was absent from its Daily file, a human filled in its
+    Decision Context, and it was still absent after two further runs.
+
+    That is not obviously wrong — docs/05 §24 says these need a person, and
+    `history/review.py` states plainly that "promoting a REVIEW candidate to
+    KEEP is not part of this Phase". What was wrong is that the pile was
+    invisible while every comparable pile had a counter (`rejected/`,
+    `signals_rejected/`, orphaned Events). docs/05 §50 makes the count the
+    signal — "REVIEW가 너무 많다 -> 자동화 실패 신호" — and nothing read it.
+
+    The counter is added here. Promotion is not: deciding what a completed
+    review *means* for an already-closed Daily file is a policy question
+    (BACKLOG E-20), and §50 points at tightening the rules rather than
+    building a promotion path anyway.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.keep = self.root / "keep"
+        self.review = self.root / "review"
+        self.repo = FileHistoryRepository(keep_dir=self.keep, review_dir=self.review)
+        self.filter = HistoryFilter()
+
+    def _event(self, event_id, event_type, **overrides):
+        data = dict(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="P",
+            event_type=event_type,
+            status="IN_PROGRESS",
+            summary=f"{event_id} summary",
+            history_candidate=True,
+            event_id=event_id,
+            timestamp="2026-08-05T10:00:00+09:00",
+        )
+        data.update(overrides)
+        return create_event(**data)
+
+    def test_the_three_review_types_never_produce_a_keep_candidate(self):
+        cases = (
+            ("RV-BLOCKED", "BLOCKED", {"status": "BLOCKED", "blocker": "b"}),
+            ("RV-COMPLETED", "COMPLETED", {"status": "COMPLETED"}),
+            ("RV-CANCELLED", "CANCELLED", {"status": "CANCELLED"}),
+        )
+        for event_id, event_type, extra in cases:
+            with self.subTest(event_type=event_type):
+                result = self.filter.evaluate(self._event(event_id, event_type, **extra))
+                self.assertEqual(result.decision, HistoryDecision.REVIEW)
+
+        self.assertEqual(self.repo.list(decision=HistoryDecision.KEEP), [])
+
+    def test_a_review_candidate_is_absent_from_the_generated_daily(self):
+        keep_event = self._event("RV-KEEP", "MILESTONE_COMPLETED", milestone="M")
+        review_event = self._event("RV-DONE", "COMPLETED", status="COMPLETED")
+        self.repo.save(self.filter.evaluate(keep_event).candidate)
+        self.repo.save(self.filter.evaluate(review_event).candidate)
+
+        path = generate_daily_history(
+            self.repo,
+            date(2026, 8, 5),
+            output_dir=self.root / "daily",
+            generated_at="2026-08-06T11:00:00+09:00",
+        )
+
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("RV-KEEP", text)
+        self.assertNotIn("RV-DONE", text)
+
+    def test_submitting_a_review_does_not_change_the_decision(self):
+        """The step that looks like it should promote it."""
+        event = self._event("RV-DONE", "COMPLETED", status="COMPLETED")
+        self.repo.save(self.filter.evaluate(event).candidate)
+        reviewer = RepositoryHistoryReviewer(self.repo)
+
+        reviewer.submit_review(
+            "HIST-RV-DONE",
+            decision_context="reviewed by the COO",
+            lessons_learned="shipped",
+        )
+
+        stored = self.repo.get("HIST-RV-DONE")
+        self.assertEqual(stored.filter_result, HistoryDecision.REVIEW)
+        self.assertEqual(stored.decision_context, "reviewed by the COO")
+        # Still not a KEEP candidate, so still not renderable.
+        self.assertEqual(self.repo.list(decision=HistoryDecision.KEEP), [])
+
+    def test_a_reviewed_candidate_is_still_absent_after_regenerating(self):
+        event = self._event("RV-DONE", "COMPLETED", status="COMPLETED")
+        self.repo.save(self.filter.evaluate(event).candidate)
+        RepositoryHistoryReviewer(self.repo).submit_review(
+            "HIST-RV-DONE", decision_context="reviewed"
+        )
+
+        path = generate_daily_history(
+            self.repo,
+            date(2026, 8, 5),
+            output_dir=self.root / "daily",
+            generated_at="2026-08-06T11:00:00+09:00",
+        )
+
+        self.assertNotIn("RV-DONE", path.read_text(encoding="utf-8"))
+
+    def test_the_candidate_is_not_lost_only_unreachable(self):
+        """The distinction that keeps this a visibility gap rather than data
+        loss: the record is durable and a human can still read it."""
+        event = self._event("RV-DONE", "COMPLETED", status="COMPLETED")
+        self.repo.save(self.filter.evaluate(event).candidate)
+
+        stored = self.repo.get("HIST-RV-DONE")
+
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.summary, "RV-DONE summary")
+        self.assertEqual(len(self.repo.list(decision=HistoryDecision.REVIEW)), 1)
+
+    def test_reconciliation_does_not_report_it_as_an_orphan(self):
+        """Why no existing detector caught this: the candidate *exists*, so
+        `find_orphaned_events()` is correct to stay quiet. The gap is that
+        nothing else was looking."""
+        from history.reconciliation import find_orphaned_events
+
+        processed = self.root / "processed"
+        processed.mkdir(parents=True)
+        event = self._event("RV-DONE", "COMPLETED", status="COMPLETED")
+        (processed / "RV-DONE.json").write_text(event.to_json(), encoding="utf-8")
+        self.repo.save(self.filter.evaluate(event).candidate)
+
+        result = find_orphaned_events(
+            processed_dir=processed, keep_dir=self.keep, review_dir=self.review
+        )
+
+        self.assertTrue(result.is_clean)
+
+
+class ReviewBacklogInStatusViewTests(unittest.TestCase):
+    """The counter docs/05 §50 asks for.
+
+    §50 states the rule as a signal — "REVIEW가 너무 많다 -> 자동화 실패
+    신호" — and warns against a structure where "COO가 매일 수십 개의 REVIEW를
+    수동 처리해야" work. Neither can be acted on without someone seeing the
+    number, and `ops_status.py` referenced `review/` only as an argument to
+    the reconciliation scan.
+    """
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_review", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _module_with(self, review_files):
+        module = self._load_entrypoint()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        review = module.RUNTIME_DIR / "history_candidates" / "review"
+        review.mkdir(parents=True)
+        for index in range(review_files):
+            (review / f"HIST-R{index}.json").write_text("{}", encoding="utf-8")
+        return module
+
+    def _run(self, module):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), attention
+
+    def test_the_count_is_always_printed(self):
+        printed, _ = self._run(self._module_with(0))
+
+        self.assertIn("검토 대기 Candidate : 0", printed)
+
+    def test_a_waiting_candidate_reaches_attention(self):
+        printed, attention = self._run(self._module_with(3))
+
+        self.assertIn("검토 대기 Candidate : 3", printed)
+        line = next(item for item in attention if "검토" in item)
+        self.assertIn("3건", line)
+        self.assertIn("Company History에 없고", line)
+
+    def test_an_empty_review_directory_raises_no_attention(self):
+        """A counter that always fires is one nobody reads."""
+        _printed, attention = self._run(self._module_with(0))
+
+        self.assertEqual([item for item in attention if "검토" in item], [])
+
+    def test_a_missing_review_directory_is_zero_not_an_error(self):
+        """On a machine that has never produced a REVIEW candidate the
+        directory does not exist, and the status view must still answer."""
+        module = self._load_entrypoint()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+
+        printed, attention = self._run(module)
+
+        self.assertIn("검토 대기 Candidate : 0", printed)
+        self.assertEqual([item for item in attention if "검토" in item], [])
+
+
+class ReviewAlertClearsWhenTheWorkIsDoneTests(unittest.TestCase):
+    """The same defect as C26's Working Copy false alarm, in C22's counter.
+
+    C22 put the whole `review/` pile in ATTENTION. Running `review_cli.py` —
+    the documented correct action — does not empty it: `submit_review()`
+    fills Decision Context and never touches `filter_result`, so the file
+    stays in `review/` (BACKLOG E-20, there is no promotion path). Measured:
+    the warning stood after a completed review, and no operator action short
+    of moving the file by hand would ever remove it.
+
+    Two different things were being reported as one:
+
+        not yet reviewed   work waiting for a person — doing it clears this
+        already reviewed   E-20's open decision — nothing an operator does
+                           today clears it, so it is a fact for the block,
+                           not an alert
+
+    "Reviewed" is read back from the stored candidate rather than tracked
+    separately: at least one Decision Context field set is exactly what
+    `submit_review()` leaves behind.
+
+    docs/05 §50's signal ("REVIEW가 너무 많다 -> 자동화 실패 신호") is
+    unharmed — the total is still printed, now with the split beside it.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.keep = self.runtime / "history_candidates" / "keep"
+        self.review = self.runtime / "history_candidates" / "review"
+        self.keep.mkdir(parents=True)
+        self.review.mkdir(parents=True)
+        (self.runtime / "state").mkdir(parents=True)
+        self.repo = FileHistoryRepository(keep_dir=self.keep, review_dir=self.review)
+        self.filter = HistoryFilter()
+
+    def _park(self, event_id):
+        event = create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="P",
+            event_type="COMPLETED",
+            status="COMPLETED",
+            summary=f"{event_id} done",
+            history_candidate=True,
+            event_id=event_id,
+            timestamp="2026-08-05T10:00:00+09:00",
+        )
+        self.repo.save(self.filter.evaluate(event).candidate)
+
+    def _view(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_reviewsplit", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [item for item in attention if "검토" in item]
+
+    def test_an_unreviewed_candidate_raises_the_alert(self):
+        self._park("RV-1")
+
+        _printed, attention = self._view()
+
+        self.assertTrue(attention)
+        self.assertIn("1건", attention[0])
+
+    def test_doing_the_review_clears_the_alert(self):
+        """The property the C22 version did not have."""
+        self._park("RV-1")
+        RepositoryHistoryReviewer(self.repo).submit_review(
+            "HIST-RV-1", decision_context="reviewed by the COO"
+        )
+
+        _printed, attention = self._view()
+
+        self.assertEqual(attention, [])
+
+    def test_any_decision_context_field_counts_as_reviewed(self):
+        """`submit_review()` lets a reviewer fill whichever field applies, so
+        the split must not insist on a particular one."""
+        for index, field in enumerate(
+            ("decision_context", "expected_outcome", "actual_outcome", "lessons_learned")
+        ):
+            with self.subTest(field=field):
+                self.setUp()
+                self._park("RV-1")
+                RepositoryHistoryReviewer(self.repo).submit_review(
+                    "HIST-RV-1", **{field: "filled in"}
+                )
+                _printed, attention = self._view()
+                self.assertEqual(attention, [])
+
+    def test_a_partly_reviewed_pile_alerts_only_on_the_remainder(self):
+        self._park("RV-1")
+        self._park("RV-2")
+        RepositoryHistoryReviewer(self.repo).submit_review(
+            "HIST-RV-1", decision_context="done"
+        )
+
+        printed, attention = self._view()
+
+        self.assertIn("미검토 1 / 검토됨 1", printed)
+        self.assertTrue(attention)
+        self.assertIn("1건", attention[0])
+
+    def test_the_total_is_still_printed_for_section_50s_signal(self):
+        """docs/05 §50 keys on the pile being large, not on how much of it
+        has been read. The number it needs must survive the split."""
+        self._park("RV-1")
+        self._park("RV-2")
+        for event_id in ("HIST-RV-1", "HIST-RV-2"):
+            RepositoryHistoryReviewer(self.repo).submit_review(
+                event_id, decision_context="done"
+            )
+
+        printed, attention = self._view()
+
+        self.assertIn("검토 대기 Candidate : 2", printed)
+        self.assertIn("검토됨 2", printed)
+        self.assertEqual(attention, [])
+
+    def test_an_unreadable_candidate_counts_as_waiting(self):
+        """It needs a person either way, and the view must still answer —
+        `FileHistoryRepository.list()` would raise here (BUG-38), which is
+        why it is not used."""
+        (self.review / "broken.json").write_text("{not json", encoding="utf-8")
+
+        printed, attention = self._view()
+
+        self.assertIn("검토 대기 Candidate : 1", printed)
+        self.assertTrue(attention)
+
+    def test_an_empty_review_directory_says_nothing(self):
+        printed, attention = self._view()
+
+        self.assertIn("검토 대기 Candidate : 0", printed)
+        self.assertEqual(attention, [])

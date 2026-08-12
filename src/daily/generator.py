@@ -119,7 +119,10 @@ def generate_daily_history(
             for candidate in source_candidates
             if _candidate_date(candidate) == target_date
         ]
-    matching_candidates.sort(key=lambda candidate: candidate.timestamp)
+    # By instant, not by the raw timestamp string — see
+    # `HistoryCandidate.chronological_key`. Two Events on the same day with
+    # different UTC offsets sorted backwards as text.
+    matching_candidates.sort(key=lambda candidate: candidate.chronological_key)
 
     markdown = render_daily_markdown(target_date, matching_candidates, generated_at)
 
@@ -204,7 +207,25 @@ def update_daily_history(
 
     try:
         existing = final_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # `ValueError` covers `UnicodeDecodeError`, which is what an existing
+        # Daily that is not valid UTF-8 raises — and `OSError` alone did not
+        # catch it, so it escaped this function entirely, contradicting the
+        # "Never raises for an I/O or rendering failure" contract three
+        # paragraphs up.
+        #
+        # Measured through the real Runner: the exception left `run_once()`
+        # from step 6.5, so Monthly, **Backup** and Dashboard never started —
+        # 6 of 9 components recorded, no commit, no Dashboard row. A
+        # component docs/14 §5 classifies as DEGRADED was aborting one it
+        # classifies as CRITICAL, which inverts the entire point of having
+        # the two severities.
+        #
+        # Exactly the defect `monthly/generator._existing_generated_at()`
+        # already fixed for the identical reason ("it used to catch only
+        # `OSError`, so a previous Monthly that was not valid UTF-8 raised
+        # `UnicodeDecodeError` (a ValueError) out of here and failed the
+        # entire rebuild"). Same shape, other module.
         return LateUpdateResult(
             date=target_date, outcome=LateUpdateOutcome.FAILED, error=str(exc)
         )

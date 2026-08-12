@@ -156,6 +156,24 @@ def _run_git(args: Sequence[str], repo_dir: Path) -> str:
             cwd=repo_dir,
             capture_output=True,
             text=True,
+            # git speaks UTF-8; the Windows default here does not. Without
+            # this pair, `text=True` decodes with the locale codepage
+            # (measured on this machine: cp949), and the failure mode is the
+            # worst available — the decode happens in subprocess's reader
+            # *thread*, so the `UnicodeDecodeError` never reaches the caller
+            # and `result.stdout` silently becomes `None`. `_parse_porcelain`
+            # would then raise AttributeError, which is not
+            # `GitOperationError`, so it would escape `backup/runner.py`'s
+            # classification and abort the run instead of being reported.
+            #
+            # Today's output is ASCII by a chain of defaults — Daily and
+            # Monthly filenames are ISO dates, and `core.quotepath` escapes
+            # non-ASCII paths — so this is removing a dependency on those
+            # defaults rather than fixing a live break. `errors="replace"`
+            # makes the guarantee unconditional: this function can no longer
+            # fail to decode anything.
+            encoding="utf-8",
+            errors="replace",
             timeout=_GIT_TIMEOUT_SECONDS,
             env=_git_environment(),
         )

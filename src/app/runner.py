@@ -234,6 +234,18 @@ _ARTIFACT_REFS = {
 }
 
 
+# Every Component `run_once()` records, in the order the pipeline reaches
+# them. Derived from `_ARTIFACT_REFS` rather than written out a second time:
+# a hand-kept copy is a list that drifts, and this one is read by
+# `ops_status.py` to notice a step that never started at all.
+#
+# On a run that completes, all nine appear in the manifest — each is
+# recorded unconditionally as SUCCESS, SKIPPED or FAILED. A run that aborts
+# records the step it died in and nothing after it, and that absence is the
+# fact worth surfacing.
+PIPELINE_COMPONENTS: tuple[str, ...] = tuple(_ARTIFACT_REFS)
+
+
 class RunResult(tuple):
     """The Runner's return value.
 
@@ -721,12 +733,39 @@ def run_once(
         recorder.begin(C_LATE_UPDATE)
         late_updated_dates: list[date] = []
         late_update_failures: list[str] = []
+
+        # One `repository.list()` for the whole loop, not one per date —
+        # exactly the batch cache `scheduler.py` already applies to its own
+        # per-date loop (CEO Decision ②, History Repository Cache A안), and
+        # the reason `update_daily_history()` accepts `keep_candidates` at
+        # all. This call site was the one that never got it.
+        #
+        # Measured with 3,000 stored Candidates and 7 late dates: 7 calls /
+        # 0.97 s becomes 1 call / 0.17 s, and the gap grows with both
+        # numbers because `keep/` is never pruned (BACKLOG B절 6번).
+        #
+        # A snapshot is correct here for the same reason it is in the
+        # Scheduler: step 5 finished writing every Candidate before this
+        # step begins, and nothing inside this loop writes one.
+        #
+        # On failure it falls back to `None`, which is the previous
+        # behaviour byte for byte — each date then makes its own call and
+        # catches its own error, so a broken repository still yields one
+        # FAILED result per date rather than escaping the step.
+        try:
+            shared_keep = (
+                repository.list(decision=HistoryDecision.KEEP) if kept_dates else None
+            )
+        except Exception:  # noqa: BLE001
+            shared_keep = None
+
         for kept_date in sorted(kept_dates):
             late_result = update_daily_history(
                 repository,
                 kept_date,
                 output_dir=local_master_dir / "daily",
                 now=now,
+                keep_candidates=shared_keep,
             )
             if late_result.outcome is LateUpdateOutcome.UPDATED_LATE_EVENT:
                 late_updated_dates.append(kept_date)
@@ -745,15 +784,37 @@ def run_once(
 
         # DEGRADED rather than CRITICAL: a Late Event that fails to merge is
         # not lost. Its Candidate is already durable in history_candidates/
-        # (step 5 ran first, and that ordering is why this is recoverable at
-        # all), so the next run retries the same date. docs/06 §41 asks for
-        # the failure to be recorded, which is what this is.
+        # (step 5 ran first, and that ordering is why it is recoverable at
+        # all). docs/06 §41 asks for the failure to be recorded, which is
+        # what this is.
+        #
+        # PERMANENT rather than RETRYABLE, and the difference is not
+        # cosmetic. `kept_dates` holds only the dates whose Candidates were
+        # written by *this* run, so the next run has no reason to look at a
+        # date whose merge failed — nothing re-queues it. Measured: a merge
+        # that failed on run 2 was still unmerged after runs 3 and 4, both of
+        # which reported `late_update` SUCCESS with `updated=0` and an
+        # overall SUCCESS / exit 0. It merged only on run 5, when an
+        # unrelated new Event happened to land on the same date.
+        #
+        # docs/14 §5 defines RETRYABLE as "없음. 다음 실행이 재시도한다" and
+        # PERMANENT as "지금 개입해야 한다 (ops_status.py ATTENTION에 뜬다)".
+        # `ops_status.py` acts on that literally — it lists only PERMANENT
+        # failures, deliberately, so a RETRYABLE one would not appear
+        # anywhere. RETRYABLE was therefore the one classification that made
+        # a Late Event silently missing from Company History with every
+        # indicator green (README RULE 7).
+        #
+        # Making the retry real is the better fix and is not this one: it
+        # needs either a persisted set of failed dates or a reconciliation
+        # pass over keep/ against the Daily files, and both are new
+        # mechanisms rather than a corrected value (BACKLOG E-17).
         if late_update_failures:
             recorder.failed(
                 C_LATE_UPDATE,
                 classification="LATE_EVENT_MERGE_FAILED",
                 reason=late_update_failures[0],
-                retryability=Retryability.RETRYABLE,
+                retryability=Retryability.PERMANENT,
                 updated=len(late_updated_dates),
                 failed=len(late_update_failures),
             )
@@ -785,7 +846,15 @@ def run_once(
         monthly_done = 0
         try:
             for updated_date in late_updated_dates:
-                mark_month_dirty(resolved_monthly_state_path, updated_date)
+                # `monthly_dir` matters: without it the "has this month been
+                # consolidated?" question is answered from state alone, and
+                # state can lag the file it describes (a run that wrote the
+                # Monthly and died before saving). See `mark_month_dirty()`.
+                mark_month_dirty(
+                    resolved_monthly_state_path,
+                    updated_date,
+                    monthly_dir=local_master_dir / "monthly",
+                )
 
             monthly_result = monthly_run_once(
                 daily_dir=local_master_dir / "daily",
@@ -970,20 +1039,37 @@ def run_once(
                     if dashboard_pending_path is not None
                     else DEFAULT_DASHBOARD_PENDING_PATH
                 )
-                resolved_run_id = run_id or now.isoformat(timespec="seconds")
+                # The manifest's run_id, not a second derivation of it. Both
+                # expressions produced the same string — `now_iso()` *is*
+                # `isoformat(timespec="seconds")` — so this was one rule
+                # written twice, and the OPS_RUNS row correlating with its
+                # Run Manifest depended on the two staying in step. Reusing
+                # the value makes the correlation structural: the Dashboard
+                # row is keyed by the manifest's own run_id or it is keyed by
+                # nothing.
+                resolved_run_id = resolved_manifest_run_id
 
                 # 밀린 기록 먼저 재시도한다(Retry Queue와 동일한 "먼저 처리" 원칙).
-                drained, still_pending = drain_pending(
+                drain_result = drain_pending(
                     resolved_dashboard_pending_path, dashboard_client
                 )
+                drained, still_pending = drain_result
                 # drain_pending()'s return value was previously discarded, so a
                 # backlog that kept failing every run was invisible: the queue
                 # grew on disk and nothing said so. Logged only when there was
                 # actually a backlog — a healthy run stays silent.
+                #
+                # REASON carries why the last one failed. Without it a record
+                # Notion permanently refuses looks exactly like one waiting out
+                # a network outage: both just reappear next run with
+                # attempt_count one higher. Same reason 4단계's NOTION_SYNC
+                # line carries REASON (BUG-13), same bounded formatting.
                 if drained or still_pending:
+                    reason = drain_result.last_reason
                     _log_dashboard(
                         resolved_notion_sync_log_path,
-                        f"DRAIN_PENDING drained={drained} still_pending={still_pending}",
+                        f"DRAIN_PENDING drained={drained} still_pending={still_pending}"
+                        + (f" REASON {_bounded_error(reason)}" if reason else ""),
                     )
 
                 dashboard_result = dashboard_record_run(

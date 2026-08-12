@@ -93,6 +93,30 @@ class AgentStatusSnapshot:
         reasons: list[str] = []
         if self.state_error is not None:
             reasons.append(f"agent state unreadable: {self.state_error}")
+
+        # A collection date in the future is a silent, permanent stop, and
+        # every other signal here reports it as perfect health.
+        #
+        # `agent.run_once()` never writes one — it caps at `now` — but clock
+        # skew on a machine that has since been corrected, or a state file
+        # restored from a newer backup, can put one there. `pending_dates()`
+        # then computes `start > end` and correctly returns nothing, so:
+        # last_run is recent, outbox is empty, pending is zero. The Desktop
+        # looks healthier than a working one, and it will not collect again
+        # until the calendar reaches that date — possibly years.
+        #
+        # Detection only. `pending_dates()`'s refusal to walk backwards is
+        # the safe behaviour and is left exactly as it is; nothing here
+        # rewrites the state or reprocesses a date. Same restraint as
+        # `scheduler/consistency.py`: report, never repair.
+        collected_through = self.last_successful_collection_date
+        if collected_through is not None and collected_through > now.date():
+            reasons.append(
+                f"agent state says it has collected through {collected_through.isoformat()}, "
+                f"which is in the future (today is {now.date().isoformat()}) — nothing will "
+                f"be collected until that date arrives"
+            )
+
         if self.outbox_count:
             reasons.append(
                 f"{self.outbox_count} event(s) created but not delivered"

@@ -47,6 +47,22 @@ SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 import scheduler.scheduler as scheduler_module  # noqa: E402
+from backup.log import BackupLogEntry  # noqa: E402
+from backup.result import BackupStatus  # noqa: E402
+from events import Event  # noqa: E402
+from history import HistoryCandidate, HistoryDecision  # noqa: E402
+from notion.dashboard_pending import PendingDashboardRecord  # noqa: E402
+from notion.retry_queue import RetryQueueEntry  # noqa: E402
+from runsummary import (  # noqa: E402
+    ComponentResult,
+    ComponentStatus,
+    Failure,
+    Retryability,
+    RunSummary,
+    Severity,
+    read_summary,
+    write_summary,
+)
 from app import runner as runner_module  # noqa: E402
 from backup.working_copy import sync_to_working_copy  # noqa: E402
 from daily import build_keep_index, generate_daily_history  # noqa: E402
@@ -1677,12 +1693,19 @@ class DashboardSchemaMappingTests(unittest.TestCase):
                 self.assertEqual(next(iter(value)), next(iter(schema[name])))
 
     def test_only_ops_runs_has_a_writer(self):
-        """GAP-11 characterization."""
+        """GAP-11 characterization.
+
+        The single write went through `client.create_project()` until a
+        find-before-create guard was added for the duplicate-row defect; it
+        now goes through `client.find_or_create_by_title()`. Still exactly
+        one writer, which is what this pins — GAP-11 is about the other four
+        OPS_* databases having none, not about how the one writer writes.
+        """
         import notion.dashboard as dashboard
 
         source = Path(dashboard.__file__).read_text(encoding="utf-8")
-        # record_run() is the single function that calls create_project().
-        writers = re.findall(r"client\.create_project\(", source)
+        # record_run() is the single function that creates an OPS_RUNS row.
+        writers = re.findall(r"client\.(?:create_project|find_or_create_by_title)\(", source)
         self.assertEqual(len(writers), 1)
         self.assertIn("def record_run(", source)
         for absent in ("def record_backup(", "def record_notion_sync(",
@@ -2460,3 +2483,338 @@ class LayeringInvariantTests(unittest.TestCase):
         for consumer in ("collector", "agent", "app"):
             with self.subTest(consumer=consumer):
                 self.assertIn("oplog", edges[consumer])
+
+
+class BackupLogIsNeverPersistedTests(unittest.TestCase):
+    """CHARACTERIZATION: docs/08 §68-69's Backup Log is not written anywhere.
+
+    §68 lists nine minimum fields and §69 shows `runtime/logs/backup/` as
+    its location. `BackupLogEntry` carries exactly those nine fields and has
+    a complete `to_dict` / `to_json` / `from_dict` / `from_json` pair — and
+    **no caller invokes any of them.** `backup.runner.run_once()` builds the
+    entry, returns it, and `app/runner.py` reads a handful of attributes off
+    it for the Run Manifest and the Dashboard. Nothing reaches disk.
+
+    Found by tracing which lines of `src/` the whole suite never executes:
+    all four serialisation methods came back with zero executions, which for
+    a fully-built round-trip API means "written for a writer that does not
+    exist".
+
+    Why this is characterised rather than fixed. Writing it means creating
+    `runtime/logs/backup/` — a new persistent artifact path. docs/14 §2
+    fixes the Artifact Taxonomy and states, as a deliberate property, that
+    the Run Manifest was "신설한 것은 `runtime/runs/last_run.json` 하나뿐";
+    its `logs/` list names collector / notion_sync / daily_late_update and
+    no backup log. Adding one means the taxonomy and `_ARTIFACT_REFS` change
+    together, and docs/ is Spec. So the gap is pinned here and recorded in
+    BACKLOG rather than closed by implementation.
+
+    What is NOT lost meanwhile: every §68 field except the two timestamps
+    already reaches an operator through the Run Manifest's `backup`
+    component (`commit_hash`, `push_result` as the failure reason,
+    `changed_files` count) and through `backup_state.json`
+    (`last_successful_backup`, `last_backup_commit`, `backup_status`). The
+    missing artifact is the per-run *history* of those — one row per run,
+    kept over time — which is what §68 asks for.
+
+    If this test starts failing, a writer was added; it should then be
+    rewritten to assert the log's location and contents.
+    """
+
+    _SERIALISERS = ("to_dict", "to_json", "from_dict", "from_json")
+
+    def _python_files(self):
+        for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            yield path
+
+    def test_the_entry_carries_every_field_section_68_requires(self):
+        """The data exists. Only the sink is missing — which is what makes
+        this a gap rather than a redesign."""
+        from backup.log import BackupLogEntry
+
+        fields = set(BackupLogEntry.__dataclass_fields__)
+        for required in (
+            "run_id",
+            "backup_start",
+            "source",
+            "changed_files",
+            "deleted_files",
+            "commit_hash",
+            "push_result",
+            "backup_end",
+            "final_status",
+        ):
+            with self.subTest(field=required):
+                self.assertIn(required, fields)
+
+    def test_the_serialisers_round_trip_correctly(self):
+        """They work. Nothing calls them."""
+        from backup.log import BackupLogEntry
+        from backup.result import BackupStatus
+
+        entry = BackupLogEntry(
+            run_id="RUN-1",
+            backup_start=datetime(2026, 8, 5, 11, 0).astimezone(),
+            source="C:/master",
+            changed_files=("daily/2026-08-05.md",),
+            deleted_files=(),
+            commit_hash="abc1234",
+            push_result="SUCCESS",
+            backup_end=datetime(2026, 8, 5, 11, 1).astimezone(),
+            final_status=BackupStatus.SUCCESS,
+        )
+
+        self.assertEqual(BackupLogEntry.from_json(entry.to_json()), entry)
+
+    def test_nothing_in_the_repository_serialises_a_backup_log_entry(self):
+        callers = 0
+        for path in self._python_files():
+            text = path.read_text(encoding="utf-8")
+            if "backup" not in str(path) and "BackupLogEntry" not in text:
+                continue
+            for name in self._SERIALISERS:
+                for match in re.finditer(rf"\b{name}\s*\(", text):
+                    line_start = text.rfind("\n", 0, match.start()) + 1
+                    line = text[line_start : text.find("\n", match.start())]
+                    if line.strip().startswith(("def ", "@classmethod")):
+                        continue
+                    # Other classes have same-named methods; only count the
+                    # ones reached through a BackupLogEntry.
+                    if "BackupLogEntry" in line or "backup_entry" in line:
+                        callers += 1
+        self.assertEqual(callers, 0)
+
+    def test_no_backup_log_directory_is_ever_created(self):
+        """§69's location. Nothing in the source names it."""
+        for path in self._python_files():
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertNotIn('"backup"' + " / ", text)
+                self.assertNotIn("logs/backup", text.replace("\\", "/"))
+
+    def test_the_run_manifest_carries_the_fields_an_operator_needs_meanwhile(self):
+        """The mitigation, pinned: losing the log is not losing the facts."""
+        from app.runner import _ARTIFACT_REFS, C_BACKUP
+
+        self.assertIn("state/backup_state.json", _ARTIFACT_REFS[C_BACKUP])
+
+
+class SerialisationFidelityTests(unittest.TestCase):
+    """Every persisted type must write every field it carries, and read back
+    everything it wrote.
+
+    Eight classes in `src/` persist themselves, and between them they hold
+    the Event, the History Candidate, the Backup record, both retry queues
+    and the Run Manifest — i.e. every durable thing this system owns except
+    the Markdown. A field added to one of those dataclasses but forgotten in
+    its `to_dict()` is silent data loss: it survives in memory for the run
+    that created it and is gone the moment the file is read back, with no
+    error anywhere.
+
+    Audited across all eight and found clean. What is kept here is the
+    guard, because "clean today" is not the property worth having — the
+    failure mode only appears the day someone adds a field, and it appears
+    silently.
+
+    The coverage check reads the source rather than instantiating, so a
+    class added later is covered without anyone remembering to add a sample.
+    """
+
+    SRC = Path(__file__).resolve().parents[1] / "src"
+
+    def _classes_with_to_dict(self):
+        import ast
+
+        found = []
+        for path in sorted(self.SRC.rglob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                to_dict = next(
+                    (
+                        n
+                        for n in node.body
+                        if isinstance(n, ast.FunctionDef) and n.name == "to_dict"
+                    ),
+                    None,
+                )
+                if to_dict is None:
+                    continue
+                fields = [
+                    n.target.id
+                    for n in node.body
+                    if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+                ]
+                keys = set()
+                for sub in ast.walk(to_dict):
+                    # `{"name": ...}` — the usual shape.
+                    if isinstance(sub, ast.Dict):
+                        for key in sub.keys:
+                            if isinstance(key, ast.Constant) and isinstance(
+                                key.value, str
+                            ):
+                                keys.add(key.value)
+                    # `data["failure"] = ...` — the conditional shape, used
+                    # where a key is only written when it has a value.
+                    # Missing it made this scan report `ComponentResult` as
+                    # dropping `failure`, which it does not.
+                    elif isinstance(sub, ast.Assign):
+                        for target in sub.targets:
+                            if (
+                                isinstance(target, ast.Subscript)
+                                and isinstance(target.slice, ast.Constant)
+                                and isinstance(target.slice.value, str)
+                            ):
+                                keys.add(target.slice.value)
+                found.append((path.name, node.name, set(fields), keys))
+        return found
+
+    def test_every_serialiser_writes_every_field_it_declares(self):
+        discovered = self._classes_with_to_dict()
+        # If this drops to nothing the scan broke, and a guard that scans
+        # nothing passes forever.
+        self.assertGreaterEqual(len(discovered), 8)
+
+        for file_name, class_name, fields, keys in discovered:
+            with self.subTest(cls=f"{file_name}:{class_name}"):
+                self.assertEqual(
+                    fields - keys,
+                    set(),
+                    f"{class_name} declares field(s) its to_dict() never writes",
+                )
+
+    def test_the_only_keys_beyond_the_fields_are_derived_ones(self):
+        """`RunSummary` deliberately writes `overall_status` and `exit_code`,
+        which are properties rather than fields — a reader of the file gets
+        the verdict without re-implementing the fold. Anything else appearing
+        here would be a key nothing can read back."""
+        allowed_extra = {"RunSummary": {"overall_status", "exit_code"}}
+
+        for file_name, class_name, fields, keys in self._classes_with_to_dict():
+            with self.subTest(cls=f"{file_name}:{class_name}"):
+                self.assertEqual(keys - fields, allowed_extra.get(class_name, set()))
+
+    def test_a_fully_populated_instance_survives_every_round_trip(self):
+        """Field coverage is necessary, not sufficient: a key can be written
+        and then never read. These samples set every optional field to a
+        distinctive value so a dropped one shows up as inequality."""
+        event = Event.from_dict(
+            {
+                "schema_version": "1.0",
+                "event_id": "RT-EVENT",
+                "timestamp": "2026-08-05T10:00:00+09:00",
+                "source": "DESKTOP_1",
+                "role": "CTO_BACKEND",
+                "project_id": "P",
+                "event_type": "BLOCKED",
+                "status": "BLOCKED",
+                "summary": "s",
+                "history_candidate": True,
+                "milestone": "M",
+                "blocker": "B",
+                "evidence": ["e1", "e2"],
+            }
+        )
+        samples = [
+            event,
+            HistoryCandidate(
+                history_id="H",
+                event_id="E",
+                timestamp="2026-08-05T10:00:00+09:00",
+                category="MILESTONE",
+                project_id="P",
+                role="COO",
+                summary="s",
+                evidence=("a", "b"),
+                filter_result=HistoryDecision.KEEP,
+                decision_context="dc",
+                expected_outcome="eo",
+                actual_outcome="ao",
+                lessons_learned="ll",
+            ),
+            BackupLogEntry(
+                run_id="R",
+                backup_start=datetime(2026, 8, 5, 11, 0).astimezone(),
+                source="S",
+                changed_files=("a",),
+                deleted_files=("b",),
+                commit_hash="c0ffee",
+                push_result="SUCCESS",
+                backup_end=datetime(2026, 8, 5, 11, 1).astimezone(),
+                final_status=BackupStatus.SUCCESS,
+            ),
+            PendingDashboardRecord(
+                run_id="R", properties={"Run ID": {}}, queued_at="q", attempt_count=3
+            ),
+            RetryQueueEntry(
+                event_id="E",
+                project_id="P",
+                event_data=event.to_dict(),
+                added_at="q",
+                attempt_count=2,
+            ),
+        ]
+
+        for sample in samples:
+            with self.subTest(cls=type(sample).__name__):
+                self.assertEqual(type(sample).from_dict(sample.to_dict()), sample)
+
+    def test_the_run_manifest_survives_the_file(self):
+        """`RunSummary` has no `from_dict`; `read_summary()` is its reader,
+        so the round trip that matters goes through the disk."""
+        summary = RunSummary(
+            run_id="RT-RUN",
+            started_at="2026-08-05T11:00:00+09:00",
+            finished_at="2026-08-05T11:01:00+09:00",
+            components=(
+                ComponentResult(
+                    name="collector",
+                    status=ComponentStatus.FAILED,
+                    failure=Failure(
+                        classification="COLLECTOR_ABORTED",
+                        severity=Severity.CRITICAL,
+                        retryability=Retryability.PERMANENT,
+                        reason="boom",
+                    ),
+                    metrics={"accepted": 1, "failed": 2},
+                    artifact_refs=("logs/collector.log",),
+                ),
+                ComponentResult(name="monthly", status=ComponentStatus.SKIPPED),
+            ),
+        )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "last_run.json"
+
+        write_summary(path, summary)
+
+        self.assertEqual(read_summary(path), summary)
+
+    def test_json_round_trips_survive_non_ascii_and_control_characters(self):
+        """Company History is Korean, and an `event_id` crosses OneDrive from
+        another Desktop with no constraint on its characters (docs/02, and
+        BACKLOG A-15 records that deliberately). The persisted form has to
+        carry both back unchanged — escaping belongs at the log writer, not
+        here."""
+        awkward = "설명 —  line sep\ttab \\ backslash \"quote\""
+        candidate = HistoryCandidate(
+            history_id="H",
+            event_id=awkward,
+            timestamp="2026-08-05T10:00:00+09:00",
+            category="DECISION",
+            project_id="P",
+            role="COO",
+            summary=awkward,
+            evidence=(awkward,),
+            filter_result=HistoryDecision.REVIEW,
+        )
+
+        back = HistoryCandidate.from_dict(json.loads(json.dumps(candidate.to_dict())))
+
+        self.assertEqual(back, candidate)
+        self.assertEqual(back.event_id, awkward)

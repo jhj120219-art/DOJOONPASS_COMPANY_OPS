@@ -119,7 +119,21 @@ def run_once(
 
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # `ValueError` covers `UnicodeDecodeError`. docs/03 §53 — quoted
+            # a few lines below as the reason `collector.collect()` is
+            # wrapped — says one malformed file must never stop the rest of
+            # the batch. The read above was the one step in this loop that
+            # did not honour it: a file in `incoming/` that is not valid
+            # UTF-8 escaped `run_once()` and aborted the whole Collector
+            # step, which is CRITICAL, taking History Filter, Daily, Monthly
+            # and Backup with it.
+            #
+            # `run_intake()` will not promote such a file (its parse test
+            # already catches ValueError), so the usual way one arrives here
+            # is corruption in place or a writer other than intake — the
+            # Desktop 4 reporter and the operator both write `incoming/`
+            # directly. §53's guarantee is unconditional either way.
             _log(log_path, f"FAILED {path.name}: could not read file ({exc})")
             results.append(ProcessedFile(path, None, RuntimeOutcome.FAILED, (str(exc),)))
             continue

@@ -188,9 +188,19 @@ def parse_daily_markdown(
 
 
 def read_daily_document(path: Path, target_date: date_type) -> DailyDocument:
-    """Parse the Daily file at `path`. Raises DailyParseError if unreadable."""
+    """Parse the Daily file at `path`. Raises DailyParseError if unreadable.
+
+    `ValueError` alongside `OSError` so that promise is actually true: a
+    Daily that is not valid UTF-8 raised `UnicodeDecodeError` straight
+    through this function. `consolidate_month()` catches `ValueError` as
+    well as `DailyParseError`, so the month still reported MONTHLY_FAILED
+    rather than crashing — but the failure reason an operator then read was
+    a bare codec message with no filename in it, while this function's own
+    error names the file. Same `except OSError`-around-a-decode shape as the
+    three that were not contained.
+    """
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise DailyParseError(f"could not read daily history: {path} ({exc})") from exc
     return parse_daily_markdown(text, target_date=target_date, path=Path(path))

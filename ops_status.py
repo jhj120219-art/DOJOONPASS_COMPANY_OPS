@@ -35,7 +35,9 @@ Exit codes:
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -56,7 +58,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from agent.delivery import find_undelivered_events  # noqa: E402
 from agent.status import read_status  # noqa: E402
 from app.desktop_activity import read_company_activity  # noqa: E402
-from app.runner import DEFAULT_RUN_SUMMARY_PATH  # noqa: E402
+from app.runner import DEFAULT_RUN_SUMMARY_PATH, PIPELINE_COMPONENTS  # noqa: E402
+from backup.working_copy import scan_for_secrets  # noqa: E402
 from history.reconciliation import find_orphaned_events  # noqa: E402
 from monthly import MonthlyStateError  # noqa: E402
 from monthly import load_state as load_monthly_state  # noqa: E402
@@ -71,6 +74,11 @@ from scheduler.consistency import (  # noqa: E402
     ConsistencyStatus,
     check_state_consistency,
 )
+from scheduler.lock import (  # noqa: E402
+    is_locked,
+    lock_held_since,
+    stale_lock_cannot_be_cleared,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -82,6 +90,115 @@ AGENT_DIR = RUNTIME_DIR / "agent"
 # ignored, and an ignored alert is worse than none.
 SILENT_AFTER_DAYS = 3
 
+# How long a held Runner lock stops looking like work and starts looking
+# like a lock nobody will ever release. Measured elsewhere in this project:
+# a 20,000-Event batch reconciles in seconds, and the git subprocess timeout
+# is 300 s, so a real run is orders of magnitude under this. Generous on
+# purpose — the cost of firing early is telling an operator to interrupt a
+# healthy long run.
+LOCK_STUCK_AFTER_HOURS = 2
+
+
+def _would_reach_the_commit(working_copy: Path, candidates: tuple[str, ...]) -> tuple[str, ...]:
+    """Of `candidates`, the ones git would actually put in a commit.
+
+    `scan_for_secrets()` answers "is this a secret-shaped filename", which
+    is the right question for the Backup gate and the wrong one for this
+    report. What reaches the remote is what `git add -A` stages, and git
+    ignores whatever `.gitignore` tells it to — including the very entries
+    docs/08 §28 asks a Backup Repo to carry (`.env`, `.env.*`, `*.tmp`,
+    `*.log`).
+
+    Without this the report was a standing false alarm for a *correctly
+    configured* Working Copy: measured, an operator who added §28's
+    `.gitignore` still saw "이 파일들은 ... 원격에 올라간다" on every run,
+    for a file git was correctly refusing to commit. That is the
+    alert-that-cannot-clear this project keeps warning about
+    (`IntakeBacklog`'s own docstring), introduced by the C24 check itself.
+
+    git is asked rather than second-guessed. `ls-files -c -o
+    --exclude-standard` lists exactly what is tracked plus what is untracked
+    and not ignored — the set `add -A` would end up with. Parsing
+    `.gitignore` here instead would be a second opinion about git's rules,
+    which is the disagreement this codebase closes elsewhere by reusing the
+    authority (`_count_transport` reuses intake's own parse test).
+
+    Fail-safe: any failure — no git, not a repository, a timeout — returns
+    the candidates unchanged, so a broken probe over-reports rather than
+    hiding a real exposure. Only run when there is something to check, so a
+    clean Working Copy costs no subprocess at all.
+    """
+    if not candidates:
+        return ()
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-c", "-o", "--exclude-standard"],
+            cwd=working_copy,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return candidates
+    if result.returncode != 0 or result.stdout is None:
+        return candidates
+    listed = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return tuple(
+        name for name in candidates if name.replace("\\", "/") in listed
+    )
+
+
+def _split_reviewed(review_dir: Path) -> tuple[int, int]:
+    """(not yet reviewed, already reviewed) in `review/`.
+
+    "Reviewed" means a human has written at least one Decision Context
+    field — exactly what `RepositoryHistoryReviewer.submit_review()` does,
+    read back from the stored candidate rather than tracked separately.
+
+    The split exists so the alert can clear. A candidate nobody has looked
+    at is work waiting for a person, and doing that work removes it from the
+    count. A candidate that HAS been reviewed is still in `review/` — there
+    is no promotion path (BACKLOG E-20) — and alerting on it would stand
+    forever no matter what the operator did.
+
+    Unreadable files count as not-yet-reviewed: they need a person either
+    way, and a diagnostic must answer when part of the evidence is damaged.
+    `FileHistoryRepository.list()` is deliberately not used — it raises on
+    the first unreadable candidate (BUG-38), which would take the whole
+    status view down.
+    """
+    if not review_dir.is_dir():
+        return (0, 0)
+    waiting = reviewed = 0
+    for path in sorted(review_dir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            waiting += 1
+            continue
+        if isinstance(data, dict) and any(
+            data.get(field) is not None
+            for field in (
+                "decision_context",
+                "expected_outcome",
+                "actual_outcome",
+                "lessons_learned",
+            )
+        ):
+            reviewed += 1
+        else:
+            waiting += 1
+    return (waiting, reviewed)
+
+
+def _runner_lock_path() -> Path:
+    """Resolved per call, not at import: `RUNTIME_DIR` is rebound by tests
+    (and would be by any future relocation), and a path frozen at import
+    would keep pointing at the old one."""
+    return RUNTIME_DIR / "locks" / "company_ops.lock"
+
 
 def _agent_start_date() -> date | None:
     raw = os.environ.get("COMPANY_OPS_AGENT_START_DATE")
@@ -91,6 +208,27 @@ def _agent_start_date() -> date | None:
         return date.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _source_note(*breakdowns) -> str:
+    """` (DESKTOP_1=2 unattributed=1)`, or empty when nothing is attributed.
+
+    Merged across the breakdowns given so one ATTENTION sentence covering
+    two piles names each Desktop once rather than twice. Empty rather than
+    "(unknown)" when there is nothing to say — a parenthetical that always
+    appears is one an operator stops reading.
+    """
+    merged: dict[str, int] = {}
+    unattributed = 0
+    for breakdown in breakdowns:
+        for source, count in breakdown.by_source:
+            merged[source] = merged.get(source, 0) + count
+        unattributed += breakdown.unattributed
+
+    parts = [f"{source}={count}" for source, count in sorted(merged.items())]
+    if unattributed:
+        parts.append(f"출처불명={unattributed}")
+    return f" ({' '.join(parts)})" if parts else ""
 
 
 def _print_company(now: datetime) -> list[str]:
@@ -148,14 +286,53 @@ def _print_company(now: datetime) -> list[str]:
         f"  backlog: transport={backlog.awaiting_intake} "
         f"incoming={backlog.awaiting_collection} rejected={backlog.rejected}"
         + (f" unparseable={backlog.unparseable}" if backlog.unparseable else "")
+        + (f" future_dated={backlog.future_dated}" if backlog.future_dated else "")
+        + (f" name_collision={backlog.name_collision}" if backlog.name_collision else "")
     )
+    # Who each pile came from (BACKLOG E-10). The counts above are the
+    # authority and are unchanged; these lines only answer "which Desktop",
+    # which previously required opening runtime/events/ by hand — and that
+    # is the difference between one Desktop misbehaving and every Desktop
+    # hitting the same problem, two situations needing opposite reactions.
+    for label, breakdown in (
+        ("transport", backlog.awaiting_intake_sources),
+        ("incoming", backlog.awaiting_collection_sources),
+        ("rejected", backlog.rejected_sources),
+    ):
+        if breakdown.total:
+            print(f"           {label:<10} {breakdown.describe()}")
+
     if not backlog.is_clear:
+        # `future_dated` is appended to the same sentence rather than given
+        # its own: without it "transport=1" stands forever with no reason,
+        # which is the standing-alert-with-no-explanation shape the
+        # `unparseable` split was created to remove (see `IntakeBacklog`).
+        reasons = []
+        if backlog.future_dated:
+            reasons.append(
+                f"{backlog.future_dated}건은 파일 시각이 이 머신의 시계보다 앞서 "
+                f"있어 시계가 따라잡을 때까지 수집되지 않는다 "
+                f"(보낸 Desktop의 시계 확인 필요)"
+            )
+        if backlog.name_collision:
+            reasons.append(
+                f"{backlog.name_collision}건은 같은 이름이 이미 processed/ 또는 "
+                f"rejected/에 있어 매 실행 실패한다 — 재실행으로 해결되지 않는다"
+                f"(BACKLOG BUG-43)"
+            )
+        stalled = f" — 그중 {'; 그중 '.join(reasons)}" if reasons else ""
         attention.append(
             f"수집되지 않고 남은 Event: transport={backlog.awaiting_intake} "
             f"incoming={backlog.awaiting_collection}"
+            + _source_note(backlog.awaiting_intake_sources, backlog.awaiting_collection_sources)
+            + stalled
         )
     if backlog.rejected:
-        attention.append(f"Collector가 거부한 Event {backlog.rejected}건 — 사람이 확인해야 한다")
+        attention.append(
+            f"Collector가 거부한 Event {backlog.rejected}건"
+            + _source_note(backlog.rejected_sources)
+            + " — 사람이 확인해야 한다"
+        )
     if backlog.unparseable:
         # Reported for the right reason. These used to be counted as
         # "awaiting intake", which said an Event was queued for collection
@@ -189,12 +366,52 @@ def _print_history(now: datetime) -> list[str]:
     daily_count = len(list(daily_dir.glob("*.md"))) if daily_dir.is_dir() else 0
     monthly_files = sorted(p.stem for p in monthly_dir.glob("*.md")) if monthly_dir.is_dir() else []
 
+    # Candidates parked for a human. `HistoryFilter` sends BLOCKED /
+    # COMPLETED / CANCELLED here (docs/05 §24), and nothing in the pipeline
+    # renders them: `generate_daily_history()` reads only KEEP, and
+    # `submit_review()` fills Decision Context without touching
+    # `filter_result`, so a reviewed candidate stays REVIEW. Measured — a
+    # COMPLETED Event was still absent from its Daily file after a review
+    # and two further runs.
+    #
+    # docs/05 §50 makes the count itself the point: "REVIEW가 너무 많다 ->
+    # 자동화 실패 신호", and "COO가 매일 수십 개의 REVIEW를 수동 처리해야
+    # 하는 구조를 만들지 않는다". That signal had no reader — this was the
+    # one pile of human-owned work with no counter, while `rejected/`,
+    # `signals_rejected/` and orphaned Events all had one (BACKLOG E-20).
+    # Split by whether a human has actually been through them. The pile as
+    # a whole is not an actionable alert — E-20's decision is what would
+    # empty it, and nothing an operator does today can. What IS actionable
+    # is the part nobody has looked at yet, and that part clears the moment
+    # they do.
+    #
+    # C22 alerted on the whole pile, so running `review_cli.py` — the
+    # documented correct action — left the warning standing forever
+    # (`submit_review()` fills Decision Context without touching
+    # `filter_result`, so the file never leaves `review/`). Measured. That
+    # is the alert-that-cannot-clear this project keeps warning about, and
+    # C26 found the same shape in the Working Copy check.
+    review_dir = RUNTIME_DIR / "history_candidates" / "review"
+    review_waiting, review_done = _split_reviewed(review_dir)
+    review_count = review_waiting + review_done
+
     print("HISTORY — Company Repository")
     print("-" * 60)
     print(f"  daily 파일          : {daily_count}")
     print(f"  monthly 파일        : {len(monthly_files)}")
     if monthly_files:
         print(f"                        {', '.join(monthly_files[-6:])}")
+    print(
+        f"  검토 대기 Candidate : {review_count}"
+        + (f" (미검토 {review_waiting} / 검토됨 {review_done})" if review_done else "")
+    )
+    if review_waiting:
+        attention.append(
+            f"사람 검토를 기다리는 History Candidate {review_waiting}건 "
+            f"(runtime/history_candidates/review/) — BLOCKED/COMPLETED/CANCELLED는 "
+            f"자동 규칙으로 판정하지 않는다(docs/05 §24). 이 건들은 아직 Company "
+            f"History에 없고 어떤 실행도 넣지 않는다(BACKLOG E-20)"
+        )
 
     try:
         state = load_monthly_state(RUNTIME_DIR / "state" / "monthly_history_state.json")
@@ -246,17 +463,59 @@ def _print_history(now: datetime) -> list[str]:
     if reconciliation.orphaned:
         for orphan in reconciliation.orphaned[:5]:
             print(f"                        ! {orphan.event_id} [{orphan.decision.value}]")
+        # `find_orphaned_events()` is a pure function and knows nothing about
+        # the lock, but the pipeline it inspects has a window where a
+        # perfectly healthy Event looks orphaned: Collector moves the WHOLE
+        # batch into `processed/` (step 4) before the History Filter loop
+        # starts writing Candidates one at a time (step 5). Run this view
+        # during a large catch-up — the usage `ops_status.py` explicitly
+        # promises is safe — and Events whose Candidate turn has simply not
+        # come yet are reported as permanently lost.
+        #
+        # The list is NOT filtered or suppressed: a real loss hidden behind
+        # "probably just running" is far worse than a false alarm, and this
+        # cannot tell the two apart. A sentence is added, nothing is removed.
+        running = " (Runner 실행 중 — 완료 후 재확인 권장)" if is_locked(_runner_lock_path()) else ""
         attention.append(
             f"수집됐지만 History에 들어가지 못한 Event {len(reconciliation.orphaned)}건: "
             f"{', '.join(o.event_id for o in reconciliation.orphaned[:5])}"
             f"{' 외' if len(reconciliation.orphaned) > 5 else ''} — 재실행으로 "
-            f"복구되지 않는다(BACKLOG A-20). 사람이 확인해야 한다"
+            f"복구되지 않는다(BACKLOG A-20). 사람이 확인해야 한다" + running
         )
     if reconciliation.unreadable:
         attention.append(
             f"processed에 읽을 수 없는 Event {len(reconciliation.unreadable)}건 — "
             f"History 반영 여부를 판단할 수 없다"
         )
+
+    # Secret-shaped files sitting in the Backup Working Copy (E-21).
+    #
+    # `backup.run_once()` scans **Local Master**, but `git add -A` commits
+    # the **Working Copy** — so a file that reached the Working Copy by any
+    # route other than sync is ungated and gets pushed. Measured: a `.env`
+    # and an `id_rsa` placed there went to the remote while the backup
+    # reported BACKUP_SUCCESS.
+    #
+    # This changes no gate: `scan_for_secrets()` is applied here exactly as
+    # it is applied to Master, with the same decided list of names, to a
+    # directory nobody was looking at. Reporting is late by construction —
+    # a scheduled Backup may already have pushed — but late is the
+    # difference between rotating a leaked credential and never knowing.
+    # Choosing what the gate guards is the decision E-15/E-21 record.
+    working_copy = RUNTIME_DIR / "backup_working_copy"
+    if working_copy.is_dir():
+        exposed = _would_reach_the_commit(
+            working_copy, scan_for_secrets(working_copy)
+        )
+        if exposed:
+            attention.append(
+                f"Backup Working Copy에 Secret 형태의 파일 {len(exposed)}건: "
+                f"{', '.join(exposed[:5])}"
+                f"{' 외' if len(exposed) > 5 else ''} — Backup은 Local Master만 "
+                f"검사하고 git은 이 파일들을 무시하지 않으므로 `git add -A`로 "
+                f"원격에 올라간다(BACKLOG E-21). 이미 push됐다면 자격증명 교체가 "
+                f"필요하다"
+            )
 
     print(f"  마지막 통합한 달    : {state.last_successful_monthly_close}")
     if state.dirty_months:
@@ -374,6 +633,48 @@ def _print_last_run() -> list[str]:
     print("LAST RUN — Run Manifest")
     print("-" * 60)
 
+    # A lock still held long after any real run could have finished.
+    #
+    # `_is_process_running()` asks whether *a* process has the recorded pid,
+    # not whether it is the one that wrote the lock. After a power cut the
+    # dead Runner's pid stays in the file; once Windows reassigns that
+    # number, every subsequent run is denied the lock and skips — silently,
+    # forever, until someone deletes the file by hand. Making the identity
+    # check exact means widening the lock file's pinned on-disk contract,
+    # which is a decision and stays in BACKLOG.
+    #
+    # This decides nothing and takes nothing: it reports that a lock has
+    # been held longer than plausible. A genuinely long run and a
+    # pid-reuse ghost both deserve the same sentence — go and look.
+    # A stale lock nothing can remove. `lock_held_since()` below only sees a
+    # lock a LIVE process holds, so this condition — dead process, file not
+    # writable — is invisible to it, and `try_acquire_lock()` reports it as
+    # ordinary contention. The Runner then skips on schedule forever while
+    # every automatic signal reads healthy (BUG-42 / BACKLOG F-1).
+    if stale_lock_cannot_be_cleared(_runner_lock_path()):
+        print("  Runner Lock : 남아 있으나 제거할 수 없음 (읽기 전용)")
+        attention.append(
+            f"Runner Lock 파일이 남아 있고 제거할 수 없다 ({_runner_lock_path()}) — "
+            f"기록된 프로세스는 이미 종료됐지만 파일이 읽기 전용이라 어떤 실행도 "
+            f"인수하지 못한다. 모든 실행이 '다른 Runner 실행 중'으로 조용히 "
+            f"건너뛰어진다. 사람이 파일을 확인해 지워야 한다"
+        )
+
+    held_since = lock_held_since(_runner_lock_path())
+    if held_since is not None:
+        reference = datetime.now().astimezone()
+        if held_since.tzinfo is None:
+            reference = reference.replace(tzinfo=None)
+        held_hours = (reference - held_since).total_seconds() / 3600
+        print(f"  Runner Lock : 보유 중 (획득 {held_since.isoformat(timespec='seconds')})")
+        if held_hours >= LOCK_STUCK_AFTER_HOURS:
+            attention.append(
+                f"Runner Lock이 {held_hours:.1f}시간째 잡혀 있다 (획득 "
+                f"{held_since.isoformat(timespec='seconds')}) — 실제로 긴 실행이 "
+                f"진행 중이거나, 죽은 Runner의 PID가 재사용돼 Lock이 영구히 "
+                f"잡힌 것으로 보이는 상태다. 확인이 필요하다"
+            )
+
     try:
         summary = read_summary(DEFAULT_RUN_SUMMARY_PATH)
     except RunSummaryError as exc:
@@ -400,6 +701,29 @@ def _print_last_run() -> list[str]:
         )
         if component.artifact_refs:
             print(f"      evidence: {', '.join(component.artifact_refs)}")
+
+    # Steps that never started. This loop only ever walked the components
+    # that ARE in the manifest, so a run that aborted in Backup — taking
+    # Dashboard with it, since the exception propagates out of `run_once()`
+    # before `recorder.begin(C_DASHBOARD)` — showed eight components and
+    # said nothing about the ninth. An operator reading LAST RUN saw a
+    # Backup failure and no reason to think anything else had been missed,
+    # while that run's Dashboard row was gone for good and not even queued
+    # for retry (BACKLOG A-18).
+    #
+    # "Never started" is deliberately its own word rather than SKIPPED:
+    # SKIPPED means the Runner reached the step and chose not to run it (no
+    # Notion configured, say), which is fine. This means the step was never
+    # reached, which is not.
+    recorded = {component.name for component in summary.components}
+    never_started = [name for name in PIPELINE_COMPONENTS if name not in recorded]
+    if never_started:
+        print(f"  ! 시작되지 못한 단계: {', '.join(never_started)}")
+        attention.append(
+            f"마지막 실행에서 시작조차 되지 못한 단계: {', '.join(never_started)} — "
+            f"앞 단계가 중단시켰다. 그 단계의 결과는 이번 실행에서 기록되지 않았고 "
+            f"자동으로 재시도되지도 않는다"
+        )
 
     # Only a PERMANENT failure needs a person now. A RETRYABLE one is what
     # the next scheduled run is for, and listing it here would put a

@@ -111,12 +111,26 @@ def _relative_files(root: Path) -> set[str]:
     return result
 
 
+# docs/08 §29 writes down three example names it expects this scan to
+# catch: `.env`, `credentials.json`, `token.json`. Only the first was here.
+# The other two were measured undetected *inside `daily/`* — which is in
+# backup scope (§26), so a file with either name would have been synced,
+# committed and pushed to the remote by a gate whose whole job is to stop
+# exactly that.
+#
+# Adding them implements §29 rather than extending it, which is the line
+# this list stays on. `secrets.json`, `credentials.yml` and `token.txt` are
+# deliberately NOT here: they are names this module's docstring measured as
+# undetected, not names the spec asks for, and choosing them would be
+# inventing policy. `SecretScanCoverageTests` keeps that gap characterised.
 _SECRET_EXACT_NAMES = frozenset(
     {
         ".env",
         ".env.local",
         ".env.production",
         ".env.development",
+        "credentials.json",
+        "token.json",
         "id_rsa",
         "id_ed25519",
     }

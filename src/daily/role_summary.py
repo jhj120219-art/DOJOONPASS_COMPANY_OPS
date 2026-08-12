@@ -121,7 +121,9 @@ def build_role_summary(
     known.extend(sorted(role for role in ROLES if role not in ROLE_ORDER))
 
     matching = [c for c in candidates if _candidate_date(c) == target_date]
-    matching.sort(key=lambda candidate: candidate.timestamp)
+    # Same ordering rule as the rendered file, and now literally the same
+    # key — see `HistoryCandidate.chronological_key`.
+    matching.sort(key=lambda candidate: candidate.chronological_key)
 
     activities: list[RoleActivity] = []
     for role in known:

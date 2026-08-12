@@ -96,6 +96,41 @@ class NotionClient:
         """
         return self._transport.create_page(self._database_id, properties)
 
+    def find_by_title(self, *, property_name: str, value: str) -> Mapping[str, Any] | None:
+        """The row whose **title** property `property_name` equals `value`.
+
+        `find_project()` cannot be reused for this: it filters on
+        `rich_text`, and a database's title property is a different Notion
+        type with a different filter key. OPS_RUNS keys its rows by `Run ID`,
+        which is the title, so without this there was no way to ask "does a
+        row for this run already exist?".
+        """
+        filter_ = {"property": property_name, "title": {"equals": value}}
+        response = self._transport.query_database(self._database_id, filter_)
+        results = response.get("results") or []
+        return results[0] if results else None
+
+    def find_or_create_by_title(
+        self, *, property_name: str, value: str, properties: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Return the existing row for `value`, creating it only if absent.
+
+        The guard `notion.sync.ExecutionPlanSync` has always had, for the
+        same reason: a write can reach Notion and still surface as an
+        exception (a reset connection after the request landed, a proxy
+        timing out on the response). A retry then creates a second row for
+        work that was already recorded, and nothing downstream can tell the
+        two apart.
+
+        Not a transaction — two callers racing can still both see "absent".
+        Nothing here races: `record_run()` and `drain_pending()` run inside
+        one Runner execution, and the Runner holds the Scheduler lock.
+        """
+        existing = self.find_by_title(property_name=property_name, value=value)
+        if existing is not None:
+            return existing
+        return self.create_project(properties)
+
     def create_database(
         self, *, parent_page_id: str, title: str, properties: Mapping[str, Any]
     ) -> Mapping[str, Any]:

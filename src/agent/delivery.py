@@ -94,13 +94,26 @@ def _problem(destination: Path, event_id: str) -> str | None:
         return DeliveryProblem.NOT_A_FILE
     try:
         raw = destination.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # `ValueError` covers `UnicodeDecodeError`. Without it a sync-folder
+        # entry that is not valid UTF-8 escaped this function, then the
+        # thread pool, then `find_undelivered_events()`, and crashed
+        # `ops_status.py` — the read-only view whose entire contract is that
+        # it answers even when the evidence is damaged.
+        #
+        # A truncated transfer is one of the shapes this module's own
+        # docstring lists as the reason it exists, and `UNREADABLE` is one of
+        # its four declared verdicts. Undecodable *is* unreadable; the guard
+        # simply did not say so.
         return DeliveryProblem.UNREADABLE
     if not raw.strip():
         return DeliveryProblem.EMPTY
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deeply nested JSON raises `RecursionError`, which is not a
+        # `ValueError`. Both mean the destination is not this Event in
+        # readable form, which is exactly what `UNREADABLE` reports.
         return DeliveryProblem.UNREADABLE
     if not isinstance(data, dict) or data.get("event_id") != event_id:
         return DeliveryProblem.DIFFERENT_EVENT
@@ -138,7 +151,10 @@ def find_undelivered_events(*, sent_dir: Path, sync_folder: Path) -> DeliveryRes
         try:
             data = json.loads(record.read_text(encoding="utf-8"))
             event_id = data["event_id"]
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            # `RecursionError` for the same reason as in `_problem()` above:
+            # deeply nested JSON does not raise `ValueError`.
+            #
             # The local record itself is damaged. Not a delivery verdict —
             # `history/reconciliation.py` reports unreadable inputs
             # separately for the same reason, and inventing a verdict from

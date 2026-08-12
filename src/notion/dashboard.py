@@ -36,6 +36,12 @@ from .client import NotionClient
 
 # ---------------------------------------------------------------- schemas
 
+# The title property of OPS_RUNS, and therefore the key a run is looked up
+# by before a row is created for it. Named once here so `record_run()` and
+# `dashboard_pending.drain_pending()` cannot drift to different keys — two
+# writers keyed differently is exactly how the duplicate row appeared.
+RUN_ID_PROPERTY = "Run ID"
+
 OPS_RUNS = "OPS_RUNS"
 OPS_BACKUP = "OPS_BACKUP"
 OPS_NOTION_SYNC = "OPS_NOTION_SYNC"
@@ -547,7 +553,15 @@ def record_run(
         )
 
     try:
-        page = client.create_project(properties)
+        # Find-before-create, not create. `dashboard_pending.py`'s docstring
+        # already promised "one Runner execution can never produce two
+        # OPS_RUNS rows, whether it is recorded on the first attempt or the
+        # tenth" — this is the line that makes that true. A write that
+        # reaches Notion but surfaces as an exception (response lost) used to
+        # be retried into a second row for the same run_id.
+        page = client.find_or_create_by_title(
+            property_name=RUN_ID_PROPERTY, value=run_id, properties=properties
+        )
     except Exception as exc:  # noqa: BLE001  (CEO ④: Runtime을 절대 중단시키지 않는다)
         return DashboardResult(
             outcome=DashboardOutcome.FAILED,

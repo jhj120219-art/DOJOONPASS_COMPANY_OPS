@@ -193,6 +193,103 @@ def try_acquire_lock(lock_path: Path, *, now: datetime) -> bool:
     return False
 
 
+def is_locked(lock_path: Path) -> bool:
+    """Is a live process holding this lock right now? Read-only.
+
+    Deliberately not `try_acquire_lock()`. That call *competes* for the
+    lock: it creates the file when free and can take over one it judges
+    stale. A status view must never do either — an operator running
+    `ops_status.py` while a Runner works must not be able to disturb it, and
+    the docstring of that script promises exactly that.
+
+    So this only reads: the lock file exists, it parses, and the process id
+    inside belongs to something currently running. Anything else is False,
+    including a lock left behind by a dead process — which is the same
+    judgement `try_acquire_lock()` makes (§27), reached without acting on it.
+
+    Nothing here decides staleness or timing. `lock_held_since()` answers
+    the "for how long" question separately.
+    """
+    observed = _read_lock(lock_path)
+    if observed is None:
+        return False
+    return _is_process_running(observed.get("process_id"))
+
+
+def lock_held_since(lock_path: Path) -> datetime | None:
+    """When the live holder acquired this lock, or None if nobody holds it.
+
+    Reads the `created_at` field the lock file has always carried — no new
+    field, so `LockFileContractTests`' pinned on-disk shape is untouched.
+    None also covers a lock whose `created_at` is missing or unparseable: a
+    time this cannot read is not a time to report.
+
+    What this is for: `_is_process_running()` checks that *a* process has
+    that pid, not that it is the same process that wrote the lock. After a
+    power cut the dead Runner's pid stays in the file, and once Windows
+    reassigns that number to something unrelated the lock looks held
+    forever — every run then skips, silently, until a human deletes the
+    file. Making the identity check exact means widening the lock file's
+    contract, which is a decision (BACKLOG). Noticing that a lock has been
+    held implausibly long needs neither.
+    """
+    observed = _read_lock(lock_path)
+    if observed is None or not _is_process_running(observed.get("process_id")):
+        return None
+    created_at = observed.get("created_at")
+    if not isinstance(created_at, str):
+        return None
+    try:
+        return datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+
+
+def stale_lock_cannot_be_cleared(lock_path: Path) -> bool:
+    """Is there a lock file that no run will ever be able to take over?
+
+    Read-only, like `is_locked()` and `lock_held_since()`: it removes
+    nothing, takes nothing, and changes no attribute.
+
+    The condition is narrow on purpose, and every part of it is required:
+
+        the lock file exists
+        the process it records is NOT running  -> §27 says it is stale
+        the file is not writable               -> `os.unlink()` will fail
+
+    A stale lock on its own is ordinary — the next run takes it over, which
+    is exactly what §27 provides for, so reporting that would be noise. What
+    this reports is a stale lock that the takeover *cannot* remove, and that
+    is permanent by construction: the recorded process is dead, so nobody
+    will ever rewrite the file, and the attribute stops every unlink.
+
+    Why it needed its own detector (BUG-42). `try_acquire_lock()` answers
+    False, and False downstream means "another run holds it" — so the Runner
+    reads a permanent, unrecoverable condition as routine contention and
+    skips, on schedule, forever. Measured: `try_acquire_lock()` False on
+    every call, and **both existing detectors blind to it** —
+    `is_locked()` False and `lock_held_since()` None, because both key on a
+    *live* process and this one is dead. A lock-skipped run also writes no
+    manifest (docs/14 §7, deliberately), so nothing else was left to notice.
+
+    Reachable without anyone doing anything unusual: files restored from a
+    Windows backup commonly come back read-only, and sync clients and
+    antivirus tools both set the attribute.
+
+    Detection only. Whether the Runner may strip an attribute from a file it
+    did not create, and whether `try_acquire_lock()` should distinguish
+    "contended" from "cannot proceed", are the two decisions BUG-42 records —
+    neither is taken here.
+    """
+    path = _long_path(lock_path)
+    observed = _read_lock(lock_path)
+    if observed is None and not path.exists():
+        return False
+    if observed is not None and _is_process_running(observed.get("process_id")):
+        return False
+    return not os.access(path, os.W_OK)
+
+
 def release_lock(lock_path: Path) -> None:
     try:
         _long_path(lock_path).unlink()

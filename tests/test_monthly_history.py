@@ -816,11 +816,22 @@ class MonthlyFaultInjectionTests(MonthlyTestCase):
 
         result = self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
 
-        # 2026-07 has no Daily coverage at all, so it reports PENDING and the
-        # flag survives for a human to resolve.
-        self.assertTrue(
-            any(r.key == "2026-07" for r in result.results)
-        )
+        # 2026-07 predates `history_start_date` (2026-08-01), so no run can
+        # consolidate it: it reports PENDING and the flag survives for a
+        # human to resolve.
+        #
+        # This used to be true for the wrong reason. The dirty loop had no
+        # §85-86 guard — `pending_months()` has one, the dirty loop took its
+        # months straight from the state file — and coverage reports
+        # "complete" for a month with zero required days, so 2026-07 was
+        # actually GENERATED: a Monthly file for a month Company History does
+        # not cover. The flag survived only because clearing it was itself
+        # missing for the GENERATED case, and the assertion below could not
+        # tell the two apart. Both are now checked.
+        pre_history = next(r for r in result.results if r.key == "2026-07")
+        self.assertEqual(pre_history.status, MonthlyStatus.MONTHLY_PENDING)
+        self.assertIn("predates", pre_history.error)
+        self.assertFalse((self.monthly_dir / "2026-07.md").exists())
         self.assertEqual(load_state(self.state_path).dirty_months, ["2026-07"])
 
     def test_a_future_dated_state_never_walks_backwards(self):
@@ -888,3 +899,147 @@ class MonthlyIsNotNotionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateLagsTheMonthlyFileTests(MonthlyTestCase):
+    """A Monthly file exists for a month the state says is still open.
+
+    `run_once()` writes the Monthly file and *then* saves state, so a run
+    that dies between the two leaves exactly that. The recovery for it was
+    already designed — the catch-up sees the file, reports
+    MONTHLY_UNCHANGED, and advances the pointer rather than rebuilding
+    forever — and it is correct as far as it goes.
+
+    What it did not survive was a Late Event arriving in that window. Two
+    separate steps each consulted the stale pointer and each drew a
+    defensible conclusion:
+
+        mark_month_dirty()   "2026-08 > last close (none) -> not consolidated
+                              yet, the catch-up will read the new Daily" -> no
+                              DIRTY flag
+        the catch-up         "the file is already there" -> MONTHLY_UNCHANGED,
+                              pointer advanced, DIRTY cleared
+
+    Between them the month closed with a Monthly that does not contain a
+    Late Event its own Daily does — permanently, and with every state field
+    reporting a healthy closed month. README RULE 7 is what that breaks.
+
+    Both halves are fixed here: the file's existence now counts as
+    "consolidated" (docs/10 §49, History over State), and MONTHLY_UNCHANGED
+    no longer clears a DIRTY flag it did not act on.
+    """
+
+    def _august_with_one_event(self):
+        self.repo.save(candidate("EVT-ONTIME", day=date(2026, 8, 5), summary="on-time work"))
+        import calendar
+
+        _, last = calendar.monthrange(2026, 8)
+        for n in range(1, last + 1):
+            generate_daily_history(
+                self.repo,
+                date(2026, 8, n),
+                output_dir=self.daily_dir,
+                generated_at=f"2026-08-{n:02d}T11:00:00+09:00",
+            )
+
+    def _crash_after_writing_the_monthly(self):
+        """Consolidate without going through `run_once()`, so no state is
+        saved — the on-disk shape a run killed mid-step leaves behind."""
+        result = self.consolidate(2026, 8, now=datetime(2026, 9, 1, 11, 0).astimezone())
+        self.assertEqual(result.status, MonthlyStatus.MONTHLY_GENERATED)
+        self.assertFalse(self.state_path.exists())
+
+    def _late_event(self):
+        self.repo.save(candidate("EVT-LATE", day=date(2026, 8, 5), summary="late work"))
+        outcome = update_daily_history(
+            self.repo,
+            date(2026, 8, 5),
+            output_dir=self.daily_dir,
+            now=datetime(2026, 9, 2, 11, 0).astimezone(),
+        )
+        self.assertEqual(outcome.added_event_ids, ("EVT-LATE",))
+
+    def test_a_late_event_reaches_monthly_even_when_state_lags_the_file(self):
+        self._august_with_one_event()
+        self._crash_after_writing_the_monthly()
+        self._late_event()
+
+        self.assertTrue(
+            mark_month_dirty(self.state_path, date(2026, 8, 5), monthly_dir=self.monthly_dir)
+        )
+        self.run_monthly(now=datetime(2026, 9, 2, 11, 30).astimezone())
+
+        self.assertIn("late work", self.monthly_text(2026, 8))
+        self.assertIn(
+            "late work", (self.daily_dir / "2026-08-05.md").read_text(encoding="utf-8")
+        )
+
+    def test_the_month_still_closes_and_the_flag_is_cleared(self):
+        """Repair must not turn into a rebuild every run."""
+        self._august_with_one_event()
+        self._crash_after_writing_the_monthly()
+        self._late_event()
+        mark_month_dirty(self.state_path, date(2026, 8, 5), monthly_dir=self.monthly_dir)
+
+        first = self.run_monthly(now=datetime(2026, 9, 2, 11, 30).astimezone())
+        self.assertEqual(first.last_successful_monthly_close, "2026-08")
+        self.assertEqual(load_state(self.state_path).dirty_months, [])
+
+        second = self.run_monthly(now=datetime(2026, 9, 3, 11, 30).astimezone())
+        self.assertEqual(second.results, ())
+
+    def test_an_existing_monthly_file_counts_as_consolidated(self):
+        self._august_with_one_event()
+        self._crash_after_writing_the_monthly()
+
+        self.assertTrue(
+            mark_month_dirty(self.state_path, date(2026, 8, 5), monthly_dir=self.monthly_dir)
+        )
+        self.assertEqual(load_state(self.state_path).dirty_months, ["2026-08"])
+
+    def test_a_month_with_no_monthly_file_is_still_not_marked(self):
+        """The optimisation this guard exists for must survive: a month that
+        genuinely has not been consolidated needs no DIRTY flag, because the
+        pending catch-up reads the updated Daily on its own."""
+        self._august_with_one_event()
+
+        self.assertFalse(
+            mark_month_dirty(self.state_path, date(2026, 8, 5), monthly_dir=self.monthly_dir)
+        )
+
+    def test_without_monthly_dir_the_old_state_only_judgement_is_kept(self):
+        """Callers that have no Monthly directory to consult keep the
+        previous behaviour rather than getting a silent change."""
+        self._august_with_one_event()
+        self._crash_after_writing_the_monthly()
+
+        self.assertFalse(mark_month_dirty(self.state_path, date(2026, 8, 5)))
+
+    def test_unchanged_no_longer_clears_a_dirty_flag_it_did_not_act_on(self):
+        """The second half, isolated: the catch-up may advance the pointer
+        over a file it did not rebuild, but it may not declare that file
+        clean."""
+        self._august_with_one_event()
+        self._crash_after_writing_the_monthly()
+        self._late_event()
+        mark_month_dirty(self.state_path, date(2026, 8, 5), monthly_dir=self.monthly_dir)
+
+        result = self.run_monthly(now=datetime(2026, 9, 2, 11, 30).astimezone())
+
+        statuses = [r.status for r in result.results]
+        self.assertIn(MonthlyStatus.MONTHLY_UNCHANGED, statuses)
+        self.assertIn(MonthlyStatus.MONTHLY_UPDATED, statuses)
+
+    def test_a_generated_month_still_clears_its_dirty_flag(self):
+        """The clear that was correct stays correct: a month built from
+        scratch already contains everything Daily holds."""
+        self._august_with_one_event()
+        state = MonthlyState(last_successful_monthly_close="2026-08", dirty_months=["2026-08"])
+        save_state(self.state_path, state)
+
+        # Pointer says 2026-08 is closed but no file exists — the dirty loop
+        # builds it, and the flag must not survive that.
+        self.run_monthly(now=datetime(2026, 9, 2, 11, 30).astimezone())
+
+        self.assertEqual(load_state(self.state_path).dirty_months, [])
+        self.assertTrue((self.monthly_dir / "2026-08.md").exists())

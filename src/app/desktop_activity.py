@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date as date_type
@@ -163,6 +164,53 @@ class DesktopActivity:
 
 
 @dataclass(frozen=True)
+class SourceBreakdown:
+    """Which Desktops a directory's files claim to come from.
+
+    Attribution is best-effort by construction, and the two ways it can fail
+    are kept apart from each other on purpose:
+
+        by_source      files whose `source` is one of `events.SOURCES`
+        unattributed   everything else
+
+    "Everything else" covers a file that is not JSON at all, one that is
+    JSON but not an object, one with no `source` field, and one whose
+    `source` is a string no Desktop is allowed to send. Those are different
+    accidents but the same answer to the only question asked here — this
+    file cannot be blamed on a Desktop — and collapsing them keeps the count
+    honest instead of inventing a Desktop for it.
+
+    A `source` outside `SOURCES` is deliberately NOT reported under the name
+    it claims. Every file counted here failed to become an Event, so its
+    contents are untrusted input; echoing an arbitrary string from one into
+    an operator's terminal is the same mistake `oplog.append_line()` escapes
+    against. The count still surfaces — as `unattributed`, which is the true
+    statement — and the file itself is still on disk for a human to open.
+
+    `total` always equals the plain file count the caller already had, so
+    adding this breakdown can never change what the backlog numbers say.
+    """
+
+    by_source: tuple[tuple[str, int], ...] = ()
+    unattributed: int = 0
+
+    @property
+    def total(self) -> int:
+        return sum(count for _, count in self.by_source) + self.unattributed
+
+    def describe(self) -> str:
+        """`"DESKTOP_1=2 DESKTOP_3=1 unattributed=1"`, empty when nothing.
+
+        Neutral wording on purpose: this module is data, and the operator-
+        facing sentence it lands in belongs to `ops_status.py`.
+        """
+        parts = [f"{source}={count}" for source, count in self.by_source]
+        if self.unattributed:
+            parts.append(f"unattributed={self.unattributed}")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
 class IntakeBacklog:
     """Work that has arrived but is not yet Company History.
 
@@ -190,6 +238,35 @@ class IntakeBacklog:
     awaiting_collection: int = 0
     rejected: int = 0
     unparseable: int = 0
+    # Files whose mtime is ahead of this machine's clock, so
+    # `run_intake._is_stable()` holds them back until wall-clock time
+    # catches up (BUG-30). Counted, never subtracted from
+    # `awaiting_intake`: they really are still queued, and the missing
+    # information was never the number — it was why the number is stuck.
+    future_dated: int = 0
+    # Files in `incoming/` whose name is already taken in `processed/` or
+    # `rejected/`. `collector/runtime.run_once()` will not overwrite a
+    # destination, so each one fails on every run and never leaves
+    # `incoming/` (BUG-43). Counted for the same reason as `future_dated`:
+    # the backlog number is correct, the reason it is stuck was missing.
+    name_collision: int = 0
+    # Which Desktop each of the three in-flight piles came from. The totals
+    # above are unchanged and remain the authority; these only say who.
+    #
+    # Without them the counts are company-wide sums, so "Collector가 거부한
+    # Event 3건" left an operator to open `runtime/events/rejected/` by hand
+    # to learn whether that was one Desktop misbehaving or three Desktops
+    # each hitting the same schema change. Those two situations need
+    # opposite reactions and looked identical (BACKLOG E-10).
+    #
+    # `unparseable` gets no breakdown: a file intake could not parse is one
+    # whose `source` cannot be read either, so every one of them would land
+    # in `unattributed` and the field would say nothing the count does not.
+    awaiting_intake_sources: "SourceBreakdown" = field(default_factory=lambda: SourceBreakdown())
+    awaiting_collection_sources: "SourceBreakdown" = field(
+        default_factory=lambda: SourceBreakdown()
+    )
+    rejected_sources: "SourceBreakdown" = field(default_factory=lambda: SourceBreakdown())
 
     @property
     def is_clear(self) -> bool:
@@ -243,7 +320,13 @@ def _read_one(path: Path):
     """
     try:
         return json.loads(path.read_text(encoding="utf-8")), path.stat().st_mtime
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # `RecursionError` for the same reason `ValueError` is here: it is
+        # what `json.loads()` raises on deeply nested input, and it is a
+        # `RuntimeError` subclass rather than a `ValueError` one. Collapsing
+        # it to None keeps the promise three lines up — "this file cannot
+        # contribute, and a human should be told it exists" — instead of
+        # taking the whole COMPANY view down with it.
         return None, None
 
 
@@ -261,30 +344,89 @@ def _read_all(paths: list[Path]) -> list[tuple[Path, tuple]]:
         return list(zip(paths, pool.map(_read_one, paths)))
 
 
-def _count(directory: Path) -> int:
+def _attribute(paths: list[Path]) -> SourceBreakdown:
+    """Which Desktop each of `paths` claims to come from. Never raises.
+
+    Reads through the same thread pool the `processed/` scan uses, and folds
+    the results back in the given order, so the answer does not depend on
+    how the pool happened to schedule the reads.
+
+    Only a `source` that is an actual member of `events.SOURCES` is
+    attributed — see `SourceBreakdown` for why a file claiming anything else
+    is counted rather than quoted.
+    """
+    counts: dict[str, int] = {}
+    unattributed = 0
+    for _path, (data, _mtime) in _read_all(paths):
+        source = data.get("source") if isinstance(data, dict) else None
+        if isinstance(source, str) and source in SOURCES:
+            counts[source] = counts.get(source, 0) + 1
+        else:
+            unattributed += 1
+    return SourceBreakdown(by_source=tuple(sorted(counts.items())), unattributed=unattributed)
+
+
+def _json_paths(directory: Path) -> list[Path]:
+    """Every `*.json` in `directory`, sorted; empty when it does not exist.
+
+    Replaces the pair of separate `glob()` passes the count and the
+    attribution would otherwise each make. One listing is not a tidiness
+    preference here: two would let a file appear between them, and then
+    `SourceBreakdown.total` would disagree with the count it is breaking
+    down — a view contradicting itself is exactly what this view exists to
+    catch elsewhere.
+    """
     path = Path(directory)
     if not path.is_dir():
-        return 0
-    return sum(1 for _ in path.glob("*.json"))
+        return []
+    return sorted(path.glob("*.json"))
 
 
-def _count_transport(directory: Path) -> tuple[int, int]:
-    """(promotable, unparseable) for the transport directory.
+def _count_transport(directory: Path) -> tuple[int, int, int, SourceBreakdown]:
+    """(promotable, unparseable, future_dated, who-sent-the-promotable).
 
     Applies `transport.run_intake()`'s own parse test rather than a second
     opinion about what "valid" means, so this view cannot disagree with the
     step it is reporting on.
+
+    The promotable files are then read a second time to attribute them.
+    That is deliberate rather than merged into one read: the verdict has to
+    come from intake's own predicate — a test pins that it does — and
+    intake's predicate takes a path, not text. transport/ holds only what is
+    in flight (normally nothing, briefly a handful), so the second read
+    costs nothing worth trading that agreement for.
+
+    `future_dated` is the count of files whose mtime is ahead of this clock.
+    `run_intake._is_stable()` decides a file has finished arriving with
+    `(now - mtime) >= stable_after_seconds`, which assumes mtime is in the
+    past. OneDrive preserves the *sending* Desktop's mtime, so a Desktop
+    whose clock runs fast stamps files in the future and the subtraction
+    goes negative — the file is held back until wall-clock time catches up,
+    which can be a day or a year (BUG-30).
+
+    It is reported, not subtracted from `awaiting_intake`. Whether such a
+    file is "in flight" is exactly the judgement BUG-30 records as open, and
+    `unparseable` was excluded only because those files are provably parked
+    forever. What was missing is not a different number — it is the reason
+    the number does not move. Measured: three consecutive runs, `moved=0`
+    every time, `transport=1` on screen every time, and nothing anywhere
+    saying why.
     """
-    path = Path(directory)
-    if not path.is_dir():
-        return (0, 0)
-    promotable = unparseable = 0
-    for entry in path.glob("*.json"):
+    promotable: list[Path] = []
+    unparseable = 0
+    future_dated = 0
+    now = time.time()
+    for entry in _json_paths(directory):
+        try:
+            if entry.stat().st_mtime > now:
+                future_dated += 1
+        except OSError:
+            pass
         if _is_parseable_json(entry):
-            promotable += 1
+            promotable.append(entry)
         else:
             unparseable += 1
-    return (promotable, unparseable)
+    return (len(promotable), unparseable, future_dated, _attribute(promotable))
 
 
 def read_company_activity(
@@ -318,8 +460,9 @@ def read_company_activity(
     last_arrival: dict[str, float] = {}
     unreadable: list[str] = []
 
+    processed_paths = _json_paths(processed_dir)
     if processed_dir.is_dir():
-        for path, (data, mtime) in _read_all(sorted(processed_dir.glob("*.json"))):
+        for path, (data, mtime) in _read_all(processed_paths):
             if data is None:
                 unreadable.append(path.name)
                 continue
@@ -363,14 +506,43 @@ def read_company_activity(
         for source in sorted(SOURCES)
     )
 
-    promotable, unparseable = _count_transport(transport_dir)
+    promotable, unparseable, future_dated, promotable_sources = _count_transport(
+        transport_dir
+    )
+    incoming_paths = _json_paths(incoming_dir)
+    rejected_paths = _json_paths(rejected_dir)
+
+    # Files in `incoming/` that the Collector can never move, because
+    # `collector/runtime.run_once()` refuses a destination whose name is
+    # already taken and leaves the file where it is. The verdict does not
+    # matter — ACCEPTED and DUPLICATE both target `processed/` — so a name
+    # collision is a permanent FAILED, every run, forever (BUG-43).
+    #
+    # Free to compute: `processed_paths` is the list the scan above already
+    # walked, and `rejected_paths` is needed for the rejected count anyway.
+    # No directory is read a second time.
+    #
+    # Reported, not reclassified. `awaiting_collection` still counts these —
+    # they really are sitting in `incoming/` — and `is_clear` is untouched.
+    # Reconciling the two notions of "already handled" is the decision
+    # BUG-43 records; the missing information was the reason the number
+    # never moves.
+    taken_names = {path.name for path in processed_paths} | {
+        path.name for path in rejected_paths
+    }
+    name_collision = sum(1 for path in incoming_paths if path.name in taken_names)
     return CompanyActivitySnapshot(
         desktops=desktops,
         backlog=IntakeBacklog(
             awaiting_intake=promotable,
             unparseable=unparseable,
-            awaiting_collection=_count(incoming_dir),
-            rejected=_count(rejected_dir),
+            future_dated=future_dated,
+            awaiting_collection=len(incoming_paths),
+            name_collision=name_collision,
+            rejected=len(rejected_paths),
+            awaiting_intake_sources=promotable_sources,
+            awaiting_collection_sources=_attribute(incoming_paths),
+            rejected_sources=_attribute(rejected_paths),
         ),
         unreadable_events=tuple(unreadable),
     )
@@ -379,11 +551,26 @@ def read_company_activity(
 def _before(left: str, right: str) -> bool:
     """True when `left` is strictly earlier than `right`.
 
-    Falls back to string order when either value cannot be parsed, so a
-    hand-corrupted Event affects only its own ordering rather than
+    Falls back to string order when the two cannot be compared as instants,
+    so a hand-corrupted Event affects only its own ordering rather than
     collapsing the whole comparison.
+
+    `TypeError` alongside `ValueError`, because there are two ways the
+    comparison can fail and the guard only covered one. `ValueError` is a
+    value that does not parse; `TypeError` is
+    "can't compare offset-naive and offset-aware datetimes", raised when one
+    Event carries an offset and the other does not.
+
+    That is reachable exactly where this function is meant to be robust.
+    `validate_event()` requires an offset, but nothing re-validates a file
+    already sitting in `processed/` — a legacy Event, a hand edit, or a
+    restore from another tool can be naive. Measured: one such file beside a
+    normal one raised out of `read_company_activity()` and took the whole
+    COMPANY view of `ops_status.py` with it, which is the one thing a
+    read-only diagnostic must never do (see this module's docstring: it
+    "must still produce an answer when part of the evidence is damaged").
     """
     try:
         return datetime.fromisoformat(left) < datetime.fromisoformat(right)
-    except ValueError:
+    except (TypeError, ValueError):
         return left < right
