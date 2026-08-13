@@ -25,6 +25,7 @@ import inspect
 import io
 import json
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -1644,3 +1645,133 @@ class WorkingCopyJunctionExposureTests(unittest.TestCase):
         reached = [p for p in self.wc.rglob("*") if p.name == ".env"]
 
         self.assertEqual(len(reached), 1)
+
+
+class EventIdForgesDailyMarkdownStructureTests(unittest.TestCase):
+    """A newline in `event_id` forges a Daily History line. NOT FIXED.
+
+    BUG-11/BUG-27 record that `summary` and `evidence` reach Daily Markdown
+    unescaped, so Markdown structure can be forged. **`event_id` is not named
+    in that record**, and it is the worse of the three: `daily/markdown.py`
+    writes it into a *structural* field —
+
+        f"- Event ID: {candidate.event_id}"
+
+    — so a newline does not merely add prose, it adds a second `- Event ID:`
+    line. Measured, with `event_id = "X\\n- Event ID: FORGED-EVENT"`, the
+    rendered day contains a standalone `- Event ID: FORGED-EVENT` line for an
+    Event that never existed.
+
+    **A-15's supporting claim is stale, which is how this surfaced.** A-15
+    argues for schema rejection partly on the grounds that such an id
+    "받아들이지만 나중에 터진다" — that `History Filter`가 `OSError`로 실행
+    전체를 중단시킨다 (BUG-5). Re-measured: `safe_candidate_filename()`
+    sanitises the newline to `_` and appends a digest
+    (`HIST-X_FORGED-LINE-82fa8b62e81e.json`), and `save()` succeeds. Nothing
+    explodes later — the CEO-approved sanitisation at the storage boundary
+    closed that. So A-15's remaining risk is not "it crashes", it is this:
+    it renders.
+
+    Still SKIP. Constraining `event_id` is docs/02's Event Schema contract
+    (A-15) and escaping the Markdown renderer is docs/06's rendering contract
+    (BUG-11/27). This test decides neither; it puts `event_id` on the record
+    beside `summary` and `evidence`, and states the measured shape so the
+    decision is made against what happens rather than what was assumed.
+
+    `oplog.one_line()` already closed the identical forgery for *logs*
+    (BUG-6, C10). The renderer has no equivalent.
+    """
+
+    FORGERY = "X\n- Event ID: FORGED-EVENT"
+
+    def _candidate(self, event_id):
+        from events import create_event
+        from history.filter import HistoryFilter
+
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="PRJ",
+            event_type="MILESTONE_COMPLETED", status="COMPLETED",
+            summary="real work", history_candidate=True,
+            event_id=event_id, timestamp="2026-08-10T10:00:00+09:00",
+        )
+        return HistoryFilter().evaluate(event).candidate
+
+    def test_a_newline_event_id_produces_a_second_event_id_line(self):
+        from daily.markdown import render_daily_markdown
+
+        markdown = render_daily_markdown(
+            target_date=date(2026, 8, 10),
+            candidates=[self._candidate(self.FORGERY)],
+            generated_at="2026-08-10T18:00:00+09:00",
+        )
+
+        forged = [
+            line for line in markdown.splitlines()
+            if line.strip() == "- Event ID: FORGED-EVENT"
+        ]
+        self.assertEqual(len(forged), 1, "the forged line is rendered standalone")
+
+    def test_one_candidate_yields_two_event_id_lines(self):
+        """The count is the point: a reader (or a parser) sees two Events."""
+        from daily.markdown import render_daily_markdown
+
+        markdown = render_daily_markdown(
+            target_date=date(2026, 8, 10),
+            candidates=[self._candidate(self.FORGERY)],
+            generated_at="2026-08-10T18:00:00+09:00",
+        )
+
+        lines = [
+            line for line in markdown.splitlines()
+            if line.strip().startswith("- Event ID:")
+        ]
+        self.assertEqual(len(lines), 2)
+
+    def test_storage_no_longer_explodes_on_such_an_id(self):
+        """A-15's stale premise, re-measured: BUG-5 is closed."""
+        import tempfile
+
+        from history.file_repository import FileHistoryRepository, safe_candidate_filename
+
+        name = safe_candidate_filename("HIST-" + self.FORGERY)
+        self.assertNotIn("\n", name)
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        keep, review = root / "keep", root / "review"
+        keep.mkdir()
+        review.mkdir()
+
+        stored = FileHistoryRepository(keep_dir=keep, review_dir=review).save(
+            self._candidate(self.FORGERY)
+        )
+
+        self.assertTrue(stored)
+        self.assertEqual(len(list(keep.glob("*.json"))), 1)
+
+    def test_the_log_writer_already_refuses_the_same_forgery(self):
+        """BUG-6/C10 closed this for logs. The contrast is the argument that
+        the renderer is the remaining half, not that the problem is new."""
+        from oplog import one_line
+
+        rendered = one_line(self.FORGERY)
+
+        self.assertNotIn("\n", rendered)
+        self.assertIn("\\n", rendered)
+
+    def test_an_ordinary_event_id_renders_exactly_one_line(self):
+        """The guard on the guard: this must not read as "the renderer is
+        broken for normal input"."""
+        from daily.markdown import render_daily_markdown
+
+        markdown = render_daily_markdown(
+            target_date=date(2026, 8, 10),
+            candidates=[self._candidate("EVT-ORDINARY")],
+            generated_at="2026-08-10T18:00:00+09:00",
+        )
+
+        lines = [
+            line for line in markdown.splitlines()
+            if line.strip().startswith("- Event ID:")
+        ]
+        self.assertEqual(lines, ["- Event ID: EVT-ORDINARY"])

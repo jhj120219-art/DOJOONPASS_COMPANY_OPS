@@ -26,6 +26,33 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 # See history/file_repository.py for the same bound and the reason for it.
 _MAX_FILENAME_STEM = 120
 
+# Every atomic writer in this project stages through
+# `tempfile.mkstemp(dir=<the destination directory>, prefix=".tmp-")` and
+# commits with one `os.replace()`. That prefix is therefore not decoration:
+# it is the one mark that distinguishes "a write that has not finished" from
+# "a finished artifact", and it is the only mark a *reader* has to go on.
+#
+# The failure path is already cleaned up (`except BaseException: os.remove`),
+# so residue only survives a write the process never returned from — power
+# loss, SIGKILL, a container stop. What made that worth naming here is what
+# the readers do with the survivor: every scanner in this repository lists a
+# directory by extension (`glob("*.json")`, `glob("*.md")`), and `.tmp-…json`
+# matches `*.json`. A half-written file is then indistinguishable from a
+# delivered Event, a stored Candidate, or a day of Company History.
+#
+# `is_incomplete_write()` is that distinction, published by the writer rather
+# than re-derived by each reader. Modules that cannot import this one (the
+# `transport`, `backup` and `history` leaves — see LayeringInvariantTests)
+# carry a byte-identical copy, exactly as `safe_event_filename()` already
+# does, and `IncompleteWriteInvariantTests` asserts every copy agrees with
+# every writer's actual mkstemp prefix.
+INCOMPLETE_WRITE_PREFIX = ".tmp-"
+
+
+def is_incomplete_write(name: str) -> bool:
+    """Whether `name` is an atomic writer's staging file, not a finished artifact."""
+    return name.startswith(INCOMPLETE_WRITE_PREFIX)
+
 
 def safe_event_filename(event_id: str) -> str:
     """Derive a Windows-safe filename from an event_id (never from summary/user text).
@@ -67,7 +94,9 @@ def write_event_json(
     if final_path.exists() and not overwrite:
         raise FileExistsError(f"event file already exists: {final_path}")
 
-    fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".tmp-", suffix=".json")
+    fd, tmp_path = tempfile.mkstemp(
+        dir=target_dir, prefix=INCOMPLETE_WRITE_PREFIX, suffix=".json"
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(event.to_json())

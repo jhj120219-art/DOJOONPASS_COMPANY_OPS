@@ -76,13 +76,32 @@ from datetime import datetime
 from pathlib import Path
 
 from events import SOURCES
+from collector.runtime import is_readable_event_file  # reuse Collector's own test
 from transport.intake import _is_parseable_json  # reuse intake's own test
+from transport.intake import is_incomplete_write as _is_incomplete_write
 
 # Measured on a cold cache at 5,000 files: 8 workers -> 4.7 s, 16 -> 3.3 s,
 # 32 and 64 -> 3.3 s. The plateau is at 16, so there is nothing to gain from
 # a larger pool and every reason not to spawn one on the operator's own
 # desktop. Bounded by CPU count as well so a small machine does not get a
 # pool wildly out of proportion to it.
+#
+# What the pool is worth, re-measured with benchmark ordering controlled —
+# the earlier figure was inflated by it. Comparing a cold serial pass against
+# a threaded pass over the files that serial pass had just cached makes the
+# pool look ~8x better than it is; running the two orders on separate fresh
+# file sets, whichever goes SECOND wins, because the dominant cost is the
+# cold first open. Like for like, at 20,000 files:
+#
+#     cold serial   8.9 s      cold threaded   2.1 s     -> 4.2x, the real win
+#     warm threaded 1.1 s      warm serial     0.94 s    -> pool costs 19%
+#
+# Cold is the operational case (this view reads files an earlier run wrote,
+# and `processed/` accumulates for months), so the pool stays. The warm
+# number is not a reason to remove it — it is the case not worth optimising.
+# Recorded because the inflated figure nearly bought its own removal: C27
+# measured the warm direction first and briefly had it 16x "slower".
+# Full table and reasoning in BACKLOG section D.
 _READ_WORKERS = max(4, min(16, (os.cpu_count() or 4) * 2))
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -250,6 +269,43 @@ class IntakeBacklog:
     # `incoming/` (BUG-43). Counted for the same reason as `future_dated`:
     # the backlog number is correct, the reason it is stuck was missing.
     name_collision: int = 0
+    # Staging files (`.tmp-…json`) left in `transport/` by a writer that was
+    # killed between its write and its `os.replace`. `run_intake()` skips
+    # them by name, so they are *not* in flight and are excluded from
+    # `awaiting_intake` — counting them there would hold the backlog at a
+    # number no run can ever reduce, which is the exact failure this class's
+    # docstring was written about. Surfaced as their own count because
+    # nothing else on disk ever removes them.
+    incomplete: int = 0
+    # Files in `transport/` whose name already exists in `incoming/`,
+    # `processed/` or `rejected/`. `run_intake()` skips them and never
+    # deletes, so each one sits there for good — and a re-sent Event, the
+    # outbox's own designed recovery from a crash mid-send, produces exactly
+    # one. Excluded from `awaiting_intake` for the same reason `unparseable`
+    # is: the file is not queued, it is already handled. See
+    # `_count_transport()` for the measurement.
+    already_collected: int = 0
+    # The other half of the same verdict: a file in `transport/` blocked by a
+    # downstream twin that is NOT the same Event — a directory, a 0-byte
+    # placeholder, a different Event under a colliding name (BUG-53 /
+    # BUG-47). That is an undelivered Event being silently suppressed, so
+    # unlike `already_collected` it needs a human and stays in ATTENTION.
+    suppressed: int = 0
+    # Files in `incoming/` the Collector cannot read at all (undecodable
+    # bytes, or an entry that is not a readable file). `run_once()` records
+    # FAILED and leaves them, so they never reach `processed/` or
+    # `rejected/` — the read is deterministic, so this repeats every run,
+    # forever. Excluded from `awaiting_collection` for `unparseable`'s
+    # reason, not `name_collision`'s: nothing is pending a decision here,
+    # the file is simply parked. Measured — three consecutive runs,
+    # `failed=1` every time, `incoming=1` on screen every time, no reason
+    # given anywhere.
+    #
+    # Note this is a *different* predicate from `unparseable`: a valid-UTF-8
+    # file holding invalid JSON is REJECTED by `collector.collect()` and
+    # leaves `incoming/` on the first run, so counting it here would report
+    # a file that is on its way out as stuck.
+    unreadable_incoming: int = 0
     # Which Desktop each of the three in-flight piles came from. The totals
     # above are unchanged and remain the authority; these only say who.
     #
@@ -272,9 +328,22 @@ class IntakeBacklog:
     def is_clear(self) -> bool:
         """Nothing is in flight.
 
-        `unparseable` is deliberately excluded: those files are not in
-        flight, they are parked. Including them would make `is_clear`
-        permanently False for a condition no run can resolve.
+        Five of the counts above are deliberately outside this: those files
+        are not in flight, they are parked, and including them would make
+        `is_clear` permanently False for a condition no run can resolve.
+
+            unparseable           intake judged it and will not promote it
+            incomplete            a write that never committed; not an Event
+            already_collected     the same Event, already handled
+            suppressed            blocked by a name that is not it
+            unreadable_incoming   the Collector cannot read it at all
+
+        The last three joined `unparseable` here rather than `future_dated`
+        and `name_collision`, which stay counted: those two are stuck on
+        open decisions (BUG-30 / BUG-43), so what "in flight" means for them
+        is not settled. For these five it is — nothing pending will move
+        them, and `suppressed` / `unreadable_incoming` still raise ATTENTION
+        on their own, which is where a human-needed condition belongs.
         """
         return not (self.awaiting_intake or self.awaiting_collection)
 
@@ -382,12 +451,35 @@ def _json_paths(directory: Path) -> list[Path]:
     return sorted(path.glob("*.json"))
 
 
-def _count_transport(directory: Path) -> tuple[int, int, int, SourceBreakdown]:
-    """(promotable, unparseable, future_dated, who-sent-the-promotable).
+def _event_id_of(path: Path) -> str | None:
+    """The `event_id` inside `path`, or None if it cannot be read as one.
+
+    Not a validation step — it never decides whether a file is a good Event.
+    It exists to answer one question `_count_transport()` has to answer about
+    two files that share a name: are they the same Event?
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("event_id")
+    return value if isinstance(value, str) else None
+
+
+def _count_transport(
+    directory: Path, downstream: tuple[Path, ...] = ()
+) -> tuple[int, int, int, int, int, int, SourceBreakdown]:
+    """(promotable, unparseable, future_dated, incomplete, already_collected,
+    suppressed, who-sent-the-promotable).
 
     Applies `transport.run_intake()`'s own parse test rather than a second
     opinion about what "valid" means, so this view cannot disagree with the
-    step it is reporting on.
+    step it is reporting on. `is_incomplete_write()` is imported from the
+    same module for the same reason — intake skips those files, and a view
+    that counted them as promotable would report a backlog the step it
+    reports on has already decided it will never touch.
 
     The promotable files are then read a second time to attribute them.
     That is deliberate rather than merged into one read: the verdict has to
@@ -411,12 +503,88 @@ def _count_transport(directory: Path) -> tuple[int, int, int, SourceBreakdown]:
     the number does not move. Measured: three consecutive runs, `moved=0`
     every time, `transport=1` on screen every time, and nothing anywhere
     saying why.
+
+    `already_collected` is the same shape, reached by the most ordinary event
+    in the system. `run_intake()` leaves a file whose name already exists in
+    `incoming/`/`processed/`/`rejected/` exactly where it is — forever, since
+    nothing deletes from `transport/` — and a re-sent Event is precisely that
+    file. `agent/outbox.py`'s docstring calls a re-send "harmless at every
+    downstream layer" and cites this very skip as the reason; that is true of
+    the pipeline and was never checked against the view. Measured, one
+    duplicate re-send after its original was collected:
+
+        run 1..3   moved=0  skipped_already_present=1
+                   awaiting_intake=1, is_clear=False, every run
+
+    so a crash between "Transport accepted" and "moved to sent/" — the case
+    the outbox is *designed* to recover from by re-sending — permanently
+    parks ATTENTION on "수집되지 않고 남은 Event", with no explanation and no
+    run able to clear it.
+
+    It is therefore excluded from `awaiting_intake` for `unparseable`'s
+    reason rather than counted for BUG-30's: intake's verdict here is
+    deterministic and nothing downstream ever removes the file that produces
+    it, so the Event is not queued — it is already handled. When the twin
+    *is* still in `incoming/`, `awaiting_collection` already counts the work,
+    so no in-flight signal is lost by this.
+
+    `downstream` is intake's own list, in intake's own order, checked with
+    intake's own existence test — this view must not hold a second opinion
+    about what "already present" means.
+
+    `suppressed` is the half of that verdict which is NOT benign, and
+    separating it is the reason this can be excluded from `awaiting_intake`
+    at all. intake's test is name-based (BUG-53), so "already present" covers
+    two situations a single count would merge:
+
+        the twin carries the same event_id      a re-sent duplicate. Nothing
+                                                to do; it is already handled
+        the twin is a directory, a 0-byte
+        placeholder, or a different Event
+        (BUG-53 / BUG-47 / a Windows
+        case-insensitive filename collision)    a real, undelivered Event is
+                                                being suppressed by a file
+                                                that is not it — silent loss
+
+    Merging them would have traded one false alert for one missing alert:
+    every one of the second kind used to raise ATTENTION (as a permanently
+    stuck `awaiting_intake`) for the wrong reason, and would have gone quiet
+    for a wrong reason instead. So the twin is opened and the two `event_id`s
+    compared. Equal means duplicate; anything else — unequal, unreadable, not
+    a file — means suppressed, and stays in ATTENTION.
+
+    Comparing ids rather than trusting the filename is also what catches the
+    case-only collision: `safe_event_filename()` appends a digest whenever it
+    has to change an id, so two distinct ids cannot share a name — except on
+    Windows, where `EVT-a.json` and `EVT-A.json` are one path. Nothing else
+    in the pipeline can see that.
+
+    The cost is up to two extra file reads per entry in `transport/`, which
+    holds only what is in flight — normally nothing, briefly a handful. Same
+    trade, for the same reason, as the second read `_attribute()` makes.
     """
     promotable: list[Path] = []
     unparseable = 0
     future_dated = 0
+    incomplete = 0
+    already_collected = 0
+    suppressed = 0
     now = time.time()
     for entry in _json_paths(directory):
+        if _is_incomplete_write(entry.name):
+            incomplete += 1
+            continue
+        twin = next(
+            (target / entry.name for target in downstream if (target / entry.name).exists()),
+            None,
+        )
+        if twin is not None:
+            mine = _event_id_of(entry)
+            if mine is not None and mine == _event_id_of(twin):
+                already_collected += 1
+            else:
+                suppressed += 1
+            continue
         try:
             if entry.stat().st_mtime > now:
                 future_dated += 1
@@ -426,7 +594,15 @@ def _count_transport(directory: Path) -> tuple[int, int, int, SourceBreakdown]:
             promotable.append(entry)
         else:
             unparseable += 1
-    return (len(promotable), unparseable, future_dated, _attribute(promotable))
+    return (
+        len(promotable),
+        unparseable,
+        future_dated,
+        incomplete,
+        already_collected,
+        suppressed,
+        _attribute(promotable),
+    )
 
 
 def read_company_activity(
@@ -506,8 +682,19 @@ def read_company_activity(
         for source in sorted(SOURCES)
     )
 
-    promotable, unparseable, future_dated, promotable_sources = _count_transport(
-        transport_dir
+    (
+        promotable,
+        unparseable,
+        future_dated,
+        incomplete,
+        already_collected,
+        suppressed,
+        promotable_sources,
+    ) = _count_transport(
+        transport_dir,
+        # Same three directories, in the same order, as
+        # `transport.run_intake()`'s own `already_elsewhere` check.
+        (incoming_dir, processed_dir, rejected_dir),
     )
     incoming_paths = _json_paths(incoming_dir)
     rejected_paths = _json_paths(rejected_dir)
@@ -531,17 +718,39 @@ def read_company_activity(
         path.name for path in rejected_paths
     }
     name_collision = sum(1 for path in incoming_paths if path.name in taken_names)
+
+    # Files the Collector cannot read at all, asked with the Collector's own
+    # read. Split out of `awaiting_collection` rather than added to it: they
+    # are not queued work, they are parked — `run_once()` fails on them
+    # identically on every run and leaves them where they are. Without this,
+    # one such file held `awaiting_collection` at 1 and `is_clear` at False
+    # across three consecutive runs with nothing saying why.
+    #
+    # `incoming/` is drained every run and normally holds nothing, so the
+    # extra read is paid only when there is something stuck — which is
+    # exactly when an operator is looking.
+    unreadable_incoming_paths = [
+        path for path in incoming_paths if not is_readable_event_file(path)
+    ]
     return CompanyActivitySnapshot(
         desktops=desktops,
         backlog=IntakeBacklog(
             awaiting_intake=promotable,
             unparseable=unparseable,
             future_dated=future_dated,
-            awaiting_collection=len(incoming_paths),
+            incomplete=incomplete,
+            already_collected=already_collected,
+            suppressed=suppressed,
+            awaiting_collection=len(incoming_paths) - len(unreadable_incoming_paths),
+            unreadable_incoming=len(unreadable_incoming_paths),
             name_collision=name_collision,
             rejected=len(rejected_paths),
             awaiting_intake_sources=promotable_sources,
-            awaiting_collection_sources=_attribute(incoming_paths),
+            # Attributed over the same set the count above uses, so
+            # `SourceBreakdown.total` keeps its promise of equalling it.
+            awaiting_collection_sources=_attribute(
+                [p for p in incoming_paths if p not in set(unreadable_incoming_paths)]
+            ),
             rejected_sources=_attribute(rejected_paths),
         ),
         unreadable_events=tuple(unreadable),

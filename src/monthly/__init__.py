@@ -14,6 +14,7 @@ from .generator import (
     MonthlyStatus,
     consolidate_month,
     mark_month_dirty,
+    monthly_history_path,
     pending_months,
     run_once,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "month_dates",
     "month_key",
     "month_title",
+    "monthly_history_path",
     "parse_daily_markdown",
     "parse_month_key",
     "pending_months",

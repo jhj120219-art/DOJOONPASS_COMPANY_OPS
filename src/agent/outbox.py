@@ -42,7 +42,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from events import Event, EventValidationError
-from reporter.local_output import safe_event_filename, write_event_json
+from reporter.local_output import (
+    is_incomplete_write,
+    safe_event_filename,
+    write_event_json,
+)
 from transport import Transport, TransportError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -96,11 +100,23 @@ def stage(event: Event, outbox_dir: Path) -> Path:
 
 
 def pending(outbox_dir: Path) -> tuple[Path, ...]:
-    """Every Event file still waiting to be sent, in stable filename order."""
+    """Every Event file still waiting to be sent, in stable filename order.
+
+    A staging file is not a pending Event. `write_event_json()` — the writer
+    `stage()` uses — `mkstemp`s into this directory, so a process killed
+    between the write and the `os.replace` leaves a `.tmp-…json` that
+    `glob("*.json")` matches. `drain()` would then read it, and a truncated
+    one fails `Event.from_json()` and lands in `unreadable`, which makes
+    `DrainSummary.is_clear` False *permanently*: the Agent stops advancing
+    its collection date and reports that a human is needed, forever, over a
+    file the Agent itself abandoned and no code removes.
+    """
     outbox_dir = Path(outbox_dir)
     if not outbox_dir.is_dir():
         return ()
-    return tuple(sorted(outbox_dir.glob("*.json")))
+    return tuple(
+        sorted(p for p in outbox_dir.glob("*.json") if not is_incomplete_write(p.name))
+    )
 
 
 def is_sent(event_id: str, sent_dir: Path) -> bool:

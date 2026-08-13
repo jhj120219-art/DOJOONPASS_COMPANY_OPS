@@ -2818,3 +2818,674 @@ class SerialisationFidelityTests(unittest.TestCase):
 
         self.assertEqual(back, candidate)
         self.assertEqual(back.event_id, awkward)
+
+
+class IncompleteWriteInvariantTests(unittest.TestCase):
+    """A write that never committed must not be read as a finished artifact.
+
+    Every atomic writer here stages through
+    `tempfile.mkstemp(dir=<destination>, prefix=".tmp-")` and commits with one
+    `os.replace()`. `AtomicWriteFailureCleanupTests` proves the *exception*
+    path removes the staging file. What nothing covered is the path where
+    there is no exception to handle: a process killed between the write and
+    the replace — power loss, SIGKILL, a container stop — leaves the staging
+    file behind, and no code in this repository ever removes it.
+
+    That would be inert if the readers could tell the two apart. They cannot:
+    every scanner lists its directory by extension, and `.tmp-....json` matches
+    `glob("*.json")` exactly as a delivered Event does. Measured before the
+    fix, one abandoned staging file per directory:
+
+        transport/    run_intake() promoted `.tmp-abc.json` into incoming/ as
+                      an Event, and the Collector then processed it
+        master/daily/ sync_to_working_copy() reported it as `added`, so a
+                      truncated day of Company History was committed and
+                      pushed to the backup remote; deleting it from Master
+                      then reported it as `deleted`, and because that gate
+                      applies nothing while `deleted` is non-empty, every
+                      later run failed too — cleaning up the garbage was what
+                      armed a permanent BACKUP_FAILED
+        keep/         FileHistoryRepository.list() raised JSONDecodeError on a
+                      truncated one (BUG-38: blocks every Candidate for that
+                      date) and returned a duplicate Candidate for a complete
+                      one
+        outbox/       drain() reported it `unreadable`, which makes
+                      `DrainSummary.is_clear` False permanently, so the Agent
+                      stopped advancing its collection date — over a file the
+                      Agent itself abandoned
+
+    The fix is one predicate, `is_incomplete_write()`, published by the writer
+    (`reporter/local_output.py`) and copied verbatim into the three leaf
+    packages that may not import it. This class is what keeps the copies
+    honest — a divergence would silently re-open whichever consumer drifted.
+    """
+
+    COPIES = (
+        "reporter/local_output.py",
+        "transport/intake.py",
+        "backup/working_copy.py",
+        "history/file_repository.py",
+    )
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def test_every_copy_of_the_predicate_declares_the_same_prefix(self):
+        prefixes = {}
+        for module in self.COPIES:
+            source = (SRC / module).read_text(encoding="utf-8")
+            found = re.findall(r'^INCOMPLETE_WRITE_PREFIX = "(.*)"$', source, re.M)
+            self.assertEqual(len(found), 1, f"{module} must declare it exactly once")
+            prefixes[module] = found[0]
+        self.assertEqual(len(set(prefixes.values())), 1, prefixes)
+
+    def test_every_copy_of_the_predicate_behaves_the_same(self):
+        import backup.working_copy as backup_copy
+        import history.file_repository as history_copy
+        import reporter.local_output as reporter_origin
+        import transport.intake as transport_copy
+
+        implementations = (
+            reporter_origin.is_incomplete_write,
+            transport_copy.is_incomplete_write,
+            backup_copy.is_incomplete_write,
+            history_copy.is_incomplete_write,
+        )
+        samples = (
+            (".tmp-abc123.json", True),
+            (".tmp-abc123.md", True),
+            (".tmp-", True),
+            ("EVT-001.json", False),
+            ("2026-08-13.md", False),
+            (".env", False),
+            ("tmp-not-staged.json", False),
+            ("a.tmp-b.json", False),
+        )
+        for name, expected in samples:
+            verdicts = {impl.__module__: impl(name) for impl in implementations}
+            with self.subTest(name=name):
+                self.assertEqual(set(verdicts.values()), {expected}, verdicts)
+
+    def test_every_writer_stages_with_the_prefix_the_readers_skip(self):
+        """The predicate is only correct while it describes what the writers
+        actually produce. A writer that changed its `mkstemp` prefix would
+        become invisible to every reader below without failing anything else.
+        """
+        import reporter.local_output as reporter_origin
+
+        prefix = reporter_origin.INCOMPLETE_WRITE_PREFIX
+        writers = sorted(
+            path
+            for path in SRC.rglob("*.py")
+            if "__pycache__" not in path.parts
+            and "mkstemp" in path.read_text(encoding="utf-8")
+        )
+        self.assertGreaterEqual(len(writers), 12, "expected the full writer set")
+        for path in writers:
+            source = path.read_text(encoding="utf-8")
+            # `tempfile.` qualified on purpose: every real call is written
+            # that way, and requiring it keeps prose that merely *mentions*
+            # `mkstemp(...)` out of the scan.
+            for call in re.findall(r"tempfile\.mkstemp\((?:[^()]|\([^()]*\))*\)", source):
+                with self.subTest(writer=str(path.relative_to(SRC)), call=call):
+                    self.assertTrue(
+                        'prefix="' + prefix + '"' in call
+                        or "prefix=INCOMPLETE_WRITE_PREFIX" in call,
+                        f"{path.name} stages with a prefix no reader skips: {call}",
+                    )
+
+    def _staging_name(self, suffix: str) -> str:
+        import reporter.local_output as reporter_origin
+
+        return reporter_origin.INCOMPLETE_WRITE_PREFIX + "killed-mid-write" + suffix
+
+    def test_no_consumer_treats_a_staging_file_as_an_artifact(self):
+        """One abandoned staging file per directory, through every scanner
+        that lists that directory. Both shapes are used: truncated (the write
+        died partway) and complete-but-never-replaced (the write finished and
+        the process died before the rename). The second is the dangerous one —
+        it parses, so no error anywhere marks it as not-an-artifact.
+        """
+        import backup.working_copy as backup_copy
+        from agent.outbox import pending
+        from history.file_repository import FileHistoryRepository
+        from transport.intake import run_intake
+
+        for shape, payload in (
+            ("truncated", '{"summary"'),
+            ("complete", '{"summary": 1}'),
+        ):
+            root = Path(tempfile.mkdtemp(dir=self.root))
+
+            with self.subTest(shape=shape, consumer="transport.run_intake"):
+                transport_dir, incoming = root / "transport", root / "incoming"
+                transport_dir.mkdir(parents=True)
+                staged = transport_dir / self._staging_name(".json")
+                staged.write_text(payload, encoding="utf-8")
+                os.utime(staged, (0, 0))
+                summary = run_intake(
+                    transport_dir=transport_dir,
+                    incoming_dir=incoming,
+                    processed_dir=root / "processed",
+                    rejected_dir=root / "rejected",
+                )
+                self.assertEqual(summary.moved, ())
+                self.assertEqual(summary.skipped_incomplete, (staged.name,))
+                self.assertEqual(list(incoming.glob("*")), [])
+                # Never deleted — it may still be a *live* write by another
+                # process, which is the same reason it must not be promoted.
+                self.assertTrue(staged.exists())
+
+            with self.subTest(shape=shape, consumer="backup.sync_to_working_copy"):
+                master, working = root / "master", root / "wc"
+                (master / "daily").mkdir(parents=True)
+                (master / "daily" / "2026-08-13.md").write_text("real\n", encoding="utf-8")
+                staged = master / "daily" / self._staging_name(".md")
+                staged.write_text(payload, encoding="utf-8")
+
+                first = backup_copy.sync_to_working_copy(master, working)
+                self.assertEqual(first.added, (os.path.join("daily", "2026-08-13.md"),))
+                self.assertEqual(
+                    sorted(p.name for p in (working / "daily").iterdir()),
+                    ["2026-08-13.md"],
+                )
+                # ...and cleaning the garbage up does not arm the deletion gate.
+                staged.unlink()
+                self.assertEqual(
+                    backup_copy.sync_to_working_copy(master, working).deleted, ()
+                )
+
+            with self.subTest(shape=shape, consumer="history.FileHistoryRepository.list"):
+                keep, review = root / "keep", root / "review"
+                keep.mkdir(parents=True)
+                (keep / self._staging_name(".json")).write_text(payload, encoding="utf-8")
+                repo = FileHistoryRepository(keep_dir=keep, review_dir=review)
+                self.assertEqual(repo.list(), [])
+
+            with self.subTest(shape=shape, consumer="agent.outbox.pending"):
+                outbox = root / "outbox"
+                outbox.mkdir(parents=True)
+                (outbox / self._staging_name(".json")).write_text(payload, encoding="utf-8")
+                (outbox / "EVT-1.json").write_text('{"real": 1}', encoding="utf-8")
+                self.assertEqual([p.name for p in pending(outbox)], ["EVT-1.json"])
+
+    def test_the_one_consumer_this_does_not_cover_and_why(self):
+        """`collector/runtime.run_once()` — deliberately outside the rule.
+
+        `reporter.local_output.write_event_json()` defaults to
+        `runtime/events/incoming/`, and `Reporter.report_and_write()` passes
+        that default through. So the Desktop 4 reporter — a path
+        `run_once()`'s own comment names ("the Desktop 4 reporter and the
+        operator both write `incoming/` directly") — can leave a staging file
+        in the one directory the Collector reads.
+
+        It is not covered, because the outcome is different in the way that
+        decided the other six. Measured, both shapes:
+
+            complete    ACCEPTED. The Event is real and reaches Company
+                        History; only its filename is the staging name
+            truncated   REJECTED -> `rejected/`, and ATTENTION says
+                        "Collector가 거부한 Event 1건" — a false statement
+                        (nothing was rejected; a write was abandoned) that
+                        clears only when a human deletes the file
+
+        Neither loses data and neither parks anything in `incoming/` — the
+        file moves on in one run, which is exactly what the other six did
+        not do. What is left is one mislabelled alert, and correcting it
+        means changing what the Collector consumes from `incoming/`, which
+        is docs/03's processing pipeline rather than a reader's filter.
+
+        Pinned rather than argued: if `run_once()` ever starts skipping these,
+        this test fails and the boundary gets revisited on purpose.
+        """
+        from collector.collector import Collector
+        from collector.runtime import run_once as collector_run_once
+        from collector.state import PersistentSeenEventStore
+        from events import create_event
+
+        payload = create_event(
+            source="DESKTOP_4",
+            role="COO",
+            project_id="PRJ",
+            event_type="MILESTONE_COMPLETED",
+            status="IN_PROGRESS",
+            summary="s",
+            history_candidate=True,
+            event_id="EVT-BOUNDARY",
+            timestamp="2026-08-10T10:00:00+09:00",
+        ).to_json()
+
+        for shape, content, expect in (
+            ("complete", payload, "processed"),
+            ("truncated", payload[:20], "rejected"),
+        ):
+            with self.subTest(shape=shape):
+                root = Path(tempfile.mkdtemp(dir=self.root))
+                incoming, processed, rejected = (
+                    root / "incoming",
+                    root / "processed",
+                    root / "rejected",
+                )
+                for directory in (incoming, processed, rejected):
+                    directory.mkdir(parents=True)
+                staged = incoming / self._staging_name(".json")
+                staged.write_text(content, encoding="utf-8")
+
+                collector_run_once(
+                    collector=Collector(
+                        seen_store=PersistentSeenEventStore(state_path=root / "seen.json")
+                    ),
+                    incoming_dir=incoming,
+                    processed_dir=processed,
+                    rejected_dir=rejected,
+                    log_path=root / "collector.log",
+                )
+
+                # It does NOT stay in incoming/ — the property that made the
+                # other six worth fixing.
+                self.assertEqual(list(incoming.iterdir()), [])
+                landed = {
+                    "processed": [p.name for p in processed.iterdir()],
+                    "rejected": [p.name for p in rejected.iterdir()],
+                }
+                self.assertEqual(landed[expect], [staged.name], landed)
+
+
+class AgentExitCodeContractTests(unittest.TestCase):
+    """`run_agent.py`'s exit codes were pinned by nothing.
+
+    `ExitCodeContractTests` exists for `run_company_ops.py` because BUG-36
+    established why it has to: the Runner is launched by Windows Task
+    Scheduler, **stdout is not captured by default**, and the exit code is
+    therefore the only automatic health signal anyone gets. Every word of
+    that applies to `run_agent.py` — same Task Scheduler, same
+    non-captured stdout, registered by `install_agent_task.ps1` on Desktops
+    1-3, which are the machines that *produce* Company History.
+
+    Nothing tested it. Every assertion in the suite is on `AgentStatus`, the
+    in-process enum; the mapping from that enum to the number the operating
+    system sees had no test at all, in either direction.
+
+    Third instance this Sprint of one discipline applied to the Runner and
+    not the Agent (after lock monitoring and run-staleness). None of the
+    three was a decision — each was a check aimed at one of two targets.
+
+    The mapping, from the script's own module docstring:
+
+        0   COMPLETED, or skipped because another Agent run holds the lock
+        1   configuration error (bad/missing environment)
+        2   FAILED — nothing lost; the outbox holds the work and the next
+            run resumes from the same date
+
+    `3` is deliberately absent and is asserted to stay absent: docs/14 gives
+    it a specific meaning shared by `run_company_ops.py` and `ops_status.py`
+    ("something needs a person"), and the Agent reaching that state is
+    `pending_dates`, not an exit code.
+    """
+
+    DOCUMENTED = {0, 1, 2}
+
+    def _returns(self):
+        source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        found = set()
+        for node in ast.walk(main):
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
+                found.add(node.value.value)
+        return found
+
+    def test_main_returns_only_the_documented_codes(self):
+        self.assertEqual(self._returns(), self.DOCUMENTED)
+
+    def test_the_module_docstring_documents_every_code_it_returns(self):
+        """The script's own header is the contract an operator reads first."""
+        source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
+        docstring = ast.get_docstring(ast.parse(source)) or ""
+
+        self.assertIn("Exit codes:", docstring)
+        for code in sorted(self._returns()):
+            with self.subTest(code=code):
+                self.assertRegex(docstring, rf"(?m)^\s+{code}\s")
+
+    def test_the_operator_guide_documents_the_same_codes(self):
+        """`AGENT.md` §6 states them for the operator. Two documents and one
+        program must not disagree about what the scheduled task will show."""
+        guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+        line = next(
+            item for item in guide.splitlines() if "`run_agent.py` 종료 코드" in item
+        )
+
+        for code in sorted(self._returns()):
+            with self.subTest(code=code):
+                self.assertIn(f"`{code}`", line)
+
+    def test_three_is_not_used_by_the_agent(self):
+        """docs/14 reserves 3 for "a person must look", shared by
+        `run_company_ops.py` and `ops_status.py`. An Agent that started
+        returning it would silently change what that number means."""
+        self.assertNotIn(3, self._returns())
+
+    def test_a_lock_skip_is_success_not_failure(self):
+        """The one mapping that is easy to get backwards, and the one the
+        Agent Lock report earlier this Sprint depends on being true: a run
+        that skipped because another holds the lock exits 0, which is why a
+        *stale* lock is invisible to Task Scheduler and needed reporting of
+        its own."""
+        source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+
+        skip_branch = None
+        for node in ast.walk(main):
+            if isinstance(node, ast.If) and "SKIPPED_ALREADY_RUNNING" in ast.dump(node.test):
+                skip_branch = node
+        self.assertIsNotNone(skip_branch, "the lock-skip branch moved or was renamed")
+
+        returns = [
+            child.value.value
+            for child in ast.walk(skip_branch)
+            if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant)
+        ]
+        self.assertEqual(returns, [0])
+
+    def test_a_failed_run_is_two_not_one(self):
+        """1 is configuration only — a run that never started. A FAILED run
+        did start and left recoverable work in the outbox, and collapsing
+        the two would tell an operator to check their environment when the
+        environment is fine."""
+        source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+
+        failed_branch = None
+        for node in ast.walk(main):
+            if isinstance(node, ast.If) and "AgentStatus" in ast.dump(node.test) \
+                    and "FAILED" in ast.dump(node.test):
+                failed_branch = node
+        self.assertIsNotNone(failed_branch, "the FAILED branch moved or was renamed")
+
+        returns = [
+            child.value.value
+            for child in ast.walk(failed_branch)
+            if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant)
+        ]
+        self.assertEqual(returns, [2])
+
+    def test_every_configuration_error_exits_one(self):
+        """Three separate paths reach it (bad profile, unusable sync folder,
+        unreadable/mismatched state). All three are the same answer to the
+        operator: nothing ran, fix the setup."""
+        source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+
+        handlers = [n for n in ast.walk(main) if isinstance(n, ast.ExceptHandler)]
+        self.assertGreaterEqual(len(handlers), 3, "expected the config/state handlers")
+        for handler in handlers:
+            returns = [
+                child.value.value
+                for child in ast.walk(handler)
+                if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant)
+            ]
+            if returns:
+                with self.subTest(handler=ast.dump(handler.type or ast.Constant(None))[:60]):
+                    self.assertEqual(returns, [1])
+
+
+class LockSkippedRunContractTests(unittest.TestCase):
+    """E-13: what a lock-skipped run reports — pinned, since nothing did.
+
+    docs/14 §7 states one half of this contract and not the other:
+
+        Lock을 얻지 못한 실행은 Manifest를 **쓰지 않는다.** 한 일이 없으므로
+        보고할 것이 없고, 실제로 일한 직전 실행의 기록을 빈 것으로 덮어쓰면
+        안 된다.
+
+    It does not say what the *process* returns. E-13 records that gap and
+    calls it documentation completeness rather than a bug, adding that the
+    behaviour "**이는 일관되며 테스트도 있다**".
+
+    Re-checked (C30): the exit code half had **no test**. Every existing
+    `_print_result()` test passes a completed run's result tuple; none passes
+    `None`, which is the lock-skip path. So the claim was about the
+    function's general coverage, not about this branch — the same shape C29
+    found in A-10, one level smaller.
+
+    Measured, and now asserted:
+
+        _print_result(None) -> 0, "[SKIPPED] …" on stdout, stderr empty
+
+    **Why the exit code matters more than "documentation completeness"
+    suggests.** This is the branch a *stale* lock makes permanent (BUG-42),
+    and the Runner is launched by Task Scheduler, whose only automatic health
+    signal is that number. A run that skips forever reports success forever —
+    which is exactly the reasoning C27 used for `run_agent.py`'s identical
+    branch, where the exit code was also unpinned until it was pinned.
+
+    Still SKIP for the fix: writing the code into docs/14 §7 is a spec edit.
+    This decides nothing; it stops the undocumented half from changing
+    unnoticed, and states in one place why it is worth documenting.
+    """
+
+    def _entrypoint(self):
+        import importlib
+
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            return importlib.import_module("run_company_ops")
+        finally:
+            sys.path.remove(str(REPO_ROOT))
+
+    def _skip_run(self):
+        import contextlib
+        import io
+
+        module = self._entrypoint()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = module._print_result(None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_lock_skipped_run_exits_zero(self):
+        code, _out, _err = self._skip_run()
+
+        self.assertEqual(code, 0)
+
+    def test_it_says_so_on_stdout_and_writes_nothing_to_stderr(self):
+        """A skip is not an error. Putting it on stderr would make every
+        contended run look like a failure to a log scraper."""
+        _code, out, err = self._skip_run()
+
+        self.assertIn("[SKIPPED]", out)
+        self.assertEqual(err, "")
+
+    def test_the_documented_half_really_is_documented(self):
+        """The premise of calling this a *gap*: §7 states the manifest rule
+        and says nothing about the exit code. If the spec ever gains the
+        second half, this fails and E-13 can be closed."""
+        spec = (REPO_ROOT / "docs" / "14_RUN_CONTRACT.md").read_text(encoding="utf-8")
+        section = spec.split("## 7.", 1)[1].split("\n## ", 1)[0]
+
+        self.assertIn("Manifest를 **쓰지 않는다.**", section)
+        self.assertNotIn("Exit", section)
+        self.assertNotIn("종료 코드", section)
+
+    def test_zero_is_not_reused_for_anything_that_did_work(self):
+        """0 means "nothing to report", and a run that *did* work only
+        reaches 0 through the manifest's own SUCCESS mapping. Two different
+        paths to the same number, both meaning "no action needed"."""
+        from runsummary import OverallStatus, exit_code_for
+
+        code, _out, _err = self._skip_run()
+
+        self.assertEqual(code, exit_code_for(OverallStatus.SUCCESS))
+
+    def test_the_agent_branch_agrees(self):
+        """`run_agent.py` has the identical branch and C27 pinned it at 0.
+        Two entrypoints, one meaning — if they ever disagree, an operator
+        watching Task Scheduler would learn the wrong lesson from whichever
+        they saw first."""
+        source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        skip_branch = next(
+            node
+            for node in ast.walk(main)
+            if isinstance(node, ast.If) and "SKIPPED_ALREADY_RUNNING" in ast.dump(node.test)
+        )
+        returns = [
+            child.value.value
+            for child in ast.walk(skip_branch)
+            if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant)
+        ]
+
+        code, _out, _err = self._skip_run()
+        self.assertEqual(returns, [code])
+
+
+class BackupLogFieldsThatReachAnArtifactTests(unittest.TestCase):
+    """E-14's mitigation claim, measured field by field.
+
+    E-14 records that the Backup Log (docs/08 §68-69) is unimplemented and
+    SKIPs it — writing `runtime/logs/backup/` is a new permanent artifact
+    path and docs/14 §2 fixes the Artifact Taxonomy. That reasoning holds.
+
+    What it also says, as the reason the gap is tolerable, is a *claim about
+    the code*:
+
+        §68의 9개 필드 중 타임스탬프 둘을 뺀 전부는 이미 Run Manifest의
+        `backup` component와 `backup_state.json`로 운영자에게 도달한다.
+
+    Measured (C30), that is not quite right. Of the nine fields:
+
+        run_id          the manifest carries its own, pinned equal elsewhere
+        backup_start    excluded by the claim
+        backup_end      excluded by the claim
+        final_status    recorded (`status`, and `backup_state.json`)
+        commit_hash     recorded (both paths, and `backup_state.json`)
+        changed_files   recorded as a COUNT, never the list
+        deleted_files   recorded as a COUNT, and only on the success path
+        push_result     recorded only as the FAILURE reason — a successful
+                        push records it nowhere
+        source          **recorded nowhere at all**
+
+    So the honest version is "six of nine reach an artifact, two of those six
+    only as a size, one only when it fails, and one never". `source` is the
+    field that says *which* Local Master a backup came from, which is the one
+    that matters on a machine that has more than one.
+
+    A second, separate reduction: C27 made failing components print their
+    metrics, and deliberately left successful ones silent. A successful
+    backup therefore reaches the *manifest file* but not the operator's
+    screen — `backup_state.json` (surfaced since C27) is what they see.
+
+    Still SKIP for the fix. This changes nothing about the decision; it
+    replaces a remembered summary with a checked one, so the cost of the gap
+    is not understated when the decision is finally made.
+    """
+
+    SPEC_FIELDS = (
+        "run_id", "backup_start", "source", "changed_files", "deleted_files",
+        "commit_hash", "push_result", "backup_end", "final_status",
+    )
+
+    def test_the_entry_still_carries_exactly_the_nine_spec_fields(self):
+        import dataclasses
+
+        from backup.log import BackupLogEntry
+
+        names = tuple(f.name for f in dataclasses.fields(BackupLogEntry))
+
+        self.assertEqual(names, self.SPEC_FIELDS)
+
+    def _recorded_metric_names(self):
+        """Metric keyword names the runner passes for the backup component."""
+        source = (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr not in {"ok", "failed"}:
+                continue
+            if not node.args or not (
+                isinstance(node.args[0], ast.Name) and node.args[0].id == "C_BACKUP"
+            ):
+                continue
+            names.update(kw.arg for kw in node.keywords if kw.arg)
+        return names
+
+    def test_source_reaches_no_artifact(self):
+        """The field E-14's summary implied was covered."""
+        recorded = self._recorded_metric_names()
+
+        self.assertNotIn("source", recorded)
+
+    def test_push_result_reaches_an_artifact_only_when_it_failed(self):
+        """It is passed as `reason` on the two failure paths and on neither
+        success path, so a successful push records it nowhere."""
+        source = (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+
+        self.assertIn("reason=backup_entry.push_result or \"\"", source)
+        self.assertNotIn("push_result=backup_entry.push_result", source)
+
+    def test_the_file_lists_are_recorded_as_sizes_not_contents(self):
+        """§68 asks for the fields; the manifest carries their lengths."""
+        source = (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+
+        self.assertIn("changed_files=len(backup_entry.changed_files)", source)
+        self.assertIn("deleted_files=len(backup_entry.deleted_files)", source)
+
+    def test_status_and_commit_hash_really_do_reach_an_artifact(self):
+        """The half of the claim that holds — asserted so the correction
+        cannot be read as "nothing reaches an artifact"."""
+        recorded = self._recorded_metric_names()
+
+        self.assertIn("commit_hash", recorded)
+        self.assertIn("status", recorded)
+
+    def test_backup_state_carries_the_durable_three(self):
+        import dataclasses
+
+        from backup.state import BackupState
+
+        names = {f.name for f in dataclasses.fields(BackupState)}
+
+        self.assertEqual(
+            names,
+            {"last_successful_backup", "last_backup_commit", "backup_status"},
+        )
+
+    def test_a_successful_backup_prints_none_of_this_to_the_operator(self):
+        """C27's deliberate choice, stated here because it is the second half
+        of "what reaches the operator": metrics print for failing components
+        only, so a successful backup is visible through `backup_state.json`
+        and nothing else."""
+        ops_status = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        self.assertIn("if component.status is ComponentStatus.SUCCESS:", ops_status)
+        self.assertIn("continue", ops_status)

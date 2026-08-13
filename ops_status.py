@@ -40,7 +40,8 @@ import os
 import subprocess
 import sys
 from datetime import date, datetime
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path, PurePosixPath
 
 # `line_buffering=True` keeps this script's own output in the order it was
 # written. Python block-buffers stdout when it is not a terminal and leaves
@@ -59,9 +60,21 @@ from agent.delivery import find_undelivered_events  # noqa: E402
 from agent.status import read_status  # noqa: E402
 from app.desktop_activity import read_company_activity  # noqa: E402
 from app.runner import DEFAULT_RUN_SUMMARY_PATH, PIPELINE_COMPONENTS  # noqa: E402
+from backup.state import BackupStateError  # noqa: E402
+from backup.state import load_state as load_backup_state  # noqa: E402
 from backup.working_copy import scan_for_secrets  # noqa: E402
+
+# The gate's own name list, not a second opinion about what a secret looks
+# like — same reason `_count_transport` reuses intake's parse test. A history
+# path is compared by its basename, exactly as `scan_for_secrets()` does.
+from backup.working_copy import _looks_like_secret  # noqa: E402
+
+# The scope set the Backup gate enforces, imported rather than restated so a
+# third scope directory is diagnosed without editing this file.
+from backup.working_copy import _ALLOWED_TOP_LEVEL_DIRS  # noqa: E402
+from history.file_repository import is_incomplete_write  # noqa: E402
 from history.reconciliation import find_orphaned_events  # noqa: E402
-from monthly import MonthlyStateError  # noqa: E402
+from monthly import MonthlyStateError, monthly_history_path  # noqa: E402
 from monthly import load_state as load_monthly_state  # noqa: E402
 from runsummary import (  # noqa: E402
     ComponentStatus,
@@ -74,6 +87,7 @@ from scheduler.consistency import (  # noqa: E402
     ConsistencyStatus,
     check_state_consistency,
 )
+from oplog import one_line  # noqa: E402
 from scheduler.lock import (  # noqa: E402
     is_locked,
     lock_held_since,
@@ -97,6 +111,18 @@ SILENT_AFTER_DAYS = 3
 # purpose — the cost of firing early is telling an operator to interrupt a
 # healthy long run.
 LOCK_STUCK_AFTER_HOURS = 2
+
+# The line `daily/markdown.py` writes for each rendered Candidate.
+# Kept as one constant because `_kept_but_not_rendered()` has to ask
+# exactly what the renderer answers — a looser test reported a
+# stranded Event as rendered (C30).
+_EVENT_ID_LINE_PREFIX = "- Event ID: "
+
+# Same sizing and the same measured reason as
+# `app/desktop_activity.py`, `history/reconciliation.py` and
+# `agent/delivery.py`: the cost of these scans is the file OPEN, and a
+# pool of 16 is where it plateaus on this machine.
+_READ_WORKERS = max(4, min(16, (os.cpu_count() or 4) * 2))
 
 
 def _would_reach_the_commit(working_copy: Path, candidates: tuple[str, ...]) -> tuple[str, ...]:
@@ -150,6 +176,245 @@ def _would_reach_the_commit(working_copy: Path, candidates: tuple[str, ...]) -> 
     )
 
 
+def _history_newer_than_the_last_backup(local_master: Path, last_backup: datetime | None):
+    """Company History files written after the last successful backup.
+
+    Answers the one question `ops_status.py` could not: **is what is on this
+    machine actually off it?** `backup_state.json` has held the answer since
+    the Backup step was written and nothing has ever read it —
+    `test_runner_failure_paths.py` says so in as many words about BUG-55:
+    "the one artifact that would betray it is `last_successful_backup` never
+    advancing, which nothing surfaces."
+
+    BUG-55 is exactly what this catches. `working_copy._is_in_scope()`
+    compares `parts[0]` against `{"daily", "monthly"}` case-sensitively, so a
+    `Daily/` directory — which docs/11 has a human create — is out of scope
+    on a filesystem that considers it the same directory. Measured, three
+    consecutive runs: `BACKUP_NOT_REQUIRED` every time, an empty remote, and
+    this view reporting "daily 파일: 1" with ATTENTION clear.
+
+    **A clock threshold would be the wrong instrument.** Company History that
+    has not changed does not need backing up, so "the last backup was N days
+    ago" is normal on a quiet week and would be a standing false alarm. The
+    condition that is never normal is *newer history than the last successful
+    push* — it clears the moment a backup succeeds and cannot fire while
+    nothing is being written.
+
+    Scanned by extension across the whole of Local Master rather than through
+    `_is_in_scope()`: reusing the scope predicate would inherit the very
+    case-sensitivity that causes BUG-55, and this check would go blind to the
+    defect it exists for. Staging files are excluded — an unfinished write is
+    not history (C27).
+    """
+    if not local_master.is_dir():
+        return []
+    candidates = [
+        path
+        for path in local_master.rglob("*.md")
+        if path.is_file() and not is_incomplete_write(path.name)
+    ]
+    if last_backup is None:
+        return sorted(candidates)
+    reference = last_backup
+    newer = []
+    for path in candidates:
+        try:
+            written = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+        except OSError:
+            continue
+        if reference.tzinfo is None:
+            written = written.replace(tzinfo=None)
+        if written > reference:
+            newer.append(path)
+    return sorted(newer)
+
+
+def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
+    """Secret-shaped paths that exist anywhere in this repository's history.
+
+    `_would_reach_the_commit()` answers "what will the NEXT commit carry".
+    The remote's history is a different question, and not asking it made the
+    Working Copy report clear for the wrong reason.
+
+    Measured: a `.env` holding a Notion token reached the remote (E-21), the
+    report fired, and then the operator did what the message leads to —
+    deleted the file. The warning went away. `git show HEAD:.env` on the
+    remote still returned the token in full. **The alert cleared because the
+    local file was gone, not because the exposure was.**
+
+    That is the one case where "the warning disappeared" is the most
+    dangerous possible answer, and it is exactly the case an operator is
+    most likely to produce, because deleting the file is the obvious move.
+
+    `rev-list --all --objects` is used rather than `log --name-only`: it
+    answers precisely "every path that has ever existed in history" and
+    measured cheapest of the three shapes tried — 0.19 s versus 0.34 s at
+    3,000 commits (about eight years of daily Company History), and
+    pathspec-bounded `log` was slowest of all because it forces a per-commit
+    diff. Cost grows with commits, which grow one per day.
+
+    **Unlike `_would_reach_the_commit()`, this is not free when clean**, and
+    that trade is deliberate rather than overlooked. That probe short-circuits
+    on an empty candidate list, so a healthy Working Copy costs no subprocess
+    at all; this one has to ask git before it knows there is nothing to say,
+    because the condition it reports is precisely the one where nothing is on
+    disk. Measured end to end on `main()`:
+
+        working copy commits    0      100     1,000    3,000
+        whole command        0.026s  0.085s   0.229s   0.369s
+
+    Sub-second at eight years of daily backups, on a command an operator runs
+    interactively. No cheaper query answers the question — the alternative is
+    not asking it, which is the state this function exists to end.
+
+    **This cannot fire on a healthy machine.** A Working Copy carrying
+    docs/08 §28's `.gitignore` never commits such a path, so history never
+    contains one. It appears only after a real exposure — which is why it is
+    allowed to stand in ATTENTION rather than being softened into a block
+    line: it is not the standing-alert-on-a-correct-machine shape C26
+    removed.
+
+    Fail-safe direction is the opposite of `_would_reach_the_commit()`'s, on
+    purpose. That probe filters a set it was handed, so failing open keeps a
+    real exposure visible. This one *adds* a claim about history; if git
+    cannot answer, asserting a leak would be inventing one. Silence returns
+    the report to exactly today's behaviour, and the present-file gate is
+    unaffected.
+
+    Known limit: it reads the local Working Copy's history. A Working Copy
+    re-created from scratch (docs/08 §30 permits it) has no old commits even
+    though the remote still does. Nothing here can see that without network
+    access to the remote, which this read-only view does not take.
+    """
+    if not working_copy.is_dir():
+        return ()
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--all", "--objects"],
+            cwd=working_copy,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0 or not result.stdout:
+        return ()
+    seen: set[str] = set()
+    for line in result.stdout.splitlines():
+        # `<oid>` for commits, `<oid> <path>` for everything with a name.
+        _, _, path = line.partition(" ")
+        path = path.strip()
+        if path and _looks_like_secret(PurePosixPath(path).name):
+            seen.add(path)
+    return tuple(sorted(seen))
+
+
+def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
+    """`(path, target)` for directory junctions inside the backup scope.
+
+    A-19/BUG-57 states the exposure; this states that it is happening. The
+    two are different, and only the second needs no decision.
+
+    Re-measured (C29) through the real sync, with a junction under `daily/`
+    pointing outside Local Master:
+
+        Path.is_symlink()            False   <- the sync's guard misses it
+        os.path.isjunction()         True    <- stdlib knows exactly
+        sync_to_working_copy() added daily/linked/notes.md,
+                                     daily/linked/private.md
+        scan_for_secrets(master)     ()      <- nothing flagged
+
+    So content that does not live under Local Master is copied into the
+    Working Copy and pushed, and the two existing guards both stay quiet:
+    `_relative_files()` excludes symlinks and a junction is not one, and the
+    secret scan only reacts to secret-*shaped names*. Ordinary files pass
+    silently.
+
+    **This reports; it does not refuse.** Whether a redirected History
+    directory is a legitimate layout is A-19's deployment decision — the
+    BACKLOG records that refusing it was implemented once and reverted for
+    exactly that reason, because redirecting `daily/` to another drive for
+    disk space is a real use. Nothing here changes what Backup copies.
+
+    Printed as a fact rather than raised as ATTENTION, following C26's rule:
+    on a deliberately redirected deployment no operator action would clear
+    it, and a permanent ATTENTION entry trains people to skim the section.
+    What the line gives is the one thing that was missing — that the
+    redirect exists, and where it points, so a junction nobody meant to
+    create is visible.
+
+    `os.path.isjunction()` is Python 3.12+; on anything older this reports
+    nothing rather than guessing.
+    """
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is None or not local_master.is_dir():
+        return ()
+    found: list[tuple[str, str]] = []
+    for name in sorted(_ALLOWED_TOP_LEVEL_DIRS):
+        scoped = local_master / name
+        if not scoped.exists():
+            continue
+        candidates = [scoped] + (
+            sorted(p for p in scoped.rglob("*")) if scoped.is_dir() else []
+        )
+        for path in candidates:
+            try:
+                if not isjunction(path):
+                    continue
+                target = os.path.realpath(path)
+            except OSError:
+                continue
+            found.append((str(path.relative_to(local_master)), target))
+    return tuple(found)
+
+
+def _misnamed_scope_directories(local_master: Path) -> tuple[tuple[str, str], ...]:
+    """`(actual, expected)` for directories that differ from an in-scope name
+    only by case.
+
+    Turns BUG-55 from "something is wrong" into "rename this directory".
+
+    `working_copy._is_in_scope()` compares the first path component against
+    `_ALLOWED_TOP_LEVEL_DIRS` exactly, while docs/11's deployment steps have a
+    human create those directories and Windows treats `Daily` and `daily` as
+    one. The result is a directory that every other part of the system —
+    including this view's own `daily 파일` count, which uses `glob()` — reads
+    happily, and that Backup silently never copies.
+
+    C27 made the consequence visible ("Company History that never reached the
+    remote"). What it could not say is *why*, so an operator had to notice the
+    capital letter in a filename and know what it meant. This names the fix.
+
+    The allowed set is imported from the module that enforces it rather than
+    restated, so a third scope directory would be diagnosed without touching
+    this function.
+
+    Detection only. Case-folding the comparison in `_is_in_scope()` is BUG-55's
+    own open decision — it changes which files Backup covers — and renaming a
+    directory under Local Master is an operator action this code must not take
+    (docs/08 §13/§46: Company History is never rewritten by the program).
+    """
+    if not local_master.is_dir():
+        return ()
+    found: list[tuple[str, str]] = []
+    try:
+        entries = sorted(local_master.iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.is_dir() or entry.name in _ALLOWED_TOP_LEVEL_DIRS:
+            continue
+        folded = entry.name.casefold()
+        for allowed in sorted(_ALLOWED_TOP_LEVEL_DIRS):
+            if folded == allowed.casefold():
+                found.append((entry.name, allowed))
+                break
+    return tuple(found)
+
+
 def _split_reviewed(review_dir: Path) -> tuple[int, int]:
     """(not yet reviewed, already reviewed) in `review/`.
 
@@ -173,6 +438,13 @@ def _split_reviewed(review_dir: Path) -> tuple[int, int]:
         return (0, 0)
     waiting = reviewed = 0
     for path in sorted(review_dir.glob("*.json")):
+        if is_incomplete_write(path.name):
+            # `FileHistoryRepository.save()` stages into this directory, so a
+            # killed run leaves a `.tmp-…json` here. Counting it as "not yet
+            # reviewed" would put a person-shaped alert on a file no person
+            # can review — the alert-that-cannot-clear this function's own
+            # docstring exists to avoid.
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, RecursionError):
@@ -208,6 +480,193 @@ def _agent_start_date() -> date | None:
         return date.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _history_start_date() -> date | None:
+    """`COMPANY_OPS_HISTORY_START_DATE`, or None when unset/unparseable.
+
+    Byte-for-byte the shape of `_agent_start_date()` directly above, and that
+    is the point. BACKLOG recorded this detection as blocked on a decision —
+    *"설정이 없을 때 무엇을 보고할지가 또 하나의 판단"* — but this module had
+    already made that decision twice, for `COMPANY_OPS_AGENT_START_DATE` and
+    `COMPANY_OPS_AGENT_SYNC_FOLDER`: read it, and when it is not there say so
+    and skip the computation rather than guessing or alerting.
+
+    Applying an answer this file already gives is not a new policy. What was
+    missing was noticing that the answer existed.
+    """
+    raw = os.environ.get("COMPANY_OPS_HISTORY_START_DATE")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _read_keep_candidates(
+    keep_dir: Path,
+) -> tuple[tuple[tuple[str, str, date], ...], tuple[str, ...]]:
+    """`(stem, event_id, date)` for every readable KEEP Candidate, read once.
+
+    Two checks need these files — `_candidates_before()` (BUG-46) and
+    `_kept_but_not_rendered()` (E-17) — and reading them twice was measured,
+    cold, at 24.3 s for 5,000 Candidates. Warm it was 0.28 s, an 87x
+    difference: the cost is the file *open*, exactly as this repository's
+    `_READ_WORKERS` comments have said since C21, and exactly the bias C27
+    caught in the old thread-pool figures. So both numbers here are cold,
+    each on its own freshly written tree.
+
+    Two minimal changes, both reusing what is already here rather than new
+    machinery:
+
+      * read once and share, instead of once per check;
+      * the same `ThreadPoolExecutor` + `_READ_WORKERS` idiom that
+        `app/desktop_activity.py`, `history/reconciliation.py` and
+        `agent/delivery.py` already use for the identical reason.
+
+    Measured cold at 5,000 Candidates / 730 Daily files:
+
+        both checks, serial, reading separately     24.3 s
+        both checks, shared threaded read            5.9 s
+
+    `FileHistoryRepository.list()` is still not used: it raises on the first
+    unreadable Candidate (BUG-38), which would take the whole status view
+    down. A Candidate that cannot be parsed is dropped here rather than
+    guessed at — neither check can claim a fact about a file it could not
+    read.
+    """
+    if not keep_dir.is_dir():
+        return (), ()
+    paths = [
+        path
+        for path in sorted(keep_dir.glob("*.json"))
+        if not is_incomplete_write(path.name)
+    ]
+    if not paths:
+        return (), ()
+
+    def _read(path: Path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            when = datetime.fromisoformat(data["timestamp"]).date()
+            event_id = data["event_id"]
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            return None
+        if not isinstance(event_id, str):
+            return None
+        return (path.stem, event_id, when)
+
+    with ThreadPoolExecutor(max_workers=_READ_WORKERS) as pool:
+        # `map` preserves input order, so the sorted-filename ordering of the
+        # results is identical to the serial version's.
+        results = list(pool.map(_read, paths))
+    parsed = tuple(item for item in results if item is not None)
+    unreadable = tuple(
+        path.name for path, item in zip(paths, results) if item is None
+    )
+    return parsed, unreadable
+
+
+def _candidates_before(candidates: tuple[tuple[str, str, date], ...], start: date) -> tuple[str, ...]:
+    """KEEP Candidates dated before `start` — stored, and unrenderable.
+
+    BUG-46's permanent half. C22 measured that the description was wider than
+    the defect: a Candidate dated in the *future* is only delayed (the
+    Scheduler renders it once that date is yesterday), but one dated before
+    `history_start_date` is permanent, because the Scheduler never goes
+    earlier than that date. `find_orphaned_events()` reports clean for these
+    — correctly, the Candidate exists — so nothing anywhere says the Event
+    will never appear in Company History.
+
+    Reachable through ordinary misconfiguration rather than corruption: a
+    Desktop whose `COMPANY_OPS_AGENT_START_DATE` is earlier than Desktop 4's
+    `COMPANY_OPS_HISTORY_START_DATE` delivers Events for dates Desktop 4 will
+    never render, and every step reports success.
+
+    `FileHistoryRepository.list()` is deliberately not used, for the reason
+    `_split_reviewed()` gives: it raises on the first unreadable Candidate
+    (BUG-38), which would take the whole status view down. A Candidate whose
+    date cannot be read is skipped rather than guessed at — this function
+    reports a fact, and an unreadable file is not evidence of one.
+    """
+    return tuple(
+        f"{stem} ({when.isoformat()})"
+        for stem, _event_id, when in candidates
+        if when < start
+    )
+
+
+def _kept_but_not_rendered(
+    candidates: tuple[tuple[str, str, date], ...], daily_dir: Path
+) -> tuple[str, ...]:
+    """KEEP Candidates whose date **has** a Daily file that does not carry them.
+
+    E-17's data loss, made visible. Its own measurement ends with the
+    sentence that matters: *"파일을 고쳐도 아무 일도 일어나지 않고, 모든 지표가
+    정상을 보고하는 채로 Company History에 Event 하나가 비어 있다."* Nothing
+    reported it, so nobody could act on it.
+
+    **The verdict is decidable between runs, which is why this needs no
+    policy decision.** Step 5 writes Candidates, step 6 renders the dates the
+    Scheduler closed, and step 6.5 merges anything landing on an
+    already-closed date — all in one run. So once a run has finished, a
+    Candidate whose Daily file *exists* and does not contain its `event_id`
+    was not merged, and nothing will retry it: step 6.5's target dates are
+    only the ones this run collected (`kept_dates`), so a later run has no
+    reason to look at that date again.
+
+    A Candidate whose Daily file does **not** exist is excluded — it is
+    simply not rendered yet (the Scheduler window), or it predates
+    `history_start_date`, which `_candidates_before()` reports on its own
+    terms.
+
+    The one window where this can read false is the same one
+    `find_orphaned_events()` documents: a Runner part-way between step 5 and
+    step 6.5. Handled the same way — the caller appends a "Runner is running"
+    note rather than suppressing the list, because a real loss hidden behind
+    "probably just running" is far worse than a caveat.
+
+    Verified on this machine's own runtime before being written: 13 of 14
+    stored Candidates were present in their Daily file, and the fourteenth
+    was genuinely absent — E-17's shape, sitting there unreported.
+
+    Daily files are read once per date rather than once per Candidate, and
+    matching is on `event_id` because that is what `daily/markdown.py` writes
+    (`- Event ID: {candidate.event_id}`).
+    """
+    if not daily_dir.is_dir():
+        return ()
+    by_date: dict[str, list[str]] = {}
+    for _stem, event_id, when in candidates:
+        by_date.setdefault(when.isoformat(), []).append(event_id)
+
+    stranded: list[str] = []
+    for when, event_ids in sorted(by_date.items()):
+        rendered = daily_dir / f"{when}.md"
+        if not rendered.is_file():
+            continue
+        try:
+            text = rendered.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        # Whole lines, not a substring search. `E-1` is a substring of the
+        # line rendered for `E-10`, so a substring test reported a genuinely
+        # stranded `E-1` as fine — measured, with ordinary sequential ids and
+        # no crafted input. The renderer writes exactly
+        # `- Event ID: {event_id}` (daily/markdown.py), so comparing whole
+        # lines asks the same question the renderer answers.
+        rendered_ids = {
+            line.strip()[len(_EVENT_ID_LINE_PREFIX):]
+            for line in text.splitlines()
+            if line.strip().startswith(_EVENT_ID_LINE_PREFIX)
+        }
+        stranded.extend(
+            f"{event_id} ({when})"
+            for event_id in event_ids
+            if event_id not in rendered_ids
+        )
+    return tuple(stranded)
 
 
 def _source_note(*breakdowns) -> str:
@@ -286,8 +745,19 @@ def _print_company(now: datetime) -> list[str]:
         f"  backlog: transport={backlog.awaiting_intake} "
         f"incoming={backlog.awaiting_collection} rejected={backlog.rejected}"
         + (f" unparseable={backlog.unparseable}" if backlog.unparseable else "")
+        + (
+            f" unreadable_incoming={backlog.unreadable_incoming}"
+            if backlog.unreadable_incoming
+            else ""
+        )
         + (f" future_dated={backlog.future_dated}" if backlog.future_dated else "")
         + (f" name_collision={backlog.name_collision}" if backlog.name_collision else "")
+        + (f" incomplete={backlog.incomplete}" if backlog.incomplete else "")
+        + (
+            f" already_collected={backlog.already_collected}"
+            if backlog.already_collected
+            else ""
+        )
     )
     # Who each pile came from (BACKLOG E-10). The counts above are the
     # authority and are unchanged; these lines only answer "which Desktop",
@@ -333,14 +803,54 @@ def _print_company(now: datetime) -> list[str]:
             + _source_note(backlog.rejected_sources)
             + " — 사람이 확인해야 한다"
         )
-    if backlog.unparseable:
+    if backlog.unparseable or backlog.unreadable_incoming:
         # Reported for the right reason. These used to be counted as
         # "awaiting intake", which said an Event was queued for collection
         # when in fact it had been judged unparseable and would never be
         # collected — a standing alert no run could clear.
+        #
+        # `incoming/`의 같은 조건을 같은 줄에 넣는다. 운영자에게는 하나의
+        # 사실이기 때문이다 — "읽을 수 없는 파일이 파이프라인 어딘가에
+        # 박혀 있고, 어떤 실행도 그것을 움직이지 못한다". 두 단계가 각각
+        # 자기 술어로 판정하지만(intake는 JSON까지, Collector는 디코딩까지)
+        # 결과는 같다: 사람이 옮기거나 지워야 한다.
+        where = []
+        if backlog.unparseable:
+            where.append(f"transport {backlog.unparseable}건")
+        if backlog.unreadable_incoming:
+            where.append(f"incoming {backlog.unreadable_incoming}건")
         attention.append(
-            f"transport에 읽을 수 없는 파일 {backlog.unparseable}건 — 수집되지 않으며 "
+            f"읽을 수 없는 파일 {' / '.join(where)} — 수집되지 않으며 "
             f"다음 실행에서도 그대로다. 사람이 확인해 옮기거나 지워야 한다"
+        )
+    if backlog.already_collected:
+        # Not ATTENTION: the twin was confirmed to carry the same event_id,
+        # so this is the outbox re-sending after a crash mid-send — designed
+        # behaviour needing no action. Printed anyway, because otherwise a
+        # file sits in transport/ forever with nothing saying why.
+        print(
+            f"           transport에 이미 수집된 Event {backlog.already_collected}건 "
+            f"— 재전송된 중복이며 승격되지 않는다(정상)"
+        )
+    if backlog.suppressed:
+        # The dangerous half of the same skip, and the reason the benign half
+        # could be taken out of ATTENTION at all.
+        attention.append(
+            f"transport의 Event {backlog.suppressed}건이 같은 이름의 다른 파일에 막혀 "
+            f"승격되지 않는다 — 그 파일은 같은 Event가 아니다(디렉터리·0바이트·다른 "
+            f"event_id). 재실행으로 해결되지 않으며 전달되지 않은 Event다 "
+            f"(BACKLOG BUG-53/BUG-47)"
+        )
+    if backlog.incomplete:
+        # A write this pipeline started and never finished (killed between
+        # `mkstemp` and `os.replace`). Named, not merely counted, because the
+        # operator action is the opposite of every other line here: these are
+        # not Events waiting for something, they are garbage, and deleting
+        # them is both safe and the only thing that clears this line.
+        attention.append(
+            f"transport에 완료되지 않은 쓰기 잔여물 {backlog.incomplete}건 "
+            f"(.tmp-*.json) — 중단된 실행이 남긴 것으로 Event가 아니다. "
+            f"수집되지 않으며 지워도 안전하다"
         )
     if snapshot.unreadable_events:
         attention.append(
@@ -363,8 +873,21 @@ def _print_history(now: datetime) -> list[str]:
     daily_dir = local_master / "daily"
     monthly_dir = local_master / "monthly"
 
-    daily_count = len(list(daily_dir.glob("*.md"))) if daily_dir.is_dir() else 0
-    monthly_files = sorted(p.stem for p in monthly_dir.glob("*.md")) if monthly_dir.is_dir() else []
+    # `.tmp-*.md` is a Daily/Monthly generator write that never committed, not
+    # a day or a month of Company History. Excluded here for the same reason
+    # `backup.working_copy` excludes it from backup scope: counting it would
+    # report history this project does not have, and for `monthly_files` the
+    # `stem` of one would be displayed as if it were a month.
+    daily_count = (
+        sum(1 for p in daily_dir.glob("*.md") if not is_incomplete_write(p.name))
+        if daily_dir.is_dir()
+        else 0
+    )
+    monthly_files = (
+        sorted(p.stem for p in monthly_dir.glob("*.md") if not is_incomplete_write(p.name))
+        if monthly_dir.is_dir()
+        else []
+    )
 
     # Candidates parked for a human. `HistoryFilter` sends BLOCKED /
     # COMPLETED / CANCELLED here (docs/05 §24), and nothing in the pipeline
@@ -395,6 +918,14 @@ def _print_history(now: datetime) -> list[str]:
     review_waiting, review_done = _split_reviewed(review_dir)
     review_count = review_waiting + review_done
 
+    # BUG-46's permanent half: Candidates the Scheduler will never reach.
+    # Unset variable -> say so and compute nothing, exactly as this file
+    # already does for the two Agent variables.
+    keep_dir = RUNTIME_DIR / "history_candidates" / "keep"
+    keep_candidates, unreadable_candidates = _read_keep_candidates(keep_dir)
+    history_start = _history_start_date()
+    stranded = _candidates_before(keep_candidates, history_start) if history_start else ()
+
     print("HISTORY — Company Repository")
     print("-" * 60)
     print(f"  daily 파일          : {daily_count}")
@@ -405,6 +936,62 @@ def _print_history(now: datetime) -> list[str]:
         f"  검토 대기 Candidate : {review_count}"
         + (f" (미검토 {review_waiting} / 검토됨 {review_done})" if review_done else "")
     )
+    if history_start is None:
+        print("  (COMPANY_OPS_HISTORY_START_DATE 미설정 — 시작일 이전 Candidate는 "
+              "계산되지 않음)")
+    elif stranded:
+        print(f"  시작일 이전 Candidate: {len(stranded)}")
+        attention.append(
+            f"Company History 시작일({history_start.isoformat()})보다 이른 KEEP "
+            f"Candidate {len(stranded)}건: {', '.join(stranded[:5])}"
+            f"{' 외' if len(stranded) > 5 else ''} — Scheduler는 시작일 이전으로 "
+            f"가지 않으므로 이 Event들은 **어떤 실행에서도** Daily History에 "
+            f"들어가지 않는다. 보내는 Desktop의 COMPANY_OPS_AGENT_START_DATE가 "
+            f"이 시작일보다 이르면 그 차이가 원인이다(BACKLOG BUG-46)"
+        )
+    # A Candidate neither check could read. Both of them drop such a file —
+    # neither can claim a fact about bytes it could not parse — so without
+    # this line it is reported by nothing, while "Candidate 정합성: OK" sits
+    # two lines below.
+    #
+    # The consequence is wider than "the next Scheduler step fails", which is
+    # what this line said when C28 added it. Measured (C29): the Scheduler
+    # builds its keep index **once per batch, before the date loop**, so one
+    # unreadable Candidate stops *every* date, not only its own.
+    #
+    #     no corruption          COMPLETED, 9 dates generated, 9 Daily files
+    #     one corrupt Candidate  FAILED,    0 dates generated, 0 Daily files
+    #
+    # That is true of a Candidate whose JSON will not parse (BUG-38) and of
+    # one whose `timestamp` will not parse (A-7) — the index reads both.
+    # Company History stops advancing entirely until a human moves the file.
+    if unreadable_candidates:
+        print(f"  읽을 수 없는 Candidate: {len(unreadable_candidates)}")
+        attention.append(
+            f"읽을 수 없는 KEEP Candidate {len(unreadable_candidates)}건: "
+            f"{', '.join(unreadable_candidates[:5])}"
+            f"{' 외' if len(unreadable_candidates) > 5 else ''} — Scheduler는 "
+            f"배치마다 keep 인덱스를 **한 번** 만들므로 이 파일 하나 때문에 "
+            f"**모든 날짜의** Daily History 생성이 멈춘다(실측: 9일치 → 0일치). "
+            f"사람이 확인해 옮기거나 고쳐야 한다(BACKLOG A-7 / BUG-38)"
+        )
+
+    # E-17: stored as Company History, absent from the day it belongs to.
+    unrendered = _kept_but_not_rendered(keep_candidates, daily_dir)
+    if unrendered:
+        print(f"  Daily 미반영 KEEP   : {len(unrendered)}")
+        running = (
+            " (Runner 실행 중 — 완료 후 재확인 권장)"
+            if is_locked(_runner_lock_path())
+            else ""
+        )
+        attention.append(
+            f"KEEP Candidate {len(unrendered)}건이 저장돼 있는데 그 날짜의 Daily "
+            f"History에 없다: {', '.join(unrendered[:5])}"
+            f"{' 외' if len(unrendered) > 5 else ''} — 그 날짜는 이미 렌더링됐고 "
+            f"Late Event 병합은 재시도되지 않으므로(BACKLOG E-17) 어떤 실행도 "
+            f"이것을 넣지 않는다. 사람이 확인해야 한다{running}"
+        )
     if review_waiting:
         attention.append(
             f"사람 검토를 기다리는 History Candidate {review_waiting}건 "
@@ -412,6 +999,55 @@ def _print_history(now: datetime) -> list[str]:
             f"자동 규칙으로 판정하지 않는다(docs/05 §24). 이 건들은 아직 Company "
             f"History에 없고 어떤 실행도 넣지 않는다(BACKLOG E-20)"
         )
+
+    # Is Company History actually off this machine? Read-only, from state the
+    # Backup step already writes — no new artifact and no new decision.
+    try:
+        backup_state = load_backup_state(RUNTIME_DIR / "state" / "backup_state.json")
+    except BackupStateError as exc:
+        print("  마지막 성공 백업    : 읽을 수 없음")
+        attention.append(f"backup state 파일이 손상됨: {exc}")
+        backup_state = None
+    if backup_state is not None:
+        last_backup = backup_state.last_successful_backup
+        print(
+            f"  마지막 성공 백업    : "
+            f"{last_backup.isoformat(timespec='seconds') if last_backup else '아직 없음'}"
+            + (f" ({backup_state.backup_status.value})" if backup_state.backup_status else "")
+        )
+        unbacked = _history_newer_than_the_last_backup(local_master, last_backup)
+        if unbacked:
+            names = ", ".join(str(p.relative_to(local_master)) for p in unbacked[:5])
+            attention.append(
+                f"원격 백업에 도달하지 않은 Company History {len(unbacked)}건: {names}"
+                f"{' 외' if len(unbacked) > 5 else ''} — "
+                + (
+                    "이 머신에서 한 번도 백업이 성공한 적이 없다"
+                    if last_backup is None
+                    else f"마지막 성공 백업({last_backup.isoformat(timespec='seconds')}) "
+                    f"이후에 쓰였다"
+                )
+                + ". Backup이 SUCCESS/NOT_REQUIRED를 보고하고 있어도 이 파일들은 "
+                "이 머신에만 있다"
+            )
+
+        # Redirected History directories, stated as a fact (A-19). Not an
+        # alert: whether the redirect is legitimate is a deployment decision,
+        # and on a machine that meant it no action would ever clear the line.
+        for where, target in _junctions_in_scope(local_master):
+            print(f"           junction {where} -> {target}")
+
+        # ...and, when it is the case-fold cause, say exactly what to rename.
+        # Without this the operator has to notice a capital letter in a
+        # filename and know what it means.
+        for actual, expected in _misnamed_scope_directories(local_master):
+            attention.append(
+                f"Local Master의 `{actual}/`는 백업 범위 밖이다 — Backup은 "
+                f"`{expected}/`만 본다(docs/08 §26, 대소문자 구분). 이 디렉터리의 "
+                f"Company History는 한 번도 백업되지 않으며 Backup은 계속 "
+                f"SUCCESS/NOT_REQUIRED를 보고한다. `{expected}/`로 이름을 바꿔야 "
+                f"한다(BACKLOG BUG-55)"
+            )
 
     try:
         state = load_monthly_state(RUNTIME_DIR / "state" / "monthly_history_state.json")
@@ -440,6 +1076,47 @@ def _print_history(now: datetime) -> list[str]:
         )
     elif consistency.status is ConsistencyStatus.STATE_UNREADABLE:
         attention.append(f"Daily State를 읽을 수 없다: {consistency.detail}")
+
+    # The same §48 check, aimed at the pair nobody aimed it at.
+    #
+    # `check_state_consistency()` compares Scheduler state against the Daily
+    # file it claims exists. `monthly_history_state.json` makes the identical
+    # kind of claim — `last_successful_monthly_close` says "this month is
+    # consolidated" — and nothing compared it to anything. §48 does not say
+    # "daily only".
+    #
+    # It cannot be a false alarm. The pointer advances on exactly two
+    # outcomes, `MONTHLY_GENERATED` (the file was just written) and
+    # `MONTHLY_UNCHANGED` (the file was already there), so the file existed
+    # at the moment the pointer was set. Missing now means it was lost
+    # afterwards — and `run_once()` will never revisit that month, because
+    # `pending_months()` starts after the pointer.
+    #
+    # Measured, `last_successful_monthly_close="2026-07"` with the file
+    # removed: `monthly_run_once()` returned no results at all, the view
+    # printed "monthly 파일: 0" and "마지막 통합한 달: 2026-07" two lines
+    # apart, and ATTENTION was empty. A month of Company History was gone
+    # with every indicator healthy.
+    #
+    # Detection only, like every other check in this block. Regenerating it
+    # is docs/10 §46's prohibition ("프로그램이 임의로 ... 다시 생성하면 안
+    # 된다") and §49's operator call.
+    #
+    # Scope matches §48's exactly — the watermark month, not every month
+    # below it. An earlier month lost while the pointer moved on is the same
+    # limitation the Daily check has, and widening it here would be
+    # inventing scope rather than applying the spec's.
+    closed = state.last_successful_monthly_close
+    if closed is not None:
+        expected_monthly = monthly_history_path(monthly_dir, closed)
+        if not expected_monthly.is_file():
+            print(f"  monthly state 정합성: STATE_INCONSISTENCY ({closed}.md 없음)")
+            attention.append(
+                f"Monthly State와 실제 History가 어긋난다: state는 {closed}을 "
+                f"통합 완료로 기록하지만 {expected_monthly}가 없다 — 어떤 실행도 "
+                f"그 달을 다시 만들지 않는다(pending_months()가 이 포인터 다음부터 "
+                f"시작한다). 사람이 확인해야 한다"
+            )
 
     # BACKLOG A-20: an Event consumed by the Collector whose History
     # Candidate was never written is lost from Company History permanently —
@@ -514,16 +1191,128 @@ def _print_history(now: datetime) -> list[str]:
                 f"{' 외' if len(exposed) > 5 else ''} — Backup은 Local Master만 "
                 f"검사하고 git은 이 파일들을 무시하지 않으므로 `git add -A`로 "
                 f"원격에 올라간다(BACKLOG E-21). 이미 push됐다면 자격증명 교체가 "
-                f"필요하다"
+                f"필요하다 — 파일을 지우는 것만으로는 원격 history에서 사라지지 "
+                f"않는다"
+            )
+
+        # What the history already carries, which deleting the file does not
+        # change. Reported separately because the action is different: the
+        # line above is "stop it from going out", this one is "it is already
+        # out". Measured — the file-present warning cleared the moment the
+        # operator deleted it, while `git show HEAD:.env` on the remote still
+        # returned the token.
+        leaked = _secrets_ever_committed(working_copy)
+        if leaked:
+            attention.append(
+                f"Backup 원격 history에 이미 들어간 Secret 형태 경로 {len(leaked)}건: "
+                f"{', '.join(leaked[:5])}"
+                f"{' 외' if len(leaked) > 5 else ''} — 파일을 지워도, 지금 Working "
+                f"Copy에 없어도 원격 history에는 남아 있다. 해당 자격증명을 "
+                f"**교체**해야 하며, 이 줄은 history를 다시 쓰기 전까지 사라지지 "
+                f"않는다(BACKLOG E-21)"
+            )
+
+        # Staging files that reached the Working Copy and are carried by git.
+        #
+        # This exists because of what C27 changed, not in spite of it.
+        # `working_copy._is_in_scope()` now excludes `.tmp-*`, which removes
+        # the trap where cleaning up such a file armed a permanent
+        # BACKUP_FAILED (the deletion gate). But exclusion cuts both ways:
+        # a staging file that was already synced and committed by the
+        # pre-C27 code is now outside `_relative_files()` on BOTH sides, so
+        # `sync_to_working_copy()` reports nothing about it, ever.
+        #
+        # Measured, a `daily/.tmp-abc123.md` holding a truncated day already
+        # in the commit: sync returned added/modified/deleted all empty,
+        # `scan_for_secrets()` found nothing (it is not secret-shaped), and
+        # ATTENTION was empty — truncated Company History sitting in the
+        # backup remote with no trace anywhere.
+        #
+        # That is the failure mode C24 and C26 are about, produced by this
+        # Sprint's own fix. A change that removes a bad signal owes a good
+        # one in its place.
+        #
+        # Same git-aware probe as above, for the same reason: only files git
+        # actually carries are reported, so a `.gitignore` that covers them
+        # makes this silent. Deleting them is safe and is what clears it —
+        # they are not Company History, and Master's copy (if any) is
+        # untouched.
+        # `.git/` is skipped. It is git's own storage, not Working Copy
+        # content, and `git ls-files` never lists anything inside it — so on
+        # the normal path those entries would be filtered out anyway. The
+        # reason to skip them here rather than rely on that: when git cannot
+        # answer, `_would_reach_the_commit()` fails safe by returning the
+        # candidates unchanged, and on a real repository with a missing or
+        # timed-out git that would report git's internals as residue. It is
+        # also 93% of the walk on this machine's Working Copy today (90 of
+        # 97 files), and that share only grows as backup history accumulates.
+        residue = _would_reach_the_commit(
+            working_copy,
+            tuple(
+                sorted(
+                    str(path.relative_to(working_copy))
+                    for path in working_copy.rglob("*")
+                    if ".git" not in path.parts
+                    and path.is_file()
+                    and is_incomplete_write(path.name)
+                )
+            ),
+        )
+        if residue:
+            attention.append(
+                f"Backup Working Copy에 완료되지 않은 쓰기 잔여물 {len(residue)}건: "
+                f"{', '.join(residue[:5])}"
+                f"{' 외' if len(residue) > 5 else ''} — 중단된 실행이 남긴 것으로 "
+                f"Company History가 아니다. git이 커밋 대상으로 들고 있으므로 "
+                f"원격에 잘린 내용이 들어간다. 지워도 안전하다"
             )
 
     print(f"  마지막 통합한 달    : {state.last_successful_monthly_close}")
     if state.dirty_months:
         print(f"  재생성 대기         : {', '.join(state.dirty_months)}")
-        attention.append(
-            f"Late Event로 다시 만들어야 할 달: {', '.join(state.dirty_months)} "
-            f"(다음 Runner 실행에서 자동 처리된다)"
-        )
+
+        # "자동 처리된다" is true of every dirty month except one kind, and
+        # for that kind it is a false statement in ATTENTION.
+        #
+        # `monthly/generator.py`'s dirty loop refuses a month that predates
+        # `history_start_date` (§85-86: never invent a month the system does
+        # not cover), returns MONTHLY_PENDING, and **deliberately leaves the
+        # flag in place** — its own comment says silently forgetting it
+        # "would hide a state file that needs a person". The Runner then
+        # classifies PENDING as not-a-failure (correct for the ordinary case,
+        # where Daily Catch-up will fill a gap), logs one line to
+        # `late_update.log`, and moves on. Nothing reads that log, so the
+        # person it was left for never hears about it.
+        #
+        # Reachable through a hand-edited or restored state file, which is a
+        # DR path rather than a corruption. Unblocked here by the same
+        # `_history_start_date()` that unblocked BUG-46 — one decision was
+        # holding two detections.
+        unresolvable: list[str] = []
+        if history_start is not None:
+            first_month = (history_start.year, history_start.month)
+            for key in state.dirty_months:
+                try:
+                    year, month = (int(part) for part in key.split("-", 1))
+                except ValueError:
+                    continue
+                if (year, month) < first_month:
+                    unresolvable.append(key)
+
+        automatic = [key for key in state.dirty_months if key not in unresolvable]
+        if automatic:
+            attention.append(
+                f"Late Event로 다시 만들어야 할 달: {', '.join(automatic)} "
+                f"(다음 Runner 실행에서 자동 처리된다)"
+            )
+        if unresolvable:
+            attention.append(
+                f"재생성 대기로 남아 있지만 **어떤 실행도 처리할 수 없는** 달: "
+                f"{', '.join(unresolvable)} — Company History 시작일"
+                f"({history_start.isoformat()}) 이전이라 Monthly 생성이 거부되고"
+                f"(docs/09 §85-86) 플래그는 그대로 남는다. state 파일을 사람이 "
+                f"확인해야 한다"
+            )
 
     # A month that closed but was never consolidated is the one case worth
     # flagging: it means Daily Coverage never became COMPLETE for it.
@@ -542,6 +1331,16 @@ def _print_history(now: datetime) -> list[str]:
         )
 
     return attention
+
+
+def _agent_lock_path() -> Path:
+    """The Agent's own lock — NOT the Runner's.
+
+    `agent/agent.py` reuses `scheduler.lock` unchanged but against
+    `runtime/agent/locks/agent.lock`, deliberately a different file: the two
+    protect different critical sections and run on different machines.
+    """
+    return AGENT_DIR / "locks" / "agent.lock"
 
 
 def _print_agent(now: datetime) -> list[str]:
@@ -613,10 +1412,57 @@ def _print_agent(now: datetime) -> list[str]:
     if snapshot.pending_dates and _agent_start_date() is None:
         print("  (COMPANY_OPS_AGENT_START_DATE 미설정 — 미수집 날짜는 계산되지 않음)")
 
-    return list(snapshot.needs_attention(now)) + delivery_attention
+    # The same two lock conditions `_print_last_run()` reports for the
+    # Runner, against the Agent's own lock file — which nothing reported.
+    #
+    # The asymmetry mattered more than it looked. A stuck Runner lock stops
+    # Desktop 4; a stuck Agent lock stops a Desktop that *produces* Company
+    # History, and `run_agent.py` returns **exit 0** for
+    # `SKIPPED_ALREADY_RUNNING` (its own module docstring: "0 COMPLETED, or
+    # skipped because another Agent run holds the lock"). So Task Scheduler
+    # records success on every run while the Agent collects nothing.
+    #
+    # Measured: a lock file recording a dead pid, made read-only —
+    # `stale_lock_cannot_be_cleared()` returns True, and the AGENT section
+    # printed nothing about it. The only trace was `needs_attention()`'s
+    # "agent has not run for N day(s)", which needs N days to appear and
+    # names a symptom rather than the cause.
+    #
+    # Read-only, decides nothing, takes nothing — `is_locked()` /
+    # `lock_held_since()` / `stale_lock_cannot_be_cleared()` are the
+    # non-competing readers, and this script promises it is safe to run
+    # while an Agent works.
+    lock_attention: list[str] = []
+    agent_lock = _agent_lock_path()
+    if stale_lock_cannot_be_cleared(agent_lock):
+        print("  Agent Lock          : 남아 있으나 제거할 수 없음 (읽기 전용)")
+        lock_attention.append(
+            f"Agent Lock 파일이 남아 있고 제거할 수 없다 ({agent_lock}) — 기록된 "
+            f"프로세스는 이미 종료됐지만 파일이 읽기 전용이라 어떤 실행도 인수하지 "
+            f"못한다. 모든 Agent 실행이 '다른 Agent 실행 중'으로 조용히 건너뛰어지고 "
+            f"exit code는 0이다. 사람이 파일을 확인해 지워야 한다"
+        )
+    else:
+        agent_held_since = lock_held_since(agent_lock)
+        if agent_held_since is not None:
+            reference = now if agent_held_since.tzinfo else now.replace(tzinfo=None)
+            held_hours = (reference - agent_held_since).total_seconds() / 3600
+            print(
+                f"  Agent Lock          : 보유 중 (획득 "
+                f"{agent_held_since.isoformat(timespec='seconds')})"
+            )
+            if held_hours >= LOCK_STUCK_AFTER_HOURS:
+                lock_attention.append(
+                    f"Agent Lock이 {held_hours:.1f}시간째 잡혀 있다 (획득 "
+                    f"{agent_held_since.isoformat(timespec='seconds')}) — 실제로 긴 "
+                    f"실행이 진행 중이거나, 죽은 Agent의 PID가 재사용돼 Lock이 영구히 "
+                    f"잡힌 것으로 보이는 상태다. 확인이 필요하다"
+                )
+
+    return list(snapshot.needs_attention(now)) + delivery_attention + lock_attention
 
 
-def _print_last_run() -> list[str]:
+def _print_last_run(now: datetime | None = None) -> list[str]:
     """The last Runner execution, from its Run Manifest.
 
     This is the view that did not exist. `ops_status.py` could describe the
@@ -662,10 +1508,18 @@ def _print_last_run() -> list[str]:
 
     held_since = lock_held_since(_runner_lock_path())
     if held_since is not None:
-        reference = datetime.now().astimezone()
+        # One clock for the whole function. This used to read
+        # `datetime.now()` directly while the staleness check above uses the
+        # `now` parameter, so the two ages in this block could be measured
+        # against different references — harmless in production (both are
+        # real now) and a trap in a fixture, which is exactly where a pinned
+        # `started_at` compared against wall-clock time was already found.
+        lock_reference = now or datetime.now().astimezone()
         if held_since.tzinfo is None:
-            reference = reference.replace(tzinfo=None)
-        held_hours = (reference - held_since).total_seconds() / 3600
+            lock_reference = lock_reference.replace(tzinfo=None)
+        elif lock_reference.tzinfo is None:
+            lock_reference = lock_reference.astimezone()
+        held_hours = (lock_reference - held_since).total_seconds() / 3600
         print(f"  Runner Lock : 보유 중 (획득 {held_since.isoformat(timespec='seconds')})")
         if held_hours >= LOCK_STUCK_AFTER_HOURS:
             attention.append(
@@ -686,6 +1540,49 @@ def _print_last_run() -> list[str]:
         return attention
 
     print(f"  실행 시각   : {summary.started_at}")
+
+    # How long ago that was — the question this line never answered.
+    #
+    # The AGENT section has had "agent has not run for N day(s)" since it was
+    # written. The Runner, which is the machine that actually assembles
+    # Company History and pushes the Backup, had no equivalent: `started_at`
+    # was printed and never compared to anything. So a Runner that simply
+    # stops — a Task Scheduler task disabled after a password change, a
+    # machine left asleep, the task deleted — leaves this block showing its
+    # last SUCCESS, in green, forever.
+    #
+    # Measured on this machine: the last run was two days old and ATTENTION
+    # carried "agent has not run for 2 day(s)" and nothing at all about the
+    # Runner.
+    #
+    # `SILENT_AFTER_DAYS` is reused rather than a new threshold invented. Its
+    # comment already states the reasoning this needs — a machine switched
+    # off for a weekend is normal in this deployment (docs/07 §58), and a
+    # threshold that fires every Monday gets ignored.
+    #
+    # A `started_at` this cannot parse is skipped rather than guessed at:
+    # this view's contract is to answer even when part of the evidence is
+    # damaged, and the manifest being unreadable is already reported above.
+    # The naive/aware guard is the same one the lock check below uses — a
+    # hand-edited manifest can carry an offset-less timestamp, and comparing
+    # it to an aware `now` raises TypeError.
+    reference = now or datetime.now().astimezone()
+    try:
+        started = datetime.fromisoformat(summary.started_at)
+    except (TypeError, ValueError):
+        started = None
+    if started is not None:
+        if started.tzinfo is None:
+            reference = reference.replace(tzinfo=None)
+        elif reference.tzinfo is None:
+            reference = reference.astimezone()
+        age_days = (reference - started).total_seconds() / 86400
+        if age_days >= SILENT_AFTER_DAYS:
+            attention.append(
+                f"Runner가 {age_days:.1f}일째 실행되지 않았다 (마지막 실행 "
+                f"{summary.started_at}) — Company History도 Backup도 그동안 "
+                f"진행되지 않았다. Task Scheduler 등록 상태를 확인해야 한다"
+            )
     print(f"  종합 상태   : {summary.overall_status.value} (exit {summary.exit_code})")
 
     for component in summary.components:
@@ -699,6 +1596,27 @@ def _print_last_run() -> list[str]:
             f"  ! {component.name}: {failure.classification} "
             f"[{failure.severity.value}/{failure.retryability.value}]"
         )
+        # The failing step's own numbers. `ComponentResult.metrics` is
+        # recorded by every `recorder.ok()/failed()` call and, until now, was
+        # read by nothing outside the tests — the same BUG-39 shape this
+        # project already fixed once for `IntakeSummary`, one layer up.
+        #
+        # It is the difference between "notion_sync is incomplete" and
+        # "notion_sync is incomplete, 47 Events queued" — the second says
+        # whether Company History is one Event behind or a month behind, and
+        # only the failing components are printed so the block stays short.
+        #
+        # Values are this project's own counters, statuses and dates, never
+        # Event content (`reason` carries that and is deliberately not
+        # printed here). `oplog.one_line()` is applied anyway: this is a
+        # persisted file rendered to a terminal, and the rule that nothing
+        # read back from disk can forge a line should not depend on today's
+        # metric list staying the way it is.
+        if component.metrics:
+            rendered = " ".join(
+                f"{key}={one_line(value)}" for key, value in sorted(component.metrics.items())
+            )
+            print(f"      {rendered}")
         if component.artifact_refs:
             print(f"      evidence: {', '.join(component.artifact_refs)}")
 
@@ -752,7 +1670,7 @@ def main() -> int:
     print()
     attention.extend(_print_history(now))
     print()
-    attention.extend(_print_last_run())
+    attention.extend(_print_last_run(now))
     print()
     attention.extend(_print_agent(now))
     print()

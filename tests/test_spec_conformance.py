@@ -1924,3 +1924,93 @@ class RoleDisplayTableCoverageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunContractSpecTableTests(unittest.TestCase):
+    """docs/14 §7's Overall Status table, read from the spec and compared to
+    the code that implements it.
+
+    docs/14 is a *specification* — README §13 makes it win over BACKLOG when
+    the two disagree — and its §7 table is the whole exit-code contract in
+    three rows:
+
+        SUCCESS   실패한 Component 없음          0
+        DEGRADED  실패했지만 전부 비critical      3
+        FAILED    CRITICAL Component 1개 이상    2
+
+    `runsummary._EXIT_CODES` is that table in Python. Nothing compared them.
+    docs/14 is quoted in a dozen docstrings across the suite, but the only
+    test that opens the file checks that its *filename* is in a list.
+
+    So the numbers could drift in either direction with nothing failing: an
+    edit to `_EXIT_CODES` would leave the spec describing a contract the
+    program no longer honours, and an edit to the table would leave the spec
+    lying about a program that never changed. Windows Task Scheduler reads
+    only that number, so "which document is right" is not academic.
+
+    The mapping is parsed out of the spec rather than restated here. A test
+    that hardcoded `{SUCCESS: 0, DEGRADED: 3, FAILED: 2}` would be a third
+    copy — one more thing to keep in step, and no evidence about the other
+    two.
+
+    Deliberately narrow: the three status rows and their codes. Nothing about
+    §7's prose, ordering, or the surrounding sections, because a test that
+    pins prose fails on every edit and gets deleted.
+    """
+
+    SPEC = REPO_ROOT / "docs" / "14_RUN_CONTRACT.md"
+
+    def _spec_table(self):
+        """{status name: exit code} parsed from §7's markdown table."""
+        text = self.SPEC.read_text(encoding="utf-8")
+        rows = re.findall(r"^\|\s*`(\w+)`\s*\|[^|]*\|\s*`(\d+)`\s*\|$", text, re.M)
+        return {name: int(code) for name, code in rows}
+
+    def test_the_spec_table_is_still_parseable(self):
+        """If §7's table is reformatted this fails loudly rather than
+        silently matching nothing — an empty table would make every
+        assertion below vacuously true."""
+        table = self._spec_table()
+
+        self.assertEqual(
+            set(table), {"SUCCESS", "DEGRADED", "FAILED"}, f"parsed: {table}"
+        )
+
+    def test_every_overall_status_appears_in_the_spec(self):
+        from runsummary import OverallStatus
+
+        self.assertEqual(
+            {status.value for status in OverallStatus}, set(self._spec_table())
+        )
+
+    def test_each_status_maps_to_the_code_the_spec_states(self):
+        from runsummary import OverallStatus, exit_code_for
+
+        table = self._spec_table()
+        for status in OverallStatus:
+            with self.subTest(status=status.value):
+                self.assertEqual(exit_code_for(status), table[status.value])
+
+    def test_the_config_error_code_is_reserved_by_the_spec_and_unused_by_the_mapping(self):
+        """§7's prose reserves `1` for a configuration error — a run that
+        never started, so no Overall Status describes it. No status may map
+        to it."""
+        from runsummary import OverallStatus, exit_code_for
+
+        text = self.SPEC.read_text(encoding="utf-8")
+
+        self.assertIn("`1`은 **설정 오류**", text)
+        self.assertNotIn(1, {exit_code_for(status) for status in OverallStatus})
+
+    def test_the_spec_and_the_two_entrypoints_agree_on_three(self):
+        """§7 says `3` means the same thing in `ops_status.py` as in the Run
+        Contract. Both are checked against the spec rather than each other,
+        so agreement cannot be preserved while both drift together."""
+        from runsummary import OverallStatus, exit_code_for
+
+        table = self._spec_table()
+        ops_status = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+        main = ops_status.split("def main()", 1)[1]
+
+        self.assertEqual(exit_code_for(OverallStatus.DEGRADED), table["DEGRADED"])
+        self.assertIn(f"return {table['DEGRADED']}", main)

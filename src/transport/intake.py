@@ -30,6 +30,19 @@ DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "runtime" / "events" / "processed"
 DEFAULT_REJECTED_DIR = PROJECT_ROOT / "runtime" / "events" / "rejected"
 DEFAULT_STABLE_AFTER_SECONDS = 5.0
 
+# Byte-identical copy of `reporter.local_output.INCOMPLETE_WRITE_PREFIX` /
+# `is_incomplete_write()`, which carries the full reasoning. Copied rather
+# than imported for the same reason `safe_event_filename()` is copied here:
+# `reporter` imports `transport` for the Transport seam, so importing back
+# would close a cycle (LayeringInvariantTests pins the direction).
+# `IncompleteWriteInvariantTests` asserts the copies agree.
+INCOMPLETE_WRITE_PREFIX = ".tmp-"
+
+
+def is_incomplete_write(name: str) -> bool:
+    """Whether `name` is an atomic writer's staging file, not a finished artifact."""
+    return name.startswith(INCOMPLETE_WRITE_PREFIX)
+
 
 @dataclass(frozen=True)
 class IntakeSummary:
@@ -37,6 +50,7 @@ class IntakeSummary:
     skipped_not_stable: tuple[str, ...]
     skipped_already_present: tuple[str, ...]
     skipped_invalid: tuple[str, ...]
+    skipped_incomplete: tuple[str, ...]
     failed: tuple[str, ...]
 
 
@@ -99,9 +113,27 @@ def run_intake(
     skipped_not_stable: list[str] = []
     skipped_already_present: list[str] = []
     skipped_invalid: list[str] = []
+    skipped_incomplete: list[str] = []
     failed: list[str] = []
 
     for path in sorted(transport_dir.glob("*.json")):
+        if is_incomplete_write(path.name):
+            # This module's one judgment call is "is this file done
+            # arriving?", and for a staging file the answer is structural
+            # rather than timing-based: `.tmp-…json` is what an atomic
+            # writer names a write it has not committed yet, so it is not
+            # done *being produced* — the stability window cannot help,
+            # because the file stopped changing precisely because the writer
+            # died. `OneDriveTransport._write_atomic()` stages into this very
+            # directory, so the residue is this pipeline's own.
+            #
+            # Left in place, never deleted: identical to every other skip
+            # here, and deleting is not this module's call — a file matching
+            # this prefix could still be a *live* write by a concurrent
+            # sender, which is also exactly why it must not be promoted.
+            skipped_incomplete.append(path.name)
+            continue
+
         already_elsewhere = any(
             (directory / path.name).exists()
             for directory in (incoming_dir, processed_dir, rejected_dir)
@@ -134,5 +166,6 @@ def run_intake(
         skipped_not_stable=tuple(skipped_not_stable),
         skipped_already_present=tuple(skipped_already_present),
         skipped_invalid=tuple(skipped_invalid),
+        skipped_incomplete=tuple(skipped_incomplete),
         failed=tuple(failed),
     )

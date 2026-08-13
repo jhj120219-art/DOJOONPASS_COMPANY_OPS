@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -419,3 +420,141 @@ class SchedulerPathSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OneCorruptCandidateStopsEveryDateTests(unittest.TestCase):
+    """A-7's blast radius, re-measured. NOT FIXED; the description corrected.
+
+    A-7 records that an unparseable `timestamp` in a stored Candidate makes
+    "Scheduler catch-up 그 날짜에서 영구히 멈춘다" — halt *at that date*.
+    Measured, that understates it:
+
+        no corruption          COMPLETED, 9 dates generated, 9 Daily files
+        one corrupt Candidate  FAILED,    0 dates generated, 0 Daily files
+
+    `scheduler.run_once()` builds its keep index **once per batch, before the
+    date loop** — a deliberate optimisation with its own comment ("배치당
+    정확히 1회"). So the failure happens before any date is attempted, and a
+    single bad Candidate dated 2026-08-20 stops 2026-08-01 as well. Company
+    History stops advancing entirely.
+
+    Two other facts the record did not have:
+
+      * `repository.list()` **survives** it — it returns the Candidate
+        unparsed. The raise comes from `build_keep_index()`, which is where
+        timestamps are parsed. So this is not BUG-38's `list()` problem; it
+        is a second, wider one that happens to be reported through the same
+        path.
+      * the same is true of a Candidate whose JSON will not parse, because
+        the index reads both.
+
+    Still SKIP — quarantine / skip / halt is A-7's Data Safety decision, and
+    the isolation itself is correct (the failure is reported precisely, not
+    swallowed). What changed is that the operator-facing message now states
+    the real consequence, and this test keeps the measurement honest: if the
+    index ever moves inside the loop, the numbers below change and the
+    message has to be revisited.
+    """
+
+    def _repo(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        keep, review = root / "keep", root / "review"
+        daily, state, locks = root / "daily", root / "state", root / "locks"
+        for directory in (keep, review, daily, state, locks):
+            directory.mkdir(parents=True)
+        return keep, review, daily, state, locks
+
+    def _candidate(self, keep, name, timestamp):
+        (keep / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "history_id": name, "event_id": name, "timestamp": timestamp,
+                    "category": "MILESTONE", "project_id": "PRJ", "role": "COO",
+                    "summary": "s", "evidence": [], "filter_result": "KEEP",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run(self, keep, review, daily, state, locks):
+        from history.file_repository import FileHistoryRepository
+        from scheduler.scheduler import run_once
+
+        return run_once(
+            FileHistoryRepository(keep_dir=keep, review_dir=review),
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 8, 10, 9, 0).astimezone(),
+            state_path=state / "daily_history_state.json",
+            daily_output_dir=daily,
+            lock_path=locks / "scheduler.lock",
+        )
+
+    def test_without_corruption_every_date_is_generated(self):
+        """The baseline the comparison needs."""
+        keep, review, daily, state, locks = self._repo()
+        for day in ("2026-08-02", "2026-08-05", "2026-08-08"):
+            self._candidate(keep, f"GOOD-{day}", f"{day}T10:00:00+09:00")
+
+        result = self._run(keep, review, daily, state, locks)
+
+        self.assertEqual(result.status.value, "COMPLETED")
+        self.assertEqual(len(list(daily.glob("*.md"))), 9)
+
+    def test_one_corrupt_candidate_stops_every_date(self):
+        keep, review, daily, state, locks = self._repo()
+        for day in ("2026-08-02", "2026-08-05", "2026-08-08"):
+            self._candidate(keep, f"GOOD-{day}", f"{day}T10:00:00+09:00")
+        self._candidate(keep, "BAD", "not-a-timestamp")
+
+        result = self._run(keep, review, daily, state, locks)
+
+        self.assertEqual(result.status.value, "FAILED")
+        self.assertEqual(result.generated_dates, ())
+        self.assertEqual(list(daily.glob("*.md")), [])
+
+    def test_it_fails_at_the_first_date_not_the_candidates_own(self):
+        """The reason the radius is wide: the index is built before the loop,
+        so the reported `failed_date` is the first pending one."""
+        keep, review, daily, state, locks = self._repo()
+        self._candidate(keep, "BAD", "not-a-timestamp")
+
+        result = self._run(keep, review, daily, state, locks)
+
+        self.assertEqual(result.failed_date, date(2026, 8, 1))
+        self.assertIn("isoformat", result.error)
+
+    def test_list_itself_survives_the_bad_timestamp(self):
+        """Not BUG-38's `list()` problem: the Candidate comes back, unparsed.
+        The raise is in the index build, where timestamps are read."""
+        from history.file_repository import FileHistoryRepository
+
+        keep, review, _daily, _state, _locks = self._repo()
+        self._candidate(keep, "GOOD", "2026-08-05T10:00:00+09:00")
+        self._candidate(keep, "BAD", "not-a-timestamp")
+
+        candidates = FileHistoryRepository(keep_dir=keep, review_dir=review).list()
+
+        self.assertEqual(len(candidates), 2)
+
+    def test_the_failure_is_reported_not_swallowed(self):
+        """A-7's isolation half is correct and stays correct: the Scheduler
+        returns FAILED with the reason rather than raising out or pretending
+        to succeed."""
+        keep, review, daily, state, locks = self._repo()
+        self._candidate(keep, "BAD", "not-a-timestamp")
+
+        result = self._run(keep, review, daily, state, locks)
+
+        self.assertEqual(result.status.value, "FAILED")
+        self.assertTrue(result.error)
+
+    def test_the_operator_message_states_the_real_consequence(self):
+        """The message said "the next Scheduler step fails", which is true and
+        too small. It has to say that every date stops."""
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("모든 날짜의", source)
+        self.assertIn("A-7", source)

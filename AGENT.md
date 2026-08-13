@@ -163,6 +163,19 @@ runtime/agent/signals/2026-08-10/search-api-done.json
 Event 자신의 timestamp로 날짜를 나누므로(docs/06 §12), 어긋나면 수집된 날짜와
 기록되는 날짜가 달라진다. 그래서 거부한다.
 
+> **같은 날짜·같은 프로젝트에 Signal을 두 개 이상 쓸 때는 `timestamp`를 넣어라.**
+>
+> 생략하면 그 날짜의 자정이 들어가는데, 그것은 **모든 Signal에 대해 같은 값**
+> 이다(catch-up이 결정론적이어야 하므로 의도된 설계다). Notion Sync는 현재
+> `Last Updated`보다 **과거이거나 동시**인 Event가 Current State를 되돌리지
+> 않게 막으므로(docs/04 §29-30), 같은 프로젝트의 **두 번째 Signal은 Notion에
+> 반영되지 않는다.**
+>
+> **Company History(Daily/Monthly)에는 둘 다 정상적으로 들어간다** — 어긋나는
+> 것은 Notion 쪽 Current State의 최신성뿐이다. 1초만 달라도 정상 적용된다.
+>
+> 자세한 재현과 두 명세의 관계는 `BACKLOG.md` E-23에 있다.
+
 ### 거부되는 Signal
 
 거부된 Signal은 삭제되지 않고 `runtime/agent/signals_rejected/<날짜>/`로
@@ -249,15 +262,30 @@ python run_agent.py      # 수동 1회 실행
 ```
 
 `ops_status.py`는 아무것도 쓰지 않고 lock도 잡지 않는다. Runner나 Agent가
-도는 중에 실행해도 안전하다. 두 가지를 보여준다.
+도는 중에 실행해도 안전하다. **네 블록**을 보여준다.
 
 **COMPANY** — Desktop 4가 수집한 Event 기준으로 각 Desktop의 마지막 소식,
-침묵 일수, 아직 수집되지 않은 backlog.
+침묵 일수, 아직 수집되지 않은 backlog. backlog 줄에는 왜 그 숫자가 줄지 않는지도
+같이 나온다(`unparseable`, `future_dated`, `name_collision`, `incomplete`,
+`already_collected`, `unreadable_incoming`) — 숫자만 있고 이유가 없으면 지워지지
+않는 경보가 되기 때문이다.
+
+**HISTORY** — Company Repository의 daily/monthly 파일 수, 사람 검토를 기다리는
+Candidate, **daily/monthly State와 실제 파일의 정합성**, 수집됐지만 History에
+들어가지 못한 Event, 그리고 Backup Working Copy에 있으면 안 되는 파일.
+
+**LAST RUN** — 마지막 Runner 실행의 Run Manifest: 실행 시각, 종합 상태,
+실패한 단계와 **그 단계의 수치**(예: `queued=47`), 시작조차 못 한 단계,
+Runner Lock 상태. 마지막 실행이 너무 오래됐으면 그것도 여기서 걸린다.
 
 **AGENT** — 이 머신 Agent의 마지막 실행, 마지막 수집 날짜, 미수집 날짜,
-outbox/sent 개수, 거부된 Signal 수.
+outbox/sent 개수, 거부된 Signal 수, 전달 정합성, Agent Lock 상태.
 
 마지막에 **ATTENTION** 절이 나온다. 비어 있으면 지금 사람이 할 일은 없다.
+
+> ATTENTION에 뜨는 것은 **사람이 지금 할 일이 있는 것**뿐이다. 다음 실행이
+> 알아서 처리하는 것(RETRYABLE), 그리고 오늘 어떤 조치로도 지울 수 없는 것은
+> 일부러 뺀다 — 지워지지 않는 경보는 그 절을 대충 넘기도록 훈련시킨다.
 
 종료 코드: `0` 정상, `1` 설정 오류, `3` 확인이 필요한 항목 있음.
 

@@ -58,11 +58,53 @@ class WorkingCopySyncResult:
 
 _ALLOWED_TOP_LEVEL_DIRS = frozenset({"daily", "monthly"})
 
+# Byte-identical copy of `reporter.local_output.INCOMPLETE_WRITE_PREFIX` /
+# `is_incomplete_write()`, which carries the full reasoning. Copied rather
+# than imported because `backup` is a leaf package with no project imports at
+# all (LayeringInvariantTests); `IncompleteWriteInvariantTests` asserts the
+# copies agree.
+INCOMPLETE_WRITE_PREFIX = ".tmp-"
+
+
+def is_incomplete_write(name: str) -> bool:
+    """Whether `name` is an atomic writer's staging file, not a finished artifact."""
+    return name.startswith(INCOMPLETE_WRITE_PREFIX)
+
 
 def _is_in_scope(rel_path: str) -> bool:
-    """docs/08 section 26: only `daily/` and `monthly/` are in scope."""
+    """docs/08 section 26: only `daily/` and `monthly/` are in scope.
+
+    A staging file (`.tmp-…md`) under either directory is excluded. This is
+    not a narrowing of section 26's "포함" list but the same reading section
+    27 already applies to everything else under Master: what is in scope is
+    *Company History*, and a file an atomic writer has not committed yet is
+    not history — `daily/generator.py` and `monthly/generator.py` both
+    `mkstemp(dir=<the in-scope directory>)`, so the residue of a run killed
+    mid-write is this pipeline's own by-product sitting in its own output
+    directory.
+
+    Measured before this exclusion existed, with a `.tmp-xyz.md` left in
+    `master/daily/`:
+
+        sync_to_working_copy()   added=('daily/.tmp-xyz.md', …)  -> committed
+                                 and pushed to the backup remote as a
+                                 truncated day of Company History
+        then removed from Master  deleted=('daily/.tmp-xyz.md',) -> the
+                                 deletion gate (sections 43-47) fails the
+                                 backup, and because `sync_to_working_copy()`
+                                 applies nothing while `deleted` is
+                                 non-empty, it fails on every subsequent run
+
+    The second line is the reason this could not be left as cosmetic noise:
+    deleting the garbage — the only sane operator response to it — is what
+    turns it into a permanent BACKUP_FAILED. Excluding it on both sides
+    (Master *and* Working Copy, since both go through this predicate) means
+    neither direction can arm that trap.
+    """
     parts = Path(rel_path).parts
-    return bool(parts) and parts[0] in _ALLOWED_TOP_LEVEL_DIRS
+    if not parts or parts[0] not in _ALLOWED_TOP_LEVEL_DIRS:
+        return False
+    return not is_incomplete_write(parts[-1])
 
 
 def _content_differs(src: Path, dst: Path) -> bool:

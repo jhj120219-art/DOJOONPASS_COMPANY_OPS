@@ -1289,3 +1289,110 @@ class CorruptStateGuidanceTests(unittest.TestCase):
         with self.assertRaises(Exception) as caught:
             load_state(path)
         self.assertNotIsInstance(caught.exception, AgentStateMismatchError)
+
+
+class EventIdCannotCaseCollideFromTheAgentTests(unittest.TestCase):
+    """E-22's blast radius, narrowed by measurement rather than argument.
+
+    E-22 (C27): two `event_id`s differing only by case become one path on a
+    case-insensitive filesystem, so the second Event is skipped as
+    already-present and never reaches Company History. The characterization
+    lives in `test_observability.py::SuppressedDeliveryTests`.
+
+    What that record did not establish is **how an Event with such an id
+    could exist here**. Measured now, from the derivation itself:
+
+        derive_event_id() -> uuid5(namespace, "source|date|signal_id")
+        str(uuid5(...))   -> lowercase hex, charset [0-9a-f-] only
+
+    So no two Agent-derived ids can differ only by case — they are all
+    lowercase. And the input cannot smuggle one in either: `signal_id` is the
+    Signal *file's* stem, and on the case-insensitive filesystem where E-22
+    exists two files whose names differ only by case are one file. On a
+    case-sensitive one they are two files, giving two entirely different
+    uuid5 values rather than case-variants.
+
+    `event_id` is also a **forbidden field in a Signal** (AGENT.md §3: a
+    Signal carrying it is rejected outright, not silently ignored), so an
+    operator cannot supply one.
+
+    **Conclusion: E-22 is unreachable through the Desktop 1-3 Signal path.**
+    It requires an Event whose `event_id` was set directly with mixed case —
+    the `reporter` API's `create_event(event_id=...)`, or tooling outside
+    this repository writing into the transport folder. That is a real but
+    much narrower surface than "any Event", and it is why E-22 sits below
+    BUG-55 in the priority list rather than above it.
+
+    Pinned rather than argued: if the derivation ever stops being uuid5 —
+    switching to a hash rendered in mixed case, or to the Signal's own text —
+    this fails and the narrowing has to be re-established.
+    """
+
+    SIGNAL_IDS = (
+        "search-api-done",
+        "Search-API-Done",
+        "SEARCH_API_DONE",
+        "a",
+        "긴-한글-시그널",
+    )
+
+    def _ids(self):
+        return [
+            derive_event_id(source=source, target_date=date(2026, 8, 10), signal_id=name)
+            for source in ("DESKTOP_1", "DESKTOP_2", "DESKTOP_3")
+            for name in self.SIGNAL_IDS
+        ]
+
+    def test_every_derived_id_is_lowercase(self):
+        for event_id in self._ids():
+            with self.subTest(event_id=event_id):
+                self.assertEqual(event_id, event_id.lower())
+
+    def test_the_charset_cannot_produce_a_case_variant(self):
+        charset = set("".join(self._ids()))
+
+        self.assertTrue(charset <= set("0123456789abcdef-"), sorted(charset))
+
+    def test_no_two_derived_ids_differ_only_by_case(self):
+        ids = self._ids()
+        folded = [event_id.casefold() for event_id in ids]
+
+        self.assertEqual(len(set(ids)), len(set(folded)))
+
+    def test_signals_whose_names_differ_only_by_case_do_not_produce_variants(self):
+        """The one input that could plausibly carry case into the id."""
+        lower = derive_event_id(
+            source="DESKTOP_1", target_date=date(2026, 8, 10), signal_id="report"
+        )
+        upper = derive_event_id(
+            source="DESKTOP_1", target_date=date(2026, 8, 10), signal_id="REPORT"
+        )
+
+        self.assertNotEqual(lower, upper)
+        # Not case-variants of each other — entirely different values.
+        self.assertNotEqual(lower.casefold(), upper.casefold())
+
+    def test_a_signal_may_not_supply_its_own_event_id(self):
+        """AGENT.md §3: identity fields are refused outright, so the narrow
+        surface stays narrow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "project_id": "PRJ",
+                        "event_type": "MILESTONE_COMPLETED",
+                        "status": "IN_PROGRESS",
+                        "summary": "s",
+                        "event_id": "EVT-a",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(SignalError):
+                parse_signal(
+                    path.read_text(encoding="utf-8"),
+                    signal_id="s",
+                    target_date=date(2026, 8, 10),
+                    path=path,
+                )

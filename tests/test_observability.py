@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -41,6 +42,43 @@ from runsummary import (  # noqa: E402
 )
 
 NOW = datetime(2026, 8, 10, 9, 0).astimezone()
+
+
+def _healthy_backup_state(state_dir, *, when=None):
+    """Write the `backup_state.json` a machine that has backed up would have.
+
+    Fixtures that create Company History and no backup state describe a
+    machine on which the Backup step has never run. That is not a neutral
+    omission — Backup is part of the same pipeline that writes the history
+    and records state on failure as well as success, so the combination
+    cannot be produced by any run, and `ops_status.py` now reports it (the
+    files exist on one machine only). Two "needs no attention" fixtures were
+    written that way and this is what they were missing.
+    """
+    # Defaults to real now, not `NOW`. The history files these fixtures
+    # create carry real mtimes, and the fact being represented is "the backup
+    # happened after the history was written" — ordering two real-time values
+    # against each other. Anchoring one of them to the pinned clock and the
+    # other to the wall clock is the same trap `LastRunViewTests` hit.
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "backup_state.json").write_text(
+        json.dumps(
+            {
+                # Full precision, exactly as `backup/state.py` writes it
+                # (`.isoformat()`, no timespec). Truncating to seconds here
+                # put the backup *before* a file written in the same second
+                # and reproduced the alarm this fixture is asserting is
+                # absent — production keeps microseconds and has no such
+                # window.
+                "last_successful_backup": (
+                    when or datetime.now().astimezone()
+                ).isoformat(),
+                "last_backup_commit": "0" * 40,
+                "backup_status": "BACKUP_SUCCESS",
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class AgentStatusTestCase(unittest.TestCase):
@@ -349,14 +387,24 @@ class CompanyActivityTests(CompanyActivityTestCase):
         self.assertIn("DESKTOP_4", silent)
 
     def test_backlog_counts_come_from_the_real_directories(self):
+        # Names are unique per directory on purpose. This fixture originally
+        # numbered every directory from 0, which made two of the three
+        # transport files share a name with an `incoming/` file — the shape
+        # `run_intake()` skips as already-present, so the view now (correctly)
+        # counts them as `already_collected` rather than backlog. What this
+        # test is about is that each count comes from its own directory, and
+        # colliding names were never part of that.
         for directory, count in ((self.transport, 3), (self.incoming, 2), (self.rejected, 1)):
             directory.mkdir(parents=True, exist_ok=True)
             for index in range(count):
-                (directory / f"{index}.json").write_text("{}", encoding="utf-8")
+                (directory / f"{directory.name}-{index}.json").write_text(
+                    "{}", encoding="utf-8"
+                )
 
         backlog = self.snapshot().backlog
 
         self.assertEqual(backlog.awaiting_intake, 3)
+        self.assertEqual(backlog.already_collected, 0)
         self.assertEqual(backlog.awaiting_collection, 2)
         self.assertEqual(backlog.rejected, 1)
         self.assertFalse(backlog.is_clear)
@@ -659,6 +707,8 @@ class StateConsistencyInStatusTests(unittest.TestCase):
         (runtime / "local_master" / "daily" / "2026-08-09.md").write_text(
             "# ok", encoding="utf-8"
         )
+        # See `_healthy_backup_state`: history that exists was also backed up.
+        _healthy_backup_state(runtime / "state")
 
         module = self._load(runtime)
 
@@ -788,6 +838,14 @@ class StatusEntrypointTests(unittest.TestCase):
             json.dumps({"last_successful_monthly_close": "2026-05", "dirty_months": []}),
             encoding="utf-8",
         )
+        # The pointer's own month must have its file: `run_once()` advances
+        # the pointer only on GENERATED or UNCHANGED, both of which leave the
+        # file on disk. Without it this fixture describes a state no run can
+        # produce, and the Monthly consistency check would (correctly) fire —
+        # so the assertion below would pass partly for the wrong reason.
+        monthly = module.RUNTIME_DIR / "local_master" / "monthly"
+        monthly.mkdir(parents=True)
+        (monthly / "2026-05.md").write_text("# 2026-05\n", encoding="utf-8")
 
         # NOW is 2026-08-10, so 2026-07 is the last closed month.
         attention = module._print_history(NOW)
@@ -805,6 +863,18 @@ class StatusEntrypointTests(unittest.TestCase):
             json.dumps({"last_successful_monthly_close": "2026-07", "dirty_months": []}),
             encoding="utf-8",
         )
+        # "Freshly consolidated" means the file exists — that is what
+        # consolidation produces, and the pointer is never advanced without
+        # it. Stating the pointer alone described a state no run can reach.
+        monthly = module.RUNTIME_DIR / "local_master" / "monthly"
+        monthly.mkdir(parents=True)
+        (monthly / "2026-07.md").write_text("# 2026-07\n", encoding="utf-8")
+        # A machine that produced Company History also ran Backup: it is a
+        # step in the same pipeline, not an optional one, and it writes state
+        # on failure as well as success. History with no backup state at all
+        # describes a machine where Backup has never run — a real condition,
+        # and now a reported one.
+        _healthy_backup_state(state)
 
         self.assertEqual(module._print_history(NOW), [])
 
@@ -1360,9 +1430,14 @@ class LastRunViewTests(unittest.TestCase):
         return [self._ok(name) for name in PIPELINE_COMPONENTS]
 
     def _run(self, module):
+        # `NOW`, not wall-clock time. `_summary()` pins `started_at` to a
+        # fixed date, so letting `_print_last_run()` default to the real
+        # clock made every assertion here depend on what day the suite is
+        # run — the Runner-staleness check turned that latent dependency
+        # into a failure, which is the useful half of finding it.
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            attention = module._print_last_run()
+            attention = module._print_last_run(NOW)
         return buffer.getvalue(), attention
 
     def test_no_recorded_run_is_reported_without_attention(self):
@@ -2300,15 +2375,24 @@ class GuardsAddedButNeverExecutedTests(unittest.TestCase):
         activity._json_paths = _with_a_vanished_entry
         self.addCleanup(setattr, activity, "_json_paths", original)
 
-        promotable, unparseable, future_dated, breakdown = activity._count_transport(
-            transport
-        )
+        (
+            promotable,
+            unparseable,
+            future_dated,
+            incomplete,
+            already_collected,
+            suppressed,
+            breakdown,
+        ) = activity._count_transport(transport)
 
         # The vanished entry is counted as unparseable, not crashed on, and
         # the real file is still attributed.
         self.assertEqual(promotable, 1)
         self.assertEqual(unparseable, 1)
         self.assertEqual(future_dated, 0)
+        self.assertEqual(incomplete, 0)
+        self.assertEqual(already_collected, 0)
+        self.assertEqual(suppressed, 0)
         self.assertEqual(breakdown.by_source, (("DESKTOP_1", 1),))
 
     def test_the_whole_company_view_survives_the_same_race(self):
@@ -2618,3 +2702,2876 @@ class GitAwareProbeShapeTests(unittest.TestCase):
         self.assertEqual(
             module._would_reach_the_commit(Path("/nonexistent"), ()), ()
         )
+
+
+class AbandonedStagingFileReportingTests(unittest.TestCase):
+    """What the operator is told about a write that never committed.
+
+    An atomic writer killed between `mkstemp` and `os.replace` leaves a
+    `.tmp-*` file in the directory it was writing into, and nothing in this
+    repository ever removes one. `IncompleteWriteInvariantTests` covers the
+    pipeline side — no step consumes one as an artifact. This class covers
+    the reporting side, where skipping a file silently is its own defect:
+    the file still occupies the directory, and a view that simply stopped
+    counting it would leave garbage accumulating with nothing saying so.
+
+    Two properties, and they pull in opposite directions:
+
+      * it must NOT be counted as work in flight — `awaiting_intake`, a
+        daily file, a Candidate awaiting review. Each of those is a number
+        an operator acts on, and no action reduces a count that includes an
+        abandoned staging file, which is the alert-that-cannot-clear shape
+        `IntakeBacklog`'s docstring and C26 both warn about;
+      * it must still be NAMED, with the one instruction that differs from
+        every other line in ATTENTION: this is not an Event waiting for
+        something, it is garbage, and deleting it is safe.
+
+    Measured before the fix: a single `.tmp-abc.json` in `transport/` held
+    `awaiting_intake` at 1 and `is_clear` at False across consecutive clean
+    runs, and a `.tmp-abc.md` in `local_master/daily/` was counted as a day
+    of Company History that does not exist.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        for relative in (
+            "events/transport",
+            "events/incoming",
+            "events/processed",
+            "events/rejected",
+            "history_candidates/review",
+            "local_master/daily",
+            "local_master/monthly",
+            "state",
+        ):
+            (self.runtime / relative).mkdir(parents=True, exist_ok=True)
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_residue", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        return module
+
+    def _run(self, printer):
+        import contextlib
+
+        module = self._module()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = getattr(module, printer)(NOW)
+        return buffer.getvalue(), attention
+
+    # ---- transport ----------------------------------------------------
+
+    def test_a_staging_file_is_not_counted_as_awaiting_intake(self):
+        (self.runtime / "events/transport/.tmp-killed.json").write_text(
+            '{"source": "DESKTOP_1"}', encoding="utf-8"
+        )
+
+        output, attention = self._run("_print_company")
+
+        self.assertIn("transport=0", output)
+        self.assertIn("incomplete=1", output)
+        self.assertNotIn(
+            "수집되지 않고 남은 Event",
+            " ".join(attention),
+            "an abandoned staging file is not an Event waiting to be collected",
+        )
+
+    def test_a_staging_file_is_named_and_called_safe_to_delete(self):
+        (self.runtime / "events/transport/.tmp-killed.json").write_text(
+            '{"source": "DESKTOP_1"}', encoding="utf-8"
+        )
+
+        _output, attention = self._run("_print_company")
+
+        residue = [item for item in attention if ".tmp-" in item]
+        self.assertEqual(len(residue), 1, attention)
+        self.assertIn("지워도 안전하다", residue[0])
+
+    def test_a_clean_transport_directory_says_nothing(self):
+        """The other half of C26's rule: the line must appear only when there
+        is something to say, and must disappear once it is dealt with."""
+        _output, attention = self._run("_print_company")
+        self.assertEqual([item for item in attention if ".tmp-" in item], [])
+
+    def test_deleting_it_clears_the_line(self):
+        staged = self.runtime / "events/transport/.tmp-killed.json"
+        staged.write_text('{"source": "DESKTOP_1"}', encoding="utf-8")
+        self.assertTrue([i for i in self._run("_print_company")[1] if ".tmp-" in i])
+
+        staged.unlink()
+
+        self.assertEqual(
+            [item for item in self._run("_print_company")[1] if ".tmp-" in item], []
+        )
+
+    def test_a_real_queued_event_is_still_reported(self):
+        """The skip must not swallow the condition it sits next to."""
+        real = self.runtime / "events/transport/EVT-1.json"
+        real.write_text('{"source": "DESKTOP_1"}', encoding="utf-8")
+        (self.runtime / "events/transport/.tmp-killed.json").write_text(
+            '{"source": "DESKTOP_1"}', encoding="utf-8"
+        )
+
+        output, attention = self._run("_print_company")
+
+        self.assertIn("transport=1", output)
+        self.assertIn("incomplete=1", output)
+        self.assertTrue([item for item in attention if "수집되지 않고 남은 Event" in item])
+
+    # ---- Company History ----------------------------------------------
+
+    def test_a_staging_file_is_not_counted_as_a_day_of_history(self):
+        daily = self.runtime / "local_master/daily"
+        (daily / "2026-08-12.md").write_text("# real\n", encoding="utf-8")
+        (daily / ".tmp-killed.md").write_text("# part", encoding="utf-8")
+
+        output, _attention = self._run("_print_history")
+
+        self.assertIn("daily 파일          : 1", output)
+
+    def test_a_staging_file_is_not_displayed_as_a_month(self):
+        monthly = self.runtime / "local_master/monthly"
+        (monthly / "2026-07.md").write_text("# real\n", encoding="utf-8")
+        (monthly / ".tmp-killed.md").write_text("# part", encoding="utf-8")
+
+        output, _attention = self._run("_print_history")
+
+        self.assertIn("monthly 파일        : 1", output)
+        self.assertNotIn(".tmp-killed", output)
+
+    def test_a_staging_file_is_not_a_candidate_awaiting_a_human(self):
+        """`FileHistoryRepository.save()` stages into `review/`, so this is
+        the same directory. A person cannot review a file the pipeline
+        abandoned, so alerting on it would stand forever."""
+        review = self.runtime / "history_candidates/review"
+        (review / ".tmp-killed.json").write_text('{"summary"', encoding="utf-8")
+
+        output, attention = self._run("_print_history")
+
+        self.assertIn("검토 대기 Candidate : 0", output)
+        self.assertEqual([item for item in attention if "사람 검토를" in item], [])
+
+    def test_a_real_candidate_next_to_it_is_still_reported(self):
+        review = self.runtime / "history_candidates/review"
+        (review / "HIST-1.json").write_text('{"summary": "s"}', encoding="utf-8")
+        (review / ".tmp-killed.json").write_text('{"summary"', encoding="utf-8")
+
+        output, attention = self._run("_print_history")
+
+        self.assertIn("검토 대기 Candidate : 1", output)
+        self.assertTrue([item for item in attention if "사람 검토를" in item])
+
+
+class ResentDuplicateBacklogTests(CompanyActivityTestCase):
+    """The outbox's designed recovery parked ATTENTION permanently.
+
+    `agent/outbox.py` re-sends any Event still in `outbox/`, which is what a
+    crash between "Transport accepted" and "moved to sent/" leaves behind.
+    Its docstring says a duplicate delivery "costs one redundant file copy
+    and produces no duplicate History", and names this skip as the reason:
+
+        transport.run_intake()   already in incoming/processed/rejected
+                                 -> skipped_already_present
+
+    True of the pipeline. Never checked against the view. `run_intake()`
+    leaves that file in `transport/` and nothing ever deletes from
+    `transport/`, so the copy is not redundant for long — it is permanent.
+    Measured, one re-send after its original had been collected:
+
+        run 1..3   moved=0, skipped_already_present=1
+                   awaiting_intake=1, is_clear=False, ATTENTION
+                   "수집되지 않고 남은 Event: transport=1"   every run
+
+    Nothing an operator does clears that, and the sentence is false: the
+    Event was collected. This is the third instance of the same shape in this
+    view — `unparseable`, `future_dated`/`name_collision`, and now the most
+    ordinary trigger of all, a successful retry.
+
+    Counted separately and excluded from `awaiting_intake`, following
+    `unparseable` rather than `future_dated`: intake's verdict is
+    deterministic and nothing removes the downstream twin that produces it,
+    so the file is not queued work. When the twin is still in `incoming/`,
+    `awaiting_collection` already counts it, so no in-flight signal is lost.
+    """
+
+    def _resend(self, name="EVT-1.json", *, collected_in="processed"):
+        payload = '{"event_id": "EVT-1", "source": "DESKTOP_1"}'
+        target = getattr(self, collected_in)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / name).write_text(payload, encoding="utf-8")
+        self.transport.mkdir(parents=True, exist_ok=True)
+        (self.transport / name).write_text(payload, encoding="utf-8")
+
+    def test_a_resent_duplicate_is_not_counted_as_awaiting_intake(self):
+        self._resend()
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_intake, 0)
+        self.assertEqual(backlog.already_collected, 1)
+
+    def test_a_resent_duplicate_alone_leaves_the_backlog_clear(self):
+        self._resend()
+
+        self.assertTrue(self.snapshot().backlog.is_clear)
+
+    def test_every_directory_intake_checks_counts(self):
+        """intake checks incoming/, processed/ and rejected/. A view that
+        checked fewer would call some of them backlog."""
+        for directory in ("incoming", "processed", "rejected"):
+            with self.subTest(directory=directory):
+                self.setUp()
+                self._resend(collected_in=directory)
+
+                backlog = self.snapshot().backlog
+
+                self.assertEqual(backlog.already_collected, 1)
+                self.assertEqual(backlog.awaiting_intake, 0)
+
+    def test_a_duplicate_of_something_still_in_incoming_is_still_in_flight(self):
+        """Excluding it must not hide work. The twin in `incoming/` has not
+        been collected yet, so `awaiting_collection` has to carry it."""
+        self._resend(collected_in="incoming")
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_collection, 1)
+        self.assertFalse(backlog.is_clear)
+
+    def test_a_genuinely_new_event_is_still_counted(self):
+        """The guard must not swallow real backlog — the opposite defect."""
+        self.transport.mkdir(parents=True, exist_ok=True)
+        (self.transport / "EVT-NEW.json").write_text(
+            '{"event_id": "EVT-NEW", "source": "DESKTOP_1"}', encoding="utf-8"
+        )
+        self._resend()
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_intake, 1)
+        self.assertEqual(backlog.already_collected, 1)
+        self.assertFalse(backlog.is_clear)
+
+    def test_the_view_uses_intake_s_own_already_present_test(self):
+        """Same reason `test_the_view_uses_intake_s_own_parse_test` exists: a
+        second opinion about "already present" would let the view and the
+        step disagree. intake checks `(directory / name).exists()` over the
+        three directories; this view is handed those same three."""
+        import inspect
+
+        import app.desktop_activity as activity
+
+        source = inspect.getsource(activity.read_company_activity)
+        self.assertIn("(incoming_dir, processed_dir, rejected_dir)", source)
+
+    def test_the_backlog_view_agrees_with_what_intake_actually_does(self):
+        """Bound to intake's behaviour rather than to a copy of its rule:
+        every file this view calls `already_collected` must be one
+        `run_intake()` really refuses to promote, run for run."""
+        from transport.intake import run_intake
+
+        self._resend()
+
+        for _ in range(3):
+            summary = run_intake(
+                transport_dir=self.transport,
+                incoming_dir=self.incoming,
+                processed_dir=self.processed,
+                rejected_dir=self.rejected,
+                stable_after_seconds=0,
+            )
+            backlog = self.snapshot().backlog
+
+            self.assertEqual(summary.moved, ())
+            self.assertEqual(len(summary.skipped_already_present), backlog.already_collected)
+            self.assertEqual(backlog.awaiting_intake, 0)
+            self.assertTrue(backlog.is_clear)
+
+
+class SuppressedDeliveryTests(CompanyActivityTestCase):
+    """The half of "already present" that is not a duplicate.
+
+    `run_intake()` decides a `transport/` file is already handled by asking
+    whether that *name* exists in `incoming/`/`processed/`/`rejected/`
+    (BUG-53). Usually the twin really is the same Event, re-sent by the
+    outbox — harmless. Sometimes it is not the same Event at all:
+
+        a directory of that name                     BUG-47
+        a 0-byte Files On-Demand placeholder         BUG-53
+        a different event_id under a colliding name  Windows folds
+                                                     `EVT-a.json` and
+                                                     `EVT-A.json` into one
+                                                     path, and
+                                                     `safe_event_filename()`
+                                                     preserves case
+
+    In every one of those the Event in `transport/` has never been delivered
+    and never will be, and nothing else in the pipeline can see it: the
+    Collector never receives the file, so it is absent from Company History
+    with no error anywhere.
+
+    Before `already_collected` existed, all of these surfaced — badly, as a
+    permanently stuck `awaiting_intake`, with a sentence ("수집되지 않고 남은
+    Event") that was false for the common duplicate and accidentally true
+    here. Taking the duplicate out of ATTENTION without separating these
+    would have replaced a false alert with a missing one, so the twin is
+    opened and the two `event_id`s compared.
+
+    The case-collision row is the one nothing else could have caught:
+    `safe_event_filename()` appends a digest whenever it changes an id
+    precisely so two ids never share a name, and that guarantee simply does
+    not hold on a case-insensitive filesystem.
+    """
+
+    MINE = '{"event_id": "EVT-1", "source": "DESKTOP_1"}'
+
+    def _plant(self, twin_builder, *, name="EVT-1.json"):
+        self.transport.mkdir(parents=True, exist_ok=True)
+        self.processed.mkdir(parents=True, exist_ok=True)
+        twin_builder(self.processed / name)
+        (self.transport / "EVT-1.json").write_text(self.MINE, encoding="utf-8")
+        return self.snapshot().backlog
+
+    def test_a_directory_of_the_same_name_is_a_suppressed_delivery(self):
+        backlog = self._plant(lambda p: p.mkdir())
+
+        self.assertEqual(backlog.suppressed, 1)
+        self.assertEqual(backlog.already_collected, 0)
+
+    def test_a_zero_byte_placeholder_is_a_suppressed_delivery(self):
+        backlog = self._plant(lambda p: p.write_text("", encoding="utf-8"))
+
+        self.assertEqual(backlog.suppressed, 1)
+        self.assertEqual(backlog.already_collected, 0)
+
+    def test_a_different_event_under_the_same_name_is_a_suppressed_delivery(self):
+        backlog = self._plant(
+            lambda p: p.write_text('{"event_id": "EVT-9"}', encoding="utf-8")
+        )
+
+        self.assertEqual(backlog.suppressed, 1)
+        self.assertEqual(backlog.already_collected, 0)
+
+    def test_a_case_only_filename_collision_is_a_suppressed_delivery(self):
+        """Only reproducible where the filesystem folds case, which is the
+        deployment target (docs/11: Windows). Elsewhere the two names are two
+        files and there is nothing to suppress — so the test asserts the
+        premise before asserting the verdict."""
+        self.transport.mkdir(parents=True, exist_ok=True)
+        self.processed.mkdir(parents=True, exist_ok=True)
+        (self.processed / "EVT-A.json").write_text(
+            '{"event_id": "EVT-A", "source": "DESKTOP_1"}', encoding="utf-8"
+        )
+        if not (self.processed / "EVT-a.json").exists():
+            self.skipTest("case-sensitive filesystem: no collision to observe")
+        (self.transport / "EVT-a.json").write_text(
+            '{"event_id": "EVT-a", "source": "DESKTOP_1"}', encoding="utf-8"
+        )
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.suppressed, 1)
+        self.assertEqual(backlog.already_collected, 0)
+        self.assertEqual(backlog.awaiting_intake, 0)
+
+    def test_a_true_duplicate_is_not_reported_as_suppressed(self):
+        backlog = self._plant(lambda p: p.write_text(self.MINE, encoding="utf-8"))
+
+        self.assertEqual(backlog.suppressed, 0)
+        self.assertEqual(backlog.already_collected, 1)
+
+    def test_intake_really_does_refuse_all_of_them(self):
+        """The premise, checked rather than assumed: every shape above is one
+        `run_intake()` skips as already-present, so the view is explaining a
+        real verdict rather than inventing a category."""
+        from transport.intake import run_intake
+
+        shapes = {
+            "directory": lambda p: p.mkdir(),
+            "zero-byte": lambda p: p.write_text("", encoding="utf-8"),
+            "other-event": lambda p: p.write_text('{"event_id": "EVT-9"}', encoding="utf-8"),
+            "true-duplicate": lambda p: p.write_text(self.MINE, encoding="utf-8"),
+        }
+        for label, builder in shapes.items():
+            with self.subTest(shape=label):
+                self.setUp()
+                self._plant(builder)
+
+                summary = run_intake(
+                    transport_dir=self.transport,
+                    incoming_dir=self.incoming,
+                    processed_dir=self.processed,
+                    rejected_dir=self.rejected,
+                    stable_after_seconds=0,
+                )
+
+                self.assertEqual(summary.moved, ())
+                self.assertEqual(summary.skipped_already_present, ("EVT-1.json",))
+
+    def test_a_suppressed_delivery_is_reported_to_the_operator(self):
+        import contextlib
+        import importlib.util
+
+        self._plant(lambda p: p.mkdir())
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_suppressed", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.root
+        module.read_company_activity = lambda **_: self.snapshot()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_company(NOW)
+
+        self.assertTrue(
+            [item for item in attention if "같은 이름의 다른 파일에 막혀" in item],
+            attention,
+        )
+
+
+class AgentLockIsReportedTests(unittest.TestCase):
+    """The Runner's lock was watched; the Agent's was not.
+
+    C23 closed BUG-42's silence for `runtime/locks/company_ops.lock`:
+    `stale_lock_cannot_be_cleared()` and `lock_held_since()` both feed
+    ATTENTION from `_print_last_run()`. `agent/agent.py` reuses the very same
+    `scheduler.lock` module against its own file,
+    `runtime/agent/locks/agent.lock`, and nothing looked at it.
+
+    The asymmetry is the wrong way round. A stuck Runner lock stops the
+    machine that *assembles* Company History, which the Run Manifest and
+    every history counter notice. A stuck Agent lock stops a machine that
+    *produces* it, and `run_agent.py` returns **exit 0** for
+    `SKIPPED_ALREADY_RUNNING` — its own docstring says so ("0 COMPLETED, or
+    skipped because another Agent run holds the lock"). Task Scheduler
+    therefore records a successful run, every day, while nothing is
+    collected.
+
+    Measured before this: a lock file naming a dead pid, made read-only —
+    `stale_lock_cannot_be_cleared()` returned True and the AGENT section
+    printed nothing. The one trace anywhere was `needs_attention()`'s "agent
+    has not run for N day(s)", which takes N days to appear and reports a
+    symptom, not a cause.
+
+    Read-only throughout: the three lock readers used here are the
+    non-competing ones (`is_locked` / `lock_held_since` /
+    `stale_lock_cannot_be_cleared`), never `try_acquire_lock()`, because this
+    script promises it is safe to run while an Agent is working.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.agent_dir = self.runtime / "agent"
+        for relative in ("locks", "state", "outbox", "sent", "signals_rejected"):
+            (self.agent_dir / relative).mkdir(parents=True, exist_ok=True)
+        self.lock = self.agent_dir / "locks" / "agent.lock"
+
+    def _write_lock(self, *, pid, created_at, read_only=False):
+        # `process_id` / `created_at` verbatim — the on-disk shape
+        # `try_acquire_lock()` writes and `LockFileContractTests` pins. A
+        # fixture inventing its own field names would test nothing.
+        self.lock.write_text(
+            json.dumps({"process_id": pid, "created_at": created_at}),
+            encoding="utf-8",
+        )
+        if read_only:
+            os.chmod(self.lock, stat.S_IREAD)
+            self.addCleanup(self._make_writable)
+
+    def _make_writable(self):
+        """Cleanup that tolerates a test having already removed the file."""
+        try:
+            os.chmod(self.lock, stat.S_IWRITE)
+        except OSError:
+            pass
+
+    def _run(self, now=None):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_agent_lock", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        module.AGENT_DIR = self.agent_dir
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_agent(now or NOW)
+        return buffer.getvalue(), attention
+
+    DEAD_PID = 999_999
+
+    def test_a_stale_unremovable_agent_lock_reaches_attention(self):
+        self._write_lock(pid=self.DEAD_PID, created_at=NOW.isoformat(), read_only=True)
+
+        output, attention = self._run()
+
+        self.assertIn("Agent Lock", output)
+        self.assertTrue([a for a in attention if "Agent Lock 파일이 남아" in a], attention)
+
+    def test_the_message_names_the_exit_code_that_hides_it(self):
+        """The operator's problem is not that a run failed — it is that every
+        run *succeeded*. Saying so is the whole point of the line."""
+        self._write_lock(pid=self.DEAD_PID, created_at=NOW.isoformat(), read_only=True)
+
+        _output, attention = self._run()
+
+        message = next(a for a in attention if "Agent Lock 파일이 남아" in a)
+        self.assertIn("exit code는 0", message)
+        self.assertIn(str(self.lock), message)
+
+    def test_it_names_the_agent_lock_not_the_runner_lock(self):
+        """Two different files protecting two different critical sections. A
+        report pointed at the wrong one would send an operator to a machine
+        that is fine."""
+        self._write_lock(pid=self.DEAD_PID, created_at=NOW.isoformat(), read_only=True)
+
+        _output, attention = self._run()
+
+        message = next(a for a in attention if "Agent Lock 파일이 남아" in a)
+        self.assertIn("agent.lock", message)
+        self.assertNotIn("company_ops.lock", message)
+
+    def test_a_lock_held_far_too_long_reaches_attention(self):
+        held_since = NOW - timedelta(hours=48)
+        self._write_lock(pid=os.getpid(), created_at=held_since.isoformat())
+
+        output, attention = self._run()
+
+        self.assertIn("Agent Lock", output)
+        self.assertTrue([a for a in attention if "Agent Lock이" in a], attention)
+
+    def test_a_lock_held_briefly_is_shown_but_not_alerted(self):
+        """A running Agent is normal. Alerting on it would be the standing
+        alert this project keeps removing."""
+        held_since = NOW - timedelta(minutes=2)
+        self._write_lock(pid=os.getpid(), created_at=held_since.isoformat())
+
+        output, attention = self._run()
+
+        self.assertIn("Agent Lock          : 보유 중", output)
+        self.assertEqual([a for a in attention if "Agent Lock" in a], [])
+
+    def test_no_lock_file_says_nothing_at_all(self):
+        output, attention = self._run()
+
+        self.assertNotIn("Agent Lock", output)
+        self.assertEqual([a for a in attention if "Agent Lock" in a], [])
+
+    def test_removing_the_lock_clears_the_line(self):
+        """C26's rule: the correct remediation — the one the message asks for
+        — has to make the alert go away."""
+        self._write_lock(pid=self.DEAD_PID, created_at=NOW.isoformat(), read_only=True)
+        self.assertTrue([a for a in self._run()[1] if "Agent Lock" in a])
+
+        os.chmod(self.lock, stat.S_IWRITE)
+        self.lock.unlink()
+
+        self.assertEqual([a for a in self._run()[1] if "Agent Lock" in a], [])
+
+    def test_a_damaged_lock_file_does_not_break_the_view(self):
+        """This view's contract is that it answers even when the evidence is
+        damaged."""
+        self.lock.write_text("{not json", encoding="utf-8")
+
+        output, attention = self._run()
+
+        self.assertIn("AGENT", output)
+        self.assertIsInstance(attention, list)
+
+    def test_the_agent_really_does_skip_on_a_lock_it_cannot_take(self):
+        """The premise, checked rather than assumed: `run_once()` must
+        actually refuse, or the report describes nothing."""
+        from agent.agent import DEFAULT_LOCK_PATH  # noqa: F401
+        from scheduler.lock import stale_lock_cannot_be_cleared, try_acquire_lock
+
+        self._write_lock(pid=self.DEAD_PID, created_at=NOW.isoformat(), read_only=True)
+
+        self.assertTrue(stale_lock_cannot_be_cleared(self.lock))
+        self.assertFalse(try_acquire_lock(self.lock, now=NOW))
+
+
+class UnreadableIncomingFileTests(CompanyActivityTestCase):
+    """The `unparseable` fix, applied to the pile it was never applied to.
+
+    `transport/` got this treatment when a 0-byte Files On-Demand
+    placeholder held `awaiting_intake` at 1 forever. `incoming/` has the
+    identical failure and kept the identical symptom:
+
+        run 1..3   collector failed=1 every run, file never leaves incoming/
+                   awaiting_collection=1, is_clear=False, every run
+                   ATTENTION "수집되지 않고 남은 Event: incoming=1"
+
+    `collector/runtime.run_once()` reads each file with
+    `read_text(encoding="utf-8")`. When that raises it records FAILED and
+    leaves the file — the read is deterministic and nothing rewrites the
+    file, so this repeats forever. `name_collision` (BUG-43) covers a
+    different permanent-FAILED cause and does not see this one.
+
+    **The predicate had to be the Collector's, not intake's.** They disagree
+    on a case that matters: a valid-UTF-8 file holding invalid JSON is
+    `unparseable` to intake, but `collector.collect()` REJECTS it and moves
+    it to `rejected/` on the first run. Reporting it as stuck would describe
+    a file that is on its way out — the "view disagrees with the step"
+    mistake this project keeps closing. So `is_readable_event_file()` is
+    exported from `collector/runtime.py` and shares one read helper with
+    `run_once()` itself.
+    """
+
+    UNDECODABLE = b'{"event_id": "\xff\xfe\x00bad"}'
+
+    def _incoming(self, name, content):
+        self.incoming.mkdir(parents=True, exist_ok=True)
+        target = self.incoming / name
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content, encoding="utf-8")
+        return target
+
+    def test_an_undecodable_file_is_not_counted_as_awaiting_collection(self):
+        self._incoming("BAD-UTF8.json", self.UNDECODABLE)
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_collection, 0)
+        self.assertEqual(backlog.unreadable_incoming, 1)
+
+    def test_an_undecodable_file_alone_leaves_the_backlog_clear(self):
+        self._incoming("BAD-UTF8.json", self.UNDECODABLE)
+
+        self.assertTrue(self.snapshot().backlog.is_clear)
+
+    def test_a_readable_file_is_still_counted(self):
+        """The guard must not hide real backlog."""
+        self._incoming("GOOD.json", '{"event_id": "E-1", "source": "DESKTOP_1"}')
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.awaiting_collection, 1)
+        self.assertEqual(backlog.unreadable_incoming, 0)
+        self.assertFalse(backlog.is_clear)
+
+    def test_invalid_json_that_is_valid_utf8_is_still_counted(self):
+        """The case where the Collector's predicate and intake's disagree.
+        `collector.collect()` REJECTS this and moves it out on the first
+        run, so it is in flight, not parked."""
+        self._incoming("BAD-JSON.json", '{"event_id"')
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(backlog.unreadable_incoming, 0)
+        self.assertEqual(backlog.awaiting_collection, 1)
+
+    def test_the_source_breakdown_still_matches_the_count(self):
+        """`SourceBreakdown.total` promises to equal the count it breaks
+        down. Splitting the count without splitting the attribution would
+        have quietly broken that."""
+        self._incoming("GOOD.json", '{"event_id": "E-1", "source": "DESKTOP_1"}')
+        self._incoming("BAD-UTF8.json", self.UNDECODABLE)
+
+        backlog = self.snapshot().backlog
+
+        self.assertEqual(
+            backlog.awaiting_collection_sources.total, backlog.awaiting_collection
+        )
+
+    def test_the_view_agrees_with_what_the_collector_actually_does(self):
+        """Bound to behaviour, not to a copy of the rule: run the real
+        Collector three times and check that what stays is what this view
+        calls unreadable, and what leaves is what it calls backlog."""
+        from collector.collector import Collector
+        from collector.runtime import run_once as collector_run_once
+        from collector.state import PersistentSeenEventStore
+
+        self._incoming("BAD-UTF8.json", self.UNDECODABLE)
+        self._incoming("BAD-JSON.json", '{"event_id"')
+        store = PersistentSeenEventStore(state_path=self.root / "seen.json")
+
+        for run in range(3):
+            with self.subTest(run=run):
+                collector_run_once(
+                    collector=Collector(seen_store=store),
+                    incoming_dir=self.incoming,
+                    processed_dir=self.processed,
+                    rejected_dir=self.rejected,
+                    log_path=self.root / "collector.log",
+                )
+                backlog = self.snapshot().backlog
+
+                self.assertEqual(
+                    sorted(p.name for p in self.incoming.iterdir()), ["BAD-UTF8.json"]
+                )
+                self.assertEqual(backlog.unreadable_incoming, 1)
+                self.assertEqual(backlog.awaiting_collection, 0)
+                self.assertTrue(backlog.is_clear)
+
+    def test_it_is_reported_to_the_operator(self):
+        import contextlib
+        import importlib.util
+
+        self._incoming("BAD-UTF8.json", self.UNDECODABLE)
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_unreadable", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.root
+        module.read_company_activity = lambda **_: self.snapshot()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_company(NOW)
+
+        message = [a for a in attention if "읽을 수 없는 파일" in a]
+        self.assertEqual(len(message), 1, attention)
+        self.assertIn("incoming 1건", message[0])
+        self.assertEqual([a for a in attention if "수집되지 않고 남은 Event" in a], [])
+
+    def test_the_predicate_is_the_collectors_own(self):
+        """A second opinion about "can this be read" is exactly the
+        disagreement that produced the wrong count in the first place."""
+        import inspect
+
+        import app.desktop_activity as activity
+
+        source = inspect.getsource(activity.read_company_activity)
+        self.assertIn("is_readable_event_file", source)
+
+        import collector.runtime as runtime
+
+        self.assertIn("_read_event_text", inspect.getsource(runtime.run_once))
+        self.assertIn("_read_event_text", inspect.getsource(runtime.is_readable_event_file))
+
+
+class FailingComponentMetricsAreShownTests(unittest.TestCase):
+    """The Run Manifest's richest field reached no reader.
+
+    `recorder.ok()` / `recorder.failed()` take `**metrics` and every step in
+    `app/runner.py` passes them — `queued`, `processed`, `accepted`,
+    `failed`, `changed_files`, `generated_days`, `still_pending`,
+    `failed_date`. They are written into `run_summary.json` and, before this,
+    read by nothing outside the test suite.
+
+    That is BUG-39's shape one layer up. BUG-39 was `IntakeSummary.failed` /
+    `skipped_*` being computed and discarded; the fix routed them into the
+    manifest. They arrived, and then stopped there.
+
+    What it costs an operator, in the case that matters most: a Notion
+    outage records
+
+        ! notion_sync: NOTION_SYNC_INCOMPLETE [DEGRADED/RETRYABLE]
+
+    identically whether one Event is queued or four hundred are. Those are
+    different situations — "the next run will catch up" versus "Company
+    History has been diverging from Notion for weeks" — and the number
+    distinguishing them was already on disk. RETRYABLE keeps such a failure
+    out of ATTENTION by design (docs/14 §5), so this line is the only place
+    an operator can see it at all.
+
+    Only non-SUCCESS components print metrics: the block deliberately hides
+    healthy steps, and this must not turn it into a wall of numbers.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        (self.runtime / "state").mkdir(parents=True)
+        (self.runtime / "locks").mkdir(parents=True)
+        self.manifest = self.runtime / "state" / "run_summary.json"
+
+    def _write_manifest(self, components):
+        self.manifest.write_text(
+            json.dumps(
+                {
+                    "run_id": "2026-08-13T09:00:00+09:00",
+                    "started_at": "2026-08-13T09:00:00+09:00",
+                    "finished_at": "2026-08-13T09:01:00+09:00",
+                    "overall_status": "DEGRADED",
+                    "exit_code": 3,
+                    "components": components,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _failing(self, name, metrics, *, retryability="RETRYABLE"):
+        return {
+            "name": name,
+            "status": "FAILED",
+            "metrics": metrics,
+            "failure": {
+                "classification": "NOTION_SYNC_INCOMPLETE",
+                "severity": "DEGRADED",
+                "retryability": retryability,
+                "reason": "connection refused",
+            },
+        }
+
+    def _run(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_metrics", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = self.manifest
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_last_run(NOW)
+        return buffer.getvalue(), attention
+
+    def test_a_failing_components_metrics_are_printed(self):
+        self._write_manifest([self._failing("notion_sync", {"queued": 47, "processed": 50})])
+
+        output, _attention = self._run()
+
+        self.assertIn("queued=47", output)
+        self.assertIn("processed=50", output)
+
+    def test_the_number_that_distinguishes_one_from_four_hundred(self):
+        """The point of the change, stated as a test: two runs whose
+        classification line is identical must not read identically."""
+        self._write_manifest([self._failing("notion_sync", {"queued": 1})])
+        small, _ = self._run()
+        self._write_manifest([self._failing("notion_sync", {"queued": 400})])
+        large, _ = self._run()
+
+        self.assertNotEqual(small, large)
+        self.assertIn("queued=1", small)
+        self.assertIn("queued=400", large)
+
+    def test_metrics_are_printed_in_a_stable_order(self):
+        self._write_manifest(
+            [self._failing("notion_sync", {"queued": 2, "processed": 9, "accepted": 4})]
+        )
+
+        output, _attention = self._run()
+
+        self.assertIn("accepted=4 processed=9 queued=2", output)
+
+    def test_a_component_with_no_metrics_prints_no_extra_line(self):
+        self._write_manifest([self._failing("notion_sync", {})])
+
+        output, _attention = self._run()
+
+        self.assertIn("notion_sync", output)
+        self.assertNotIn("      \n", output)
+
+    def test_successful_components_stay_hidden(self):
+        """The block hides healthy steps on purpose; printing their metrics
+        would undo that."""
+        self._write_manifest(
+            [
+                {"name": "collector", "status": "SUCCESS", "metrics": {"accepted": 12}},
+                self._failing("notion_sync", {"queued": 1}),
+            ]
+        )
+
+        output, _attention = self._run()
+
+        self.assertNotIn("accepted=12", output)
+        self.assertIn("queued=1", output)
+
+    def test_a_line_breaking_metric_value_cannot_forge_a_line(self):
+        """Today every metric is one of this project's own counters. The
+        escaping does not depend on that staying true — a manifest is a file
+        read back from disk, and `oplog.one_line()` is this project's answer
+        for anything rendered from one."""
+        self._write_manifest(
+            [self._failing("daily", {"failed_date": "2026-08-01\n  ! backup: ALL GOOD"})]
+        )
+
+        output, _attention = self._run()
+
+        self.assertIn("\\n", output)
+        self.assertNotIn("\n  ! backup: ALL GOOD", output)
+
+    def test_the_failure_reason_is_still_not_printed_here(self):
+        """`reason` is the one failure field that carries text from outside
+        this system (a Notion API message, an exception string). It is
+        unchanged by this — metrics only."""
+        self._write_manifest([self._failing("notion_sync", {"queued": 1})])
+
+        output, _attention = self._run()
+
+        self.assertNotIn("connection refused", output)
+
+
+class MonthlyStateConsistencyTests(unittest.TestCase):
+    """docs/10 §48's check, aimed at the pair nobody aimed it at.
+
+    `scheduler/consistency.py` implements §48 — "State Last Success ->
+    Corresponding Local History 존재?" — and `ops_status.py` calls it, for
+    the Daily pair. `monthly_history_state.json` makes the identical kind of
+    claim: `last_successful_monthly_close` says a month is consolidated, and
+    the artifact backing that claim is `monthly/<YYYY-MM>.md`. Nothing
+    compared the two. §48 does not say "daily only".
+
+    Why it is data loss rather than cosmetics: `run_once()` takes its
+    catch-up months from `pending_months()`, which starts *after* the
+    pointer. A month below the pointer is never revisited by any run, ever.
+    Measured, pointer at `2026-07` with the file removed:
+
+        monthly_run_once()   returned no results at all
+        ops_status           "monthly 파일: 0" and "마지막 통합한 달: 2026-07"
+                             printed two lines apart, nothing connecting them
+        ATTENTION            empty
+
+    A month of Company History gone, every indicator healthy.
+
+    **It cannot be a false alarm, and that is checked below rather than
+    asserted.** The pointer advances on exactly two outcomes —
+    `MONTHLY_GENERATED` (file just written) and `MONTHLY_UNCHANGED` (file
+    already there) — so the file existed when the pointer was set. Any other
+    outcome breaks the loop without advancing. That property is what makes
+    "pointer set, file absent" unambiguous, and C24/C26 are why it is
+    tested: a detector whose clean case is not verified is a standing false
+    alarm waiting to happen.
+
+    Detection only, like every other check in this block. Regenerating the
+    month is docs/10 §46's prohibition and §49's operator call.
+    """
+
+    NOW = datetime(2026, 8, 13, 9, 0).astimezone()
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.daily = self.runtime / "local_master" / "daily"
+        self.monthly = self.runtime / "local_master" / "monthly"
+        for relative in (
+            self.daily,
+            self.monthly,
+            self.runtime / "state",
+            self.runtime / "events" / "processed",
+            self.runtime / "history_candidates" / "keep",
+            self.runtime / "history_candidates" / "review",
+        ):
+            relative.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.runtime / "state" / "monthly_history_state.json"
+
+    def _daily_month(self, year, month, days):
+        for day in days:
+            (self.daily / f"{year}-{month:02d}-{day:02d}.md").write_text(
+                f"# DOJOONPASS Company History — {year}-{month:02d}-{day:02d}\n\n"
+                f"## Summary\n\nwork\n",
+                encoding="utf-8",
+            )
+
+    def _write_state(self, closed, dirty=()):
+        self.state_path.write_text(
+            json.dumps(
+                {"last_successful_monthly_close": closed, "dirty_months": list(dirty)}
+            ),
+            encoding="utf-8",
+        )
+
+    def _run(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_monthly", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(self.NOW)
+        return buffer.getvalue(), attention
+
+    def _monthly_alerts(self, attention):
+        return [a for a in attention if "Monthly State와 실제 History가 어긋난다" in a]
+
+    def test_a_pointer_with_no_file_reaches_attention(self):
+        self._daily_month(2026, 7, range(1, 4))
+        self._write_state("2026-07")
+
+        output, attention = self._run()
+
+        self.assertIn("STATE_INCONSISTENCY", output)
+        self.assertEqual(len(self._monthly_alerts(attention)), 1, attention)
+
+    def test_the_message_says_no_run_will_fix_it(self):
+        """The operator's question is "will this sort itself out?". For this
+        condition the answer is no, and saying so is the point."""
+        self._write_state("2026-07")
+
+        _output, attention = self._run()
+
+        message = self._monthly_alerts(attention)[0]
+        self.assertIn("2026-07", message)
+        self.assertIn("다시 만들지 않는다", message)
+
+    def test_a_pointer_with_its_file_present_says_nothing(self):
+        (self.monthly / "2026-07.md").write_text("# 2026-07\n", encoding="utf-8")
+        self._write_state("2026-07")
+
+        output, attention = self._run()
+
+        self.assertNotIn("STATE_INCONSISTENCY", output)
+        self.assertEqual(self._monthly_alerts(attention), [])
+
+    def test_no_pointer_yet_says_nothing(self):
+        """A first-ever run claims nothing, so there is nothing to contradict."""
+        self._write_state(None)
+
+        output, attention = self._run()
+
+        self.assertNotIn("STATE_INCONSISTENCY", output)
+        self.assertEqual(self._monthly_alerts(attention), [])
+
+    def test_restoring_the_file_clears_the_line(self):
+        """C26's rule. The remediation here is restoring the Monthly file
+        from the backup remote, and that has to make the alert go away."""
+        self._write_state("2026-07")
+        self.assertTrue(self._monthly_alerts(self._run()[1]))
+
+        (self.monthly / "2026-07.md").write_text("# 2026-07\n", encoding="utf-8")
+
+        self.assertEqual(self._monthly_alerts(self._run()[1]), [])
+
+    def test_a_real_consolidation_never_triggers_it(self):
+        """The false-alarm guard, run against the real generator rather than
+        a hand-written state file: consolidate a month for real, then check
+        the view is silent."""
+        from monthly import run_once as monthly_run_once
+
+        self._daily_month(2026, 7, range(1, 32))
+        self._write_state(None)
+
+        result = monthly_run_once(
+            daily_dir=self.daily,
+            monthly_dir=self.monthly,
+            state_path=self.state_path,
+            now=self.NOW,
+            history_start_date=date(2026, 7, 1),
+        )
+
+        self.assertTrue(result.results, "expected the month to consolidate")
+        _output, attention = self._run()
+        self.assertEqual(self._monthly_alerts(attention), [])
+
+    def test_the_pointer_only_advances_when_the_file_exists(self):
+        """The premise the check rests on, asserted directly: after any run,
+        a set pointer implies its file is on disk."""
+        from monthly import load_state as load_monthly_state
+        from monthly import monthly_history_path
+        from monthly import run_once as monthly_run_once
+
+        # July complete, August incomplete -> the loop must stop at August.
+        self._daily_month(2026, 7, range(1, 32))
+        self._daily_month(2026, 8, [1])
+        self._write_state(None)
+
+        monthly_run_once(
+            daily_dir=self.daily,
+            monthly_dir=self.monthly,
+            state_path=self.state_path,
+            now=self.NOW,
+            history_start_date=date(2026, 7, 1),
+        )
+
+        closed = load_monthly_state(self.state_path).last_successful_monthly_close
+        self.assertIsNotNone(closed)
+        self.assertTrue(monthly_history_path(self.monthly, closed).is_file())
+
+    def test_the_view_looks_where_the_writer_writes(self):
+        """A second opinion about the filename would make the check answer a
+        question about a path that does not exist."""
+        import inspect
+
+        import monthly.generator as generator
+
+        source = inspect.getsource(generator)
+        self.assertIn("final_path = monthly_history_path(", source)
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        self.assertIn("monthly_history_path(monthly_dir, closed)", path.read_text(encoding="utf-8"))
+
+
+class CommittedStagingResidueTests(unittest.TestCase):
+    """The signal C27's own fix removed, put back.
+
+    C27 excluded `.tmp-*` from `working_copy._is_in_scope()`. That was right:
+    it stopped a staging file from being synced and committed as Company
+    History, and it disarmed the trap where *cleaning the file up* made the
+    deletion gate fail every subsequent Backup.
+
+    Exclusion cuts both ways. `_relative_files()` is applied to Master **and**
+    to the Working Copy, so a staging file that the pre-C27 code already
+    synced and committed is now outside both sides — `sync_to_working_copy()`
+    reports nothing about it, forever.
+
+    Measured, `daily/.tmp-abc123.md` holding a truncated day, already in the
+    commit, running the post-C27 code:
+
+        sync_to_working_copy()   added=() modified=() deleted=()
+        scan_for_secrets(wc)     ()          -- it is not secret-shaped
+        ops_status ATTENTION     []          -- nothing, anywhere
+
+    Truncated Company History in the backup remote with no trace. That is
+    exactly the shape C24 and C26 are about, and this time the instrument
+    that went blind was this Sprint's own change. **A change that removes a
+    bad signal owes a good one in its place.**
+
+    The probe is `_would_reach_the_commit()`, the same git-aware one C26
+    built for the secret report, for the same reason: what matters is what
+    git carries, not what the filesystem holds. A `.gitignore` covering the
+    file makes this silent, because then it really is not going anywhere.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        (self.runtime / "state").mkdir(parents=True)
+        self.wc = self.runtime / "backup_working_copy"
+        (self.wc / "daily").mkdir(parents=True)
+        (self.wc / "daily" / "2026-08-13.md").write_text("# real\n", encoding="utf-8")
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.wc,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    def _init_repo(self, *, gitignore=None):
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "test@example.invalid")
+        self._git("config", "user.name", "Residue Test")
+        if gitignore is not None:
+            (self.wc / ".gitignore").write_text(gitignore, encoding="utf-8")
+        self._git("add", "-A")
+        self._git("commit", "-m", "init")
+
+    def _plant(self, name="daily/.tmp-abc123.md"):
+        target = self.wc / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# DOJOONPASS Company Hist", encoding="utf-8")
+        return target
+
+    def _warnings(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_residue_wc", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return [item for item in attention if "완료되지 않은 쓰기 잔여물" in item]
+
+    def test_committed_residue_is_reported(self):
+        self._plant()
+        self._init_repo()
+
+        warnings = self._warnings()
+
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn(".tmp-abc123.md", warnings[0])
+
+    def test_the_message_says_it_is_safe_to_delete(self):
+        """The operator action here is the opposite of every other Working
+        Copy warning: this is garbage, not a credential to rotate."""
+        self._plant()
+        self._init_repo()
+
+        self.assertIn("지워도 안전하다", self._warnings()[0])
+
+    def test_sync_really_does_say_nothing_about_it(self):
+        """The premise, checked rather than asserted: this is reported here
+        precisely because the Backup path no longer can."""
+        from backup.working_copy import scan_for_secrets, sync_to_working_copy
+
+        master = self.runtime / "local_master"
+        (master / "daily").mkdir(parents=True)
+        (master / "daily" / "2026-08-13.md").write_text("# real\n", encoding="utf-8")
+        self._plant()
+        self._init_repo()
+
+        result = sync_to_working_copy(master, self.wc)
+
+        self.assertEqual((result.added, result.modified, result.deleted), ((), (), ()))
+        self.assertEqual(scan_for_secrets(self.wc), ())
+
+    def test_a_gitignored_staging_file_is_not_reported(self):
+        """docs/08 §28's `.gitignore` lists `*.tmp` but not `.tmp-*`; an
+        operator who adds a pattern that does cover them has genuinely fixed
+        it, and the line must go quiet — C26's rule."""
+        self._plant()
+        self._init_repo(gitignore=".tmp-*\n")
+
+        self.assertEqual(self._warnings(), [])
+
+    def test_git_really_does_refuse_to_commit_it(self):
+        """The premise of the test above."""
+        self._plant()
+        self._init_repo(gitignore=".tmp-*\n")
+
+        committed = self._git("ls-tree", "-r", "--name-only", "HEAD").stdout.split()
+
+        self.assertNotIn("daily/.tmp-abc123.md", committed)
+
+    def test_deleting_it_clears_the_line(self):
+        staged = self._plant()
+        self._init_repo()
+        self.assertTrue(self._warnings())
+
+        staged.unlink()
+
+        self.assertEqual(self._warnings(), [])
+
+    def test_a_clean_working_copy_says_nothing(self):
+        self._init_repo()
+
+        self.assertEqual(self._warnings(), [])
+
+    def test_real_company_history_is_never_reported(self):
+        """The guard must not start calling Daily files garbage."""
+        self._init_repo()
+
+        warnings = self._warnings()
+
+        self.assertEqual(warnings, [])
+        committed = self._git("ls-tree", "-r", "--name-only", "HEAD").stdout.split()
+        self.assertIn("daily/2026-08-13.md", committed)
+
+    def test_gits_own_storage_is_never_reported(self):
+        """`.git/` is git's storage, not Working Copy content. On the normal
+        path `git ls-files` would filter it out anyway; the reason to skip it
+        explicitly is the fail-safe path, where a missing or timed-out git
+        makes `_would_reach_the_commit()` return its candidates unchanged."""
+        self._init_repo()
+        internal = self.wc / ".git" / ".tmp-gitinternal.pack"
+        internal.parent.mkdir(parents=True, exist_ok=True)
+        internal.write_text("x", encoding="utf-8")
+
+        self.assertEqual(self._warnings(), [])
+
+    def test_gits_own_storage_is_not_reported_on_the_fail_safe_path_either(self):
+        """No repository at all: the probe cannot ask git, so it reports its
+        candidates as-is — and `.git/` must not be among them."""
+        internal = self.wc / ".git" / ".tmp-gitinternal.pack"
+        internal.parent.mkdir(parents=True, exist_ok=True)
+        internal.write_text("x", encoding="utf-8")
+        real = self._plant()
+
+        warnings = self._warnings()
+
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn(real.name, warnings[0])
+        self.assertNotIn("gitinternal", warnings[0])
+
+    def test_a_non_repository_working_copy_still_reports(self):
+        """Fail-safe, same direction as C26's probe: a probe that cannot get
+        an answer over-reports rather than going quiet."""
+        self._plant()
+
+        warnings = self._warnings()
+
+        self.assertEqual(len(warnings), 1, warnings)
+
+    def test_it_is_independent_of_the_secret_report(self):
+        """Two different conditions, two different operator actions —
+        rotate a credential versus delete a stray file. A staging file that
+        is also secret-shaped must not collapse them."""
+        self._plant("daily/.tmp-abc123.md")
+        (self.wc / ".env").write_text("TOKEN=" + "x" * 40 + "\n", encoding="utf-8")
+        self._init_repo()
+
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_residue_both", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+
+        self.assertTrue([a for a in attention if "Secret 형태의 파일" in a], attention)
+        self.assertTrue([a for a in attention if "완료되지 않은 쓰기 잔여물" in a], attention)
+
+
+class RunnerHasNotRunTests(unittest.TestCase):
+    """The Agent has this check. The Runner — which does the work — did not.
+
+    `AgentStatusSnapshot.needs_attention()` has reported "agent has not run
+    for N day(s)" since it was written. `_print_last_run()` printed
+    `started_at` and never compared it to anything, so a Runner that simply
+    stops leaves the LAST RUN block showing its last SUCCESS, in green,
+    indefinitely.
+
+    That is the more dangerous half of the pair. The Runner is the machine
+    that assembles Company History from collected Events, closes Daily and
+    Monthly, and pushes the Backup. When it stops, all of that stops — and
+    the ways it stops are ordinary Windows ones: a Task Scheduler task
+    disabled after a password change (docs/11's own runbook covers
+    re-registering it), a machine left asleep, the task deleted.
+
+    Measured on this machine before the check existed: the last run was two
+    days old, and ATTENTION carried "agent has not run for 2 day(s)" and
+    nothing whatsoever about the Runner.
+
+    Symmetric with the Agent Lock finding earlier this Sprint, in the
+    opposite direction — the Runner had lock monitoring and no staleness
+    check; the Agent had staleness and no lock monitoring. Neither gap was
+    a decision; both were a check aimed at one of two targets.
+
+    `SILENT_AFTER_DAYS` is reused rather than a new threshold chosen. Its
+    existing comment is exactly the reasoning required here: a machine
+    switched off for a weekend is normal in this deployment (docs/07 §58),
+    and a threshold that fires every Monday gets ignored.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        (self.runtime / "state").mkdir(parents=True)
+        (self.runtime / "locks").mkdir(parents=True)
+        self.manifest = self.runtime / "state" / "run_summary.json"
+
+    def _write_manifest(self, started_at):
+        self.manifest.write_text(
+            json.dumps(
+                {
+                    "run_id": str(started_at),
+                    "started_at": started_at,
+                    "finished_at": started_at,
+                    "overall_status": "SUCCESS",
+                    "exit_code": 0,
+                    "components": [{"name": "collector", "status": "SUCCESS"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run(self, now=None):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_stale_runner", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = self.manifest
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_last_run(now or NOW)
+        return buffer.getvalue(), [a for a in attention if "Runner가" in a]
+
+    def _threshold(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_threshold", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.SILENT_AFTER_DAYS
+
+    def test_a_runner_that_stopped_reaches_attention(self):
+        self._write_manifest((NOW - timedelta(days=9)).isoformat())
+
+        _output, alerts = self._run()
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("Runner가", alerts[0])
+
+    def test_the_message_says_what_stopped_with_it(self):
+        """"The Runner did not run" is only half the fact an operator needs;
+        the other half is that Company History and Backup stopped too."""
+        self._write_manifest((NOW - timedelta(days=9)).isoformat())
+
+        _output, alerts = self._run()
+
+        self.assertIn("Company History", alerts[0])
+        self.assertIn("Backup", alerts[0])
+
+    def test_a_recent_run_says_nothing(self):
+        self._write_manifest((NOW - timedelta(hours=6)).isoformat())
+
+        _output, alerts = self._run()
+
+        self.assertEqual(alerts, [])
+
+    def test_the_boundary_is_the_existing_silence_threshold(self):
+        """No new number was invented. Just under fires nothing, just over
+        fires — bound to the constant, not to a literal."""
+        days = self._threshold()
+
+        self._write_manifest((NOW - timedelta(days=days, hours=1)).isoformat())
+        self.assertEqual(len(self._run()[1]), 1)
+
+        self._write_manifest((NOW - timedelta(days=days, hours=-1)).isoformat())
+        self.assertEqual(self._run()[1], [])
+
+    def test_running_it_again_clears_the_line(self):
+        """C26's rule. The remediation is re-registering the scheduled task,
+        and the next run's manifest has to make this go away."""
+        self._write_manifest((NOW - timedelta(days=9)).isoformat())
+        self.assertTrue(self._run()[1])
+
+        self._write_manifest(NOW.isoformat())
+
+        self.assertEqual(self._run()[1], [])
+
+    def test_no_manifest_at_all_is_not_reported_as_stale(self):
+        """A first-ever install has no run to be stale, and the block already
+        says "아직 기록된 실행이 없다"."""
+        output, alerts = self._run()
+
+        self.assertIn("아직 기록된 실행이 없다", output)
+        self.assertEqual(alerts, [])
+
+    def test_an_unparseable_timestamp_does_not_break_the_view(self):
+        """This view answers even when part of the evidence is damaged."""
+        self._write_manifest("not-a-timestamp")
+
+        output, alerts = self._run()
+
+        self.assertIn("LAST RUN", output)
+        self.assertEqual(alerts, [])
+
+    def test_a_naive_timestamp_does_not_raise(self):
+        """A hand-edited or restored manifest can carry an offset-less
+        timestamp, and comparing it to an aware `now` raises TypeError —
+        the naive/aware mistake this repository has already made once."""
+        self._write_manifest((NOW - timedelta(days=9)).replace(tzinfo=None).isoformat())
+
+        _output, alerts = self._run()
+
+        self.assertEqual(len(alerts), 1, alerts)
+
+    def test_it_reports_a_stopped_runner_even_when_the_last_run_succeeded(self):
+        """The whole point: SUCCESS is what makes this invisible. A failed
+        run is already loud."""
+        self._write_manifest((NOW - timedelta(days=9)).isoformat())
+
+        output, alerts = self._run()
+
+        self.assertIn("SUCCESS", output)
+        self.assertTrue(alerts)
+
+
+class UnbackedCompanyHistoryTests(unittest.TestCase):
+    """"Is what is on this machine actually off it?" — the question the
+    status view could not answer.
+
+    `backup_state.json` has carried `last_successful_backup` since the Backup
+    step was written and **no production code has ever read it**. The suite
+    already says so, in the BUG-55 characterization: *"the one artifact that
+    would betray it is `last_successful_backup` never advancing, which
+    nothing surfaces."*
+
+    BUG-55 is what that costs. `working_copy._is_in_scope()` compares
+    `parts[0]` against `{"daily", "monthly"}` case-sensitively, and docs/11's
+    deployment steps have a human create the directories. On a filesystem
+    that folds case, a `Daily/` directory is the same directory to everything
+    except that comparison. Reproduced end to end against a real bare remote,
+    three consecutive runs:
+
+        run 1..3   BACKUP_NOT_REQUIRED, changed=()
+        remote     holds nothing
+        state      last_successful_backup = None
+        ops_status "daily 파일: 1", ATTENTION empty
+
+    A real day of Company History, on one machine only, with every indicator
+    green — and this view even counting the file, because `glob()` folds case
+    where the scope check does not.
+
+    **A clock threshold would have been the wrong instrument.** History that
+    has not changed does not need backing up, so "the last backup was N days
+    ago" is normal on a quiet week and would be a standing false alarm — the
+    shape this project keeps removing. The condition that is never normal is
+    *history newer than the last successful push*: it cannot fire while
+    nothing is being written, and it clears the moment a backup succeeds.
+    Both halves are asserted below, against the real Backup runner.
+
+    The scan deliberately does NOT reuse `_is_in_scope()`. Doing so would
+    inherit the case-sensitivity that causes BUG-55 and leave the check blind
+    to the one defect it exists for.
+
+    Detection only. Case-folding the scope comparison is BUG-55's own open
+    decision (it changes which files Backup covers); this reports, and names
+    the file, which is how an operator sees the wrong-case directory at all.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.master = self.runtime / "local_master"
+        self.wc = self.runtime / "backup_working_copy"
+        (self.runtime / "state").mkdir(parents=True)
+        self.wc.mkdir(parents=True)
+        self.state_path = self.runtime / "state" / "backup_state.json"
+        self.remote = self.root / "remote.git"
+
+    def _git(self, cwd, *args):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        ).stdout.strip()
+
+    def _init_remote(self):
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(self.remote)],
+            capture_output=True, check=True,
+        )
+        self._git(self.wc, "init", "-b", "main")
+        self._git(self.wc, "config", "user.email", "test@example.invalid")
+        self._git(self.wc, "config", "user.name", "Unbacked Test")
+        self._git(self.wc, "remote", "add", "origin", str(self.remote))
+        (self.wc / ".gitkeep").write_text("", encoding="utf-8")
+        self._git(self.wc, "add", "-A")
+        self._git(self.wc, "commit", "-m", "init")
+        self._git(self.wc, "push", "-u", "origin", "main")
+
+    def _backup(self, run_id="RUN"):
+        import backup.runner as backup_runner
+
+        return backup_runner.run_once(
+            master_dir=self.master, working_copy_dir=self.wc,
+            state_path=self.state_path, run_id=run_id,
+        )
+
+    def _alerts(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_unbacked", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(datetime.now().astimezone())
+        return buffer.getvalue(), [a for a in attention if "원격 백업에 도달하지" in a]
+
+    def _write_day(self, relative):
+        target = self.master / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# a real day of history\n", encoding="utf-8")
+        return target
+
+    # ---- the defect ----------------------------------------------------
+
+    def test_bug_55_history_is_reported_as_unbacked(self):
+        from backup.result import BackupStatus
+
+        self._init_remote()
+        self._write_day("Daily/2026-08-13.md")  # wrong case, per docs/11 setup
+
+        for run in range(3):
+            entry = self._backup(f"RUN-{run}")
+            self.assertIs(entry.final_status, BackupStatus.NOT_REQUIRED)
+        self.assertEqual(
+            sorted(self._git(self.remote, "ls-tree", "-r", "--name-only", "HEAD").split()),
+            [".gitkeep"],
+        )
+
+        _output, alerts = self._alerts()
+
+        self.assertEqual(len(alerts), 1, alerts)
+
+    def test_the_alert_names_the_file_and_a_second_line_names_the_cause(self):
+        """Two lines with two jobs, split in C28.
+
+        This one states the consequence — Company History that is only on
+        this machine — and names the file. That is true of *any* unbacked
+        history, not only BUG-55. The cause (`Daily/` should be `daily/`)
+        moved to its own line, because that line can say exactly what to
+        rename and this one cannot. See `CaseFoldedScopeDirectoryTests`.
+        """
+        import contextlib
+        import importlib.util
+
+        self._init_remote()
+        self._write_day("Daily/2026-08-13.md")
+        self._backup()
+
+        _output, alerts = self._alerts()
+        self.assertIn("2026-08-13.md", alerts[0])
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_unbacked_pair", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        with contextlib.redirect_stdout(io.StringIO()):
+            everything = module._print_history(datetime.now().astimezone())
+
+        cause = [a for a in everything if "백업 범위 밖" in a]
+        self.assertEqual(len(cause), 1, everything)
+        self.assertIn("BUG-55", cause[0])
+        self.assertIn("`daily/`", cause[0])
+
+    def test_the_last_successful_backup_is_printed(self):
+        """The number itself, which nothing showed."""
+        self._init_remote()
+        self._write_day("daily/2026-08-13.md")
+
+        output, _alerts = self._alerts()
+        self.assertIn("마지막 성공 백업", output)
+        self.assertIn("아직 없음", output)
+
+        self._backup()
+
+        output, _alerts = self._alerts()
+        self.assertNotIn("아직 없음", output)
+
+    # ---- the false-alarm guard -----------------------------------------
+
+    def test_a_successful_backup_clears_it(self):
+        from backup.result import BackupStatus
+
+        self._init_remote()
+        self._write_day("daily/2026-08-13.md")
+        self.assertEqual(len(self._alerts()[1]), 1)
+
+        entry = self._backup()
+
+        self.assertIs(entry.final_status, BackupStatus.SUCCESS)
+        self.assertEqual(self._alerts()[1], [])
+
+    def test_a_quiet_week_says_nothing(self):
+        """The case a clock threshold would have got wrong. History that has
+        not changed does not need backing up, and `BACKUP_NOT_REQUIRED` is
+        the correct, healthy answer."""
+        from backup.result import BackupStatus
+
+        self._init_remote()
+        self._write_day("daily/2026-08-13.md")
+        self._backup("RUN-1")
+
+        for run in range(3):
+            entry = self._backup(f"QUIET-{run}")
+            self.assertIs(entry.final_status, BackupStatus.NOT_REQUIRED)
+            self.assertEqual(self._alerts()[1], [], f"quiet run {run}")
+
+    def test_new_history_awaiting_its_backup_is_reported_then_clears(self):
+        """Transient by design: between generation and the backup in the same
+        run there is a real window where history is only on this machine."""
+        self._init_remote()
+        self._write_day("daily/2026-08-13.md")
+        self._backup("RUN-1")
+
+        time.sleep(1.1)  # mtime resolution
+        self._write_day("daily/2026-08-14.md")
+        self.assertEqual(len(self._alerts()[1]), 1)
+
+        self._backup("RUN-2")
+
+        self.assertEqual(self._alerts()[1], [])
+
+    def test_an_empty_local_master_says_nothing(self):
+        self._init_remote()
+
+        self.assertEqual(self._alerts()[1], [])
+
+    def test_a_staging_file_is_not_treated_as_unbacked_history(self):
+        """An unfinished write is not Company History (C27), so it must not
+        raise a backup alarm either."""
+        self._init_remote()
+        self._write_day("daily/2026-08-13.md")
+        self._backup("RUN-1")
+
+        time.sleep(1.1)
+        (self.master / "daily" / ".tmp-killed.md").write_text("part", encoding="utf-8")
+
+        self.assertEqual(self._alerts()[1], [])
+
+    def test_the_check_never_consults_backup_status(self):
+        """F-7/BUG-41 narrowed by measurement.
+
+        BUG-41 is that `BACKUP_FAILED` is silently overwritten by a later
+        run. Measured both ways against a real remote:
+
+            remote comes back   run 2 pushes for real -> the overwrite is
+                                CORRECT, and this check is correctly silent
+            remote stays down   status stays PENDING, the file is not on the
+                                remote -> this check fires and names it
+
+        The point is that neither outcome depends on the status field: this
+        check compares Company History against `last_successful_backup`, so
+        whatever `backup_status` was overwritten with, unbacked history stays
+        visible. That does not fix BUG-41 — the status is still overwritten —
+        but it removes the consequence that made it dangerous.
+        """
+        from backup.result import BackupStatus
+
+        self._init_remote()
+        self._write_day("daily/2026-08-13.md")
+
+        # A status claiming success, with nothing ever pushed.
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "last_successful_backup": None,
+                    "last_backup_commit": None,
+                    "backup_status": BackupStatus.SUCCESS.value,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _output, alerts = self._alerts()
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("2026-08-13.md", alerts[0])
+
+    def test_a_damaged_backup_state_is_reported_not_raised(self):
+        """This view answers even when part of the evidence is damaged."""
+        self.state_path.write_text("{not json", encoding="utf-8")
+
+        output, _alerts = self._alerts()
+
+        self.assertIn("읽을 수 없음", output)
+
+
+class SecretAlreadyInHistoryTests(unittest.TestCase):
+    """The Working Copy report cleared for the wrong reason.
+
+    C24 put "a secret-shaped file is in the Working Copy" in ATTENTION and
+    C26 made it git-aware, so it now answers **what the next commit will
+    carry**. The remote's history is a different question and nobody asked
+    it. Measured end to end against a real bare remote:
+
+        1. `.env` holding a Notion token reaches the Working Copy and is
+           pushed (E-21)                     -> ATTENTION fires
+        2. the operator deletes the file — the move the message leads to
+                                             -> **ATTENTION clears**
+        3. `git show HEAD:.env` on the remote still returns the token
+
+    The alert went away because the local file was gone, not because the
+    exposure was. That is the single worst thing "the warning disappeared"
+    can mean, and step 2 is the most likely thing an operator does.
+
+    **This cannot fire on a healthy machine**, which is why it is allowed to
+    stand in ATTENTION rather than being softened into a block line. A
+    Working Copy carrying docs/08 §28's `.gitignore` never commits such a
+    path, so history never holds one — measured across seven configurations
+    below. It is not the standing-alert-on-a-correct-machine shape C26
+    removed; it appears only after a real leak.
+
+    The two probes are deliberately independent and say different things:
+
+        `_would_reach_the_commit()`   stop it from going out
+        `_secrets_ever_committed()`   it is already out
+
+    Fail-safe runs the *opposite* way from the older probe, on purpose.
+    That one filters a set it was handed, so failing open keeps a real
+    exposure visible; this one adds a claim about history, and asserting a
+    leak because git could not answer would be inventing one.
+    """
+
+    TOKEN = "ntn_" + "G" * 40
+    SECTION_28 = ".env\n.env.*\n*.tmp\n*.log\n"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        (self.runtime / "state").mkdir(parents=True)
+        self.wc = self.runtime / "backup_working_copy"
+        (self.wc / "daily").mkdir(parents=True)
+        (self.wc / "daily" / "2026-08-13.md").write_text("# day\n", encoding="utf-8")
+
+    def _git(self, *args, cwd=None):
+        return subprocess.run(
+            ["git", *args], cwd=cwd or self.wc, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        ).stdout.strip()
+
+    def _init(self, *, gitignore=None):
+        self._git("init", "-b", "main")
+        self._git("config", "user.email", "test@example.invalid")
+        self._git("config", "user.name", "History Probe Test")
+        if gitignore is not None:
+            (self.wc / ".gitignore").write_text(gitignore, encoding="utf-8")
+
+    def _plant(self, name=".env"):
+        target = self.wc / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"NOTION_API_TOKEN={self.TOKEN}\n", encoding="utf-8")
+        return target
+
+    def _commit(self, message="c"):
+        self._git("add", "-A")
+        self._git("commit", "-m", message)
+
+    def _attention(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_history", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        with contextlib.redirect_stdout(io.StringIO()):
+            items = module._print_history(NOW)
+        return (
+            [a for a in items if "history에 이미 들어간" in a],
+            [a for a in items if "Secret 형태의 파일" in a],
+        )
+
+    # ---- the defect ----------------------------------------------------
+
+    def test_deleting_the_file_does_not_clear_the_history_exposure(self):
+        """The whole finding, in one test."""
+        self._init()
+        planted = self._plant()
+        self._commit()
+        history, reaching = self._attention()
+        self.assertEqual((len(history), len(reaching)), (1, 1))
+
+        planted.unlink()
+
+        history, reaching = self._attention()
+        self.assertEqual(len(reaching), 0, "the older probe correctly goes quiet")
+        self.assertEqual(len(history), 1, "the exposure is still real and still reported")
+
+    def test_the_secret_really_is_still_readable_from_the_commit(self):
+        """The premise, checked rather than asserted: this is reported
+        because the bytes are still there, not because a name once was."""
+        self._init()
+        planted = self._plant()
+        self._commit()
+        planted.unlink()
+        self._commit("remove it")
+
+        blob = self._git("show", "HEAD~1:.env")
+
+        self.assertIn(self.TOKEN, blob)
+
+    def test_the_message_names_rotation_as_the_action(self):
+        """Deleting is what an operator will try; rotating is what actually
+        helps. The message has to say which."""
+        self._init()
+        self._plant()
+        self._commit()
+
+        history, _ = self._attention()
+
+        self.assertIn("교체", history[0])
+        self.assertIn(".env", history[0])
+
+    def test_the_file_present_message_warns_that_deleting_is_not_enough(self):
+        """The two lines have to agree, or the operator learns the wrong
+        lesson from the one that appears first."""
+        self._init()
+        self._plant()
+
+        _history, reaching = self._attention()
+
+        self.assertIn("지우는 것만으로는", reaching[0])
+
+    # ---- the false-alarm guard -----------------------------------------
+
+    def test_a_healthy_repository_says_nothing(self):
+        self._init(gitignore=self.SECTION_28)
+        self._commit()
+
+        history, reaching = self._attention()
+
+        self.assertEqual((history, reaching), ([], []))
+
+    def test_a_gitignored_secret_never_enters_history(self):
+        """The correct configuration, with the secret sitting right there."""
+        self._init(gitignore=self.SECTION_28)
+        self._plant()
+        self._commit()
+        self._commit("again")
+
+        history, reaching = self._attention()
+
+        self.assertEqual(history, [])
+        self.assertEqual(reaching, [])
+        self.assertNotIn(".env", self._git("ls-tree", "-r", "--name-only", "HEAD").split())
+
+    def test_a_secret_not_yet_committed_is_not_reported_as_history(self):
+        """Two different facts: about to leak, versus already leaked."""
+        self._init()
+        self._plant()
+
+        history, reaching = self._attention()
+
+        self.assertEqual(history, [])
+        self.assertEqual(len(reaching), 1)
+
+    def test_a_non_repository_is_silent_about_history(self):
+        """Fail-safe runs the other way here: git cannot answer, so no claim
+        about history is made. The present-file gate is unaffected."""
+        self._plant()
+
+        history, reaching = self._attention()
+
+        self.assertEqual(history, [])
+        self.assertEqual(len(reaching), 1, "the older probe still over-reports")
+
+    def test_a_secret_in_a_subdirectory_is_found(self):
+        """History paths are compared by basename, exactly as
+        `scan_for_secrets()` does."""
+        self._init(gitignore=self.SECTION_28)
+        self._plant("notes/id_rsa")
+        self._commit()
+
+        history, _reaching = self._attention()
+
+        self.assertEqual(len(history), 1)
+        self.assertIn("notes/id_rsa", history[0])
+
+    def test_it_uses_the_gates_own_name_list(self):
+        """A second opinion about what a secret looks like would let this
+        report and the Backup gate disagree. The report imports the gate's
+        own predicate rather than restating its list."""
+        from backup.working_copy import _looks_like_secret
+
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("from backup.working_copy import _looks_like_secret", source)
+
+        # And the predicate really is the gate's: a name the gate flags, and
+        # one it does not.
+        self.assertTrue(_looks_like_secret("id_rsa"))
+        self.assertFalse(_looks_like_secret("2026-08-13.md"))
+
+    def test_the_probe_returns_paths_not_just_names(self):
+        """`notes/id_rsa` and `id_rsa` are different facts to an operator
+        deciding which credential to rotate."""
+        import importlib.util
+
+        self._init()
+        self._plant("notes/id_rsa")
+        self._commit()
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module._secrets_ever_committed(self.wc), ("notes/id_rsa",))
+
+
+class CaseFoldedScopeDirectoryTests(unittest.TestCase):
+    """BUG-55, from "something is wrong" to "rename this directory".
+
+    C27 made the consequence visible: Company History that never reached the
+    remote. It could not say *why*, so an operator had to notice a capital
+    letter inside a filename (`Daily\\2026-08-13.md`) and know what it meant.
+
+    `working_copy._is_in_scope()` compares the first path component against
+    `_ALLOWED_TOP_LEVEL_DIRS` exactly. docs/11's deployment steps have a human
+    create those directories, and Windows treats `Daily` and `daily` as one —
+    so every other part of the system reads the directory happily, including
+    this view's own `daily 파일` count (which uses `glob()`, and folds case),
+    while Backup silently never copies it.
+
+    The allowed set is imported from the module that enforces it. Restating
+    `{"daily", "monthly"}` here would be a second opinion about backup scope,
+    and a third scope directory would then be diagnosed nowhere.
+
+    Detection only. Case-folding the comparison is BUG-55's own decision — it
+    changes which files Backup covers — and renaming a directory under Local
+    Master is an action this program must not take (docs/08 §13/§46: Company
+    History is never rewritten by the program).
+    """
+
+    def _master(self, *names):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        master = root / "local_master"
+        master.mkdir()
+        for name in names:
+            (master / name).mkdir()
+        return master
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_casefold", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_case_folded_daily_is_diagnosed_with_its_correct_name(self):
+        master = self._master("Daily", "monthly")
+
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master), (("Daily", "daily"),)
+        )
+
+    def test_it_covers_every_scope_directory_not_just_daily(self):
+        master = self._master("daily", "MONTHLY")
+
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master), (("MONTHLY", "monthly"),)
+        )
+
+    def test_both_wrong_at_once_are_both_named(self):
+        master = self._master("Daily", "Monthly")
+
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master),
+            (("Daily", "daily"), ("Monthly", "monthly")),
+        )
+
+    # ---- the false-alarm guard -----------------------------------------
+
+    def test_correctly_named_directories_say_nothing(self):
+        master = self._master("daily", "monthly")
+
+        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+
+    def test_a_legitimately_out_of_scope_directory_is_not_flagged(self):
+        """docs/08 §26 marks `decisions/` conditional, not required. Being
+        out of scope is not the defect — *looking* in scope is."""
+        master = self._master("daily", "monthly", "decisions")
+
+        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+
+    def test_a_merely_similar_name_is_not_flagged(self):
+        master = self._master("daily", "monthly", "dailies")
+
+        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+
+    def test_a_file_with_a_scope_name_is_not_a_directory_problem(self):
+        """Only directories can hold Company History, so only directories are
+        diagnosed. Note the fixture cannot also create `monthly/`: on a
+        case-insensitive filesystem — the one this defect exists on — a file
+        named `Monthly` and a directory named `monthly` are one path."""
+        master = self._master("daily")
+        (master / "Monthly").write_text("not a directory", encoding="utf-8")
+
+        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+
+    def test_an_empty_or_missing_master_says_nothing(self):
+        module = self._module()
+
+        self.assertEqual(module._misnamed_scope_directories(self._master()), ())
+        self.assertEqual(
+            module._misnamed_scope_directories(Path(tempfile.mkdtemp()) / "nope"), ()
+        )
+
+    # ---- it really is the backup gate's own set ------------------------
+
+    def test_the_allowed_set_comes_from_the_module_that_enforces_it(self):
+        from backup.working_copy import _ALLOWED_TOP_LEVEL_DIRS, _is_in_scope
+
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "from backup.working_copy import _ALLOWED_TOP_LEVEL_DIRS", source
+        )
+        # And the premise: the gate really does reject the case variant.
+        for allowed in _ALLOWED_TOP_LEVEL_DIRS:
+            with self.subTest(directory=allowed):
+                self.assertTrue(_is_in_scope(f"{allowed}/2026-08-13.md"))
+                self.assertFalse(_is_in_scope(f"{allowed.capitalize()}/2026-08-13.md"))
+
+    def test_the_operator_message_names_both_the_wrong_and_right_name(self):
+        import contextlib
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "state").mkdir(parents=True)
+        (runtime / "local_master" / "Daily").mkdir(parents=True)
+        (runtime / "local_master" / "Daily" / "2026-08-13.md").write_text(
+            "# day\n", encoding="utf-8"
+        )
+
+        module = self._module()
+        module.RUNTIME_DIR = runtime
+        with contextlib.redirect_stdout(io.StringIO()):
+            attention = module._print_history(NOW)
+
+        message = next(a for a in attention if "백업 범위 밖" in a)
+        self.assertIn("`Daily/`", message)
+        self.assertIn("`daily/`", message)
+        self.assertIn("BUG-55", message)
+
+
+class CandidatesBeforeTheHistoryStartTests(unittest.TestCase):
+    """BUG-46's permanent half, unblocked by noticing the decision was made.
+
+    C22 narrowed BUG-46 by measurement: a KEEP Candidate dated in the
+    *future* is only delayed — the Scheduler renders it once that date is
+    yesterday — while one dated before `history_start_date` is **permanent**,
+    because the Scheduler never goes earlier than that date.
+    `find_orphaned_events()` reports clean for these (correctly: the
+    Candidate exists), so nothing said the Event would never appear.
+
+    C22 recorded the detection as blocked: *"설정이 없을 때 무엇을 보고할지가
+    또 하나의 판단"*. **That judgement had already been made in this very
+    file, twice** — `_agent_start_date()` and the sync-folder read both
+    resolve an environment variable, and both answer "not set" by printing a
+    note and computing nothing. `_history_start_date()` is byte-for-byte that
+    shape. Applying an answer the module already gives is not a new policy;
+    what was missing was noticing it existed.
+
+    The same unblocking applies to the unresolvable `dirty_months` case
+    recorded alongside it — one decision was holding two detections.
+
+    Reachable through ordinary misconfiguration rather than corruption: a
+    Desktop whose `COMPANY_OPS_AGENT_START_DATE` is earlier than Desktop 4's
+    `COMPANY_OPS_HISTORY_START_DATE` delivers Events for dates Desktop 4 will
+    never render, and every step of every run reports success.
+
+    Detection only. What to *do* with a stranded Candidate is BUG-46/E-20's
+    open decision; the message names the likely cause and stops there.
+    """
+
+    START = "2026-08-01"
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "local_master/daily", "local_master/monthly", "state",
+                    "events/processed"):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _candidate(self, runtime, name, day):
+        (runtime / "history_candidates" / "keep" / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "history_id": name, "event_id": name.replace("HIST-", ""),
+                    "timestamp": f"{day}T10:00:00+09:00", "category": "MILESTONE",
+                    "project_id": "PRJ", "role": "COO", "summary": "s",
+                    "evidence": [], "filter_result": "KEEP",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run(self, runtime, start):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_prehistory", path)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            os.environ,
+            {} if start is None else {"COMPANY_OPS_HISTORY_START_DATE": start},
+            clear=False,
+        ):
+            if start is None:
+                os.environ.pop("COMPANY_OPS_HISTORY_START_DATE", None)
+            spec.loader.exec_module(module)
+            module.RUNTIME_DIR = runtime
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "시작일" in a]
+
+    # ---- the defect ----------------------------------------------------
+
+    def test_a_candidate_before_the_start_date_is_reported(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OLD", "2026-07-20")
+
+        _output, alerts = self._run(runtime, self.START)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("HIST-OLD", alerts[0])
+        self.assertIn("2026-07-20", alerts[0])
+
+    def test_the_message_says_no_run_will_ever_render_it(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OLD", "2026-07-20")
+
+        _output, alerts = self._run(runtime, self.START)
+
+        self.assertIn("어떤 실행에서도", alerts[0])
+        self.assertIn("BUG-46", alerts[0])
+
+    def test_it_names_the_likely_misconfiguration(self):
+        """The cause an operator can actually act on: two start dates that
+        disagree across Desktops."""
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OLD", "2026-07-20")
+
+        _output, alerts = self._run(runtime, self.START)
+
+        self.assertIn("COMPANY_OPS_AGENT_START_DATE", alerts[0])
+
+    # ---- the false-alarm guard -----------------------------------------
+
+    def test_a_candidate_after_the_start_date_is_not_reported(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OK", "2026-08-05")
+
+        _output, alerts = self._run(runtime, self.START)
+
+        self.assertEqual(alerts, [])
+
+    def test_a_future_dated_candidate_is_not_reported(self):
+        """C22's measurement: a future date is delayed, not lost — the
+        Scheduler renders it once that day is yesterday. Reporting it would
+        be an alert that clears itself, which is the noise this project
+        removes."""
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-FUTURE", "2026-09-15")
+
+        _output, alerts = self._run(runtime, self.START)
+
+        self.assertEqual(alerts, [])
+
+    def test_an_unset_variable_computes_nothing_and_says_so(self):
+        """The behaviour this file already chose for its two Agent
+        variables: report that the computation was skipped, do not guess and
+        do not alert."""
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OLD", "2026-07-20")
+
+        output, alerts = self._run(runtime, None)
+
+        self.assertIn("COMPANY_OPS_HISTORY_START_DATE 미설정", output)
+        self.assertEqual(alerts, [])
+
+    def test_an_unparseable_variable_is_treated_as_unset(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OLD", "2026-07-20")
+
+        output, alerts = self._run(runtime, "not-a-date")
+
+        self.assertIn("미설정", output)
+        self.assertEqual(alerts, [])
+
+    def test_an_unreadable_candidate_is_skipped_not_guessed(self):
+        """`FileHistoryRepository.list()` would raise here (BUG-38) and take
+        the view down. A file whose date cannot be read is not evidence of a
+        stranded Event."""
+        runtime = self._runtime()
+        self._candidate(runtime, "HIST-OLD", "2026-07-20")
+        (runtime / "history_candidates" / "keep" / "broken.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        output, alerts = self._run(runtime, self.START)
+
+        self.assertIn("HISTORY", output)
+        self.assertEqual(len(alerts), 1)
+        self.assertNotIn("broken", alerts[0])
+
+    def test_a_staging_file_is_not_a_stranded_candidate(self):
+        runtime = self._runtime()
+        (runtime / "history_candidates" / "keep" / ".tmp-partial.json").write_text(
+            json.dumps({"timestamp": "2026-07-20T10:00:00+09:00"}), encoding="utf-8"
+        )
+
+        _output, alerts = self._run(runtime, self.START)
+
+        self.assertEqual(alerts, [])
+
+    def test_the_resolver_matches_the_one_beside_it(self):
+        """`_history_start_date()` deliberately mirrors `_agent_start_date()`
+        — same read, same None on unset, same None on unparseable. That
+        sameness is the argument that this needed no new decision."""
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_resolvers", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(module._history_start_date())
+            self.assertIsNone(module._agent_start_date())
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COMPANY_OPS_HISTORY_START_DATE": "bad",
+                "COMPANY_OPS_AGENT_START_DATE": "bad",
+            },
+            clear=True,
+        ):
+            self.assertIsNone(module._history_start_date())
+            self.assertIsNone(module._agent_start_date())
+        with mock.patch.dict(
+            os.environ,
+            {
+                "COMPANY_OPS_HISTORY_START_DATE": "2026-08-01",
+                "COMPANY_OPS_AGENT_START_DATE": "2026-08-01",
+            },
+            clear=True,
+        ):
+            self.assertEqual(module._history_start_date(), date(2026, 8, 1))
+            self.assertEqual(module._agent_start_date(), date(2026, 8, 1))
+
+
+class UnresolvableDirtyMonthTests(CandidatesBeforeTheHistoryStartTests):
+    """The second detection the same decision was holding.
+
+    `monthly/generator.py`'s dirty loop refuses a month that predates
+    `history_start_date` (docs/09 §85-86: never invent a month the system
+    does not cover), returns MONTHLY_PENDING, and **deliberately leaves the
+    flag in place** — its comment says silently forgetting it "would hide a
+    state file that needs a person". The Runner then classifies PENDING as
+    not-a-failure, which is right for the ordinary case (Daily Catch-up will
+    fill a gap), writes one line to `late_update.log`, and moves on. Nothing
+    reads that log.
+
+    So the flag stayed, the person was never told, and ATTENTION said the
+    opposite: *"다음 Runner 실행에서 자동 처리된다"* — a false statement for
+    exactly the month no run can process.
+
+    Unblocked by `_history_start_date()`, the same resolver that unblocked
+    BUG-46. One decision was holding two detections, and the decision had
+    already been made elsewhere in this file.
+    """
+
+    def _state(self, runtime, dirty):
+        (runtime / "state" / "monthly_history_state.json").write_text(
+            json.dumps({"last_successful_monthly_close": None, "dirty_months": dirty}),
+            encoding="utf-8",
+        )
+
+    def _dirty_alerts(self, runtime, start):
+        _output, _ = self._run(runtime, start)
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_dirty", path)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(
+            os.environ,
+            {} if start is None else {"COMPANY_OPS_HISTORY_START_DATE": start},
+            clear=False,
+        ):
+            if start is None:
+                os.environ.pop("COMPANY_OPS_HISTORY_START_DATE", None)
+            spec.loader.exec_module(module)
+            module.RUNTIME_DIR = runtime
+            with contextlib.redirect_stdout(io.StringIO()):
+                items = module._print_history(NOW)
+        return (
+            [a for a in items if "자동 처리된다" in a],
+            [a for a in items if "어떤 실행도 처리할 수 없는" in a],
+        )
+
+    def test_an_ordinary_dirty_month_still_says_it_is_automatic(self):
+        runtime = self._runtime()
+        self._state(runtime, ["2026-08"])
+
+        automatic, unresolvable = self._dirty_alerts(runtime, self.START)
+
+        self.assertEqual(len(automatic), 1)
+        self.assertEqual(unresolvable, [])
+
+    def test_a_pre_history_dirty_month_is_not_called_automatic(self):
+        """The false statement, removed."""
+        runtime = self._runtime()
+        self._state(runtime, ["2026-05"])
+
+        automatic, unresolvable = self._dirty_alerts(runtime, self.START)
+
+        self.assertEqual(automatic, [])
+        self.assertEqual(len(unresolvable), 1)
+        self.assertIn("2026-05", unresolvable[0])
+
+    def test_a_mixed_state_separates_the_two(self):
+        runtime = self._runtime()
+        self._state(runtime, ["2026-05", "2026-08"])
+
+        automatic, unresolvable = self._dirty_alerts(runtime, self.START)
+
+        self.assertIn("2026-08", automatic[0])
+        self.assertNotIn("2026-05", automatic[0])
+        self.assertIn("2026-05", unresolvable[0])
+
+    def test_without_the_start_date_no_month_is_called_unresolvable(self):
+        """It cannot be judged, so no claim is made — today's behaviour."""
+        runtime = self._runtime()
+        self._state(runtime, ["2026-05"])
+
+        automatic, unresolvable = self._dirty_alerts(runtime, None)
+
+        self.assertEqual(len(automatic), 1)
+        self.assertEqual(unresolvable, [])
+
+    def test_a_malformed_month_key_never_reaches_this_check(self):
+        """Measured rather than assumed: `monthly.load_state()` validates the
+        `dirty_months` shape and raises, so the whole state is reported as
+        damaged before any month is classified. The `continue` guard in the
+        classifier is therefore belt-and-braces, not the thing that handles
+        this — worth knowing, because a guard nobody can reach is a guard
+        nobody maintains."""
+        from monthly import MonthlyStateError
+        from monthly import load_state as load_monthly_state
+
+        runtime = self._runtime()
+        self._state(runtime, ["not-a-month"])
+
+        with self.assertRaises(MonthlyStateError):
+            load_monthly_state(runtime / "state" / "monthly_history_state.json")
+
+        automatic, unresolvable = self._dirty_alerts(runtime, self.START)
+        self.assertEqual((automatic, unresolvable), ([], []))
+
+    def test_the_generator_really_does_refuse_such_a_month(self):
+        """The premise, from the generator rather than assumed."""
+        import inspect
+
+        import monthly.generator as generator
+
+        source = inspect.getsource(generator.run_once)
+        self.assertIn("predates the history start date", source)
+
+
+class KeptButNotRenderedTests(unittest.TestCase):
+    """E-17's loss, made visible. NOT fixed — reported.
+
+    E-17: when `update_daily_history()` fails, that Late Event is never
+    retried. Step 6.5's target dates are only the ones *this* run collected
+    (`kept_dates`), so no later run has a reason to look at that date again.
+    Its own measurement ends with the sentence that matters:
+
+        파일을 고쳐도 아무 일도 일어나지 않고, **모든 지표가 정상을 보고하는
+        채로** Company History에 Event 하나가 비어 있다.
+
+    C20 corrected the classification (RETRYABLE -> PERMANENT) so the *failing
+    run* shows up. What stayed invisible is the state afterwards: a Candidate
+    stored as Company History, absent from the day it belongs to, with every
+    later run reporting SUCCESS.
+
+    **The verdict is decidable between runs, which is why this needed no
+    policy decision.** Step 5 writes Candidates, step 6 renders the dates the
+    Scheduler closed, and step 6.5 merges anything landing on an
+    already-closed date — all within one run. So once a run has finished, a
+    Candidate whose Daily file *exists* and does not contain its `event_id`
+    was not merged, and nothing will retry it.
+
+    A Candidate whose Daily file does not exist yet is excluded: that is the
+    Scheduler window (not yet rendered), or BUG-46's pre-history case, which
+    `_candidates_before()` reports on its own terms.
+
+    **Verified against this machine's real runtime before being written**:
+    13 of 14 stored Candidates were present in their Daily file, and the
+    fourteenth was genuinely absent — E-17's shape, sitting there unreported.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "local_master/daily", "local_master/monthly", "state",
+                    "events/processed", "locks"):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _candidate(self, runtime, event_id, day):
+        (runtime / "history_candidates" / "keep" / f"HIST-{event_id}.json").write_text(
+            json.dumps(
+                {
+                    "history_id": f"HIST-{event_id}", "event_id": event_id,
+                    "timestamp": f"{day}T10:00:00+09:00", "category": "MILESTONE",
+                    "project_id": "PRJ", "role": "COO", "summary": "s",
+                    "evidence": [], "filter_result": "KEEP",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _daily(self, runtime, day, *event_ids):
+        body = [f"# DOJOONPASS Company History — {day}", "", "## Milestones", ""]
+        for event_id in event_ids:
+            body.append(f"- Event ID: {event_id}")
+        (runtime / "local_master" / "daily" / f"{day}.md").write_text(
+            "\n".join(body) + "\n", encoding="utf-8"
+        )
+
+    def _run(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_e17", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "Daily History에 없다" in a]
+
+    # ---- the defect ----------------------------------------------------
+
+    def test_a_candidate_missing_from_its_rendered_day_is_reported(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-STRANDED", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-OTHER")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("EVT-STRANDED", alerts[0])
+        self.assertIn("2026-08-05", alerts[0])
+
+    def test_the_message_says_no_run_will_add_it(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-STRANDED", "2026-08-05")
+        self._daily(runtime, "2026-08-05")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertIn("어떤 실행도", alerts[0])
+        self.assertIn("E-17", alerts[0])
+
+    # ---- the false-alarm guard -----------------------------------------
+
+    def test_a_rendered_candidate_is_not_reported(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-OK", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-OK")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_a_candidate_whose_day_is_not_rendered_yet_is_not_reported(self):
+        """The Scheduler window: no Daily file means not yet, not lost."""
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-PENDING", "2026-08-09")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_several_candidates_on_one_day_are_judged_individually(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-IN", "2026-08-05")
+        self._candidate(runtime, "EVT-OUT", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-IN")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("EVT-OUT", alerts[0])
+        self.assertNotIn("EVT-IN", alerts[0])
+
+    def test_an_unreadable_candidate_is_skipped(self):
+        runtime = self._runtime()
+        (runtime / "history_candidates" / "keep" / "broken.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        output, alerts = self._run(runtime)
+
+        self.assertIn("HISTORY", output)
+        self.assertEqual(alerts, [])
+
+    def test_an_unreadable_candidate_is_reported_rather_than_only_skipped(self):
+        """The blind spot C28's own checks created, closed in the same Sprint.
+
+        Both new checks drop a Candidate they cannot parse — neither can
+        claim a fact about bytes it could not read. That left the file
+        reported by nothing, with "Candidate 정합성: OK" two lines below.
+
+        It is not harmless: `scheduler.run_once()` builds its keep index from
+        `repository.list()`, which raises on the first unreadable Candidate
+        (BUG-38), so the *next* run's Scheduler step fails. This names the
+        file before that happens.
+        """
+        runtime = self._runtime()
+        (runtime / "history_candidates" / "keep" / "HIST-BROKEN.json").write_text(
+            "{truncated", encoding="utf-8"
+        )
+
+        output, _alerts = self._run(runtime)
+
+        self.assertIn("읽을 수 없는 Candidate", output)
+
+    def test_a_readable_candidate_is_not_reported_as_unreadable(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-OK", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-OK")
+
+        output, _alerts = self._run(runtime)
+
+        self.assertNotIn("읽을 수 없는 Candidate", output)
+
+    def test_a_staging_file_is_not_reported_as_unreadable(self):
+        """`.tmp-` is an unfinished write, not a damaged Candidate (C27)."""
+        runtime = self._runtime()
+        (runtime / "history_candidates" / "keep" / ".tmp-x.json").write_text(
+            "{truncated", encoding="utf-8"
+        )
+
+        output, _alerts = self._run(runtime)
+
+        self.assertNotIn("읽을 수 없는 Candidate", output)
+
+    def test_a_staging_file_is_not_a_stranded_candidate(self):
+        runtime = self._runtime()
+        (runtime / "history_candidates" / "keep" / ".tmp-x.json").write_text(
+            json.dumps({"event_id": "E", "timestamp": "2026-08-05T10:00:00+09:00"}),
+            encoding="utf-8",
+        )
+        self._daily(runtime, "2026-08-05")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_a_running_runner_adds_the_caveat_without_hiding_the_list(self):
+        """Same treatment `find_orphaned_events()` documents: a Runner
+        between step 5 and step 6.5 can produce this transiently. A real loss
+        hidden behind "probably just running" is worse than a caveat."""
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-STRANDED", "2026-08-05")
+        self._daily(runtime, "2026-08-05")
+        (runtime / "locks" / "company_ops.lock").write_text(
+            json.dumps(
+                {"process_id": os.getpid(), "created_at": NOW.isoformat(timespec="seconds")}
+            ),
+            encoding="utf-8",
+        )
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Runner 실행 중", alerts[0])
+
+    def test_a_prefix_of_another_id_is_not_mistaken_for_rendered(self):
+        """A false negative in this very check, found in C30.
+
+        The first version asked `event_id not in text`. `E-1` is a substring
+        of the line rendered for `E-10`, so a genuinely stranded `E-1` was
+        reported as fine — with ordinary sequential ids and no crafted input.
+
+        Whole lines are compared now, which is the same question the renderer
+        answers: `daily/markdown.py` writes exactly `- Event ID: {event_id}`.
+        """
+        runtime = self._runtime()
+        self._candidate(runtime, "E-1", "2026-08-05")
+        self._candidate(runtime, "E-10", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "E-10")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("E-1 (", alerts[0])
+
+    def test_both_ids_rendered_reports_neither(self):
+        runtime = self._runtime()
+        self._candidate(runtime, "E-1", "2026-08-05")
+        self._candidate(runtime, "E-10", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "E-1", "E-10")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_an_id_mentioned_in_prose_does_not_count_as_rendered(self):
+        """Only the renderer's own line counts. A summary that happens to
+        quote an id is not that id being rendered."""
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-QUOTED", "2026-08-05")
+        (runtime / "local_master" / "daily" / "2026-08-05.md").write_text(
+            "# DOJOONPASS Company History — 2026-08-05\n\n"
+            "## Summary\n\nfollow-up to EVT-QUOTED\n",
+            encoding="utf-8",
+        )
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+
+    def test_the_match_is_on_the_id_the_renderer_writes(self):
+        """`daily/markdown.py` writes `- Event ID: {event_id}`. Matching on
+        anything else would drift from the renderer."""
+        import inspect
+
+        import daily.markdown as markdown
+
+        self.assertIn("Event ID: {candidate.event_id}", inspect.getsource(markdown))
+
+
+class JunctionInBackupScopeTests(unittest.TestCase):
+    """A-19/BUG-57 made visible without deciding it.
+
+    A junction under a backup-scoped directory copies content from outside
+    Local Master into the Working Copy and pushes it. Re-measured through the
+    real sync (C29):
+
+        Path.is_symlink()             False   <- the sync's guard misses it
+        os.path.isjunction()          True    <- stdlib knows exactly
+        sync_to_working_copy() added  daily/linked/notes.md,
+                                      daily/linked/private.md
+        scan_for_secrets(master)      ()      <- nothing flagged
+
+    Both existing guards stay quiet by construction: `_relative_files()`
+    excludes symlinks and a junction is not one, and the secret scan only
+    reacts to secret-*shaped names*, so ordinary files pass silently. The
+    BACKLOG's note that the scan "catches it" is true only for a file that is
+    also secret-named.
+
+    **Reported, never refused.** Whether a redirected History directory is a
+    legitimate layout is A-19's deployment decision — the record says
+    refusing it was implemented once and reverted for exactly that reason
+    (redirecting `daily/` to another drive for disk space is a real use).
+    Nothing here changes what Backup copies.
+
+    Printed as a fact, not raised as ATTENTION, following C26: on a
+    deliberately redirected deployment no operator action would clear it.
+    What was missing is that the redirect exists and where it points.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "state", "events/processed"):
+            (runtime / rel).mkdir(parents=True)
+        (runtime / "local_master" / "monthly").mkdir(parents=True)
+        outside = root / "outside"
+        outside.mkdir()
+        (outside / "notes.md").write_text("outside Local Master\n", encoding="utf-8")
+        return runtime, outside
+
+    def _junction(self, link: Path, target: Path):
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest("directory junctions are not available on this machine")
+
+    def _lines(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_junction", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        printed = [line.strip() for line in buffer.getvalue().splitlines() if "junction" in line]
+        return printed, [a for a in attention if "junction" in a]
+
+    def test_a_junction_inside_daily_is_reported_with_its_target(self):
+        runtime, outside = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        daily.mkdir()
+        (daily / "2026-08-13.md").write_text("# d\n", encoding="utf-8")
+        self._junction(daily / "linked", outside)
+
+        printed, alerts = self._lines(runtime)
+
+        self.assertEqual(len(printed), 1, printed)
+        self.assertIn("daily", printed[0])
+        self.assertIn("linked", printed[0])
+        self.assertIn(str(outside), printed[0])
+        self.assertEqual(alerts, [], "a deployment choice is not an alert")
+
+    def test_a_whole_scope_directory_that_is_a_junction_is_reported(self):
+        """The layout the record calls legitimate — redirecting `daily/` to
+        another drive. Still stated, because the operator should be able to
+        see it from the status view."""
+        runtime, outside = self._runtime()
+        self._junction(runtime / "local_master" / "daily", outside)
+
+        printed, alerts = self._lines(runtime)
+
+        self.assertEqual(len(printed), 1, printed)
+        self.assertEqual(alerts, [])
+
+    def test_an_ordinary_layout_says_nothing(self):
+        runtime, _outside = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        daily.mkdir()
+        (daily / "2026-08-13.md").write_text("# d\n", encoding="utf-8")
+
+        printed, alerts = self._lines(runtime)
+
+        self.assertEqual((printed, alerts), ([], []))
+
+    def test_the_sync_really_does_copy_through_it(self):
+        """The premise, from the real sync rather than assumed — and the
+        reason the two existing guards do not see it."""
+        from backup.working_copy import scan_for_secrets, sync_to_working_copy
+
+        runtime, outside = self._runtime()
+        master = runtime / "local_master"
+        daily = master / "daily"
+        daily.mkdir()
+        (daily / "2026-08-13.md").write_text("# d\n", encoding="utf-8")
+        link = daily / "linked"
+        self._junction(link, outside)
+        wc = runtime / "wc"
+        wc.mkdir()
+
+        result = sync_to_working_copy(master, wc)
+
+        self.assertFalse(link.is_symlink(), "a junction is not a symlink")
+        self.assertTrue(os.path.isjunction(link))
+        self.assertTrue(any("linked" in name for name in result.added), result.added)
+        self.assertEqual(scan_for_secrets(master), (), "ordinary names are not flagged")
+
+    def test_it_reports_nothing_when_the_platform_cannot_answer(self):
+        """`os.path.isjunction()` is Python 3.12+. Older interpreters get
+        silence rather than a guess."""
+        import importlib.util
+
+        runtime, _outside = self._runtime()
+        (runtime / "local_master" / "daily").mkdir()
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_junction_old", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with mock.patch.object(os.path, "isjunction", None, create=True):
+            self.assertEqual(
+                module._junctions_in_scope(runtime / "local_master"), ()
+            )

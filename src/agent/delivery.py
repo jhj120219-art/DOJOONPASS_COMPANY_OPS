@@ -48,8 +48,11 @@ from transport.onedrive import safe_event_filename
 
 # Same pool sizing and same measured reason as `app/desktop_activity.py`
 # and `history/reconciliation.py`: this reads every record in `sent/` plus
-# its destination, and on this machine a file open costs ~5.3 ms. Measured
-# serially: 1,000 events 6.0 s, 20,000 events 118 s — unusable in a status
+# its destination, and on this machine a file open costs ~5.3 ms. The pool
+# is worth 4.2x on a cold cache at 20,000 files (8.9 s -> 2.1 s); the larger
+# factor this comment used to quote came from a cache-ordering artefact —
+# see `app/desktop_activity.py`'s `_READ_WORKERS` and BACKLOG section D.
+# Unthreaded, a directory of that size is unusable in a status
 # view that is meant to be the first thing an operator runs.
 #
 # A pure read path whose output is aggregated, so threading changes only

@@ -24,6 +24,7 @@ Nothing here changes production code, Runtime behaviour, or any spec.
 """
 
 import ast
+import inspect
 import re
 import subprocess
 import sys
@@ -577,3 +578,191 @@ class EntrypointOutputOrderingTests(unittest.TestCase):
             lines = log.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(lines, ["first-stdout", "second-stderr", "third-stdout"])
+
+
+class OperatorGuideMatchesTheToolTests(unittest.TestCase):
+    """`AGENT.md` §6 describes `ops_status.py`. It had drifted.
+
+    The guide said the tool "shows two things" and named COMPANY and AGENT.
+    The tool prints **four** blocks — COMPANY, HISTORY, LAST RUN, AGENT — and
+    two of the four are where the state-vs-artifact consistency checks, the
+    Backup Working Copy warnings, the Run Manifest and both lock checks live.
+    An operator following the guide would not know the halves that carry most
+    of the diagnostics exist at all.
+
+    Drift is the expected outcome, not an accident: this Sprint alone added
+    lines to HISTORY and LAST RUN, and nothing anywhere connected the guide
+    to the tool. BACKLOG E-11 records that "고쳤다" claims outlive the
+    repository because tests and BACKLOG do not reference each other; this is
+    the same failure between a document and the program it documents, and it
+    is cheap to close for this one pair.
+
+    Deliberately narrow. It asserts that every block heading the tool prints
+    is named in the guide — not wording, not ordering, not completeness of
+    the prose. A test that pinned the text would fail on every edit and be
+    deleted; this one fails only when the tool grows a block the guide has
+    never heard of, which is exactly the drift that happened.
+    """
+
+    # `ATTENTION` is one of them: it is printed with the same "NAME — "
+    # shape when empty, and the guide already explains it. It is in this
+    # list because the tool prints it, not because it looked like a
+    # block — the second test below is what put it here.
+    BLOCK_HEADINGS = ("COMPANY", "HISTORY", "LAST RUN", "AGENT", "ATTENTION")
+
+    def test_the_guide_names_every_block_the_tool_prints(self):
+        guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+        section = guide.split("## 6. 확인 방법", 1)
+        self.assertEqual(len(section), 2, "AGENT.md §6 heading moved or renamed")
+        body = section[1].split("\n## ", 1)[0]
+
+        for heading in self.BLOCK_HEADINGS:
+            with self.subTest(block=heading):
+                self.assertIn(
+                    heading, body, f"AGENT.md §6 does not mention the {heading} block"
+                )
+
+    def test_the_block_list_is_the_one_the_tool_actually_prints(self):
+        """The other half: the list above must come from the program, not
+        from whatever was true when this test was written."""
+        source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        printed = set(re.findall(r'print\("([A-Z][A-Z ]+) —', source))
+
+        self.assertEqual(
+            printed,
+            set(self.BLOCK_HEADINGS),
+            "ops_status.py prints a different set of blocks than this test "
+            "and AGENT.md know about",
+        )
+
+    def test_the_documented_exit_codes_are_the_ones_returned(self):
+        """§6 states `0` / `1` / `3`. A fourth would be undocumented."""
+        guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+        source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        main = source.split("def main()", 1)[1]
+        returned = set(re.findall(r"return (\d+)", main))
+
+        self.assertEqual(returned, {"0", "3"}, returned)
+        for code in sorted(returned):
+            with self.subTest(code=code):
+                self.assertIn(f"`{code}`", guide)
+
+
+class DashboardDatabasesWithNoWriterTests(unittest.TestCase):
+    """A-16, verified instead of remembered.
+
+    `bootstrap_dashboard_databases()` creates five Operations databases and
+    only one of them is ever written. That has been recorded since C10 as a
+    sentence in BACKLOG, checked by nothing — so it was a claim about the
+    code that could quietly stop being true (or quietly stay true while
+    everyone assumed it had been fixed). Both directions are the failure mode
+    E-11 names.
+
+    **`DeadCodeCharacterizationTests` structurally cannot see this one.** It
+    counts references by name, and `build_ops_backup_properties` *is*
+    referenced — by `notion/__init__.py`'s import and `__all__`. A name that
+    is exported but never called looks alive to a reference count. Verified
+    with an AST walk instead, which counts actual `Call` nodes:
+
+        build_ops_run_properties       1 call   (dashboard.record_run)
+        build_ops_backup_properties    0 calls
+        record_run                     1 call   (app/runner.py)
+
+    Still SKIP: which database receives what is docs/04 §53's "Notion 데이터
+    과잉 방지" decision, and wiring `OPS_BACKUP` in would add a Notion write
+    to every run. This test decides nothing — it makes the day someone wires
+    it in, or deletes it, a visible event that points back at A-16.
+
+    The AST walk is deliberately narrow: `Call` nodes whose callee is a bare
+    name or an attribute with the matching name. An indirect call through a
+    variable would be missed, which is worth knowing rather than papering
+    over — nothing in this repository dispatches these builders indirectly.
+    """
+
+    BUILDERS = ("build_ops_run_properties", "build_ops_backup_properties")
+
+    def _call_counts(self, *names):
+        counts = {name: 0 for name in names}
+        for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError:  # pragma: no cover - a syntax error fails elsewhere
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+                if called in counts:
+                    counts[called] += 1
+        return counts
+
+    def test_the_run_builder_is_called_and_the_backup_builder_is_not(self):
+        counts = self._call_counts(*self.BUILDERS)
+
+        self.assertGreaterEqual(counts["build_ops_run_properties"], 1)
+        self.assertEqual(
+            counts["build_ops_backup_properties"],
+            0,
+            "OPS_BACKUP now has a writer — A-16 needs updating either way",
+        )
+
+    def test_a_reference_count_cannot_see_it(self):
+        """Why this test exists separately from `DeadCodeCharacterizationTests`:
+        the exported name is referenced, so counting references finds it
+        alive."""
+        referenced = 0
+        for path in list(SRC.rglob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8")
+            referenced += text.count("build_ops_backup_properties")
+
+        self.assertGreater(referenced, 1, "it is imported and exported")
+        self.assertEqual(self._call_counts("build_ops_backup_properties")[
+            "build_ops_backup_properties"
+        ], 0)
+
+    def test_every_bootstrapped_database_is_named_and_only_one_is_written(self):
+        """The five databases are created; `record_run()` writes `OPS_RUNS`.
+        Pinning both halves keeps the gap's size honest."""
+        from notion.dashboard import (
+            OPS_BACKUP,
+            OPS_NOTION_SYNC,
+            OPS_READINESS,
+            OPS_RISK,
+            OPS_RUNS,
+        )
+        import notion.dashboard as dashboard
+
+        created = {OPS_RUNS, OPS_BACKUP, OPS_NOTION_SYNC, OPS_RISK, OPS_READINESS}
+        self.assertEqual(len(created), 5)
+
+        record_run_source = inspect.getsource(dashboard.record_run)
+        self.assertIn("OPS_RUNS", record_run_source)
+        for unwritten in (OPS_BACKUP, OPS_NOTION_SYNC, OPS_RISK, OPS_READINESS):
+            with self.subTest(database=unwritten):
+                self.assertNotIn(f'"{unwritten}"', record_run_source)
+
+    def test_the_unwritten_databases_have_no_builder_at_all(self):
+        """Three of the four are further from being wired than `OPS_BACKUP`:
+        they have no property builder either. Recorded so that "four are
+        empty" does not read as "four are one call away"."""
+        import notion.dashboard as dashboard
+
+        for database in ("notion_sync", "risk", "readiness"):
+            with self.subTest(database=database):
+                self.assertFalse(
+                    hasattr(dashboard, f"build_ops_{database}_properties"),
+                    f"build_ops_{database}_properties now exists — A-16 moved",
+                )

@@ -34,6 +34,18 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 # Every real history_id ("HIST-" + a UUID = 41 characters) is far shorter.
 _MAX_FILENAME_STEM = 120
 
+# Byte-identical copy of `reporter.local_output.INCOMPLETE_WRITE_PREFIX` /
+# `is_incomplete_write()`, which carries the full reasoning. Copied rather
+# than imported because `history` may import only `events`
+# (LayeringInvariantTests); `IncompleteWriteInvariantTests` asserts the
+# copies agree.
+INCOMPLETE_WRITE_PREFIX = ".tmp-"
+
+
+def is_incomplete_write(name: str) -> bool:
+    """Whether `name` is an atomic writer's staging file, not a finished artifact."""
+    return name.startswith(INCOMPLETE_WRITE_PREFIX)
+
 
 def safe_candidate_filename(history_id: str) -> str:
     """Derive a filesystem-safe filename from a `history_id`.
@@ -102,7 +114,9 @@ class FileHistoryRepository(HistoryRepository):
         if final_path.exists() and not overwrite:
             raise FileExistsError(f"history candidate already stored: {final_path}")
 
-        fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".tmp-", suffix=".json")
+        fd, tmp_path = tempfile.mkstemp(
+            dir=target_dir, prefix=INCOMPLETE_WRITE_PREFIX, suffix=".json"
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(candidate.to_dict(), handle, ensure_ascii=False, indent=2)
@@ -140,6 +154,18 @@ class FileHistoryRepository(HistoryRepository):
             if not directory.exists():
                 continue
             for path in sorted(directory.glob("*.json")):
+                if is_incomplete_write(path.name):
+                    # `save()` stages into this same directory, so a run
+                    # killed mid-write leaves a `.tmp-…json` here that
+                    # `glob("*.json")` cannot tell from a stored Candidate.
+                    # Reading it has two outcomes and both are wrong: a
+                    # truncated file raises JSONDecodeError, which this
+                    # method does not catch (BUG-38) and which therefore
+                    # blocks every Candidate for that date; a file that was
+                    # fully written but never `os.replace`d parses fine and
+                    # returns the *same* Candidate twice, once under its real
+                    # name and once under the staging name.
+                    continue
                 data = json.loads(path.read_text(encoding="utf-8"))
                 results.append(HistoryCandidate.from_dict(data))
         return results

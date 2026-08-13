@@ -425,6 +425,7 @@ def run_once(
             skipped_not_stable=len(intake_summary.skipped_not_stable),
             skipped_already_present=len(intake_summary.skipped_already_present),
             skipped_invalid=len(intake_summary.skipped_invalid),
+            skipped_incomplete=len(intake_summary.skipped_incomplete),
         )
 
         # 3. Collector — docs/07 §9 "Collector 실행" + "Pending Event 처리"

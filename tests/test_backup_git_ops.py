@@ -445,3 +445,128 @@ class PorcelainRenameBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StagingResidueThroughTheRealBackupTests(GitOpsTestCase):
+    """C27's highest-severity fix, verified end to end instead of at the seam.
+
+    The unit coverage stops at `sync_to_working_copy()`. What that cannot
+    answer is the question docs/08 §29 and BACKLOG E-21 are actually about:
+    **does what `BACKUP_SUCCESS` claims match what is in the remote commit?**
+    `git add -A` stages the Working Copy, not the sync result, so the two
+    are only equal if nothing reaches the Working Copy by another route.
+
+    Three runs against a real bare remote, in order, because the second and
+    third only mean something after the first:
+
+        run 1  Master holds a real day and a `.tmp-` staging file left by a
+               killed run          -> BACKUP_SUCCESS, and the remote commit
+                                      contains the day and NOT the staging
+                                      file
+        run 2  the operator deletes the staging file from Master — the only
+               sane response to garbage
+                                   -> BACKUP_NOT_REQUIRED, deleted=()
+
+               Pre-C27 this was the trap: the staging file HAD been synced,
+               so removing it from Master reported a deletion, and the
+               deletion gate (§43-47) applies nothing while `deleted` is
+               non-empty — every subsequent run failed. Cleaning up the
+               garbage was what broke Backup permanently.
+
+        run 3  a REAL day is deleted from Master
+                                   -> BACKUP_FAILED, deleted names that day,
+                                      and the remote still holds it
+
+    Run 3 is the half that makes run 2 safe to assert. An exclusion that
+    also swallowed real deletions would pass runs 1 and 2 and destroy the
+    protection §43-47 exists for.
+    """
+
+    def _setup_master_and_remote(self):
+        master = self.repo_dir.parent / "local_master"
+        (master / "daily").mkdir(parents=True)
+        bare = self.repo_dir.parent / "remote.git"
+        _run_git(["init", "--bare", "-b", "main", str(bare)], cwd=self.repo_dir.parent)
+        _run_git(["remote", "add", "origin", str(bare)], cwd=self.repo_dir)
+        # docs/08 §30 operator setup: an initialised, tracking Working Copy.
+        (self.repo_dir / ".gitkeep").write_text("", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.repo_dir)
+        _run_git(["commit", "-m", "init"], cwd=self.repo_dir)
+        _run_git(["push", "-u", "origin", "main"], cwd=self.repo_dir)
+        return master, bare
+
+    def _remote_files(self, bare):
+        return sorted(_run_git(["ls-tree", "-r", "--name-only", "HEAD"], cwd=bare).split())
+
+    def _backup(self, master, run_id):
+        import backup.runner as backup_runner
+
+        return backup_runner.run_once(
+            master_dir=master,
+            working_copy_dir=self.repo_dir,
+            state_path=self.repo_dir.parent / "backup_state.json",
+            run_id=run_id,
+        )
+
+    def test_the_remote_commit_matches_what_backup_success_claims(self):
+        from backup.result import BackupStatus
+
+        master, bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-13.md").write_text("# real day\n", encoding="utf-8")
+        (master / "daily" / ".tmp-killed.md").write_text(
+            "# DOJOONPASS Company Hist", encoding="utf-8"
+        )
+
+        entry = self._backup(master, "RUN-1")
+
+        self.assertIs(entry.final_status, BackupStatus.SUCCESS)
+        self.assertEqual(entry.push_result, "SUCCESS")
+        remote = self._remote_files(bare)
+        self.assertIn("daily/2026-08-13.md", remote)
+        self.assertEqual([f for f in remote if ".tmp-" in f], [], remote)
+
+    def test_cleaning_the_staging_file_up_does_not_break_backup(self):
+        """The trap C27 removed, stated as the operator's action."""
+        from backup.result import BackupStatus
+
+        master, _bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-13.md").write_text("# real day\n", encoding="utf-8")
+        staged = master / "daily" / ".tmp-killed.md"
+        staged.write_text("# DOJOONPASS Company Hist", encoding="utf-8")
+        self._backup(master, "RUN-1")
+
+        staged.unlink()
+        entry = self._backup(master, "RUN-2")
+
+        self.assertEqual(entry.deleted_files, ())
+        self.assertIsNot(entry.final_status, BackupStatus.FAILED)
+
+    def test_deleting_a_real_day_still_fails_the_backup(self):
+        """The guard on the guard. An exclusion that swallowed real
+        deletions would pass both tests above and silently remove the
+        protection docs/08 §43-47 exists for."""
+        from backup.result import BackupStatus
+
+        master, bare = self._setup_master_and_remote()
+        day = master / "daily" / "2026-08-13.md"
+        day.write_text("# real day\n", encoding="utf-8")
+        self._backup(master, "RUN-1")
+
+        day.unlink()
+        entry = self._backup(master, "RUN-2")
+
+        self.assertIs(entry.final_status, BackupStatus.FAILED)
+        self.assertEqual(len(entry.deleted_files), 1, entry.deleted_files)
+        self.assertIn("2026-08-13.md", entry.deleted_files[0])
+        # ...and the remote is untouched: the gate stops before push.
+        self.assertIn("daily/2026-08-13.md", self._remote_files(bare))
+
+    def test_a_staging_file_alone_is_not_a_backup(self):
+        """Master holding only a staging file means there is no Company
+        History to back up — not a backup of one file."""
+        master, bare = self._setup_master_and_remote()
+        (master / "daily" / ".tmp-killed.md").write_text("partial", encoding="utf-8")
+
+        self._backup(master, "RUN-1")
+
+        self.assertEqual(self._remote_files(bare), [".gitkeep"])

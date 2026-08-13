@@ -47,6 +47,18 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MONTHLY_DIR = PROJECT_ROOT / "runtime" / "monthly"
 
 
+def monthly_history_path(monthly_dir: Path, key: str) -> Path:
+    """Where the Monthly History file for `key` (`"YYYY-MM"`) lives.
+
+    One derivation, named. It was written out twice inside this module
+    already, and a *reader* needs it too: `monthly_history_state.json`'s
+    `last_successful_monthly_close` is a claim about a file, and anything
+    checking that claim (docs/10 §48, "State Last Success -> Corresponding
+    Local History 존재?") has to look in the same place the writer wrote.
+    """
+    return Path(monthly_dir) / f"{key}.md"
+
+
 class MonthlyStatus(enum.Enum):
     """docs/09 §40-44. `GENERATED` covers §73's empty month too — the spec
     permits collapsing `MONTHLY_GENERATED_EMPTY` into "GENERATED with 0
@@ -152,7 +164,7 @@ def consolidate_month(
     """
     daily_dir = Path(daily_dir)
     monthly_dir = Path(monthly_dir)
-    final_path = monthly_dir / f"{month_key(year, month)}.md"
+    final_path = monthly_history_path(monthly_dir, month_key(year, month))
 
     coverage = check_coverage(
         daily_dir, year, month, history_start_date=history_start_date
@@ -452,7 +464,7 @@ def mark_month_dirty(
         and key <= state.last_successful_monthly_close
     )
     if not consolidated and monthly_dir is not None:
-        consolidated = (Path(monthly_dir) / f"{key}.md").exists()
+        consolidated = monthly_history_path(monthly_dir, key).exists()
 
     if not consolidated:
         return False

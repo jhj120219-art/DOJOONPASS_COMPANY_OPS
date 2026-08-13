@@ -29,6 +29,9 @@ from history import HistoryDecision  # noqa: E402
 from history.file_repository import safe_candidate_filename  # noqa: E402
 from history.reconciliation import find_orphaned_events  # noqa: E402
 from reporter.local_output import safe_event_filename  # noqa: E402
+from collector.state import PersistentSeenEventStore  # noqa: E402
+from events import Event  # noqa: E402
+from history.filter import HistoryFilter  # noqa: E402
 
 
 class ReconciliationTestCase(unittest.TestCase):
@@ -290,3 +293,138 @@ class ThreadedReadEquivalenceTests(ReconciliationTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetentionErasesTheEvidenceOfALossTests(unittest.TestCase):
+    """A-20's detector depends on an artifact B-6 is deciding whether to
+    delete. NOT FIXED; characterised, because the two are one decision.
+
+    A-20/BUG-25: the Collector marks an `event_id` seen and moves the file to
+    `processed/` before step 5 writes the History Candidate. Anything that
+    ends the run between those two points loses the Event from Company
+    History permanently — the seen store means no later run reconsiders it.
+
+    `find_orphaned_events()` is the answer to "which Event went missing", and
+    it works by scanning `processed/` and recomputing the decision from the
+    Event itself. **The Event file is the evidence.** The seen store, which
+    is what makes the loss permanent, holds only ids.
+
+    B-6 (보존 정책) is the open decision about deleting `processed/`,
+    `sent/`, `transport/`, `rejected/` and the collector state, all of which
+    grow without bound. Measured here:
+
+        processed file present   find_orphaned_events -> ['EVT-LOST']
+        seen store               knows EVT-LOST
+        file deleted (retention) find_orphaned_events -> []
+        seen store               STILL knows EVT-LOST
+
+    So retention would not lose any *data* that was not already lost — but it
+    would erase the only record that it *was* lost, while leaving the seen
+    store entry that guarantees no run will ever bring it back. A loss that
+    was detectable becomes a loss that is not.
+
+    **Why the detector cannot simply read the seen store instead.** The store
+    holds ids and nothing else. `find_orphaned_events()` recomputes each
+    Event's decision with `HistoryFilter` precisely because nothing records
+    it, and a DROP Event correctly has no Candidate. Without the Event's
+    content there is no way to tell "lost" from "correctly dropped", and DROP
+    is the common case — a seen-store-based detector would report every
+    dropped Event as an orphan. The dependency on `processed/` is not an
+    oversight; it is what makes the report accurate.
+
+    **What this adds to B-6:** whichever way retention is decided, `processed/`
+    is not merely a duplicate-suppression aid. It is A-20's evidence, and
+    deleting it silently narrows what the system can still tell an operator
+    about a loss that already happened.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.processed = self.root / "processed"
+        self.keep = self.root / "keep"
+        self.review = self.root / "review"
+        for directory in (self.processed, self.keep, self.review):
+            directory.mkdir(parents=True)
+
+    def _consumed_event(self, event_id="EVT-LOST"):
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="PRJ",
+            event_type="MILESTONE_COMPLETED", status="COMPLETED",
+            summary="work that is now lost", history_candidate=True,
+            event_id=event_id, timestamp="2026-08-10T10:00:00+09:00",
+        )
+        path = self.processed / f"{event_id}.json"
+        path.write_text(event.to_json(), encoding="utf-8")
+        store = PersistentSeenEventStore(state_path=self.root / "collector_state.json")
+        store.mark_seen(event_id)
+        return path, store
+
+    def _orphans(self):
+        result = find_orphaned_events(
+            processed_dir=self.processed, keep_dir=self.keep, review_dir=self.review
+        )
+        return [o.event_id for o in result.orphaned]
+
+    def test_the_loss_is_detectable_while_the_event_file_survives(self):
+        self._consumed_event()
+
+        self.assertEqual(self._orphans(), ["EVT-LOST"])
+
+    def test_deleting_the_processed_file_makes_the_loss_undetectable(self):
+        path, _store = self._consumed_event()
+        self.assertEqual(self._orphans(), ["EVT-LOST"])
+
+        path.unlink()
+
+        self.assertEqual(self._orphans(), [])
+
+    def test_but_the_loss_itself_is_still_permanent(self):
+        """The half that does not go away: the seen store still holds the id,
+        so no run will reconsider the Event, and no Candidate exists."""
+        path, store = self._consumed_event()
+
+        path.unlink()
+
+        self.assertTrue(store.is_seen("EVT-LOST"))
+        self.assertFalse((self.keep / "HIST-EVT-LOST.json").exists())
+        self.assertFalse((self.review / "HIST-EVT-LOST.json").exists())
+
+    def test_the_seen_store_alone_cannot_replace_the_evidence(self):
+        """Why the detector is not simply re-pointed at the seen store: a
+        DROP Event is *correctly* without a Candidate, and the store cannot
+        tell the two apart."""
+        dropped = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="PRJ",
+            event_type="STARTED", status="IN_PROGRESS",
+            summary="routine", history_candidate=False,
+            event_id="EVT-DROPPED", timestamp="2026-08-10T10:00:00+09:00",
+        )
+        (self.processed / "EVT-DROPPED.json").write_text(
+            dropped.to_json(), encoding="utf-8"
+        )
+        self._consumed_event()
+
+        # With the Events present the detector separates them correctly.
+        self.assertEqual(self._orphans(), ["EVT-LOST"])
+
+        # The seen store, which is all that would remain, holds both ids and
+        # nothing that distinguishes them.
+        store = PersistentSeenEventStore(state_path=self.root / "collector_state.json")
+        store.mark_seen("EVT-DROPPED")
+        self.assertTrue(store.is_seen("EVT-LOST"))
+        self.assertTrue(store.is_seen("EVT-DROPPED"))
+
+    def test_the_decision_is_recomputed_not_remembered(self):
+        """The property that makes `processed/` sufficient evidence:
+        `HistoryFilter.evaluate()` derives the decision from the Event alone,
+        so the detector reaches the same verdict the lost run would have."""
+        path, _store = self._consumed_event()
+        event = Event.from_json(path.read_text(encoding="utf-8"))
+
+        first = HistoryFilter().evaluate(event).decision
+        second = HistoryFilter().evaluate(event).decision
+
+        self.assertIs(first, second)
+        self.assertIs(first, HistoryDecision.KEEP)

@@ -49,8 +49,11 @@ from .result import HistoryDecision
 # Same pool sizing, and for the same measured reason, as
 # `app/desktop_activity.py`. This scan reads every file in `processed/`, and
 # on this machine that costs ~5.3 ms per file — almost entirely file OPEN,
-# not JSON parsing. Measured serially here: 1,000 events 6.0 s, 20,000
-# events 116 s. `ops_status.py` runs this on every invocation and is
+# not JSON parsing. The pool is worth 4.2x on a cold cache at 20,000 files
+# (8.9 s -> 2.1 s); the larger factor this comment used to quote came from
+# a benchmark whose serial pass ran cold and whose threaded pass ran on the
+# cache that pass had just warmed — see `app/desktop_activity.py`'s
+# `_READ_WORKERS` and BACKLOG section D. `ops_status.py` runs this on every invocation and is
 # documented as the "check this first" view, so a two-minute status command
 # would simply not be used.
 #

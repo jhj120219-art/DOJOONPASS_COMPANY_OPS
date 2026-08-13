@@ -58,6 +58,38 @@ class RuntimeSummary:
     files: tuple[ProcessedFile, ...]
 
 
+def _read_event_text(path: Path) -> tuple[str | None, str | None]:
+    """`(text, error)` — exactly the read `run_once()` performs, once.
+
+    Extracted so that a *reader* asking "can the Collector get through this
+    file at all?" gets the Collector's own answer rather than a second
+    opinion. That distinction is not academic here: intake's
+    `_is_parseable_json()` also requires valid JSON, but a valid-UTF-8 file
+    holding invalid JSON is REJECTED by `collector.collect()` and moves out
+    of `incoming/` on the first run, whereas one this read cannot decode
+    stays. Asking the wrong predicate would report a file that is leaving as
+    if it were stuck.
+
+    `ValueError` covers `UnicodeDecodeError`; see `run_once()` for why that
+    matters and what escaped before it was caught.
+    """
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
+
+
+def is_readable_event_file(path: Path) -> bool:
+    """Whether `run_once()` can read this file at all.
+
+    A False here is permanent by construction: the read is deterministic and
+    nothing rewrites the file, so the Collector records FAILED and leaves it
+    in `incoming/` on every run, forever. That is why a status view must be
+    able to ask — see `app/desktop_activity.py`.
+    """
+    return _read_event_text(path)[1] is None
+
+
 def _log(log_path: Path, message: str) -> None:
     """One timestamped line — now via `oplog.append_line()`.
 
@@ -117,9 +149,8 @@ def run_once(
     for path in sorted(incoming_dir.glob("*.json")):
         _log(log_path, f"PROCESSING {path.name}")
 
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except (OSError, ValueError) as exc:
+        raw, read_error = _read_event_text(path)
+        if read_error is not None:
             # `ValueError` covers `UnicodeDecodeError`. docs/03 §53 — quoted
             # a few lines below as the reason `collector.collect()` is
             # wrapped — says one malformed file must never stop the rest of
@@ -134,8 +165,8 @@ def run_once(
             # is corruption in place or a writer other than intake — the
             # Desktop 4 reporter and the operator both write `incoming/`
             # directly. §53's guarantee is unconditional either way.
-            _log(log_path, f"FAILED {path.name}: could not read file ({exc})")
-            results.append(ProcessedFile(path, None, RuntimeOutcome.FAILED, (str(exc),)))
+            _log(log_path, f"FAILED {path.name}: could not read file ({read_error})")
+            results.append(ProcessedFile(path, None, RuntimeOutcome.FAILED, (read_error,)))
             continue
 
         try:
