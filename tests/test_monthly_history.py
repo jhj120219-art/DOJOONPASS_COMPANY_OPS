@@ -204,6 +204,151 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual([i.event_id for i in document.items], ["EVT-1"])
 
+    def test_a_summary_that_reads_like_a_label_is_still_a_summary(self):
+        """REGRESSION. `_first_bullet()` used to skip any bullet matching the
+        shape `^[A-Z][A-Za-z ]+:[ \\t]` — "does this look like a label" rather
+        than "is this one of our labels".
+
+        An ordinary summary of `Fixed: login token refresh loop.` matches it.
+        So did every other bullet in the block (`Owner:`, `Event ID:`), which
+        meant `_first_bullet()` returned None, the item was dropped, and the
+        Event vanished from Monthly History with no warning anywhere —
+        `Consolidated Items` simply counted one fewer. Nothing about the
+        input is crafted; this is how engineers write summaries.
+        """
+        body = (
+            "# Title\n\n## Issues\n\n### Auth Service\n\n"
+            "- Fixed: login token refresh loop.\n"
+            "- Owner: CTO Backend\n- Event ID: EVT-1\n"
+        )
+        document = self._daily(body)
+
+        self.assertEqual([i.event_id for i in document.items], ["EVT-1"])
+        self.assertEqual(document.items[0].summary, "Fixed: login token refresh loop.")
+
+    def test_the_common_label_shaped_summaries_all_survive(self):
+        """The shape is not rare. Each of these lost its whole item."""
+        for summary in (
+            "Fixed: login token refresh loop.",
+            "Decision: adopt the new deploy runbook.",
+            "Resolved: duplicate charge on retry.",
+            "Note: campaign paused until Q4.",
+            "TODO: split the auth service.",
+            "Launch: closed beta opened to 50 users.",
+            "Beta: onboarding flow shipped.",
+        ):
+            with self.subTest(summary=summary):
+                body = (
+                    "# Title\n\n## Milestones\n\n### P\n\n"
+                    f"- {summary}\n- Owner: COO\n- Event ID: EVT-S\n"
+                )
+                document = self._daily(body)
+
+                self.assertEqual(len(document.items), 1)
+                self.assertEqual(document.items[0].summary, summary)
+
+    def test_the_renderer_s_own_label_bullets_are_still_skipped(self):
+        """The reason the scan exists at all: docs/06 §57 lets a human edit
+        the Daily, so a label bullet may sit above the summary. Every label
+        `daily/markdown._render_item_block()` can write must still be
+        skipped, or a hand-reordered block would report `Owner: COO` as its
+        summary."""
+        body = (
+            "# Title\n\n## Decisions\n\n### P\n\n"
+            "- Owner: COO\n"
+            "- Event ID: EVT-REORDERED\n"
+            "- Decision Context: budget review\n"
+            "- Expected Outcome: 20% lower spend\n"
+            "- Actual Outcome: 18% lower spend\n"
+            "- Lessons Learned: measure earlier\n"
+            "- The real summary sits last.\n"
+        )
+        document = self._daily(body)
+
+        self.assertEqual(len(document.items), 1)
+        self.assertEqual(document.items[0].summary, "The real summary sits last.")
+
+    def test_the_skipped_labels_are_exactly_the_ones_the_renderer_writes(self):
+        """Pins the two lists together. A label added to
+        `daily/markdown._render_item_block()` and not here would be reported
+        as an item's summary; one removed there and left here would swallow a
+        real summary. Either way the drift is silent, so it fails here."""
+        import inspect
+        import re
+
+        from daily import markdown as daily_markdown
+        from monthly.parser import _ITEM_LABELS
+
+        source = inspect.getsource(daily_markdown._render_item_block)
+        written = set(re.findall(r'f"- ([A-Za-z ]+): \{', source))
+
+        self.assertEqual(written, set(_ITEM_LABELS))
+
+    def test_an_item_with_an_empty_event_id_is_not_consolidated(self):
+        """CHARACTERIZATION — asserts today's behaviour, deliberately.
+
+        `_EVENT_ID_LINE` here uses `(\\S.*?)`, the same shape C31 loosened in
+        `daily/late_events.existing_event_ids()`. It is deliberately NOT
+        loosened here, because the two regexes answer different questions.
+
+        `late_events` asks "is this Event already in this document" (docs/06
+        §38's duplicate guard), and for a rendered `- Event ID: ` the answer
+        is plainly yes — leaving it strict made the item re-appended on every
+        run (`EmptyEventIdIsStillAnEventIdTests`).
+
+        This one asks "may this be consolidated" (docs/09 §59, keyed on
+        event_id). A hand-edited Daily's blank `- Event ID:` line cannot be
+        told apart from "I do not know the id", and consolidating several of
+        those under `""` would merge distinct items into one. Which reading
+        is right is A-15's wall — whether the schema should accept an empty
+        `event_id` at all — and it is recorded in BACKLOG C31 §2.
+
+        Measured: a Daily carrying two item blocks, one with a blank id,
+        contributes one item to Monthly. If this starts failing, that
+        decision was made and BACKLOG must be updated with it.
+        """
+        body = (
+            "# H\n\n## Milestones\n\n"
+            "### P\n\n- Real work happened.\n- Owner: COO\n- Event ID: \n\n"
+            "### Q\n\n- Other work.\n- Owner: COO\n- Event ID: EVT-2\n"
+        )
+        document = self._daily(body)
+
+        self.assertEqual([i.event_id for i in document.items], ["EVT-2"])
+
+    def test_the_daily_side_keeps_the_same_item(self):
+        """The other half of the asymmetry, asserted in one place so the pair
+        is visible rather than inferred from two files."""
+        from daily.late_events import existing_event_ids
+
+        self.assertEqual(existing_event_ids("- Event ID: \n"), {""})
+
+    def test_an_item_block_with_no_summary_bullet_is_dropped_and_counted(self):
+        """The remaining `summary is None` drop, which nothing executed.
+
+        Found by tracing which `src/` lines the suite runs: `_first_bullet()`'s
+        `return None` and the `if summary is None: continue` that consumes it
+        were never reached by any test. C31 §1 narrowed *why* that branch
+        fires — a label-shaped summary no longer triggers it — but the branch
+        itself remained, untested, and it is a silent drop.
+
+        Reachable by hand edit (docs/06 §57): an item block whose prose bullet
+        was deleted while its `- Owner:` / `- Event ID:` lines stayed.
+
+        Both halves are asserted: the item really is dropped (today's
+        behaviour, unchanged), and the loss is now **counted** rather than
+        silent. If the drop is ever fixed, the first assertion flips and this
+        record is forced up to date.
+        """
+        body = (
+            "# T\n\n## Milestones\n\n### P\n\n- Owner: COO\n- Event ID: EVT-NOSUM\n"
+        )
+
+        document = self._daily(body)
+
+        self.assertEqual(document.items, ())
+        self.assertEqual(document.unconsolidated, 1)
+
     def test_the_section_titles_match_the_daily_renderer(self):
         """The inverse mapping is a literal here; if the Daily renderer's
         titles change, historical Monthly output would silently
@@ -362,6 +507,377 @@ class MockTestNormalMonth(MonthlyTestCase):
         self.assertIn("## Major Milestones", text)
         self.assertIn("## Major Issues & Resolutions", text)
         self.assertIn("## Key Learnings", text)
+
+
+class RendererToParserRoundTripTests(unittest.TestCase):
+    """Everything `daily/markdown.py` can write must come back.
+
+    C31 §1 found the Daily→Monthly seam losing items to a shape heuristic.
+    This is the property test that whole class of defect fails: render a
+    maximal Daily — all four categories, mixed project-id casings, every
+    optional Decision Context field, evidence, and a late item — then parse
+    it and require every Event back with its category, project, owner and
+    summary intact.
+
+    A unit test per drop reason can only cover the reasons someone thought
+    of. This covers the seam.
+    """
+
+    def _candidate(self, event_id, category, project_id, summary, *, full=False):
+        return HistoryCandidate(
+            history_id=f"HIST-{event_id}", event_id=event_id,
+            timestamp="2026-08-05T10:00:00+09:00", category=category,
+            project_id=project_id, role="CTO_BACKEND", summary=summary,
+            evidence=("pytest PASS", "tsc PASS"),
+            filter_result=HistoryDecision.KEEP,
+            decision_context="budget review" if full else None,
+            expected_outcome="20% lower spend" if full else None,
+            actual_outcome="18% lower spend" if full else None,
+            lessons_learned="measure earlier" if full else None,
+        )
+
+    def _rendered(self):
+        from daily.late_events import append_late_events
+        from daily.markdown import render_daily_markdown
+
+        candidates = [
+            self._candidate("EVT-D", "DECISION", "SEARCH_BACKEND",
+                            "Adopted the runbook.", full=True),
+            self._candidate("EVT-M", "MILESTONE", "content_os", "Closed beta shipped."),
+            self._candidate("EVT-I", "ISSUE", "PAYMENTS", "Fixed: token refresh loop."),
+            self._candidate("EVT-L", "LEARNING", "growth", "Note: users misread status."),
+        ]
+        text = render_daily_markdown(
+            date(2026, 8, 5), candidates, "2026-08-06T11:00:00+09:00"
+        )
+        return append_late_events(
+            text,
+            (self._candidate("EVT-LATE", "MILESTONE", "ops", "Resolved: duplicate charge."),),
+            now_iso="2026-08-07T11:00:00+09:00",
+        )
+
+    def test_every_rendered_event_survives_the_parse(self):
+        document = parse_daily_markdown(self._rendered(), target_date=date(2026, 8, 5))
+
+        self.assertEqual(
+            sorted(i.event_id for i in document.items),
+            ["EVT-D", "EVT-I", "EVT-L", "EVT-LATE", "EVT-M"],
+        )
+
+    def test_each_one_keeps_its_category_project_owner_and_summary(self):
+        by_id = {i.event_id: i for i in parse_daily_markdown(
+            self._rendered(), target_date=date(2026, 8, 5)
+        ).items}
+
+        expected = {
+            "EVT-D": ("DECISION", "Search Backend", "Adopted the runbook."),
+            "EVT-M": ("MILESTONE", "Content Os", "Closed beta shipped."),
+            "EVT-I": ("ISSUE", "Payments", "Fixed: token refresh loop."),
+            "EVT-L": ("LEARNING", "Growth", "Note: users misread status."),
+            "EVT-LATE": ("MILESTONE", "Ops", "Resolved: duplicate charge."),
+        }
+        for event_id, (category, project, summary) in expected.items():
+            with self.subTest(event_id=event_id):
+                item = by_id[event_id]
+                self.assertEqual(item.category, category)
+                self.assertEqual(item.project, project)
+                self.assertEqual(item.summary, summary)
+                self.assertEqual(item.owner, "CTO Backend")
+
+    def test_a_fully_understood_document_reports_nothing_unconsolidated(self):
+        """The detector's own false-alarm guard, on the maximal document."""
+        self.assertEqual(
+            parse_daily_markdown(self._rendered(), target_date=date(2026, 8, 5)).unconsolidated,
+            0,
+        )
+
+
+class ProjectIdBreaksTheMonthlyParseTests(unittest.TestCase):
+    """NEW, **P0**. One Event's `project_id` drops its innocent siblings.
+
+    CHARACTERIZATION of the loss plus a regression test for the detection.
+
+    BUG-11/27 names `summary` and `evidence` as the fields rendered into
+    Daily Markdown without escaping; C30 §4 added `event_id`. **`project_id`
+    has never been named**, and it is the worst of the four: the other three
+    corrupt their own item, this one can delete other Events.
+
+    `daily/markdown._render_item_block()` writes it as a `### ` heading via
+    `_display_project_name()`, and `validate_event()` constrains `project_id`
+    only to "present and non-null" — measured, a value containing a newline
+    is ACCEPTED by the schema, so it crosses the transport from another
+    Desktop.
+
+    Blast radius, measured with three ordinary Events where only the first
+    has a crafted `project_id`:
+
+        ordinary                     3/3 survive
+        newline only                 3/3 survive
+        `\\n\\n- INJECTED`             3/3 survive, EVT-1 summary hijacked
+        `\\n\\n### Second Block`       3/3 survive, EVT-1 summary hijacked
+        `\\n\\n## Metadata`            **0/3 survive**
+
+    The last row is the finding. A `## ` heading closes the category section,
+    so every item block after it — including the two innocent Events — falls
+    outside every consolidatable section and vanishes from Monthly History.
+    `consolidate_month()` returned MONTHLY_GENERATED.
+
+    `.title()` in `_display_project_name()` accidentally blunts part of it:
+    it lowercases `Event ID:` to `Event Id:`, so a *ghost item* cannot be
+    forged this way. That is luck, not a defence, and it is written down here
+    so nobody mistakes it for one.
+
+    NOT FIXED — escaping the renderer is docs/06's contract (BUG-11/27) and
+    constraining `project_id` is docs/02's (A-15). What needed no decision is
+    that the loss is now counted (`DailyDocument.unconsolidated`).
+    """
+
+    def _document(self, project_id):
+        from daily.markdown import render_daily_markdown
+
+        candidates = [
+            HistoryCandidate(
+                history_id=f"H{i}", event_id=f"EVT-{i}",
+                timestamp="2026-08-05T10:00:00+09:00", category="MILESTONE",
+                project_id=pid, role="COO", summary=f"work {i}", evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+            for i, pid in enumerate((project_id, "P2", "P3"), start=1)
+        ]
+        return parse_daily_markdown(
+            render_daily_markdown(date(2026, 8, 5), candidates, "g"),
+            target_date=date(2026, 8, 5),
+        )
+
+    def test_the_schema_accepts_a_project_id_with_a_newline(self):
+        """Reachability. If this starts failing, A-15/docs/02 was decided."""
+        from events import validate_event
+
+        self.assertEqual(
+            validate_event({
+                "schema_version": "1.0", "event_id": "E",
+                "timestamp": "2026-08-05T10:00:00+09:00", "source": "DESKTOP_1",
+                "role": "CTO_BACKEND", "project_id": "P\n## Decisions",
+                "event_type": "MILESTONE_COMPLETED", "status": "IN_PROGRESS",
+                "summary": "s", "history_candidate": True,
+            }),
+            [],
+        )
+
+    def test_a_heading_in_one_project_id_drops_every_sibling(self):
+        document = self._document("P\n\n## Metadata\n\n- x")
+
+        self.assertEqual([i.event_id for i in document.items], [])
+
+    def test_the_loss_is_counted_rather_than_silent(self):
+        """The half that needed no decision."""
+        document = self._document("P\n\n## Metadata\n\n- x")
+
+        self.assertEqual(document.unconsolidated, 3)
+
+    def test_the_lesser_shapes_corrupt_only_their_own_item(self):
+        for project_id, expected_summary in (
+            ("P\n\n- INJECTED SUMMARY", "Injected Summary"),
+            ("P\n\n### Second Block\n\n- other", "Other"),
+        ):
+            with self.subTest(project_id=project_id):
+                document = self._document(project_id)
+
+                self.assertEqual(len(document.items), 3)
+                first = next(i for i in document.items if i.event_id == "EVT-1")
+                self.assertEqual(first.summary, expected_summary)
+
+    def test_an_ordinary_project_id_is_untouched(self):
+        document = self._document("PAYMENTS")
+
+        self.assertEqual(len(document.items), 3)
+        self.assertEqual(document.unconsolidated, 0)
+        self.assertEqual(
+            next(i for i in document.items if i.event_id == "EVT-1").summary, "work 1"
+        )
+
+    def test_a_ghost_item_cannot_be_forged_through_this_field(self):
+        """`.title()` lowercases `Event ID:` to `Event Id:`, which the
+        parser's label regex does not match. Pinned because it is the one
+        thing keeping this from being a phantom-Event vector, and it is an
+        accident of a display helper rather than a guard."""
+        document = self._document(
+            "P\n\n### Ghost\n\n- forged\n- Owner: COO\n- Event ID: EVT-GHOST"
+        )
+
+        self.assertNotIn("EVT-GHOST", [i.event_id for i in document.items])
+
+
+class UnconsolidatedReachesTheOperatorTests(MonthlyTestCase):
+    """The last link: the count has to arrive somewhere a person reads.
+
+    A number on a result object that nobody writes down is BUG-39's exact
+    shape, and this sprint added the number — so it owes the sink. AGENT.md
+    §6a already sends an operator to `daily_late_update.log` for "돌긴 돌았는데
+    뭔가 안 됐다", which is precisely this situation, and Monthly failures
+    already go there. No new artifact, no new format.
+    """
+
+    def _month_with_a_broken_project_id(self):
+        import calendar
+
+        self.repo.save(
+            candidate(
+                "EVT-BROKEN", day=date(2026, 8, 5), category="MILESTONE",
+                project="P\n\n## Metadata\n\n- x",
+            )
+        )
+        self.repo.save(candidate("EVT-INNOCENT", day=date(2026, 8, 5), category="MILESTONE"))
+        _, last = calendar.monthrange(2026, 8)
+        for day_number in range(1, last + 1):
+            generate_daily_history(
+                self.repo, date(2026, 8, day_number),
+                output_dir=self.daily_dir, generated_at="g",
+            )
+
+    def test_the_consolidation_carries_the_count_out(self):
+        self._month_with_a_broken_project_id()
+
+        result = self.consolidate(2026, 8)
+
+        self.assertIs(result.status, MonthlyStatus.MONTHLY_GENERATED)
+        self.assertEqual(result.item_count, 0)
+        self.assertEqual(result.unconsolidated_days, ("2026-08-05: 2",))
+
+    def test_a_healthy_month_carries_nothing(self):
+        self.fill_month(2026, 8, days_with_work=(5, 12))
+
+        result = self.consolidate(2026, 8)
+
+        self.assertEqual(result.unconsolidated_days, ())
+
+    def test_the_runner_writes_it_to_the_log_operators_are_told_to_read(self):
+        import app.runner as runner_module
+
+        self._month_with_a_broken_project_id()
+        log_path = self.root / "daily_late_update.log"
+
+        for month_result in run_once(
+            daily_dir=self.daily_dir,
+            monthly_dir=self.monthly_dir,
+            history_start_date=START,
+            now=datetime(2026, 9, 2, 11, 0).astimezone(),
+            state_path=self.state_path,
+        ).results:
+            if month_result.unconsolidated_days:
+                runner_module._log_late_update(
+                    log_path,
+                    f"MONTHLY_UNCONSOLIDATED {month_result.key} "
+                    f"{', '.join(month_result.unconsolidated_days)}",
+                )
+
+        written = log_path.read_text(encoding="utf-8")
+        self.assertIn("MONTHLY_UNCONSOLIDATED 2026-08", written)
+        self.assertIn("2026-08-05: 2", written)
+
+    def test_the_runner_really_contains_that_call(self):
+        """The half the test above cannot prove by construction."""
+        import inspect
+
+        import app.runner as runner_module
+
+        source = inspect.getsource(runner_module.run_once)
+
+        self.assertIn("month_result.unconsolidated_days", source)
+        self.assertIn("MONTHLY_UNCONSOLIDATED", source)
+
+
+class LabelShapedSummaryEndToEndTests(MonthlyTestCase):
+    """The parser defect, exercised through the real pipeline rather than a
+    hand-written document.
+
+    Repository -> `generate_daily_history()` -> Daily Markdown ->
+    `run_once()` -> Monthly Markdown. Nothing is hand-edited and nothing is
+    crafted: the only unusual thing about the Event is that its summary
+    begins `Fixed: `, which is how a real engineer writes one.
+
+    Before the fix the Daily file was correct and complete, the run reported
+    `MONTHLY_GENERATED`, and the Event was simply not in the Monthly. The
+    Daily said `Event Count: 2` and the Monthly said `Consolidated Items: 1`
+    two files apart, and nothing compared them.
+    """
+
+    LABEL_SHAPED = "Fixed: login token refresh loop."
+    ORDINARY = "Adopted the new deploy runbook."
+
+    def _run_the_month(self):
+        self.repo.save(
+            candidate(
+                "EVT-LABELSHAPED",
+                day=date(2026, 8, 5),
+                category="ISSUE",
+                summary=self.LABEL_SHAPED,
+            )
+        )
+        self.repo.save(
+            candidate(
+                "EVT-ORDINARY",
+                day=date(2026, 8, 6),
+                category="DECISION",
+                summary=self.ORDINARY,
+            )
+        )
+        self.fill_month(2026, 8)
+        return self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+
+    def test_the_daily_file_carries_it_either_way(self):
+        """Isolates where the loss was. Daily was never the problem."""
+        self._run_the_month()
+
+        daily = (self.daily_dir / "2026-08-05.md").read_text(encoding="utf-8")
+
+        self.assertIn(self.LABEL_SHAPED, daily)
+        self.assertIn("- Event ID: EVT-LABELSHAPED", daily)
+
+    def test_it_reaches_the_monthly_history(self):
+        result = self._run_the_month()
+
+        self.assertEqual(result.generated, ("2026-08",))
+        text = self.monthly_text(2026, 8)
+
+        self.assertIn("EVT-LABELSHAPED", text)
+        self.assertIn(self.LABEL_SHAPED, text)
+        self.assertIn("## Major Issues & Resolutions", text)
+
+    def test_the_consolidated_count_matches_what_was_written(self):
+        """The half of the damage an operator could conceivably have seen —
+        and only by opening two files and counting."""
+        self._run_the_month()
+        text = self.monthly_text(2026, 8)
+
+        self.assertIn("- Consolidated Items: 2", text)
+        self.assertEqual(text.count("- Event ID: "), 2)
+
+    def test_a_late_arriving_one_reaches_it_too(self):
+        """The `## Late Events` path renders through the same item template,
+        so it lost the same items — and a late Event is the case with no
+        second chance at all."""
+        self.fill_month(2026, 8)
+        self.repo.save(
+            candidate(
+                "EVT-LATE-LABELSHAPED",
+                day=date(2026, 8, 5),
+                category="MILESTONE",
+                summary="Resolved: the duplicate charge on retry.",
+            )
+        )
+        update_daily_history(
+            self.repo,
+            date(2026, 8, 5),
+            output_dir=self.daily_dir,
+            now=datetime(2026, 8, 7, 11, 0).astimezone(),
+        )
+
+        self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+        text = self.monthly_text(2026, 8)
+
+        self.assertIn("EVT-LATE-LABELSHAPED", text)
+        self.assertIn("Resolved: the duplicate charge on retry.", text)
 
 
 class MockTestMissingDaily(MonthlyTestCase):
@@ -1043,3 +1559,710 @@ class StateLagsTheMonthlyFileTests(MonthlyTestCase):
 
         self.assertEqual(load_state(self.state_path).dirty_months, [])
         self.assertTrue((self.monthly_dir / "2026-08.md").exists())
+
+
+class LabelNamedSummaryTests(unittest.TestCase):
+    """A summary may legitimately open with one of the renderer's own label
+    words. Four of the seven are domain-natural here.
+
+    C31 §1 narrowed the shape test `^[A-Z][A-Za-z ]+:` to the exact label
+    set, which fixed `Fixed: ` -- and left every *real* label name still
+    losing its item. Measured, all seven dropped:
+
+        Owner: ...   Event ID: ...   Category: ...   Decision Context: ...
+        Expected Outcome: ...   Actual Outcome: ...   Lessons Learned: ...
+
+    `Lessons Learned: ...` is how a LEARNING item's summary reads and
+    `Decision Context: ...` is how a DECISION's does, so this is not an
+    exotic input -- it is the vocabulary docs/05 gives these categories.
+
+    The renderer's **order** settles it without guessing: it writes its
+    labels once each, in `_ITEM_LABELS`' sequence, so a first bullet whose
+    label sits later in that sequence than one below it -- or that repeats a
+    label appearing below it -- is something the renderer never wrote, which
+    leaves prose as the only explanation.
+    """
+
+    def _round_trip(self, summary, *, category="LEARNING"):
+        from daily.markdown import render_daily_markdown
+
+        item = HistoryCandidate(
+            history_id="H", event_id="EVT-REAL",
+            timestamp="2026-08-05T10:00:00+09:00", category=category,
+            project_id="P", role="COO", summary=summary, evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+        return parse_daily_markdown(
+            render_daily_markdown(date(2026, 8, 5), [item], "g"),
+            target_date=date(2026, 8, 5),
+        )
+
+    def test_every_label_name_survives_as_a_summary(self):
+        from monthly.parser import _ITEM_LABELS
+
+        for label in _ITEM_LABELS:
+            with self.subTest(label=label):
+                summary = label + ": measured this and acted on it."
+
+                document = self._round_trip(summary)
+
+                self.assertEqual(len(document.items), 1, label + " lost its item")
+                self.assertEqual(document.items[0].summary, summary)
+
+    def test_the_item_keeps_its_own_event_id(self):
+        """The second half. `Event ID: ...` as a summary made that line the
+        FIRST `- Event ID:` in the block, so the item was consolidated under
+        an id of "measured it." -- and docs/09 §59 de-duplicates on it."""
+        document = self._round_trip("Event ID: measured this and acted on it.")
+
+        self.assertEqual(document.items[0].event_id, "EVT-REAL")
+
+    def test_owner_is_not_hijacked_either(self):
+        document = self._round_trip("Owner: measured this and acted on it.")
+
+        self.assertEqual(document.items[0].owner, "COO")
+
+    def test_a_reordered_hand_edit_still_finds_the_real_summary(self):
+        """docs/06 §57. A label bullet moved above the summary must still be
+        treated as a label -- the order rule must not swallow this case."""
+        body = (
+            "# T\n\n## Milestones\n\n### P\n\n"
+            "- Owner: COO\n- the real summary\n- Event ID: EVT-H\n"
+        )
+
+        document = parse_daily_markdown(body, target_date=date(2026, 8, 5))
+
+        self.assertEqual([i.event_id for i in document.items], ["EVT-H"])
+        self.assertEqual(document.items[0].summary, "the real summary")
+
+    def test_a_block_with_only_label_bullets_is_still_dropped(self):
+        """The order rule must not invent a summary out of a label bullet."""
+        body = "# T\n\n## Milestones\n\n### P\n\n- Owner: COO\n- Event ID: EVT-N\n"
+
+        document = parse_daily_markdown(body, target_date=date(2026, 8, 5))
+
+        self.assertEqual(document.items, ())
+        self.assertEqual(document.unconsolidated, 1)
+
+    def test_the_label_sequence_is_the_renderers_own(self):
+        """The order is load-bearing now, not just the set. Extracted from
+        `_render_item_block()`'s source so the two cannot drift."""
+        import inspect
+        import re
+
+        from daily import markdown as daily_markdown
+        from monthly.parser import _ITEM_LABELS
+
+        written = re.findall(
+            r'f"- ([A-Za-z ]+): \{',
+            inspect.getsource(daily_markdown._render_item_block),
+        )
+
+        self.assertEqual(written, list(_ITEM_LABELS))
+
+    def test_the_two_readers_of_this_format_agree(self):
+        """`daily/markdown.py` and `monthly/parser.py` both have to answer
+        "which bullet is the summary", and they cannot share the code:
+        `monthly` is a declared leaf (test_architecture_invariants
+        `ALLOWED["monthly"] == set()`) so that consolidation cannot reach
+        past the Daily text into `history`/`events` — docs/09 §12-13.
+
+        So they are two implementations of one rule, and this is what keeps
+        them together. Behaviour, not source: the tuple equality above
+        catches a renamed label, this catches a rule that drifts.
+        """
+        from daily.markdown import ITEM_LABELS, label_position
+        from monthly.parser import _ITEM_LABELS, _label_position
+
+        self.assertEqual(ITEM_LABELS, _ITEM_LABELS)
+
+        cases = ["", "a", "- x", "## x", "Fixed: y", "owner: x", "Owner", "Owner:x"]
+        cases += [label + suffix for label in ITEM_LABELS for suffix in (":", ": v", ":\tv", "s: v", ": ")]
+
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(label_position(text), _label_position(text))
+
+    def test_both_readers_pick_the_same_summary_bullet(self):
+        """The rule itself, not just its label lookup — `_first_bullet()`
+        against `summary_line_indices()` over every block arrangement the
+        order/duplicate rule distinguishes."""
+        from daily.markdown import summary_line_indices
+        from monthly.parser import _first_bullet
+
+        blocks = (
+            ["- plain", "- Owner: COO", "- Event ID: E1"],
+            ["- Owner: COO", "- plain", "- Event ID: E1"],
+            ["- Lessons Learned: x", "- Owner: COO", "- Event ID: E1"],
+            ["- Owner: COO", "- Owner: COO", "- Event ID: E1"],
+            ["- Owner: COO", "- Event ID: E1"],
+            ["- Event ID: E1", "- Owner: COO"],
+            ["- Event ID: E1"],
+            # The sole-identifier override, both sides of it.
+            ["- Event ID: E1", "- Owner: COO", "- the summary"],
+            ["- Event ID: E1", "- Event ID: E2", "- the summary"],
+            ["- Event ID: prose", "- Owner: COO", "- Event ID: E1"],
+            ["- Owner: prose", "- Owner: COO", "- Event ID: E1"],
+            ["- Lessons Learned: prose", "- Owner: COO", "- Event ID: E1"],
+            [],
+        )
+        for block in blocks:
+            with self.subTest(block=block):
+                lines = ["# T", "", "## Milestones", "", "### P", ""] + block
+
+                index, _text = _first_bullet(lines, 6, len(lines))
+                mine = summary_line_indices(lines)
+
+                self.assertEqual(mine, set() if index is None else {index})
+
+
+class RendererParserFuzzTests(unittest.TestCase):
+    """Seeded fuzz over renderer -> parser. The enumerated cases above cover
+    the shapes someone thought of; this looks for the ones nobody did.
+
+    Two populations, two different promises:
+
+        benign       what the renderer produces from ordinary Events --
+                     must round-trip EXACTLY. Zero loss, not "counted loss".
+        adversarial  summaries and project_ids carrying newlines and
+                     headings (BUG-11/27, C31 §16 -- an open docs/06
+                     decision). Loss is expected; going UNCOUNTED is not.
+
+    Seeded, so it is the same documents on every machine and every day -- a
+    fuzz whose corpus moves is the time bomb this sprint removed from
+    `ArrivalVersusWorkDateTests`.
+
+    The benign figure is what made the label-name defect visible: it sat at
+    641 losing documents in 4,000 while every enumerated test passed.
+    """
+
+    SEED = 20260814
+    CATEGORIES = ("DECISION", "MILESTONE", "ISSUE", "LEARNING")
+    BENIGN_SUMMARIES = (
+        "Shipped it.", "Fixed: login token refresh loop.", "Note: paused.",
+        "한글 요약입니다.", "A" * 300, "a", "- leading dash", "## prose hash",
+        "tabs\tinside", "  spaced  ", "Resolved #1234 — duplicate charge.",
+        "Owner: measured it.", "Event ID: measured it.", "Category: measured it.",
+        "Decision Context: measured it.", "Expected Outcome: measured it.",
+        "Actual Outcome: measured it.", "Lessons Learned: measured it.",
+    )
+    BENIGN_PROJECTS = ("SEARCH_BACKEND", "content_os", "a", "한글프로젝트", "P-1")
+    ADVERSARIAL_SUMMARIES = (
+        "x\n\n## Metadata\n\n- y", "x\n\n### Block\n\n- z", "x\n- INJECTED",
+        "x\n- Event ID: FORGED", "x\r\n## Notes", "x\n",
+    )
+    ADVERSARIAL_PROJECTS = (
+        "P\n\n## Metadata\n\n- x", "P\n\n### Other\n\n- y", "P\rQ",
+    )
+
+    def _documents(self, summaries, projects, trials):
+        import random
+
+        from daily.markdown import render_daily_markdown
+
+        rng = random.Random(self.SEED)
+        for _ in range(trials):
+            candidates = [
+                HistoryCandidate(
+                    history_id="H%d" % i, event_id="E%d" % i,
+                    timestamp="2026-08-05T%02d:00:00+09:00" % rng.randint(0, 23),
+                    category=rng.choice(self.CATEGORIES),
+                    project_id=rng.choice(projects), role="COO",
+                    summary=rng.choice(summaries), evidence=(),
+                    filter_result=HistoryDecision.KEEP,
+                )
+                for i in range(rng.randint(1, 5))
+            ]
+            document = parse_daily_markdown(
+                render_daily_markdown(date(2026, 8, 5), candidates, "g"),
+                target_date=date(2026, 8, 5),
+            )
+            missing = {c.event_id for c in candidates} - {
+                i.event_id for i in document.items
+            }
+            yield candidates, document, missing
+
+    def test_benign_documents_round_trip_exactly(self):
+        losing = [
+            sorted(missing)
+            for _c, _d, missing in self._documents(
+                self.BENIGN_SUMMARIES, self.BENIGN_PROJECTS, 2000
+            )
+            if missing
+        ]
+
+        self.assertEqual(
+            losing[:5], [], "%d of 2000 benign documents lost items" % len(losing)
+        )
+
+    def test_adversarial_loss_is_never_uncounted(self):
+        silent = [
+            (sorted(missing), document.unconsolidated)
+            for _c, document, missing in self._documents(
+                self.BENIGN_SUMMARIES + self.ADVERSARIAL_SUMMARIES,
+                self.BENIGN_PROJECTS + self.ADVERSARIAL_PROJECTS,
+                2000,
+            )
+            if missing and document.unconsolidated < len(missing)
+        ]
+
+        self.assertEqual(
+            silent[:5], [], "%d documents lost items silently" % len(silent)
+        )
+
+    def test_the_adversarial_population_really_does_lose_items(self):
+        """Otherwise the test above passes by testing nothing."""
+        losing = sum(
+            1
+            for _c, _d, missing in self._documents(
+                self.BENIGN_SUMMARIES + self.ADVERSARIAL_SUMMARIES,
+                self.BENIGN_PROJECTS + self.ADVERSARIAL_PROJECTS,
+                2000,
+            )
+            if missing
+        )
+
+        self.assertGreater(
+            losing, 100, "the adversarial corpus stopped being adversarial"
+        )
+
+
+class ForgedGeneratedAtTests(MonthlyTestCase):
+    """§58 pairs `Generated At` (when the month was first closed) with
+    `Last Updated At` (when a Late Event changed it), and a rebuild carries
+    the former forward by reading it back out of the old file.
+
+    `render_monthly_markdown()` writes an item's summary raw as its block's
+    first bullet, so a Daily summary of `Generated At: 1999-...` renders a
+    line indistinguishable from the field -- and above it, since Metadata is
+    the last block. `_existing_generated_at()` returned the first match.
+
+    Measured before the fix, one item with that summary:
+
+        - Generated At: 1999-01-01T00:00:00+09:00   <- the summary
+        - Generated At: 2026-09-01T02:00:00+09:00   <- the field
+        _existing_generated_at() -> '1999-01-01T00:00:00+09:00'
+
+    The next ordinary dirty rebuild then writes the forged value in as the
+    month's real `Generated At`, and it stays: deleting the offending Event
+    does not bring the original back, because by then the Metadata block
+    itself holds the forgery. No corruption and no hand edit needed -- any
+    Event author can write that summary.
+    """
+
+    FORGED = "1999-01-01T00:00:00+09:00"
+
+    def _month_with_summary(self, summary):
+        self.repo.save(
+            candidate("EVT-F", day=date(2026, 8, 5), summary=summary)
+        )
+        self.fill_month(2026, 8, days_with_work=())
+        return self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+
+    def test_a_summary_cannot_forge_the_months_generated_at(self):
+        from monthly.generator import _existing_generated_at
+
+        self._month_with_summary("Generated At: " + self.FORGED)
+
+        read_back = _existing_generated_at(self.monthly_dir / "2026-08.md")
+
+        self.assertNotEqual(read_back, self.FORGED)
+        self.assertIn("- Generated At: %s" % read_back, self.monthly_text(2026, 8))
+
+    def test_the_forgery_does_not_survive_a_rebuild(self):
+        """The end of the path, through the ordinary §58 dirty rebuild that
+        makes the forgery permanent."""
+        self._month_with_summary("Generated At: " + self.FORGED)
+        # `[-1]`, not `next()`: the forged summary line is rendered ABOVE the
+        # Metadata block, so the first match in the file is the forgery. That
+        # is the whole defect, and it catches the test too.
+        original = [
+            line
+            for line in self.monthly_text(2026, 8).splitlines()
+            if line.startswith("- Generated At: ")
+        ][-1]
+        self.assertNotIn(self.FORGED, original)
+
+        self.repo.save(candidate("EVT-LATE", day=date(2026, 8, 20)))
+        update_daily_history(
+            self.repo,
+            date(2026, 8, 20),
+            output_dir=self.daily_dir,
+            now=datetime(2026, 9, 3, 15, 0).astimezone(),
+        )
+        mark_month_dirty(self.state_path, date(2026, 8, 20))
+        self.run_monthly(now=datetime(2026, 9, 3, 16, 0).astimezone())
+
+        text = self.monthly_text(2026, 8)
+        self.assertEqual(
+            [l for l in text.splitlines() if l.startswith("- Generated At: ")][-1],
+            original,
+        )
+        self.assertNotIn("- Generated At: %s\n" % self.FORGED, text.split("## Metadata")[-1])
+        self.assertIn("- Last Updated At: ", text)
+
+    def test_the_pipeline_cannot_deliver_a_multi_line_summary_here(self):
+        """Scoping the fix honestly. BUG-11/27 is about a summary rendered
+        unescaped, and the obvious worry is a summary carrying a literal
+        `## Metadata` heading -- but it cannot arrive by this path.
+        `parse_daily_markdown()` is line-based, so the Daily->Monthly seam
+        keeps only the first line of one. Measured, that summary end to end:
+
+            items                []      (dropped, BUG-11/27)
+            unconsolidated       1       (counted, C31 §16)
+            a newline reaching a MonthlyItem.summary: False
+
+        So a second Metadata block inside a Monthly file means a hand-edited
+        Monthly file, which is what the test below covers.
+        """
+        from daily.markdown import render_daily_markdown
+
+        candidates = [
+            candidate(
+                "EVT-N",
+                day=date(2026, 8, 5),
+                summary="x\n\n## Metadata\n\n- Generated At: %s" % self.FORGED,
+            )
+        ]
+
+        document = parse_daily_markdown(
+            render_daily_markdown(date(2026, 8, 5), candidates, "gen"),
+            target_date=date(2026, 8, 5),
+        )
+
+        self.assertEqual([i.summary for i in document.items], [])
+        self.assertEqual(document.unconsolidated, 1)
+
+    def test_the_last_metadata_block_wins(self):
+        """A hand-edited Monthly (docs/06 §57's Monthly equivalent) carrying
+        a second Metadata block. The real one is always last —
+        `render_monthly_markdown()` appends it last on both of its paths — so
+        preferring the last block is decidable here with no escaping
+        decision, which is BUG-11/27's to make and not this module's.
+        """
+        from monthly.generator import _existing_generated_at
+
+        self.fill_month(2026, 8, days_with_work=(5,))
+        self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+        path = self.monthly_dir / "2026-08.md"
+        body = path.read_text(encoding="utf-8")
+        real = [l for l in body.splitlines() if l.startswith("- Generated At: ")][-1]
+        path.write_text(
+            "# T\n\n## Metadata\n\n- Generated At: %s\n\n%s" % (self.FORGED, body),
+            encoding="utf-8",
+        )
+
+        self.assertEqual("- Generated At: %s" % _existing_generated_at(path), real)
+
+    def test_an_ordinary_month_still_carries_its_generated_at_forward(self):
+        """The fix narrows the read; §58 must still work."""
+        self.fill_month(2026, 8, days_with_work=(5,))
+        self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+        original = next(
+            line
+            for line in self.monthly_text(2026, 8).splitlines()
+            if line.startswith("- Generated At: ")
+        )
+
+        self.repo.save(candidate("EVT-LATE", day=date(2026, 8, 20)))
+        update_daily_history(
+            self.repo,
+            date(2026, 8, 20),
+            output_dir=self.daily_dir,
+            now=datetime(2026, 9, 3, 15, 0).astimezone(),
+        )
+        mark_month_dirty(self.state_path, date(2026, 8, 20))
+        self.run_monthly(now=datetime(2026, 9, 3, 16, 0).astimezone())
+
+        self.assertIn(original, self.monthly_text(2026, 8))
+
+    def test_the_metadata_title_is_the_renderers_own(self):
+        """Reader and writer share one constant so they cannot drift."""
+        from monthly.markdown import METADATA_TITLE
+
+        self.fill_month(2026, 8, days_with_work=(5,))
+        self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+
+        self.assertIn("\n%s\n" % METADATA_TITLE, self.monthly_text(2026, 8))
+
+
+class ReorderedLabelIsStillALabelTests(unittest.TestCase):
+    """The blind spot the label-order rule created, found by asking what
+    else could explain an arrangement the renderer cannot produce.
+
+    The rule reasoned: the renderer writes its labels once each, in order,
+    after the summary -- so a first bullet whose label sits later in that
+    sequence than one below it is not something the renderer wrote, which
+    leaves prose as the only explanation. The last step is wrong. docs/06
+    section 57 permits a hand edit, and a hand edit can move a label bullet
+    above the summary; that produces the identical arrangement.
+
+    Measured, `- Event ID: EVT-H` moved above `- Owner:`:
+
+        existing_event_ids()        set()       <- the block's id, gone
+        select_late_candidates()    ['EVT-H']   <- re-added, EVERY run
+        Monthly                     dropped
+
+    An unbounded duplicate in a Company History file: the same defect the
+    empty-`event_id` fix closed (section 38's guard reading back what the
+    renderer wrote), arriving by a different door. Before the label-order
+    rule existed this reader found the id, so this was a regression that
+    rule introduced.
+
+    The repair is one override, and it is decidable rather than heuristic:
+    **an exclusion must never leave a block with no identifier.** If the
+    bullet about to be called prose carries the block's only `Event ID:`, it
+    is the label, because nothing else in the block can be. When a second
+    `Event ID:` bullet exists below, the first really is prose -- that is
+    the case the order rule was written for, and it still holds.
+    """
+
+    def _document(self, block):
+        return "# T\n\n## Milestones\n\n### P\n\n" + "\n".join(block) + "\n"
+
+    def _candidate(self):
+        return HistoryCandidate(
+            history_id="HIST-EVT-H", event_id="EVT-H",
+            timestamp="2026-08-05T10:00:00+09:00", category="MILESTONE",
+            project_id="P", role="COO", summary="late", evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def test_a_reordered_event_id_is_not_read_as_prose(self):
+        from daily.late_events import existing_event_ids
+
+        body = self._document(["- Event ID: EVT-H", "- Owner: COO", "- the summary"])
+
+        self.assertEqual(existing_event_ids(body), {"EVT-H"})
+
+    def test_the_late_event_is_not_re_added(self):
+        """The consequence, which is what makes this worth a test: an
+        unbounded duplicate, once per run that revisits the date."""
+        from daily.late_events import select_late_candidates
+
+        for block in (
+            ["- Event ID: EVT-H", "- Owner: COO", "- the summary"],
+            ["- Event ID: EVT-H", "- Owner: COO"],
+            ["- Event ID: EVT-H"],
+        ):
+            with self.subTest(block=block):
+                body = self._document(block)
+
+                self.assertEqual(
+                    select_late_candidates(body, [self._candidate()]), ()
+                )
+
+    def test_the_whole_item_is_recovered_not_merely_the_id(self):
+        """Strictly better than before, not merely less wrong: this block
+        used to lose all three fields."""
+        document = parse_daily_markdown(
+            self._document(["- Event ID: EVT-H", "- Owner: COO", "- the summary"]),
+            target_date=date(2026, 8, 5),
+        )
+
+        self.assertEqual(
+            [(i.event_id, i.owner, i.summary) for i in document.items],
+            [("EVT-H", "COO", "the summary")],
+        )
+        self.assertEqual(document.unconsolidated, 0)
+
+    def test_a_second_event_id_below_still_means_the_first_is_prose(self):
+        """The override must not undo the defect the order rule fixed."""
+        document = parse_daily_markdown(
+            self._document(
+                ["- Event ID: measured it.", "- Owner: COO", "- Event ID: EVT-H"]
+            ),
+            target_date=date(2026, 8, 5),
+        )
+
+        self.assertEqual(
+            [(i.event_id, i.summary) for i in document.items],
+            [("EVT-H", "Event ID: measured it.")],
+        )
+
+    def test_a_prose_summary_is_not_counted_as_a_lost_item(self):
+        """`unconsolidated` counts `- Event ID:` lines against items, and a
+        summary reading `Event ID: …` is such a line. Reporting a loss on a
+        document that consolidated everything it had is the cry-wolf
+        direction, on the one counter that exists to be believed."""
+        document = parse_daily_markdown(
+            self._document(
+                ["- Event ID: measured it.", "- Owner: COO", "- Event ID: EVT-H"]
+            ),
+            target_date=date(2026, 8, 5),
+        )
+
+        self.assertEqual(len(document.items), 1)
+        self.assertEqual(document.unconsolidated, 0)
+
+    def test_the_counter_still_reports_the_losses_it_is_for(self):
+        """Both directions. The three shapes it must keep catching."""
+        for label, block, expected in (
+            ("no summary bullet", ["- Event ID: EVT-H", "- Owner: COO"], 1),
+            ("one id twice", ["- s", "- Event ID: EVT-A", "- Event ID: EVT-B"], 1),
+            ("renderer output", ["- s", "- Owner: COO", "- Event ID: EVT-H"], 0),
+        ):
+            with self.subTest(label=label):
+                document = parse_daily_markdown(
+                    self._document(block), target_date=date(2026, 8, 5)
+                )
+
+                self.assertEqual(document.unconsolidated, expected)
+
+    def test_a_line_outside_every_section_is_still_counted(self):
+        """The counter scans the whole document on purpose -- a section that
+        ended early puts its lines outside the walk. Excluding prose
+        summaries must not narrow that."""
+        body = (
+            "# T\n\n## Milestones\n\n### P\n\n- s1\n- Event ID: E1\n"
+            "\n## Metadata\n\n- Event ID: E3\n"
+        )
+
+        document = parse_daily_markdown(body, target_date=date(2026, 8, 5))
+
+        self.assertEqual([i.event_id for i in document.items], ["E1"])
+        self.assertEqual(document.unconsolidated, 1)
+
+
+class MonthlyShortfallHasTwoCausesTests(MonthlyTestCase):
+    """The shortfall check knows two numbers disagree. It used to tell the
+    operator *why*, with certainty, and prescribe one action.
+
+    The old sentence named the unrecognised-category cause and closed with
+    "다시 만들어도 같은 결과가 나온다" -- re-generating gives the same
+    result. Both halves are wrong for the other cause. docs/06 §57 and
+    docs/11 §71 let the COO edit official History by hand, and a deleted
+    item block produces the identical discrepancy. Measured, three items
+    rendered, one block deleted by hand:
+
+        as generated       ()
+        block deleted      ('2026-08', 3, 2)
+        plain re-run       month already closed, statuses [] -- stays deleted
+        forced rebuild     3 items, EVT-1 back
+
+    So for that cause a rebuild **does** fix it, and "check the Category
+    lines" sends the operator hunting through a month of Daily files for a
+    bad value that is not there.
+
+    This pins what the two causes actually do, so the sentence cannot drift
+    back to asserting one of them.
+    """
+
+    def _monthly_path(self):
+        return self.monthly_dir / "2026-08.md"
+
+    def _three_item_month(self):
+        for index in range(3):
+            self.repo.save(
+                candidate(
+                    f"EVT-{index}",
+                    day=date(2026, 8, 5),
+                    hour=10 + index,
+                    category="DECISION",
+                )
+            )
+        self.fill_month(2026, 8, days_with_work=())
+        self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+        return self._monthly_path().read_text(encoding="utf-8")
+
+    def _shortfall(self):
+        from ops_status import _monthly_counts_more_than_it_shows
+
+        return _monthly_counts_more_than_it_shows(self.monthly_dir)
+
+    def test_a_generated_month_is_quiet(self):
+        self._three_item_month()
+
+        self.assertEqual(self._shortfall(), ())
+
+    def test_a_hand_deleted_block_is_reported(self):
+        original = self._three_item_month()
+        edited = original.replace(
+            "- Owner: CTO Backend\n- Event ID: EVT-1\n- Source: 2026-08-05.md\n\n", ""
+        )
+        self.assertNotEqual(edited, original, "the fixture stopped matching")
+        self._monthly_path().write_text(edited, encoding="utf-8")
+
+        self.assertEqual(self._shortfall(), (("2026-08", 3, 2),))
+
+    def test_a_plain_re_run_does_not_repair_it(self):
+        """The month is already closed and not dirty, so nothing revisits
+        it -- which is why the discrepancy persists at all."""
+        original = self._three_item_month()
+        self._monthly_path().write_text(
+            original.replace(
+                "- Owner: CTO Backend\n- Event ID: EVT-1\n- Source: 2026-08-05.md\n\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_monthly(now=datetime(2026, 9, 2, 11, 0).astimezone())
+
+        self.assertEqual([r.status for r in result.results], [])
+        self.assertEqual(self._shortfall(), (("2026-08", 3, 2),))
+
+    def test_a_forced_rebuild_does_repair_it(self):
+        """The half the old sentence denied."""
+        original = self._three_item_month()
+        self._monthly_path().write_text(
+            original.replace(
+                "- Owner: CTO Backend\n- Event ID: EVT-1\n- Source: 2026-08-05.md\n\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+        mark_month_dirty(self.state_path, date(2026, 8, 5))
+
+        self.run_monthly(now=datetime(2026, 9, 3, 11, 0).astimezone())
+
+        self.assertIn("EVT-1", self._monthly_path().read_text(encoding="utf-8"))
+        self.assertEqual(self._shortfall(), ())
+
+    def test_the_unrecognised_category_cause_survives_a_rebuild(self):
+        """The other half, and the reason the two need different actions.
+        A hand-typed `- Category:` outside the four is in the Daily file, so
+        rebuilding reproduces the drop exactly."""
+        self.repo.save(candidate("EVT-K", day=date(2026, 8, 5), category="DECISION"))
+        self.fill_month(2026, 8, days_with_work=())
+        daily = self.daily_dir / "2026-08-05.md"
+        # A `## Late Events` item states its own category on a bullet, and
+        # docs/06 §57 lets a human type it. `Decision` is not `DECISION`, so
+        # the parser passes it through verbatim and the Monthly renderer
+        # files it under no section while `len(items)` still counts it.
+        edited = (
+            daily.read_text(encoding="utf-8")
+            .replace("## Decisions", "## Late Events")
+            .replace(
+                "- Event ID: EVT-K",
+                "- Event ID: EVT-K\n- Category: Decision",
+            )
+        )
+        self.assertIn("- Category: Decision", edited)
+        daily.write_text(edited, encoding="utf-8")
+        self.run_monthly(now=datetime(2026, 9, 1, 11, 0).astimezone())
+
+        before = self._shortfall()
+        self.assertEqual(
+            before, (("2026-08", 1, 0),), "the fixture stopped reproducing the cause"
+        )
+
+        mark_month_dirty(self.state_path, date(2026, 8, 5))
+        self.run_monthly(now=datetime(2026, 9, 3, 11, 0).astimezone())
+
+        self.assertEqual(self._shortfall(), before)
+
+    def test_the_message_names_both_causes(self):
+        """The sentence is the deliverable here, so it is asserted."""
+        import importlib.util
+        import inspect
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_two_causes", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = inspect.getsource(module._print_history)
+
+        self.assertIn("다시 만들어도 같은 결과", source)
+        self.assertIn("복구된다", source)
+        self.assertIn("둘 중 어느 쪽인지는", source)

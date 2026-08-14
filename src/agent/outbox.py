@@ -83,7 +83,26 @@ def stage(event: Event, outbox_dir: Path) -> Path:
     """
     outbox_dir = Path(outbox_dir)
     existing = outbox_dir / safe_event_filename(event.event_id)
-    if existing.exists():
+    # `is_file()`, not `exists()`. The question is "is this Event already
+    # persisted", and a *directory* wearing the Event's name is not a
+    # persisted Event — but it does exist. Measured, with a directory named
+    # `EVT-1.json` in the outbox:
+    #
+    #     stage() returned    EVT-1.json     <- reported success
+    #     (outbox/EVT-1.json).is_file()      False
+    #
+    # This function's first line promises to persist the Event, and it had
+    # not. The blast radius was bounded — `drain()` files the entry as
+    # `unreadable`, `DrainSummary.is_clear` goes False, and the collection
+    # date does not advance — but the failure surfaced as "an unreadable
+    # file in the outbox (Permission denied)" rather than as the date that
+    # could not be collected.
+    #
+    # With `is_file()` the write below runs, `_write_atomic()` refuses the
+    # occupied name, and the `FileExistsError` reaches `collect_date()`,
+    # which already treats a failed outbox write as the durability boundary
+    # it is: `DateOutcome.FAILED`, date not marked collected.
+    if existing.is_file():
         return existing
     try:
         return write_event_json(event, directory=outbox_dir, overwrite=False)
@@ -94,7 +113,11 @@ def stage(event: Event, outbox_dir: Path) -> Path:
         # `mkdir(parents=True)` hitting a plain file where `outbox_dir` must
         # be, which fault injection caught reporting a phantom success and
         # letting the date advance with the Event nowhere on disk.
-        if not existing.exists():
+        # `is_file()` here for the same reason as above: the only case that
+        # may be swallowed is a real Event file appearing in the race
+        # window. A directory holding the name is the collision this branch
+        # exists to re-raise, not the race it exists to absorb.
+        if not existing.is_file():
             raise
         return existing
 
@@ -125,8 +148,15 @@ def is_sent(event_id: str, sent_dir: Path) -> bool:
     Lets the Agent skip re-staging an Event it has already sent — the
     "이미 처리된 Event 재전송 방지" requirement — without consulting
     Desktop 4, which may be switched off.
+
+    `is_file()`, not `exists()`. This answers "was this Event delivered", and
+    a directory carrying the Event's name answers "is this name taken"
+    instead — measured: `is_sent()` returned True for a directory, which is
+    the Agent deciding not to send an Event that was never sent. The name
+    question has its own predicate one function up (`stage()`), where a
+    directory legitimately does block the write and `exists()` is right.
     """
-    return (Path(sent_dir) / safe_event_filename(event_id)).exists()
+    return (Path(sent_dir) / safe_event_filename(event_id)).is_file()
 
 
 def drain(

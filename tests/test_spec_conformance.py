@@ -2014,3 +2014,170 @@ class RunContractSpecTableTests(unittest.TestCase):
 
         self.assertEqual(exit_code_for(OverallStatus.DEGRADED), table["DEGRADED"])
         self.assertIn(f"return {table['DEGRADED']}", main)
+
+
+class SpecCitationsPointSomewhereTests(unittest.TestCase):
+    """Every `docs/NN §M` in the tree names a section that exists.
+
+    This codebase does not justify decisions in prose -- it cites. 807
+    citations across source, tests, AGENT.md and BACKLOG.md, and a reader
+    who follows one is meant to land on the rule being invoked. A citation
+    that lands nowhere is the same failure mode this project already has a
+    whole Sprint about (C30's "stale supporting claim"): the decision may
+    still be right, but the thing offered as evidence is not checkable.
+
+    Nothing enforced it. Measured on first run, exactly one was wrong --
+    `scheduler.py` cited section 951 of the Scheduler spec for "수동 실행도
+    동일한 Lock과 State 규칙을 따른다", and 951 is the **line number** of that
+    sentence, not its section; it lives in §44 (Manual Run). One in 807 is a
+    good ratio, and it is also the kind of error that only accumulates,
+    because nothing was looking.
+
+    (Written without the offending citation spelled out, because this check
+    reads its own file -- which is the first thing it proved.)
+
+    Deliberately only checks that the section exists, not that it says what
+    the citing comment claims. The latter is not decidable by a test, and a
+    check that pretends otherwise would be the stale claim it is trying to
+    prevent.
+    """
+
+    #: `docs/07 §44`, `docs/09 sections 12-13`, `docs/06 §36-40`, `docs/08 §19/§21`.
+    #: The gap before the marker is kept to a few characters of punctuation on
+    #: purpose: a looser pattern reads across into an unrelated `README §13`
+    #: further along the same line and reports it as a docs citation.
+    CITATION = re.compile(
+        r"docs/(\d\d)(?:_[A-Z0-9_]+\.md)?[ ,]{0,3}"
+        r"(?:§|sections?\s+)(\d+(?:\s*[-–/,]\s*§?\d+)*)"
+    )
+    HEADING = re.compile(r"^#{1,6}\s+(\d+)[.\s]")
+
+    def _sections(self):
+        docs = REPO_ROOT / "docs"
+        self.assertTrue(docs.is_dir(), "docs/ is missing")
+        by_number = {}
+        for path in sorted(docs.glob("*.md")):
+            by_number[path.name[:2]] = (
+                path.name,
+                {
+                    int(match.group(1))
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if (match := self.HEADING.match(line))
+                },
+            )
+        return by_number
+
+    def _citing_files(self):
+        files = [
+            path
+            for path in REPO_ROOT.rglob("*.py")
+            if "__pycache__" not in path.parts and ".git" not in path.parts
+        ]
+        for name in ("AGENT.md", "BACKLOG.md", "README.md"):
+            if (REPO_ROOT / name).is_file():
+                files.append(REPO_ROOT / name)
+        return files
+
+    def test_every_cited_section_exists(self):
+        sections = self._sections()
+        dangling = []
+        counted = 0
+        for path in self._citing_files():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                for match in self.CITATION.finditer(line):
+                    document = match.group(1)
+                    if document not in sections:
+                        continue
+                    name, known = sections[document]
+                    for cited in re.findall(r"\d+", match.group(2)):
+                        counted += 1
+                        if int(cited) not in known:
+                            dangling.append(
+                                f"{path.relative_to(REPO_ROOT)}:{number} -> {name} §{cited}"
+                            )
+
+        self.assertGreater(counted, 500, "the citation pattern stopped matching")
+        self.assertEqual(dangling[:10], [], f"{len(dangling)} dangling citations")
+
+    def test_the_check_would_notice_a_bad_citation(self):
+        """Otherwise the test above passes because it matches nothing."""
+        sections = self._sections()
+        name, known = sections["07"]
+
+        self.assertIn(44, known, f"{name} lost the section scheduler.py cites")
+        self.assertNotIn(951, known, "951 is a line number, not a section")
+        self.assertEqual(
+            [
+                m.group(2)
+                for m in self.CITATION.finditer("see %s/07 §%d here" % ("docs", 951))
+            ],
+            ["951"],
+        )
+
+
+class BacklogIdCitationsResolveTests(unittest.TestCase):
+    """Every `BUG-NN` cited in the tree can be looked up in BACKLOG.md.
+
+    The sibling of the section check above, and it found more. 618 citations
+    of 87 distinct ids; **15 of those ids appeared nowhere in BACKLOG.md**,
+    accounting for ~65 citations. They are an early Audit's numbering that
+    was never carried across, so a reader following `BUG-18` landed nowhere
+    and could not tell whether it was open or closed.
+
+    The information was not lost -- each citing docstring describes the
+    defect in full -- so the citations were left alone rather than rewritten
+    (the ids are the historical trace; deleting them deletes it). BACKLOG
+    gained an index instead, built from those same docstrings. This test is
+    what keeps a new dangling id from arriving quietly.
+
+    Only that the id is findable, not that BACKLOG says the right thing
+    about it -- same limit, and for the same reason, as the section check.
+    """
+
+    ID = re.compile(r"\b(BUG-\d+)\b")
+
+    def test_every_cited_bug_id_appears_in_the_backlog(self):
+        backlog = (REPO_ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+        known = set(self.ID.findall(backlog))
+
+        cited = {}
+        for path in sorted(REPO_ROOT.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                for found in self.ID.findall(line):
+                    cited.setdefault(found, f"{path.relative_to(REPO_ROOT)}:{number}")
+
+        self.assertGreater(len(cited), 50, "the id pattern stopped matching")
+        dangling = sorted(
+            (f"{key} (first cited {site})" for key, site in cited.items()
+             if key not in known),
+            key=lambda text: int(text.split("-")[1].split(" ")[0]),
+        )
+
+        self.assertEqual(dangling, [], f"{len(dangling)} ids resolve nowhere")
+
+    def test_the_index_did_not_lose_an_entry(self):
+        """The 15 ids the index exists for. Listed here rather than derived,
+        so deleting a row from BACKLOG fails loudly instead of quietly
+        shrinking what the test above covers."""
+        backlog = (REPO_ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+
+        for identifier in (
+            "BUG-1", "BUG-2", "BUG-7", "BUG-8", "BUG-9", "BUG-10", "BUG-12",
+            "BUG-14", "BUG-15", "BUG-16", "BUG-18", "BUG-19", "BUG-23",
+            "BUG-34", "BUG-35",
+        ):
+            with self.subTest(identifier=identifier):
+                # `assertTrue`, not `assertIn`: the latter renders the whole
+                # of BACKLOG.md into the failure message (474 KB, measured).
+                self.assertTrue(
+                    f"| {identifier} |" in backlog,
+                    f"{identifier} lost its row in the BACKLOG index",
+                )

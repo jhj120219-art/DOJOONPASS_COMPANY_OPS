@@ -7,7 +7,179 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-08-13 (C30 — **낡은 보조 주장 Sprint.** SKIP 판단 자체는 옳은데
+마지막 갱신: 2026-08-14 (C31 — **쓴 쪽과 읽는 쪽이 어긋난다 Sprint.**
+한 모듈이 쓴 것을 다른 모듈이 되읽는 지점을 전수 대조했다 — 여덟 쌍 중 **세 쌍이
+어긋나 있었고 셋 다 조용한 유실**이었다((1)~(3)). 그 조사가 끝난 자리에서 같은
+질문("이 문자열은 어디서 왔고, 받는 쪽은 그것을 어떻게 읽는가")을 계속 밀어
+나머지 스물네 건이 나왔다.
+(1) **`Fixed: ` 로 시작하는 평범한 요약 하나가 그 항목을 Monthly에서 통째로
+지운다** — `monthly/parser._first_bullet()`이 "라벨처럼 생겼는가"(`^[A-Z][A-Za-z ]+:`)를
+물었고, 사람이 쓰는 요약은 늘 그렇게 생겼다. 공격 입력도 손편집도 필요 없다.
+Daily는 멀쩡하고 Monthly는 `MONTHLY_GENERATED`를 보고한다. 실 파이프라인 실측:
+평범한 항목 **5건 중 4건이 그 달에서 사라진다**(`Consolidated Items: 5` → `1`).
+**수정** — 렌더러가 실제로 쓰는 라벨 집합만 건너뛴다.
+(2) **`event_id`가 빈 문자열이면 Late Event가 매 실행 다시 추가된다** —
+`existing_event_ids()`의 `(\S.*)`가 `- Event ID: ` 를 못 읽어 §38 중복 가드가
+무력화된다. 실측 3회 실행 → 같은 항목 3벌, `Late Events Added: 3` 옆에
+`Event Count: 1`. **수정**, 그리고 그 때문에 생기던 `ops_status` 오탐도 함께 닫았다
+(C30이 넣은 prefix 슬라이싱의 반대편 모서리).
+(3) **Monthly 렌더러는 네 Category 밖의 항목을 어느 Section에도 넣지 않고 버리는데
+`Consolidated Items`는 그것까지 센다** — Daily 쪽 형제(`test_daily_history.py`)는
+기록돼 있었고 Monthly에는 아무도 겨눈 적이 없다. Daily는 요약이라도 남지만 Monthly는
+아무것도 남지 않는다. Section 결정은 docs/09 §14이므로 **탐지만** 추가.
+(4) **신규 보안 — Secret 게이트가 자기 목록에 있는 이름을 대소문자 때문에 못
+알아본다.** 실제 remote로 E2E: `daily/ID_RSA` → BACKUP_SUCCESS, push SUCCESS,
+`git show main:daily/ID_RSA`로 키가 읽힌다. `daily/id_rsa` → BACKUP_FAILED, 원격 무변화.
+BUG-55와 같은 뿌리의 두 번째 위치. 게이트를 바꾸면 새 BACKUP_FAILED 조건이
+생기므로(E-15) **탐지만** 추가.
+(5) **Baseline이 1916/0이 아니었다** — 이 머신에서 2건 실패. 둘 다 코드가 아니라
+테스트가 환경을 고정하고 있었다. 하나는 실시간 시계에 매인 fixture(어제까지 통과,
+오늘 실패), 하나는 PowerShell **UI 언어**에 매인 문자열(`WhatIf` vs `What if` —
+같은 머신에서 부모 프로세스 로케일만 달라도 갈린다). 둘 다 수정.
+(6) `backup/git_ops`의 인증 실패 분류가 영어 git 메시지에 의존한다 — 이 머신의
+Git for Windows에는 번역 카탈로그가 없어 현재 무해함을 **실측**하고,
+`GIT_TERMINAL_PROMPT` 선례대로 `LC_ALL=C`로 의존 자체를 제거했다(분류 목록은
+그대로 — 목록을 넓히는 것이 BUG-52다).
+(7) **BUG-58 재측정을 요청받은 대로 수행했고**(F-3이 "남은 범위 재측정 필요"라고
+적어 둔 것) sync 경로에는 남은 범위가 없음을 실측했다. 그 추적 중 **신규 보안
+결함**이 나왔다 — 같은 원격 응답 본문을 로그는 redact하는데 `run_company_ops.py`의
+stdout은 그대로 찍는다(토큰 전문 + 결과 줄 위조). sink에 `redact`/`one_line`을
+걸어 수정.
+(8) **그 질문을 자매 entrypoint에 던졌더니 더 나쁜 것이 나왔다** — 개행이 든
+`event_id` 하나가 `ops_status.py`의 **ATTENTION 절 안에 통째로 위조된 줄**을
+세운다. 실측된 위조 문구는 "모든 검사 통과 — 사람이 지금 할 일은 없다"였다.
+AGENT.md §6이 가장 먼저 보라고 하는 뷰다. sink에 `one_line`을 걸어 수정
+(BUG-6과 같은 모양, 아무도 겨눈 적 없는 자리).
+(9) **날짜 경계 산술을 훑다가 C17이 Agent에만 물었던 질문이 나왔다** — Runner의
+state 포인터가 **미래**를 가리키면 Company History가 그 날짜까지 영구히 멈추는데,
+Scheduler는 COMPLETED를, 정합성 검사는 CONSISTENT를 보고한다(실측: 4개월 정지,
+ATTENTION 0건). 형제를 전수로 훑어 **세 개**를 찾았고 세 번째가 가장 나쁘다 —
+`backup_state.last_successful_backup`이 미래면 "이 History는 이 머신에만 있다"는
+**안전 검사 자체가 침묵한다.** `agent/status.py`가 자기 state에 대해 **이미 같은
+답을 적어 두었으므로** 그것을 형제 셋에 적용했다 — 탐지만, 오탐 불가.
+(10) **그 조사가 스스로 함정에 걸렸다** — `RUNTIME_DIR`을 돌려도 `AGENT_DIR`은
+import 시점에 얼어 있어 AGENT 블록만 **실기계**를 읽고 있었다. 하마터면 "C17의
+선례가 연결돼 있지 않다"고 잘못 기록할 뻔했다(C13 결함 2의 두 번째 자리).
+호출 시점 파생으로 고쳤고, 모듈 레벨에서 경로를 얼리는 것을 AST로 금지했다.
+(11) **`exists()`가 답하는 질문은 그 코드가 묻는 질문이 아니었다 (P0)** —
+`2026-08-12.md`라는 **디렉터리** 하나가 Scheduler에게 "그 날은 이미 썼다"고 답하게
+만든다. 실측: `COMPLETED`, `generated=('2026-08-12', …)` — **쓰지도 않은 날을
+생성했다고 자기 결과에 적고** 포인터를 그 너머로 옮긴다. 그 날이 빠진 것을 잡으라고
+만든 두 검사가 **둘 다** 있다고 동의한다. Monthly도 같다(`MONTHLY_UNCHANGED`).
+"산출물이 있는가"(`is_file()`)와 "이름이 쓰였는가"(`exists()`)를 구분해 4곳 수정,
+3곳은 그대로가 옳음을 확인·고정.
+(12) **Monthly parser를 끝까지 판 결과 네 번째 주입 경로가 나왔다 (P0)** —
+BUG-11/27은 `summary`·`evidence`를, C30 §4는 `event_id`를 지목했다. **`project_id`는
+이름이 붙은 적이 없고 가장 나쁘다**: `
+
+## Metadata`가 든 project_id 하나가
+Category Section을 닫아 **무고한 Event 2건을 포함해 3/3 전부**를 Monthly에서
+지우는데 `MONTHLY_GENERATED`가 나온다. escape는 docs/06 결정이라 SKIP하고,
+**유실을 세는 것**(`unconsolidated`)은 파싱이 이미 일어나는 자리라 **비용 0**으로
+넣어 `daily_late_update.log`까지 연결했다. 그 과정에서 BUG-39 sweep이
+`MonthlyResult`를 빠뜨리고 있었다는 것도 찾아 invariant를 붙였다.
+(13) **Dead Capability 전수 목록을 처음 만들었고**(A-16·E-20이 각각 하나씩만
+기록해 뒀다), 그 과정에서 **진단이 거짓말을 하고 있는 것**을 찾았다 —
+`init_notion.py`의 Dashboard 진단이 행복 경로에서 `다음 할 일: None`이라고 말하는데,
+OPS_* Database를 만드는 함수는 **어떤 명령도 부르지 않는다**(AST, alias 해석 포함,
+호출 지점 0). 운영자는 설정이 끝난 줄 알고 `NOTION_OPS_RUNS_DATABASE_ID`를 비워 두며,
+그 상태에서 Dashboard 기록은 매 실행 건너뛰어진다. 자동 생성은 실 Workspace 변경이라
+SKIP, **메시지를 사실로 만드는 것**은 즉시 수정. 그리고 자동 분석 세 개가 연달아
+틀렸다는 것도 기록했다(패키지 밖 미사용 → 114/180 오탐, call-graph → 64/231 오탐,
+alias 미해석 → 15개 중 11개 오탐). **믿을 수 있는 것은 alias를 푼 AST Call 세기뿐이다.**
+(14) **Failure Isolation 감사에서 등급 역전이 두 번째 자리에서 나왔다 (P0)** —
+Notion Sync(DEGRADED)가 `processed/` 파일 하나를 못 읽으면 **Daily History도 Backup도
+실행되지 않고 run이 통째로 중단된다**(실측: Daily NONE, backup state MISSING). 이
+단계 자신의 주석이 "Notion 실패가 Runtime을 막지 않는다"고 말하는데도 그랬다.
+읽기를 per-event로 감싸 수정 — 수정 후 Daily 13개 기록, Backup 도달,
+`notion_sync`는 `unreadable:1`로 FAILED. CRITICAL 쪽(History Filter)의 같은 패턴은
+BUG-20이 의도로 고정해 둔 것이라 **건드리지 않았다.**
+(15) **Monthly parser를 seed 고정 fuzz로 닫았고, 열거 테스트가 놓친 둘이 나왔다** —
+benign 4,000건 중 **641건이 항목을 잃고** 있었다(열거 테스트는 전부 통과). 원인은
+(a) 요약이 렌더러의 **라벨 이름**으로 시작할 수 있다는 것(`Lessons Learned: …`는
+LEARNING 요약이 실제로 읽히는 방식이다 — 일곱 개 전부 LOST)과 (b) 그런 요약이 자기
+항목의 **`event_id`를 가로챈다**는 것(§59가 그 값으로 중복 제거를 한다). 렌더러가
+라벨을 **한 번씩 정해진 순서로** 쓴다는 사실로 추측 없이 판정하게 고쳤다.
+benign 유실 **641 -> 0**, adversarial은 여전히 유실하지만 **silent 0**.
+(16) **같은 뿌리가 인접 경로 넷에 더 있었다** — 뿌리는 파서가 아니라 **포맷**이다:
+요약이 raw로 렌더되므로 `Event ID: X`라는 요약은 라벨 줄과 바이트 단위로 같고,
+이 파일을 줄 단위로 읽는 모든 코드가 같은 방식으로 속는다. §38 중복 가드는
+**Late Event를 영구히 버렸고**(fuzz 1,000건에 98건, Event Count 오류 429건),
+§58의 `Generated At`은 **영구 위조**됐으며, ops_status의 Monthly shortfall 검사는
+"거짓 경보는 못 한다"는 **자기 docstring을 어겼다**(멀쩡한 달에 `('2026-08', 999, 1)`),
+E-17 유실 탐지기는 요약이 지목한 Candidate에 대해 **꺼졌다**.
+규칙을 렌더러 옆에 두되 `monthly`는 선언된 leaf라 두 벌로 두고 **행동 동등성
+테스트**로 묶었다.
+(17) **인용이 가리키는 곳이 실제로 있는지 아무도 확인한 적이 없다** — 이 저장소는
+결정을 인용으로 정당화한다(`docs/NN §M` 807건, `BUG-NN` 618건, `README RULE N`
+39건). Scheduler 명세를 가리킨 인용 하나는 **줄 번호를 절 번호로 적은 것**이었고
+(951은 그 문장의 줄 번호, 진짜는 §44),
+`BUG-NN` 15개(65건 인용)는 초기 Audit 번호라 **BACKLOG에 옮겨진 적이 없다**.
+65건을 고쳐 쓰는 대신 인용처에서 가져온 설명으로 **색인**을 만들어 포인터가 풀리게
+했고, 새 dangling id는 테스트가 막는다.
+(18) **`.tmp-` 잔여물을 세 디렉터리 중 둘만 제대로 부르고 있었다** — C27의 규칙이
+전수 적용됐는지 아무도 본 적이 없어 `glob`/`iterdir` 22곳을 대조했다. 구멍은
+**`incoming/`** 하나, 하필 `write_event_json()`이 실제로 staging하는 곳이다.
+staging 파일 하나가 "Collector가 아직 가져가지 않은 Event 1건"이 되고 `is_clear`를
+False로 잡았다 — 그런데 `awaiting_collection`은 *promote된 것*을 세고 그 파일은
+promote된 적이 없다. 고치는 도중 내가 넣은 회귀(`name_collision` 축소)를 **기존
+테스트의 docstring이 정확히 금지하고 있었고** 그것이 잡아냈다.
+(19) **(1)에서 내가 만든 blind spot** — 라벨 순서 규칙의 전제("렌더러가 쓸 수 없는
+배치니 산문이다")가 틀렸다. **§57이 허용하는 손편집**이 똑같은 배치를 만든다.
+`- Event ID:`를 `- Owner:` 위로 옮기면 블록의 id가 사라져 **Late Event가 매 실행
+다시 추가된다**(무한 증가). 순서 규칙 이전에는 찾던 id이므로 회귀다. override
+하나로 닫았다 — **exclusion이 블록의 유일한 식별자를 없앨 수는 없다.** 같은 뿌리의
+reader 넷 전부에 적용되고, 전에 통째로 잃던 블록은 이제 세 필드를 다 되찾는다.
+(20) **운영자에게 하는 말이 코드보다 셌다** — ATTENTION 41줄을 코드와 전수 대조했고
+셋이 과했다. E-17 경보의 "**어떤 실행도 이것을 넣지 않는다**"는 틀렸다(같은 날짜
+Event가 하나라도 더 오면 방치된 Candidate가 **함께 들어간다** — 실측
+`added_event_ids=('EVT-S','EVT-N')`). Monthly shortfall 경보는 원인 하나를 단정하고
+**틀린 조치**를 지시했다(손편집 원인은 강제 rebuild가 복구한다). 그 검사의
+docstring이 주장한 "거짓 양성 없음"도 "as generated"까지만 참이었다. 셋 다
+사람이 할 조치를 바꾸는 오류다.
+(21) **C31의 `.exists()` 스윕이 전수가 아니었고, 하나는 내가 잘못 분류했다** —
+31곳을 전부 재분류했다. 놓친 것은 `agent/outbox.stage()`로, Event 이름의
+**디렉터리**가 있으면 아무것도 쓰지 않고 성공을 반환했다(Agent의 내구성 경계를
+건너뛴다). 차단은 돼 있었지만 설계가 아니라 운이었고, 운영자에게는 실패한
+**날짜** 대신 "읽을 수 없는 파일"이 떴다. 잘못 분류한 것은 C31이 넣은
+`test_name_taken_questions_still_use_exists`로, 근거로 적은 위험(디렉터리를
+덮어쓴다)이 실측상 일어나지 않는다 — 거부는 한 단계 아래가 한다.
+(22) **중복 결함 전부가 위반하는 성질을 아무도 단언하지 않고 있었다** — 전체
+파이프라인 3연속 실행은 **완전 멱등**임을 트리 해시로 확인했다(커밋 증가 0,
+state 수렴). 그런데 그 테스트에 **이빨이 없었다**: §38 가드를 눈멀게 해도 한 건도
+실패하지 않는다 — 새 입력이 없으면 6.5단계가 아예 안 돈다. 연속 실행이 각각 같은
+닫힌 날짜의 Event를 수집하는 모양으로 바꾸니 그제야 잡힌다(`- Event ID:` 3줄 대
+**7줄**, Event Count 0이 Late Events Added 6과 모순).
+(23) **Mutation Testing — 핵심 가드 17개를 부러뜨려 스위트에게 물었다** — §28에서
+이빨 없는 테스트를 하나 잡은 뒤 같은 질문을 스위트 전체에 던졌다. **17개 전부
+잡혔다**(결함 없음). 다만 방법론 함정 하나를 기록한다: `-x`가 보여주는 첫 실패가
+**구조/인벤토리 테스트**일 수 있다 — 함수가 lambda로 바뀐 것을 정체성으로 알아챈
+것이지 동작으로 알아챈 게 아니다. `_SEVERITY`와 `overall_status`가 그랬고, 그것을
+빼고 다시 돌려야 진짜 행동 테스트가 드러난다.
+(24) **Daily 시퀀스에 구멍이 나도 모든 지표가 정상을 보고한다** — Recovery/DR
+감사에서 나왔다. 열흘 중 사흘을 지우면 `check_state_consistency()`는 **CONSISTENT**,
+ATTENTION은 침묵, Scheduler는 `last_close+1`부터라 **영원히 돌아오지 않는다**.
+정합성 검사가 틀린 게 아니라 **가운데를 보는 눈이 없었다**. 판정은 파일만으로
+결정 가능하다(빈 날에도 파일이 쓰이므로 Daily 파일명은 끊기지 않는 구간이어야
+한다). **탐지만** 추가했고, 사라진 날 중 Backup Working Copy에 아직 있는 것을
+이름으로 집어 준다. `os.scandir`로 10년치 62 ms → 5.4 ms(실측 후 결정).
+(25) **Monthly 시퀀스에도 같은 구멍** — 04·05를 지워도 아무 ATTENTION도 없다.
+탐지 추가. 다만 조치가 Daily보다 낫고 그게 정확하다: Monthly는 Daily에서만
+파생되므로 dirty 표시 후 재실행이 **내용까지 복구한다**(실측).
+(26) **삭제된 Company History가 Run Manifest에 이름조차 남지 않았다** — 삭제
+차단 자체는 훌륭하다(원격 전파 없음, exit 2). 그런데 Manifest는
+`BACKUP_FAILED` / `reason: ""` / `changed_files=1`뿐이라 **History가 지워졌다는
+사실도, 자격증명 실패와의 차이도** 알 수 없었다. `deleted_files`를 삭제 분기에도
+싣고 `reason`에 사실을 적었다. 새 classification 값은 docs/14 §5의 어휘라 SKIP.
+(27) **C27이 "결정이 필요하다"며 남긴 거짓 경보 하나는 결정이 필요 없었다** —
+중단된 쓰기 잔여물이 `rejected/`에 들어가면 ATTENTION이 "Collector가 거부한
+Event 1건"이라고 말한다. Collector가 그것을 소비하지 *않게* 만드는 것은 docs/03
+결정이지만, 보고서가 그것을 뭐라고 부르는지는 아니다. 파이프라인 무변경으로
+문장을 분리했고, C27의 경계 테스트 docstring에 남아 있던 낡은 주장도 같이 고쳤다.
+전체 Regression **2149 passed / 0 failed / 4 skipped**
+(baseline 1914 passed / **2 failed** / 4 skipped — 신규 테스트 +229))
+
+이전 갱신: 2026-08-13 (C30 — **낡은 보조 주장 Sprint.** SKIP 판단 자체는 옳은데
 그 옆에 적힌 주장이 낡아 있는 경우를 찾는다. E-13: "테스트도 있다"가 **그 분기에는
 해당하지 않았다**(lock 미획득 exit code를 아무것도 고정하지 않고 있었다).
 E-14: 완화 주장을 필드 단위로 재측정 — 9개 중 6개만 도달하고 `source`는 **전혀**
@@ -200,6 +372,24 @@ CMO  - 활동 / 콘텐츠 / 실험 / 이슈
 역할별 그룹핑(활동 / 완료 / 이슈 + 무활동 역할 명시)을 제공한다. Daily
 History Markdown 파일은 전혀 바꾸지 않았다 — docs/06이 그 구조를 고정하고
 `tests/test_spec_conformance.py`가 섹션 순서를 검증하기 때문이다.
+
+**C31 정정 — "제공한다"는 함수에 대해서는 맞고 시스템에 대해서는 아니다.**
+`build_role_summary()`를 **production에서 호출하는 곳이 하나도 없다.**
+AST로 확인했다(C29 §3의 선례대로 — grep은 예전에 export를 호출로 오인한 적이 있다):
+`src/**` 와 루트 스크립트 전체에서 이 이름에 대한 Call 노드는
+`role_summary.py` 자신의 생성자 2개(137·140행)뿐이고, 나머지는
+`daily/__init__.py`의 import와 `__all__` re-export다. 즉 **운영자는 역할별 요약을
+한 번도 본 적이 없다** — A-16 / E-20과 같은 모양(구현·export까지 됐으나 호출자 없음)이다.
+
+연결하는 것은 승인 없이 못 한다 — 역할별 요약을 *어디에* 렌더링할지가 A-3/A-4
+(docs/06 변경)다. 승인 없이 한 것은 **기록이 다시 낡지 않게 고정한 것**이다:
+호출자가 생기면 테스트가 깨지고 이 항목을 다시 써야 한다
+(`test_daily_role_summary.py::NoProductionCallerTests` 3건 — 호출자 부재, 그럼에도
+export돼 있다는 것, 그리고 호출하면 **정상 동작한다**는 것까지. "미연결"이지
+"고장"이 아니라는 구분이 다음 사람에게 필요하다).
+
+부수 기록: 그래서 `role_summary._candidate_date()`의 무방비 `fromisoformat`
+(A-7과 같은 모양)도 production 영향이 없다 — 도달 경로 자체가 없다.
 
 ### A-4. Daily History Markdown에 역할별 섹션 추가
 
@@ -607,6 +797,44 @@ C10이 여기를 건드리지 않은 이유: 어느 Database에 무엇을 쓸지
 **SKIP.** (스키마가 나중 Sprint를 위한 의도적 준비라면 그렇다고 적어 두는
 것만으로도 충분하다 — 지금은 아무 문서도 그 말을 하지 않는다.)
 
+### A-21. 네 Category 밖의 항목을 Monthly가 어떻게 다루는가 (C31 신규, **데이터 유실**)
+
+**발견한 사실.** `monthly/markdown.render_monthly_markdown()`은
+`item.category in by_category`일 때만 항목을 Section에 넣는다. 네 값
+(DECISION/MILESTONE/ISSUE/LEARNING) 밖이면 **어느 Section에도 들어가지 않고**,
+그런데 같은 함수가 쓰는 `- Consolidated Items:`는 `len(items)`이므로 버린 것까지
+센다.
+
+**재현 결과.** 항목 2개, 하나는 `category="Decision"`:
+
+    - Consolidated Items: 2
+    Section : Major Decisions, Source Records, Metadata
+    EVT-2   : 파일에 없음 (요약도 id도 없음)
+    consolidate_month() -> MONTHLY_GENERATED, item_count=2
+
+**현재 제한.** 부패도 공격도 필요 없다. `## Late Events` 항목은 Daily 파일의
+`- Category:` 줄로 자기 Category를 밝히고(docs/06 §37, docs/09 §12-13),
+`monthly/parser.py`는 그 텍스트를 그대로 읽으며, docs/06 §57 · docs/11 §71은 COO의
+Daily 손편집을 명시적으로 허용한다. 손으로 친 `- Category: Decision` 한 줄이 그
+Event를 그 달에서 영구히 지운다 — 다시 만들어도 같은 파일이 나온다.
+
+Daily 쪽 형제(`category=None`인 KEEP Candidate)는 이미 특성화돼 있다
+(`tests/test_daily_history.py::test_a_category_less_keep_candidate_silently_
+loses_its_detail`). 이쪽이 더 나쁘다 — Daily는 `## Summary`에 요약이,
+`## Evidence`에 id가 남지만 Monthly에는 그 둘 다 없다.
+
+**필요한 승인/조건.** docs/09 §14의 렌더링 결정. §14는 열한 Section을 나열할 뿐
+"목록에 없는 Category"를 다루지 않는다.
+
+**승인 후 구현 방향.** 세 갈래이고 전부 §14를 바꾼다 — (a) 알 수 없는 Category를
+가장 가까운 Section에 넣는다, (b) `## Other` 같은 Section을 하나 만든다,
+(c) 버리되 `Consolidated Items`를 렌더링된 수로 줄이고 Daily 쪽과 함께 정한다.
+Daily 쪽 형제와 **같은 하나의 결정**이므로 함께 정하는 편이 낫다.
+
+**지금 한 것(승인 불필요).** `ops_status._monthly_counts_more_than_it_shows()` —
+한 파일 안의 두 숫자만 비교하므로 창도 오탐 경우도 없다.
+**Evidence:** `tests/test_observability.py::MonthlyCountsMoreThanItShowsTests` 11건.
+
 ---
 
 ## B. 승인 없이 가능한 다음 작업
@@ -786,6 +1014,91 @@ add → commit → push를 한 `try` 안에서 돌리므로 **push 실패는 com
 **Evidence:** `tests/test_untrusted_event_input.py::WorkingCopyStrayFileTests`
 7건. 마지막 둘이 후보 수정 두 개의 현재 상태(`.gitignore` 부재, `add -A`)를
 고정하므로, 어느 쪽이 바뀌어도 이 항목이 함께 갱신된다.
+
+### E-25. `BACKUP_FAILED` 하나가 서로 다른 두 사건을 가리킨다 (C31 신규, **Run Contract**)
+
+**SKIP 사유: docs/14 §5의 Failure Classification 어휘 변경 = Spec 변경(§6).**
+
+docs/08은 Backup이 FAILED로 끝나는 경로를 둘 적어 두었고 둘은 성격이 다르다:
+
+    §21       인증/권한 실패 — 자격증명을 고쳐야 한다
+    §31/§44-47 Local Master 파일 삭제 감지 — Company History가 사라졌다
+
+둘 다 `BACKUP_FAILED` / `PERMANENT` / `CRITICAL`로 보고된다. docs/14 §5의 예시는
+`BACKUP_FAILED`를 **인증 실패**에 명시적으로 묶고 있으므로(*"인증 실패는
+`BACKUP_FAILED`/`PERMANENT`/`CRITICAL`이다(§21…)"*), 삭제 차단을 같은 값으로
+보고하는 것은 이미 예시와 어긋난다. 운영자 관점에서도 조치가 완전히 다르다 —
+전자는 토큰, 후자는 **사라진 파일을 찾는 일**이다.
+
+**필요한 결정.** `BACKUP_DELETION_BLOCKED`(가칭) 같은 값을 §5 어휘에 추가할지.
+추가하면 `ops_status.py`의 PERMANENT 경보 문장과 Run Manifest를 읽는 모든 것이
+새 값을 알아야 하고, 그것은 계약 변경이다.
+
+**C31이 승인 없이 한 것:** 값은 그대로 두고 **`reason`에 사실을 적었다**(§32).
+`Failure.reason`은 자기 docstring이 자유 텍스트라고 명시한 필드이고,
+`deleted_files` metric도 삭제 분기에 실었다. 이제 Manifest만 읽어도 두 경우가
+구별되지만, **분류 자체는 여전히 하나**다.
+
+### E-24. Secret 게이트가 자기 목록의 이름을 대소문자 때문에 못 알아본다 (C31 신규, **보안**)
+
+**측정(실 git, 로컬 bare remote, 실제 `backup.run_once()`).** 같은 내용, 같은
+in-scope 디렉터리, 파일 이름의 대소문자만 다르다:
+
+    daily/ID_RSA   BACKUP_SUCCESS   push_result="SUCCESS"
+                   원격 tree : daily/2026-08-05.md, daily/ID_RSA
+                   git show main:daily/ID_RSA -> 키 본문이 그대로 읽힌다
+    daily/id_rsa   BACKUP_FAILED    "secret files detected: daily\id_rsa"
+                   원격 tree : (비어 있음)
+
+접미사도 같다 — `server.PEM` · `client.Key` · `bundle.P12` 전부 미탐지.
+`.env`/`.ENV`/`.Env`는 파일시스템이 애초에 한 파일로 합쳐 버리는데, 그것이 바로
+요점이다: **파일시스템은 이름을 대소문자 구분 없이 다루고 게이트는 그러지 않는다.**
+어느 철자로 만들었는지라는 우연이 보호 여부를 정한다.
+
+**원인.** `backup/working_copy._looks_like_secret()`:
+
+    return name in _SECRET_EXACT_NAMES or name.endswith(_SECRET_SUFFIXES)
+
+목록 자체는 옳다(docs/08 §29가 적은 이름들, C20이 두 개를 마저 채웠다). 틀린
+것은 비교가 Windows 파일시스템의 이름 동치와 다르다는 것이다.
+
+**BUG-55와 같은 뿌리, 다른 위치.** BUG-55는 `daily/` vs `Daily/` — 무엇이
+*백업되는가*. 이쪽은 무엇이 *차단되는가*. 두 곳 다 "대소문자 구분 비교 ×
+구분하지 않는 파일시스템"이다.
+
+**왜 SKIP.** 비교를 case-fold하면 게이트에 **새로운 BACKUP_FAILED 조건**이 생긴다.
+그것이 정확히 E-15가 기록한 피해다 — 거짓 양성 하나가 Company History를 원격에
+못 가게 만들고, Backup은 사람이 개입할 때까지 실패한다. E-15/E-21의 후보 수정이
+전부 "게이트를 어디에 무엇으로 겨눌 것인가"라는 하나의 결정을 기다리고 있고,
+이 항목은 그 결정의 세 번째 면이다.
+
+**탐지는 추가했다.** `ops_status._secret_names_the_gate_will_not_recognise()`,
+Local Master와 Backup Working Copy 양쪽. 이름 목록은 게이트에서 import한다(C28의
+규칙: 두 번째 의견을 만들지 않는다). 게이트가 이미 보는 파일은 보고하지 않아
+E-21 줄과 겹치지 않는다. 보고는 구조상 늦다 — 예약된 Backup이 이미 push했을 수
+있다 — 그러나 늦은 것과 영영 모르는 것의 차이는 자격증명 교체 여부다.
+
+**history 쪽 보고도 함께 열었다.** 이미 push된 경우 파일 이름을 고쳐도 원격
+history에는 남으므로 `_secrets_ever_committed()`가 그쪽을 보고하는데, 그 검사도
+같은 대소문자 비교를 써서 `ID_RSA`는 **유출이 실제로 일어나는 바로 그 경로에서**
+보이지 않았다. 그쪽은 **게이트가 아니라 보고**이므로 — 아무리 넓혀도 Backup을
+실패시킬 수 없다 — case-fold를 추가했다. 이 저장소가 secret 신호에 대해 이미
+택한 방향이다(`_would_reach_the_commit()`은 git이 답 못 하면 과다 보고로
+폴백하고, `oplog.SECRET_PATTERNS`는 의도적으로 과다 매칭한다): 불필요한 교체는
+반나절이고 놓친 교체는 살아 있는 자격증명이다.
+
+**여전히 못 막는 것.** BUG-7의 한계는 그대로다 — 목록에 없는 이름
+(`secrets.yaml` 등)과 파일 **내용**. 게이트 자체도 그대로다.
+
+**다음에 필요한 조건.** E-15 / E-21과 **같은 하나의 결정**. 정해지면 셋이 함께
+닫힌다.
+
+**Evidence:** `tests/test_backup_git_ops.py::StagingResidueThroughTheRealBackupTests::
+test_only_the_case_of_a_secret_filename_decides_whether_it_leaks` (+ 대조 1건,
+실제 remote), `tests/test_untrusted_event_input.py::SecretNameCaseTests` 7건,
+`tests/test_observability.py::…::test_a_case_variant_already_in_history_is_reported`
+(+ 과다 매칭 가드 1건). 게이트가 case-insensitive해지면 앞의 둘이 실패하므로
+이 항목이 함께 갱신된다.
 ---
 
 ## F. 테스트가 고정했지만 BACKLOG에 없던 미수정 항목 (C22 전수 조사)
@@ -830,7 +1143,7 @@ C22에서 전수 대조했다: 테스트 docstring이 참조하는 결함 식별
 
 | ID | 무엇인가 | 왜 미수정인가 |
 |---|---|---|
-| **BUG-58** | Notion이 준 실패 설명을 버리고 HTTP status text만 남김 | *부분 완화됨* — `_error_detail()`이 지금은 본문을 붙인다. 남은 범위 재측정 필요 |
+| ~~**BUG-58**~~ | Notion이 준 실패 설명을 버리고 HTTP status text만 남김 | **C31에서 재측정 — sync 경로에서는 남은 범위가 없다.** 실 `_request()`에 진짜 400 본문을 물려 끝까지 추적: `NotionAPIError` → `SyncResult.error` → `notion_sync.log`의 `REASON`까지 전부 도달한다. `dashboard`·`bootstrap`·`health_check`도 `str(exc)`를 쓴다. Manifest의 `Failure.reason`이 `queued[0]` 하나인 것은 유실이 아니라 설계다(detail은 `artifact_refs`가 가리키는 로그에 있다). **그 추적 중에 신규 보안 결함 발견** — 같은 문자열이 stdout에는 redact 없이 나갔다(C31 §11, 수정함) |
 | **BUG-56** (P3) | Collector 로그가 성공 줄은 `event_id`로, 나머지는 파일명으로 키를 잡아 sanitize된 Event를 로그에서 추적할 수 없음 | 로그 형식 변경 |
 | **BUG-51** | `.env` 값을 trim하지 않아 `"  "` 같은 오타가 통과하고 나중에 401로 실패 | trim이 설정 계약 변경 |
 | **BUG-31** | `diff_properties()`가 Property **타입**을 보지 않아 이름만 같으면 EXISTS로 판정 | 불일치를 감지한 뒤 무엇을 할지가 결정 |
@@ -866,6 +1179,1758 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C31. Writer/Reader Mismatch Sprint
+
+C30은 "SKIP 판단 옆에 적힌 주장이 낡았는가"를 물었다. C31은 **한 모듈이 쓴 것을
+다른 모듈이 되읽는 지점**을 전수 대조한다. 이 저장소에는 그런 왕복이 여덟 쌍
+있고, 세 쌍이 어긋나 있었다.
+
+| 쓰는 쪽 | 읽는 쪽 | 결과 |
+|---|---|---|
+| `daily/markdown` | `monthly/parser` | **§1 어긋남 (수정)** |
+| `daily/markdown` | `daily/late_events.existing_event_ids` | **§2 어긋남 (수정)** |
+| `daily/markdown` | `ops_status._kept_but_not_rendered` | **§2b 어긋남 (수정)** |
+| `monthly/markdown` | `monthly/generator._existing_generated_at` | 일치 (`split(":", 1)` 확인) |
+| `monthly/markdown` | 자기 자신의 `Consolidated Items` | **§3 어긋남 (탐지)** |
+| `late_events._update_metadata` | 자기 자신의 정규식 | 일치 |
+| `runsummary.write_summary` | `ops_status._print_last_run` | 일치 (파생 필드는 재계산) |
+| `oplog.append_line` | (읽는 코드 없음 — 사람) | 해당 없음 |
+
+### 1. 평범한 요약 한 줄이 그 항목을 Monthly에서 지운다 (신규, **P1, 데이터 유실**)
+
+`monthly/parser._first_bullet()`은 item block 안에서 요약 bullet을 찾는다.
+docstring은 "라벨이 붙지 않은 유일한 bullet"이라고 정확히 적어 두었는데, 구현은
+라벨 **집합**이 아니라 라벨 **모양**을 물었다.
+
+    if re.match(r"^[A-Z][A-Za-z ]+:[ \t]", text):   # <- 건너뛴다
+
+사람이 쓰는 요약은 늘 그 모양이다. 실측:
+
+    ## Issues
+    ### Auth Service
+    - Fixed: login token refresh loop.
+    - Owner: CTO Backend
+    - Event ID: EVT-1
+
+    parse_daily_markdown(...) -> items 1개 (EVT-2만), EVT-1 없음
+
+`- Fixed: …`가 라벨로 걸러지고, 이어지는 `- Owner:` · `- Event ID:`도 걸러지므로
+`_first_bullet()`이 `None`을 돌려주고 **항목 전체가 버려진다.** 같은 모양:
+`Decision: ` `Resolved: ` `Note: ` `TODO: ` `Launch: ` `Beta: ` — 전부 재현했다.
+
+**공격 입력도 손편집도 필요 없다.** Daily 파일은 완전하고, `consolidate_month()`는
+`MONTHLY_GENERATED`를 돌려주고, 두 파일 사이에서 `Event Count: 2`와
+`Consolidated Items: 1`이 조용히 어긋난다. Daily 커버리지 검사는 **파일 단위**라
+항목 하나가 빠진 것을 볼 수 없다(`monthly/coverage.py`).
+
+**Blast radius를 실 파이프라인으로 쟀다.** Repository → `generate_daily_history()`
+→ 한 달치 Daily → 늦게 도착한 Event 1건까지 `update_daily_history()` → `run_once()`.
+평범한 요약 5개 중 4개가 라벨 모양(`Adopted: ` `Fixed: ` `Note: ` `Resolved: `)이고
+1개는 아니다:
+
+    수정 후   item_count=5   렌더링 5   - Consolidated Items: 5
+    수정 전   item_count=1   렌더링 1   - Consolidated Items: 1
+
+**5건 중 4건이 그 달에서 사라진다.** 손편집도 공격 입력도 없고, Daily 파일은
+전부 완전하며, `MONTHLY_GENERATED`가 보고된다.
+
+**수정:** 렌더러가 실제로 쓰는 라벨만 건너뛴다(`_ITEM_LABELS` 7종). 손편집으로
+라벨이 요약 위로 올라간 경우(docs/06 §57)를 견디는 성질은 그대로다.
+
+테스트 4 + E2E 4건. 그중 하나는 `daily/markdown._render_item_block()` 소스에서
+라벨을 추출해 `_ITEM_LABELS`와 대조하므로, 렌더러에 라벨이 하나 늘면 여기서
+실패한다 — 이 결함이 다시 생기는 유일한 경로를 막는다.
+
+### 2. 빈 `event_id` 하나가 Daily 파일을 무한히 부풀린다 (신규, **무결성**)
+
+`validate_event()`는 required field를 `is None`으로만 검사하므로 `event_id=""`는
+**오늘 유효한 Event**다(그것을 바꾸는 것은 A-15 = docs/02 결정). 렌더러는 그것을
+`- Event ID: `로 쓴다 — 줄은 있고 값이 비었다.
+
+`existing_event_ids()`의 `(\S.*)`는 비어 있는 값을 못 읽는다. 그래서 docs/06 §38의
+중복 가드가 그 항목에 대해 **작동하지 않는다.** 실측, KEEP Candidate 1개 저장,
+이미 닫힌 날짜, 평범한 3회 실행:
+
+    run 1  UPDATED_LATE_EVENT ('',)
+    run 2  UPDATED_LATE_EVENT ('',)
+    run 3  UPDATED_LATE_EVENT ('',)
+    -> `## Late Events` 블록 3벌 (Candidate는 1개)
+    -> `- Late Events Added: 3` 바로 옆에 `- Event Count: 1`
+
+`total_events`도 같은 함수로 세므로 두 숫자가 한 파일 안에서 서로를 부정한다.
+
+**수정:** `(.*)`. 게이트를 넓히는 것이 아니라 **§18의 렌더러가 쓴 것을 §38의
+가드가 읽게** 하는 것이다. Evidence 줄(`- <id>: <text>`)이 걸리지 않는 성질은
+줄 시작 조건이 지키므로 그대로다(테스트로 고정).
+
+**§2가 남긴 비대칭 하나는 일부러 두었다 (신규 기록, SKIP).** `monthly/parser.py`의
+`_EVENT_ID_LINE`도 `(\S.*?)`를 쓴다. 그래서 빈 id를 가진 항목은 이제 Daily에는
+정확히 한 번 들어가지만 Monthly에는 **여전히 들어가지 않는다.** 실측:
+
+    Daily 파일의 item block : 2   (하나는 `- Event ID: `)
+    Monthly로 파싱된 항목   : ['EVT-2']
+
+**같은 `(\S…)`이지만 같은 질문이 아니다.** `late_events` 쪽은 "이 문서에 이미
+있는가"(§38 중복 가드)를 묻고, 거기서 빈 값은 명확히 "있다"이다. 파서 쪽은
+"이것을 통합해도 되는가"(§59, event_id로 dedup)를 묻는데, 손으로 편집한 Daily의
+`- Event ID:` 빈 줄이 **"빈 id"인지 "id를 모른다"인지 구분할 수 없다.** 후자를
+`""`로 통합하면 서로 다른 두 항목이 한 항목으로 합쳐진다 — 지금 동작이 막고 있는
+것이 그것이다.
+
+즉 이쪽은 §1처럼 "구현이 자기 docstring과 다르다"가 아니라 **무엇이 옳은지가
+결정인 경우**다. 빈 `event_id`를 스키마가 받아들일 것인가라는 A-15와 같은 벽이고,
+A-15가 정해지면 함께 닫힌다. 재발견 비용을 없애려고 실측만 남긴다.
+
+### 2b. 그 수정이 드러낸 오탐 — C30 수정의 반대편 모서리 (신규)
+
+C30 §5는 `_kept_but_not_rendered()`를 "줄 전체 비교"로 고쳤는데, 방법이
+**줄을 분해하는 쪽**이었다: `startswith("- Event ID: ")` 후 접두사를 잘라낸다.
+그 접두사는 공백으로 끝난다. 빈 `event_id`가 렌더링한 줄은 `strip()`하면
+`- Event ID:`이므로 **접두사로 시작하지 않는다.**
+
+    old: '' in rendered_ids            -> False  (Daily에 있는데 "영구 유실"로 보고)
+    old: 'EVT-PAD ' in rendered_ids    -> False  (같은 이유, 반대쪽 끝)
+
+즉 §2를 고쳤다면 그 항목은 이제 Daily에 정확히 한 번 들어가는데 `ops_status`가
+"어떤 실행도 이것을 넣지 않는다"고 말하는 상태가 됐을 것이다.
+
+**수정:** 분해하지 않고 **렌더러처럼 조립한다** — id로 줄을 만들어 파일의 줄
+집합에서 찾는다. C30이 세운 원칙("렌더러가 답하는 것과 같은 질문을 묻는다")을
+더 곧장 구현한 것이고, 잘라낼 접두사가 없으므로 이 모서리가 아예 없다.
+
+### 3. Monthly는 버린 항목까지 세어 놓는다 (신규, **데이터 유실**, 탐지만)
+
+`render_monthly_markdown()`은 `item.category in by_category`일 때만 Section에
+넣는다. 네 값(DECISION/MILESTONE/ISSUE/LEARNING) 밖이면 어느 Section에도 들어가지
+않는데, `- Consolidated Items:`는 `len(items)`를 쓴다. 실측:
+
+    items 2개 (하나는 category="Decision")
+    - Consolidated Items: 2
+    Section    : Major Decisions, Source Records, Metadata
+    EVT-2      : 없음
+    consolidate_month() -> MONTHLY_GENERATED, item_count=2
+
+**부패나 공격 없이 도달한다.** `## Late Events` 항목은 Daily 파일의
+`- Category:` 줄로 자기 Category를 밝히고(docs/06 §37), `monthly/parser.py`는 그
+줄의 텍스트를 그대로 읽으며, docs/06 §57 · docs/11 §71은 COO의 Daily 손편집을
+명시적으로 허용한다. 손으로 친 `- Category: Decision` 하나가 그 Event를 그 달에서
+지운다 — 다시 만들어도 같은 결과다.
+
+**Daily 쪽 형제는 이미 기록돼 있었다**(`test_daily_history.py::
+test_a_category_less_keep_candidate_silently_loses_its_detail`). Monthly에는 아무도
+같은 질문을 겨눈 적이 없고, 이쪽이 더 나쁘다 — Daily는 `## Summary`에 요약이라도
+남고 `## Evidence`에 id가 남지만, Monthly에는 그 둘 다 없다.
+
+**왜 SKIP:** 알 수 없는 Category를 어느 Section에 넣을지는 docs/09 §14의 렌더링
+결정이다. 결정이 필요 없었던 것은 **파일이 자기가 버린 항목의 개수를 두 줄 아래에
+적어 둔다**는 사실이다.
+
+**탐지:** `ops_status._monthly_counts_more_than_it_shows()` — 한 파일 안의 두
+숫자만 비교하므로 창(window)도 오탐 경우도 없다. `claimed < rendered`(손편집)는
+보고하지 않는다.
+
+**이 탐지기 자신의 한계 — 스스로 물어 찾았고 실측했다.** summary는 escape 없이
+렌더링되므로(BUG-11/27, docs/06 렌더링 결정 대기), 개행과 `- Event ID: …`를 담은
+summary 하나가 이 검사가 세는 줄을 늘린다. 실측 — 항목 2개, 하나는 Category 때문에
+버려지고 하나는 summary가 줄을 위조:
+
+    - Consolidated Items: 2
+    `- Event ID: ` 줄        2
+    EVT-2 파일에 존재         False
+    이 검사                   ()  ← 침묵
+
+**방향이 중요하다.** 위조는 `rendered`를 **올리는** 것만 가능하므로 이 검사를
+침묵시킬 수는 있어도 거짓 경보를 내게 할 수는 없다 — 경보로서 안전한 쪽이다.
+`### ` 제목을 세도 같은 뿌리에 당한다(문제는 summary가 임의 Markdown을 쓸 수
+있다는 것 자체다). 닫는 것은 BUG-11/27의 결정이지 이 함수의 몫이 아니다.
+특성화 테스트로 고정했다.
+
+**다음에 필요한 조건:** "네 Category 밖의 항목을 Monthly가 어떻게 다루는가"에
+대한 docs/09 §14 결정. 정해지면 Daily 쪽 형제와 **함께** 닫힌다.
+
+### 4. Secret 게이트가 자기 목록의 이름을 못 알아본다 (신규, **보안**, 탐지만)
+
+`_looks_like_secret()`은 이름을 정확히 비교한다. Windows는 그러지 않는다.
+같은 내용, 같은 in-scope 디렉터리, 실제 bare remote로 E2E:
+
+    daily/ID_RSA   BACKUP_SUCCESS   push=SUCCESS
+                   remote tree: daily/2026-08-05.md, daily/ID_RSA
+                   git show main:daily/ID_RSA  -> 키 본문이 그대로 읽힘
+    daily/id_rsa   BACKUP_FAILED    "secret files detected: daily\id_rsa"
+                   remote tree: (비어 있음)
+
+접미사도 같다(`server.PEM`, `client.Key`, `bundle.P12` 전부 미탐지).
+`.env`/`.ENV`/`.Env`는 파일시스템이 한 파일로 합쳐 버리는데 — 그것이 바로 요점이다.
+**어느 쪽 철자로 만들었는지라는 우연이 보호 여부를 정한다.**
+
+BUG-55와 같은 뿌리(대소문자 구분 비교 × 구분하지 않는 파일시스템)의 **두 번째
+위치**다. BUG-55는 무엇이 *백업되는가*를, 이쪽은 무엇이 *차단되는가*를 정한다.
+
+**왜 SKIP:** 비교를 case-fold하면 게이트에 **새로운 BACKUP_FAILED 조건**이
+생긴다. 그것이 정확히 E-15가 기록한 피해(거짓 양성 하나가 Company History를
+원격에 못 가게 한다)이고, E-15/E-21의 후보 수정 전부가 결정 대기 중이다.
+그래서 BUG-55가 받은 것과 같은 처우 — 보고하고 아무것도 바꾸지 않는다.
+
+**탐지:** `ops_status._secret_names_the_gate_will_not_recognise()`, Local Master와
+Working Copy 양쪽. 이름 목록은 게이트에서 import한다(C28이 세운 규칙: 두 번째
+의견을 만들지 않는다). 게이트가 이미 보는 파일은 보고하지 않는다 — 한 파일에
+두 줄은 그 절을 안 읽게 만드는 방법이다.
+
+**다음에 필요한 조건:** E-15/E-21과 **같은 하나의 결정** — "Secret Scan은 무엇을,
+어느 이름 규칙으로 지키는가". 정해지면 셋이 함께 닫힌다.
+
+### 5. Baseline이 기록과 달랐다 — 테스트가 환경을 고정하고 있었다 (신규 2건)
+
+C30은 `1916 passed / 0 failed`로 닫혔다. 이 머신에서 오늘 측정한 baseline은
+**1914 passed / 2 failed**다. 둘 다 production 코드가 아니라 테스트의 결함이었고,
+둘 다 "어제까지는 통과했다"는 종류다.
+
+**(a) 실시간 시계에 매인 fixture.** `ArrivalVersusWorkDateTests._age_file()`이
+`time.time() - days_ago*86400`으로 파일 mtime을 만드는데, 그 클래스의 단언은 전부
+고정된 `NOW = 2026-08-10`에 대해 이뤄진다. `days_ago=6`은 실행일이 08-10이면
+"NOW보다 6일 전"이지만 08-14면 "NOW보다 **2일 후**"다.
+
+    caught_up_recently(NOW, days=3)  ==  silent >= 3 > arrival
+    실행일 2026-08-13  arrival=3  -> 3 > 3 False -> 통과
+    실행일 2026-08-14  arrival=2  -> 3 > 2 True  -> 실패
+
+C27 §12가 고친 것과 같은 부류이고, 벽시계가 나흘 움직여야 드러나므로 그때 쓸려
+나가지 않았다. **수정:** `NOW.timestamp()` 기준으로 나이를 만든다. 이 클래스의
+`_age_file` 사용처 4곳 전부 NOW에 대해 단언하므로 전부 결정론적이 된다.
+
+**(b) PowerShell UI 언어에 매인 문자열.** `test_both_effects_are_announced_as_
+would_be_done`이 `assertIn("WhatIf", combined)`를 단언한다. 그것은 PowerShell이
+`ShouldProcess` 미리보기를 찍는 접두사인데, **로케일마다 다르다.** 같은 머신,
+같은 스크립트, 같은 PowerShell 5.1.26100.8875, 부모 프로세스의 UI culture만
+다르게 해서 실측:
+
+    ko-KR   WhatIf: 대상 "user environment"에서 ... 수행합니다.
+    en-US   What if: Performing the operation ... on target ...
+
+즉 이 테스트는 **한국어 Windows에서만 통과**하고 영어 머신에서는 반드시 실패한다.
+docs/11이 배포 대상으로 삼는 머신이 후자일 수 있다. **수정:** 스크립트 자신이
+`ShouldProcess`에 넘기는 문자열(`Set COMPANY_OPS_* variables`, `user environment`,
+`Register scheduled task`, task 이름)로 단언한다 — 모든 로케일이 그대로 되뱉는다.
+두 로케일에서 각각 실행해 확인했다.
+
+**교훈:** "전체 통과"는 *이 머신, 이 날짜, 이 콘솔 언어에서* 통과했다는 뜻이다.
+기록에 그 조건이 적혀 있지 않으면 다음 사람은 코드가 깨진 줄 안다.
+
+### 6. 인증 실패 분류의 언어 의존 — 실측 후 제거 (하드닝)
+
+`_AUTH_FAILURE_MARKERS`는 영어 문구 목록이고, git은 카탈로그가 설치돼 있으면
+메시지를 번역한다. 번역되면 어떤 marker도 맞지 않아 진짜 자격증명 실패가
+`is_authentication_failure()=False` → BACKUP_PENDING → **docs/08 §62가 금지하는
+무한 재시도 루프**가 된다. 분류가 볼 수 없는 경로다.
+
+**추측하지 않고 실측했다.** 이 머신의 Git for Windows 2.55.0.windows.3에는
+카탈로그가 **하나도 없다**(`C:\Program Files\Git\mingw64\share\locale` 자체가
+없다). `LC_ALL=ko_KR.UTF-8`에서도 영어로 답한다. 즉 현재 무해하다.
+
+그래도 `_git_environment()`에 `LC_ALL=C` / `LANG=C`를 넣었다 — 같은 함수가
+`GIT_TERMINAL_PROMPT`에 대해 이미 한 것과 정확히 같은 이유다("marker는 목록에
+있는데 그 조건을 만들 수 있는 것이 아무것도 없었다"). **분류 목록은 그대로다** —
+목록을 넓히는 것은 BUG-52이고 여전히 결정 대기다. 여기서 바뀐 것은 이미 결정된
+목록이 실제로 적용된다는 것뿐이다.
+
+### 7. 같은 부류 전수 조사 — 형제 확인
+
+**(a) 대소문자 × 파일시스템.** §4를 찾고 나서 같은 모양을 전부 훑었다.
+`safe_candidate_filename()`이 만드는 `HIST-{event_id}.json`은 대소문자만 다른 두
+id에 대해 Windows에서 한 경로가 되고, `FileHistoryRepository.save()`는
+`overwrite=False`라 `FileExistsError`를 던진다 — Runner의 History Filter 단계에는
+per-event 오류 처리가 없으므로(BUG-20 characterization) 실행 전체가 중단된다.
+
+**도달 불가로 확인했다.** 그 쌍이 History Filter까지 오려면 두 Event가 모두
+ACCEPTED로 `processed/`에 있어야 하는데, 파일 이름 기반 중복 억제가 한 층 앞에서
+먼저 발화한다(E-22). 그리고 E-22 자체가 Agent 경로로는 구조적으로 불가능함이
+C28에서 측정돼 있다(uuid5는 전부 소문자). 새 항목 없음 — 같은 조사를 다시 하지
+않기 위해 기록한다.
+
+**(b) 느슨한 멤버십 검사.** C30 §6이 `in text`를 훑었다. 이번에는
+`startswith`/`endswith` 13곳을 전수 확인했다. `_looks_like_secret`(§4) 외에는
+전부 자기 writer와 짝이 맞거나 우리 코드가 만든 접두사(`.tmp-`)다.
+
+### 8. 성능 — 새 검사의 비용을 측정했다
+
+§3의 탐지기는 Monthly 파일을 전부 읽는다. C27이 정정한 편향(cold/warm)을 그대로
+적용해, 매번 새로 쓴 트리에서 cold로 쟀다:
+
+    24개월 x  30항목   serial 124.7 ms   threaded  5.6 ms
+    120개월 x 60항목   serial 667.9 ms   threaded 14.4 ms
+    이 머신 실제 runtime(0개월)              0.014 ms
+
+`ops_status.py` 전체가 이 머신에서 ~44 ms다. serial이면 2년치 Monthly가 상태
+조회 시간을 세 배로 만든다. `_read_keep_candidates()`가 이미 쓰는
+`ThreadPoolExecutor` + `_READ_WORKERS` 관용구를 그대로 재사용해 22~46배 줄였고,
+결과 순서는 정렬된 파일명 순서 그대로다(`map`이 입력 순서를 보존한다).
+
+§4의 탐지기는 두 트리를 `rglob`로 한 번씩 걷는다. Working Copy 실측 97개 파일 중
+**90개가 `.git/`**이라 바로 위 잔여물 검사와 같은 이유·같은 방식으로 제외했다
+(5.31 ms → 3.88 ms). Working Copy 쪽 결과는 E-21 줄과 똑같이
+`_would_reach_the_commit()`을 통과시킨다 — C26이 측정한 대로, git에게 묻지 않고
+보고하면 docs/08 §28대로 `.gitignore`를 둔 **올바른** 설정에서 상시 거짓 경보가 된다.
+Local Master에는 물어볼 저장소가 없으므로 그쪽은 목록 그대로다(그 경로의 사실은
+"sync가 복사하고 게이트가 안 막는다"이지 "git이 커밋한다"가 아니다).
+
+**그리고 개별 probe가 아니라 명령 전체를 쟀다**(목표가 요구하는 대로). 이 머신의
+실제 runtime에서 5회, 네 블록 전부:
+
+    C31 이후   48.2  49.0  53.7  53.7  55.1 ms   (중앙값 53.7)
+    C28 기준                                      ~44 ms
+
+**+9.7 ms.** 검사 두 개와 `one_line` 가드 여섯 개를 더한 값이고, 이 머신에는 아직
+Monthly 파일이 0개라 §3 탐지기는 0.014 ms만 쓴다 — 증가분의 대부분은 §4의 두
+`rglob`이다. 사람이 대화형으로 치는 명령에서 사실상 보이지 않는다.
+
+### 9. 넣지 않기로 한 검사 하나 — 측정 후 판단
+
+§1을 고친 뒤에도 `monthly/parser.py`가 항목을 조용히 버리는 경로가 둘 남는다:
+item block에 `- Event ID:` 줄이 없을 때, 그리고 `## Late Events` 항목에
+`- Category:` 줄이 없을 때(파서 스스로 "추측해 넣는 것보다 Daily에만 남기는 편이
+낫다"고 적어 둔 **의도된** 결정이다). 결정은 결정이지만 그 결정이 만든 유실을
+아무도 보고하지 않는 것은 별개다 — E-17에 적용한 것과 같은 논리다.
+
+탐지기는 만들 수 있다: 소비 가능한 `##` Section 안의 `###` 블록 수와
+`parse_daily_markdown()`이 돌려주는 항목 수를 비교하면 된다. 한 파일 안에서
+끝나므로 창도 타이밍도 없다.
+
+**넣지 않았다. 근거는 두 개의 측정이다.**
+
+    이 머신의 실제 Daily 6개   블록 13 / 파싱 13   (불일치 0)
+    730개 Daily x 4항목        cold threaded read 540 ms + parse 21 ms
+
+540 ms는 `ops_status.py` 전체(~44 ms)의 12배다. 그리고 남은 두 경로는 각각
+손편집이거나 `include_category=True`가 생기기 **이전** 버전이 쓴 Daily를 복원한
+경우인데, 현재 코드의 `append_late_events()`는 항상 그 bullet을 쓴다.
+
+즉 **비용은 확정적이고 발생은 관측되지 않는다.** 상황이 바뀌는 조건을 적어 둔다:
+백업에서 복원한 Daily가 섞였거나, `## Late Events`를 손으로 편집한 이력이 생기면
+그때 이 검사를 넣는다(그때는 대상을 그 달로 좁힐 수 있다).
+
+Daily 쪽 형제 하나는 이미 덮여 있다는 것도 확인했다 — 렌더러가 Category 때문에
+버린 KEEP Candidate는 그 날짜 Daily에 `- Event ID:` 줄이 없으므로
+`_kept_but_not_rendered()`가 Candidate 방향에서 잡는다. Monthly에는 그런 반대
+방향 검사가 없었고, 그것이 §3이다.
+
+### 10. C27이 "결정이 필요하다"고 남긴 경보 하나 — 결정은 필요 없었다
+
+C27 §8은 `is_incomplete_write()`를 소비자 6곳에 적용하면서 Collector를 **일부러
+제외**했고(그 판단은 옳다), 남는 것을 이렇게 적었다:
+
+> 남는 것은 **잘못 이름 붙은 경보 하나**이고, 그것을 고치려면 Collector가
+> `incoming/`에서 무엇을 소비하는지를 바꿔야 한다 — 읽는 쪽의 필터가 아니라
+> docs/03의 처리 파이프라인이다.
+
+**앞 절은 맞고 뒤 절은 두 가지를 한 문장에 묶었다.** Collector가 staging 파일을
+소비하지 *않게* 만드는 것은 확실히 docs/03의 결정이다. 그 결과를 **보고서가
+뭐라고 부르는지**는 아니다.
+
+증상: `write_event_json()`의 기본 디렉터리가 `runtime/events/incoming/`이고 거기에
+`mkstemp`한다. Desktop 4 reporter가 쓰기 도중 죽으면 Collector가 읽는 바로 그
+디렉터리에 `.tmp-….json`이 남고, 잘린 것은 REJECTED로 `rejected/`에 staging
+이름 그대로 들어간다. 그러면 ATTENTION이:
+
+    Collector가 거부한 Event 1건 — 사람이 확인해야 한다
+
+**거짓 문장이다.** 거부된 Event는 없고, 이 머신의 쓰기가 중단됐을 뿐이며, 보낸
+Desktop은 존재하지 않는다. 운영자를 엉뚱한 기계로 보낸다.
+
+**수정(파이프라인 무변경).** `IntakeBacklog.rejected_incomplete_write`를 나눠
+세고, ATTENTION에 다른 문장을 쓴다 — "거부된 Event가 아니다 … 지워도 안전하다".
+`name_collision`은 **필터하지 않은 목록**으로 계속 계산한다: 이름이 잡혀 있는지는
+그 파일이 staging이든 아니든 같은 사실이고, `run_once()`는 어느 쪽이든 destination을
+거부한다(BUG-43). Collector가 무엇을 소비하는지는 한 글자도 바뀌지 않았고,
+C27이 세운 경계 테스트가 그대로 그것을 고정한다.
+
+**그리고 C27의 경계 테스트 docstring을 갱신했다** — 그 안에 적힌 "ATTENTION says
+… a false statement"가 이제 사실이 아니다. C30이 사냥한 바로 그 모양(판단은
+옳은데 옆에 적힌 주장이 낡음)을 이번 Sprint가 스스로 만들지 않도록,
+같은 커밋에서 고쳤다.
+
+테스트 6건(`test_observability.py::RejectedStagingResidueTests`). 그중 하나는
+`collector/runtime.run_once()`가 여전히 `is_incomplete_write`를 쓰지 않음을
+소스에서 확인해, 이 수정이 경계를 건드리지 않았음을 고정한다.
+
+### 11. BUG-58 재측정 — 요청받은 대로 쟀고, 그 과정에서 보안 결함이 나왔다
+
+F-3의 BUG-58에는 *"부분 완화됨 … **남은 범위 재측정 필요**"*라고 적혀 있다.
+승인이 필요 없는 측정이므로 실제로 쟀다.
+
+**결과: sync 경로에서는 남은 범위가 없다.** 실제 `RealNotionTransport._request()`에
+Notion의 진짜 400 본문을 물려 끝까지 따라갔다:
+
+    1. NotionAPIError      Notion API returned 400: Bad Request | {"code":"validation_error", …}
+    2. SyncResult.error    그대로 (str(exc))
+    3. notion_sync.log     REASON …  ← `_log_notion_sync()`가 붙인다
+
+`dashboard.py` · `bootstrap.py` · `client.health_check()`도 전부 `str(exc)`를
+쓴다. Run Manifest의 `Failure.reason`은 `queued[0].error` 하나뿐이지만 그것은
+유실이 아니라 Manifest의 설계다("Detail is referenced, never inlined" — 같은
+component의 `artifact_refs`가 로그를 가리킨다). **F-3 항목을 그렇게 갱신했다.**
+
+**그런데 그 추적 중에 신규 결함이 나왔다(보안).** 그 문자열은 **원격 HTTP 응답
+본문**이고, `oplog.append_line()`은 정확히 그것 때문에 `redact()`와 `one_line()`을
+건다 — 그 docstring이 드는 근거가 *"a 502 page containing `Authorization: Bearer
+ntn_…` put the token straight into notion_sync.log"*이다. 그런데 같은 문자열을
+`run_company_ops.py::_print_result()`가 **아무것도 걸지 않고 stdout에 찍는다.**
+
+실측 — Notion 대신 응답한 프록시가 502와 함께 요청 헤더를 되돌려주는 경우:
+
+    notion_sync.log   토큰 [REDACTED], 1줄
+    이 stdout         Authorization: Bearer ntn_… 전문, 4줄
+
+두 번째 줄의 "4줄"도 장식이 아니다. 본문의 개행이 `  - <event_id> …` 결과 줄을
+**추가로 위조**한다 — 운영자가 무슨 일이 있었는지 판단하는 바로 그 보고서에서,
+BUG-6과 같은 모양이 아무도 겨눈 적 없는 sink에서 재현된다.
+
+**수정: sink에 건다.** 문자열이 만들어지는 `notion/transport.py`가 아니라
+출력 지점이다 — `notion`은 `events`만 import할 수 있고(LayeringInvariantTests)
+그 표를 넓히는 것은 **아키텍처 결정**이다. `run_company_ops.py`는 composition
+root의 entrypoint라 이미 모든 것 위에 있고, `ops_status.py`가 같은 이유로 이미
+`one_line`을 import하고 있다. 진단 내용(`502`, 어느 property가 거부됐는지)은
+그대로 남는다.
+
+테스트 1건(`test_architecture_invariants.py::…::
+test_a_notion_response_body_reaches_stdout_redacted_and_on_one_line`) — 토큰
+부재, `[REDACTED]` 존재, 진단 정보 잔존, 그리고 SyncResult 1건당 결과 줄 정확히
+1줄을 모두 단언한다.
+
+### 12. 같은 질문을 자매 entrypoint에 던졌더니 더 나쁜 것이 나왔다 (신규, **보안**)
+
+§11을 고친 뒤 "이 sink에만 있는 문제인가"를 물었다. `ops_status.py`가 더 나빴다.
+
+`event_id`는 다른 Desktop에서 OneDrive를 건너오고 docs/02는 그것을 "present and
+non-null"로만 제약한다(A-15). 그래서 개행이 든 id가 그대로 저장되고,
+`_kept_but_not_rendered()`·`find_orphaned_events()`·`_candidates_before()`가 그것을
+ATTENTION 메시지에 끼워 넣는다. 실측 — KEEP Candidate 1건, id가
+`"X\n  ! 모든 검사 통과 — 사람이 지금 할 일은 없다"`로 시작:
+
+    ! KEEP Candidate 1건이 저장돼 있는데 그 날짜의 Daily History에 없다: X
+    ! 모든 검사 통과 — 사람이 지금 할 일은 없다 (2026-08-05) — 그 날짜는 …
+
+**둘째 줄은 전부 공격자가 쓴 것이고**, 진짜 발견과 똑같은 `  ! ` 접두사를 달고
+ATTENTION 안에 서 있으며, 그 절이 보고하는 내용의 **반대**를 말한다. AGENT.md
+§6은 운영자에게 이 뷰를 **가장 먼저** 보라고 한다 — 이 시스템에서 줄을 위조하기에
+가장 값어치 있는 자리다.
+
+**BUG-6과 같은 모양이다.** `oplog.one_line()`이 `collector.log`에 대해 이것을
+이미 닫았고(C10), 이 파일도 Run Manifest metrics에 대해서는 그 논리를 이미
+받아들이고 있었다 — *"디스크에서 되읽은 것이 줄을 위조할 수 없다는 규칙이 오늘의
+metric 목록에 의존해서는 안 된다"*. **metrics가 작은 쪽이었다.** 큰 쪽인
+ATTENTION 줄들이 정작 신뢰할 수 없는 id를 나른다.
+
+**수정: sink에 건다.** `main()`의 출력 루프 한 곳이므로 지금 있는 40여 개
+append 지점과 앞으로 추가될 것 전부가 자동으로 덮인다. 같은 `!` 접두사와 고정
+들여쓰기를 쓰는 블록 내부 출력 두 곳(orphaned Event, undelivered Event)과, 파일에서
+되읽는 Run Manifest 문자열(`started_at`, `component.name`, `classification`)에도
+같은 규칙을 적용했다.
+
+**`redact()`는 일부러 걸지 않았다** — ATTENTION 메시지는 파일명·id·개수로만
+만들어지고 파일 **내용**을 나르지 않는다. 예외 메시지를 나르는 둘은 state 파일
+파싱 오류이고 그 텍스트는 위치 정보뿐이다("Expecting ',' delimiter: line 3
+column 5"). 운영자가 조치해야 할 경로를 과다 redact하면 얻는 것보다 잃는 것이
+크다. 언젠가 응답 본문을 나르기 시작하면 그때는 `redact()`도 필요하다 —
+`run_company_ops.py`가 이미 그런 경우다(§11).
+
+**세 번째 entrypoint까지 같은 규칙으로 맞췄다.** `run_agent.py`도 날짜별 오류를
+`    - {error}`로 찍는데, 그 문자열은 Signal 파일명·파싱 오류·Transport 실패다.
+`agent.py`가 만드는 지점에서 이미 `redact()`를 걸어 두었지만 **줄을 끝내지 못하게
+하지는 않는다.** 실측 — 개행이 든 오류 하나가
+`  2026-01-01: COMPLETED events=99 …` 결과 행을 통째로 위조한다(수집되지 않은
+날짜를 수집된 것처럼 보이게 한다). `one_line`을 걸어 닫았다.
+
+이제 세 entrypoint가 모두 같은 규칙을 지킨다:
+
+| sink | 걸린 것 |
+|---|---|
+| `oplog.append_line()` (모든 로그) | `redact` + `one_line` (기존) |
+| `run_company_ops.py::_print_result()` | `redact` + `one_line` (§11 신규) |
+| `ops_status.py::main()` + 블록 3곳 | `one_line` (§12 신규 — 내용을 나르지 않으므로 redact 제외, 이유는 코드 주석) |
+| `run_agent.py::main()` | `one_line` (§12 신규 — redact는 `agent.py`가 이미 원천에서 건다) |
+
+테스트 5건(`test_observability.py::AttentionLineForgeryTests`) + 1건
+(`test_agent.py::…::test_a_per_date_error_cannot_forge_a_result_row`), 각각
+수정 전 코드에 대해 **7건 / 1건 실패**를 확인했다. ATTENTION 쪽 하나는 `\n` 외에
+`str.splitlines()`가 끊는 나머지 문자들(`\r` `\v` `\f` `\x1c` …)도 함께 덮이는지
+확인한다 — `replace()`가 아니라 `one_line()`을 쓰는 이유가 그것이다.
+
+---
+
+### 13. 미래 날짜 State 포인터 — C17이 Agent에만 물었던 질문 (신규 3건, **데이터 정지 / 검사 침묵**)
+
+날짜 경계 산술을 훑다가 나왔다. `scheduler`·`agent.catchup`·`monthly`의 날짜
+걸음은 전부 `timedelta`/`calendar` 기반이라 월말·연말·윤년에 결함이 없다(확인함).
+결함은 산술이 아니라 **그 산술에 들어가는 포인터**에 있었다.
+
+`_generate_pending_dates()`는 `start = 포인터 + 1일`, `end = 어제`를 계산한다.
+포인터가 달력보다 앞서 있으면 `start > end`가 되어 루프가 **0회** 돈다. 뒤로 걷지
+않는 것은 옳은 동작이고, 그래서 **스스로 회복하지 않는다.**
+`monthly.pending_months()`가 한 단위 위에서 똑같이 동작한다.
+
+**C17은 이 모양을 Agent state에 대해 이미 찾아 보고하고 있다** —
+`agent/status.py`가 지금도 이렇게 말한다: *"agent state says it has collected
+through X, which is in the future … nothing will be collected until that date
+arrives"*. **Runner 자신의 state 파일 두 개에는 아무도 같은 질문을 하지 않았다.**
+
+**실측(실 Scheduler, 실 Repository).** 포인터 `2026-12-25` + 그 Daily 파일 존재,
+"지금" 2026-08-14, 2026-08-12를 기다리는 KEEP Candidate 1건:
+
+    scheduler.run_once()   COMPLETED, generated=()
+    state consistency      CONSISTENT
+    ATTENTION              (없음)
+    2026-08-12.md          생성되지 않음
+
+Monthly 쪽도 같다 — 포인터 `2027-06`, "지금" 2026-08: `results=()`, ATTENTION
+없음, 화면에는 `마지막 통합한 달: 2027-06`이 성과처럼 찍힌다.
+
+**`check_state_consistency()`는 이것을 볼 수 없다.** 그 검사는 "주장한 Daily 파일이
+존재하는가"만 묻는데, 도달 가능한 형태에서는 **파일이 존재한다** — 시계가 앞서
+있는 동안 Scheduler가 직접 썼기 때문이다.
+
+**도달 경로.** 시계가 앞섰다가 교정된 경우(CMOS 배터리 방전, NTP 점프, 오래된
+시계로 재개된 VM)나 그런 머신에서 복원한 state 파일 — C17이 Agent 쪽에 대해
+기록한 것과 같은 두 원인이다.
+
+**탐지만, 그리고 결정이 필요 없다.** 같은 파일이 이미 답을 정해 두었으므로
+(C28 §6의 규칙: "승인 필요라고 적혀 있지만 이미 결정된 것") 그 답을 형제 state
+파일에 적용한 것뿐이다. 고치는 것은 "Company History가 어느 날짜부터 재개해야
+하는가"를 정하는 일이고 그것은 docs/10 §46 금지·§64 운영자 판단이다.
+
+**오탐 불가.** `end`는 항상 어제이고 §49는 진행 중인 달의 통합을 금지하므로,
+건강한 실행은 이 포인터를 오늘/이번 달 너머로 절대 보내지 못한다. 경계값
+(오늘 · 이번 달)은 영구 정지를 만들지 않으므로 일부러 보고하지 않는다.
+
+**그 부류를 전수로 훑다가 세 번째가 나왔고, 그것이 가장 나쁘다.**
+`backup_state.last_successful_backup`이 미래면
+`_history_newer_than_the_last_backup()`이 **아무것도** 반환하지 않는다 — "이 파일은
+이 머신에만 있다"를 말하려고 만든 **안전 검사가 통째로 침묵한다.** 앞의 둘은
+*일*을 멈추고, 이것은 *검사*를 멈춘다. 실측, 한 번도 push된 적 없는 진짜 Daily 1개:
+
+    last_successful_backup 2026-08-01   -> 경보 1건 (정확)
+    last_successful_backup 2027-05-01   -> 경보 0건
+
+`backup/state.py`도 실행의 시계로 이 값을 쓰므로 원인이 같고, 복원된
+`backup_state.json`은 그것을 머신 사이로 옮긴다. **침묵하게 될 그 줄보다 먼저**
+보고하도록 넣었다 — 운영자가 침묵을 신뢰하는 대신 침묵의 이유를 읽게 하려는
+것이다("아래 줄이 조용한 것은 안전하다는 뜻이 아니다"). naive/aware 비교 가드는
+`_history_newer_than_the_last_backup()`이 이미 쓰는 것과 같다.
+
+**그리고 이 검사는 하마터면 거짓 경보를 달고 나갈 뻔했다 — 기존 테스트 2건이
+잡았다.** 처음 구현은 이 타임스탬프를 호출자의 `now`와 비교했다. 그런데
+`ops_status.py`는 **Runner가 도는 중에 실행해도 안전하다고 스스로 약속**하고
+`main()`은 시계를 맨 위에서 한 번만 읽는다 — 그 뒤 수백 ms 후에 Backup이 끝나면
+그 값은 정당하게 `now`보다 뒤다. 건강한 머신에서 두 명령을 같이 돌릴 때마다
+ATTENTION에 한 줄이 서는 셈이었다. 코드를 읽어서가 아니라 **"needs no attention"
+픽스처 2건이 실패해서** 드러났다(`_healthy_backup_state()`가 일부러 실제 시계를
+쓴다 — 같은 상황의 1초짜리 판본이다).
+
+**두 가지를 고쳤다.** (1) 비교 대상을 **실제 시계**로 바꿨다 — 이 값과 그것이
+비교되는 파일 mtime은 둘 다 실시간 측정이고, 하나만 고정 시계에 묶는 것이 바로
+그 픽스처가 이름 붙인 함정이다(운영에서는 같은 값). (2) **허용 오차 1시간**을
+뒀다 — 피해가 거리에 비례하기 때문이다. 1시간 앞선 값은 미백업 검사를 1시간
+가리고 스스로 낫지만, 몇 달 앞선 값은 달력이 올 때까지 가린다. 1시간은 어떤
+실행 시간보다도 훨씬 길고(git subprocess timeout만 300초) "사실상 영구"보다는
+훨씬 짧다. 실측:
+
+    +1초 (Runner가 끝나는 중)  경보 0
+    +5분 / +59분               경보 0
+    +3시간 / +300일            경보 1
+
+그리고 이 검사의 테스트는 **오늘 기준 상대 날짜를 쓰지 않는다**(`9999-01-01` /
+`2000-01-01`) — 이번 Sprint가 §5(a)에서 제거한 시한폭탄을 새로 심지 않기 위해서다.
+
+**포인터 전수 목록(형제 확인 완료).**
+
+| 포인터 | 미래일 때 | 상태 |
+|---|---|---|
+| `agent_state.last_successful_collection_date` | Agent가 수집을 멈춤 | C17에서 보고 중 |
+| `daily_history_state.last_successful_daily_close` | Daily가 멈춤 | **C31 신규** |
+| `monthly_history_state.last_successful_monthly_close` | Monthly가 멈춤 | **C31 신규** |
+| `backup_state.last_successful_backup` | 미백업 검사가 침묵 | **C31 신규** |
+| `agent_state.last_run` | 정보용 — 정지 없음 | 해당 없음 |
+| `collector_state` / retry queue | 포인터가 아니라 집합 | 해당 없음 |
+
+테스트 14건(`test_observability.py::FutureDatedStatePointerTests`). 그중 하나는
+**실제 Scheduler를 돌려** COMPLETED/CONSISTENT/파일 없음을 함께 단언하고, 하나는
+`agent/status.py`의 선례 문구가 아직 거기 있는지 확인한다 — 그 답이 사라지면 이것은
+"이미 내려진 결정의 적용"이 아니게 되기 때문이다.
+
+### 14. 그 조사가 스스로 걸려든 함정 — `RUNTIME_DIR`이 절반만 듣는 손잡이였다 (신규)
+
+§13을 확인하려고 Agent 쪽 선례가 **실제로 살아 있는지** 물었다. 임시 트리에
+미래 날짜 `agent_state.json`을 두고 `RUNTIME_DIR`을 거기로 돌린 뒤 `_print_agent()`를
+불렀더니 이렇게 나왔다:
+
+    AGENT attention items: 1
+      ! agent has not run for 3 day(s)
+
+미래 날짜 경고가 없다. **하마터면 "C17의 선례가 ops_status에 연결돼 있지 않다"는
+결론을 기록할 뻔했다.** 실제 원인은 다른 것이었다 —
+
+    AGENT_DIR = RUNTIME_DIR / "agent"     # import 시점에 고정
+
+모듈 상수라 import 때 얼어붙는다. 그래서 `RUNTIME_DIR`을 돌려도 AGENT 블록만
+**이 저장소의 진짜 `runtime/agent`**를 읽고 있었다. 위 "3 day(s)"는 픽스처가 아니라
+**이 머신의 실제 Agent 상태**였다. `AGENT_DIR`까지 함께 돌리자 선례는 정확히
+동작했다(그래서 §13의 논거 자체는 유효하다).
+
+**그리고 그 규칙은 이미 이 파일 안에 적혀 있었다.** 바로 위쪽
+`_runner_lock_path()`의 docstring: *"Resolved per call, not at import:
+`RUNTIME_DIR` is rebound by tests … and a path frozen at import would keep
+pointing at the old one."* Runner Lock 경로는 그 규칙을 지키고 `AGENT_DIR`만
+지키지 않고 있었다 — C20 §3(명세가 두 이름을 적었는데 목록에 하나만 있었다),
+C27 §4(Runner Lock은 감시하고 Agent Lock은 감시하지 않았다)와 **같은 모양**이다.
+새 규칙이 아니라 빠뜨린 한 곳에 적용한 것이다.
+
+**C13 결함 2와 같은 것이 두 번째 자리에서 반복됐다.** 그때의 문장이 그대로 맞는다:
+*"a test calling it directly picked up the repository's own live manifest — which
+said SUCCESS — and got exit 0 for a Backup failure."* 운영에서는 세 상수가 항상
+일관되므로 production 결함은 아니다. **테스트·진단이 조용히 실기계를 읽는 함정**이고,
+그런 테스트는 엉뚱한 이유로 통과하거나 실패한다.
+
+**수정:** `_agent_dir()`로 호출 시점에 파생한다. 이제 `RUNTIME_DIR`이 이 모듈이
+소유한 모든 경로의 **유일한 손잡이**이고, 뷰를 격리하는 일이 절반만 될 수 없다.
+기존 테스트에서 죽은 `module.AGENT_DIR = ...` 대입도 함께 지웠다 — 아무도 읽지
+않는 대입이 남아 있으면 다음 사람이 그것을 필요한 것으로 읽는다.
+
+테스트 3건(`test_observability.py::RuntimeDirIsTheOnlyKnobTests`). 두 개는 동작
+(`RUNTIME_DIR`만 돌려도 AGENT 뷰와 Agent Lock 경로가 따라온다)을, 하나는 **구조**를
+고정한다 — 모듈 레벨에서 `RUNTIME_DIR`로부터 경로를 얼리는 새 상수를 AST로 금지한다.
+그 가드가 예전 형태를 실제로 잡는지 확인했다(`frozen: ['AGENT_DIR']`).
+
+### 15. `exists()`가 답하는 질문은 그 코드가 묻는 질문이 아니었다 (신규, **P0**)
+
+`exists()`는 **"이 이름이 이미 쓰였는가"**에 답한다. `2026-08-12.md`라는
+**디렉터리**는 그 질문에 예라고 답하고, **"이 날의 Company History가 쓰였는가"**에는
+아니라고 답한다. 네 곳이 앞의 술어로 뒤의 질문을 묻고 있었다.
+
+**실측(실 Scheduler, 실 Repository).** 2026-08-12를 기다리는 KEEP Candidate 1건 +
+같은 이름의 디렉터리:
+
+    scheduler.run_once()              COMPLETED
+    result.generated_dates            ('2026-08-12', '2026-08-13')
+    check_state_consistency()         CONSISTENT
+    (daily/'2026-08-12.md').is_file() False
+
+**실행이 쓰지도 않은 날을 "생성했다"고 자기 결과에 적었고**,
+`last_successful_daily_close`를 그 너머로 옮겼다. 그 Candidate는 이제 어떤 실행도
+닿지 않는다 — docs/07 §30의 "순서대로 닫고 빈틈을 남기지 않는다"가, **루프가 볼 수
+없는 빈틈** 때문에 무너진다. 그리고 그 날이 빠진 것을 잡으라고 만든 두 검사
+(`check_state_consistency`, `_kept_but_not_rendered`)가 **둘 다** 있다고 동의한다.
+
+Monthly도 한 단위 위에서 같다 — `2026-08.md` 디렉터리 → `MONTHLY_UNCHANGED`,
+그리고 UNCHANGED는 catch-up 포인터를 전진시킨다(`run_once()`). 그 달은 조용히
+영영 쓰이지 않는다.
+
+**규칙을 세우고 전수 적용했다.**
+
+| 묻는 질문 | 올바른 술어 | 해당 |
+|---|---|---|
+| 이 산출물이 있는가 | `is_file()` | scheduler, consistency, monthly×2, late update, **reconciliation(A-20 탐지기), outbox.is_sent** — **6곳 수정** |
+| 이 이름이 쓰였는가 | `exists()` | outbox.stage, collector destination, intake 중복 — **그대로가 옳다** |
+
+전수 훑는 중에 두 개가 더 나왔고 둘 다 같은 부류다:
+
+* **`history/reconciliation`** — A-20 탐지기. "이 Event의 Candidate가 쓰였는가"를
+  묻는데, Candidate 이름의 디렉터리 하나가 그것을 침묵시킨다. 실측: 진짜 고아
+  Event 1건이 아무것도 없을 때는 정확히 보고되고, 그 이름의 디렉터리를 만들자
+  **보고가 사라졌다.** §13의 backup 타임스탬프와 같은 "검사를 침묵시키는" 부류다.
+* **`agent/outbox.is_sent()`** — "이 Event가 전달됐는가". 디렉터리에 대해 True를
+  돌려주면 Agent가 **보낸 적 없는 Event를 다시 보내지 않는다.** `sent/`는 outbox의
+  "Event를 잃지 않는다" 보장이 현금화되는 바로 그 자리다.
+
+두 번째 줄이 중요하다: 디렉터리도 이름을 차지하므로 그쪽을 `is_file()`로 좁히면
+실행이 디렉터리 위에 쓰려고 **시도**하게 된다. 전수 적용이 아니라 질문별 적용이다.
+그 경계를 테스트로 고정했다.
+
+**그리고 이 규칙도 이미 저장소 안에 있었다.** `agent/delivery.py::_problem()`의
+첫 줄이 `if not destination.is_file(): return NOT_A_FILE`이다 — 배달 검증은
+"거기 뭔가 있는가"(`exists()`)와 "그것이 이 Event인가"(`is_file()` + 내용 확인)를
+이미 정확히 나눠 놓았다. §14의 `_runner_lock_path()`와 같은 모양이다: 규칙은
+있었고, 여섯 곳이 따르지 않고 있었다.
+
+**전수 확인 — state 로더 8종은 이미 안전하다.** `state.json` 자리에 디렉터리를
+두고 전부 호출했다. 여덟 개 모두 **자기가 선언한 오류 타입**으로 떨어진다
+(`SchedulerStateError`·`MonthlyStateError`·`BackupStateError`·`AgentStateError`·
+`CollectorStateError`·`RetryQueueError`·`DashboardPendingError`·`RunSummaryError`).
+미선언 예외가 새어나가 뷰를 죽이는 경우는 없다 — 그쪽은 `exists()` 뒤에서
+`read_text()`가 실패하고 그 실패가 이미 보고 대상이므로 손댈 것이 없다.
+
+**메시지도 함께 고쳤다.** 고치기 전에는 실패해도 엉뚱한 것을 가리켰다 —
+Late Update는 `[Errno 13] Permission denied`로 **임시 파일 경로**를, Monthly는
+`[WinError 5] … '.tmp-xxxx.md'`로 곧 지울 파일을 지목했다. 이제 둘 다
+`a non-file is in the way of daily/monthly history: <경로>`라고 말한다.
+`generate_daily_history()`에서는 이 분기를 **먼저** 검사한다 — 나중에 두면
+일반 메시지("이미 존재한다")가 이겨서 디렉터리를 두고 "그 날은 이미 쓰였다"고
+답한다.
+
+수정 후:
+
+    scheduler   FAILED, failed_date=2026-08-12, generated=()
+                error: a non-file is in the way of daily history: …
+    monthly     MONTHLY_FAILED, 같은 형태의 메시지, staging 잔여물 0건
+    consistency STATE_INCONSISTENCY
+
+**건강한 경우는 한 글자도 바뀌지 않는다**(실제 파일은 `is_file()`도 참).
+
+테스트 10건(`test_state_consistency.py::NonFileInTheWayTests`). 그중 하나는
+포인터가 전진하지 **않는지**를(영구화의 절반이 그것이었다), 하나는 "이름이
+쓰였는가" 쪽 세 곳이 여전히 `exists()`인지를 고정한다.
+
+**부수 발견 — 이 수정이 substring 테스트 하나를 깨뜨렸다.**
+`test_consistency_module_does_not_import_scheduler_run_once`가 원문에 대해
+`assertNotIn("run_once", source)`를 단언하는데, 내가 **주석에** `scheduler.run_once()`라고
+쓰자 실패했다. 모듈은 여전히 아무것도 import·호출하지 않는다. 이 저장소가 계속
+찾아온 결함(C30 §5)이 production이 아니라 **테스트 안에** 있던 경우다 — 주석이
+깨뜨릴 수 있는 테스트는 사람에게 주석을 쓰지 말라고 가르치고, 반대로
+`getattr(scheduler, "run_" + "once")`는 그냥 통과시킨다. C29 §3의 선례대로
+**AST로 바꿨다**(import 집합과 호출 이름 집합을 각각 확인). 진짜 import·호출을
+여전히 잡는지 확인했다.
+
+### 16. Monthly parser 끝까지 — `project_id`는 아무도 이름 붙인 적 없는 네 번째 주입 경로 (신규, **P0**)
+
+§1을 고친 뒤 "이 seam에 다른 유실이 더 있는가"를 끝까지 물었다.
+
+**먼저 왕복부터 고정했다.** 렌더러가 쓸 수 있는 최대 문서 — 네 Category 전부,
+project_id 대소문자 혼합, Decision Context 4필드 전부, evidence, 그리고 Late
+항목 하나 — 를 렌더링해서 파서에 넣고 **event_id·category·project·owner·summary가
+전부 돌아오는지** 단언한다. 개별 drop 사유마다 테스트를 쓰는 것은 누군가 생각해 낸
+사유만 덮지만, 이것은 seam 자체를 덮는다. 5/5 왕복 확인.
+
+**그 다음 적대적 입력으로 갔고, 거기서 나왔다.**
+
+BUG-11/27은 escape 없이 렌더링되는 필드로 `summary`와 `evidence`를 지목한다.
+C30 §4가 `event_id`를 추가했다. **`project_id`는 한 번도 이름이 붙은 적이 없고,
+넷 중 가장 나쁘다 — 나머지 셋은 자기 항목을 망치지만 이것은 다른 Event를 지운다.**
+
+`_render_item_block()`이 `_display_project_name(project_id)`를 `### ` 제목으로 쓰고,
+`validate_event()`는 `project_id`를 "present and non-null"로만 제약한다(실측: 개행이
+든 값이 **ACCEPTED**). 즉 다른 Desktop에서 transport를 건너온다.
+
+**Blast radius 실측** — 평범한 Event 3건, 첫 번째만 조작된 `project_id`:
+
+    ordinary                    3/3 생존
+    newline only                3/3 생존
+    `\n\n- INJECTED`            3/3 생존, EVT-1 summary 탈취
+    `\n\n### Second Block`      3/3 생존, EVT-1 summary 탈취
+    `\n\n## Metadata`           **0/3 생존**
+
+마지막 줄이 결함이다. `## ` 제목이 Category Section을 닫아 버려서, 그 뒤의 모든
+item block — **무고한 Event 2건 포함** — 이 소비 가능한 Section 밖으로 밀려나
+Monthly에서 사라진다. `consolidate_month()`는 **MONTHLY_GENERATED**를 반환한다.
+
+**유령 항목은 못 만든다 — 그리고 그건 방어가 아니라 우연이다.**
+`_display_project_name()`의 `.title()`이 `Event ID:`를 `Event Id:`로 낮춰서 파서의
+라벨 정규식에 걸리지 않는다. 방어로 오해하지 않도록 테스트로 적어 뒀다.
+
+**여전히 SKIP:** 렌더러 escape는 docs/06 계약(BUG-11/27), `project_id` 제약은
+docs/02 계약(A-15). 둘 다 결정이다.
+
+**결정이 필요 없었던 것: 유실을 세는 것.** `DailyDocument.unconsolidated` —
+문서가 가진 `- Event ID:` 줄 수에서 실제로 항목이 된 수를 뺀다. 렌더러가 항목당
+정확히 한 줄을 쓰므로 이해 가능한 문서에서는 0이고, 그 이상은 **Daily에는 있는데
+Monthly에는 없을 Company History**다.
+
+    healthy          Event ID 줄 3   items 3   unconsolidated 0
+    section closed   Event ID 줄 3   items 0   unconsolidated 3
+
+**비용 0 — 추측이 아니라 실측이다.** `read_daily_document()`가 어차피 그 달의
+모든 Daily를 파싱하고, 줄은 이미 split돼 있다. 파일을 한 번도 더 읽지 않는다 —
+§9에서 540 ms 때문에 넣지 않기로 했던 검사를, 파싱이 이미 일어나는 자리로 옮겨서
+공짜로 얻었다.
+
+    parse x2000 (문서당 30항목)   383.6 ms   그중 새 카운트 10.9 ms (2.8%)
+    consolidate_month  5항목/일 x 31일   30.3 ms
+    consolidate_month 30항목/일 x 31일   35.4 ms
+
+추가 파일 읽기 0회, 한 달 통합 전체가 여전히 35 ms 미만이다.
+
+**전체 Section 밖으로 밀려난 블록까지 세려면 문서 전체를 봐야 한다** — Section
+walk 안에서 세면 잘려 나간 블록은 애초에 보이지 않으므로 0을 보고한다. 그래서
+비교 대상은 walk가 아니라 문서 전체다.
+
+**sink까지 연결했다.** `MonthlyResult.unconsolidated_days` →
+`app/runner.py`가 `MONTHLY_UNCONSOLIDATED <달> <날짜: N>` 한 줄을
+`daily_late_update.log`에 쓴다. 새 artifact도 새 형식도 아니다 — Monthly 실패가
+이미 가는 곳이고, AGENT.md §6a가 *"돌긴 돌았는데 뭔가 안 됐다"* 일 때 운영자를
+보내는 파일이 바로 거기다.
+
+**그 과정에서 BUG-39 sweep의 구멍도 찾았다.** `test_architecture_invariants.py`는
+`RuntimeSummary`·`BackupLogEntry`·`SchedulerRunResult`에 대해 "계산되고 버려지는
+필드"를 훑는데 **`MonthlyResult`는 그 sweep에 없었다.** 그래서 이번 결함이 정확히
+BUG-39의 모양으로 거기 앉아 있을 수 있었다. 같은 invariant를 Monthly에도 붙였고,
+읽히지 않는 5개(`year`·`month`·`coverage`·`source_dates`·`path`)가 왜 그래도 되는지
+`BackupLogEntry`와 같은 논거로 고정했다.
+
+테스트 17건 — 왕복 3, 주입 6, sink 4, BUG-39 invariant 1, 그리고 §1의 기존 것들.
+탐지기 테스트는 탐지기 없는 코드에 대해 실패함을 확인했다.
+
+**인접 경계를 물었더니 §11이 반만 고쳐져 있었다 (자기 blind spot).**
+`project_id`가 어디로 더 흘러가는지 훑다가 `run_company_ops.py`의 같은 줄로
+돌아왔다:
+
+    print(f"  - {r.event_id} ({r.project_id}): {r.status.value}{suffix}")
+
+§11에서 `suffix`(= `r.error`)에만 `redact(one_line(...))`를 걸었다. **같은 줄에
+있고 같은 transport를 건너오는 나머지 두 필드는 그대로였다.** 실측 —
+`event_id = "EVT-1
+  - EVT-GHOST (PRJ): SYNCED"`:
+
+    `  - `로 시작하는 출력 줄   2개
+    두 번째                     전부 공격자가 쓴 것
+
+한 줄의 눈에 띄는 절반만 막는 것은 절반짜리 수정이다. 두 필드 모두 `one_line`을
+걸었고(`redact`는 걸지 않았다 — 이 둘은 운영자가 Event를 찾는 데 필요한 식별자이고
+`r.error`와 달리 원격 응답 본문을 나르지 않는다), 두 모양 다 테스트로 고정했다.
+
+### 17. Dead Capability 전수 — 구현·export까지 됐으나 아무도 부르지 않는 것 (완결)
+
+§16에서 `build_role_summary`를 찾고 나서 "이 부류가 몇 개인가"를 전수로 물었다.
+A-16(`build_ops_backup_properties`)과 E-20이 각각 하나씩 기록해 두었을 뿐,
+목록을 만든 적은 없었다.
+
+**결과 — production 호출자가 0인 public 함수/메서드는 정확히 열둘이다**
+(AST Call 노드 + Attribute 읽기, **import alias 해석**, property 제외):
+
+| 함수 | 상태 |
+|---|---|
+| `notion/dashboard.bootstrap_dashboard_databases` | **C31 §18 신규** — OPS_* DB를 만드는 유일한 함수인데 아무도 부르지 않는다 |
+| `notion/dashboard.build_ops_backup_properties` | **A-16 기록됨** — OPS_BACKUP에 아무것도 안 쓴다 |
+| `notion/dashboard_pending.remove_pending` | **B-7 기록됨** — 삭제 여부가 열린 결정 |
+| `daily/role_summary.build_role_summary` | **C31 §16 신규** — A-3의 "제공한다"가 시스템에 대해서는 틀렸다 |
+| `daily/role_summary.for_role` · `of_category` | 같은 모듈, 같은 이유 |
+| `reporter.Reporter.report_and_write` · `report_and_send` | 대체됨 — 아래 |
+| `notion/retry_queue.enqueue` · `dequeue` | 대체됨 — Runner는 batch API(B안)를 쓴다. 모듈 docstring이 이미 그렇게 적어 두었다 |
+| `runsummary.RunSummary.component` | 편의 조회 — 호출자들은 `components`를 순회한다 |
+| `reporter/local_output.read_event_json` | 읽기 seam |
+
+**Reporter 편의 래퍼 둘은 "빠진 것"이 아니라 "대체된 것"이다.** 핵심
+`Reporter.report()`는 Agent가 쓴다. 두 래퍼는 report + 즉시 write/send를 묶은
+것인데, Agent는 대신 `report()` → `outbox.stage()` → `outbox.drain()`을 쓴다 —
+outbox가 내구성(*"an Event that was created is never lost"*)을 주기 때문이다.
+즉 이 둘을 부르는 것은 그 보장을 우회하는 일이므로 **부르지 않는 것이 옳다.**
+`report_and_write`의 기본 디렉터리가 `incoming/`이라는 사실은 C27 §8의 경계
+논의에 이미 나와 있다. 기술 부채로 기록하되 결함은 아니다.
+
+**방법론 경고 — 자동 분석 두 개를 시도했고 둘 다 못 쓴다.** 다음 사람이 같은
+길로 가지 않도록 적어 둔다.
+
+* **"패키지 밖에서 안 쓰이는 export"** → 180개 중 114개가 걸린다. 같은 패키지 안의
+  정상적인 사용(`monthly/generator`가 `monthly/parser`를 부르는 것)을 전부 죽은
+  것으로 센다.
+* **entrypoint에서의 call-graph 도달성** → 231개 중 64개가 "도달 불가"로 나오는데,
+  손으로 확인하니 `run_intake`(15곳) · `record_run`(12곳)처럼 **명백히 호출되는
+  것들**이 대거 섞여 있다. 이름 기반 그래프는 동명 함수(`run_once`가 여섯 모듈에
+  있다)와 간접 호출에서 무너진다.
+* **grep** → `bootstrap_dashboard_databases(` 이 2곳이라고 답했다. 둘 다 **주석과
+  docstring**이었다. 실제 호출은 0이다.
+* **alias를 풀지 않은 AST** → 15개를 죽었다고 했는데 그중 `build_index`는
+  `app/runner.py`가 `build_index as build_retry_queue_index`로 import해서 **매 실행
+  호출한다**. 11개가 오탐이었다.
+
+**믿을 수 있는 것은 import alias를 푼 AST Call/Attribute 세기뿐이고**, 위 표는
+그것으로 얻은 결과다. 열둘 전부 손으로 재확인했다.
+
+**그리고 이 목록 자체를 테스트로 고정했다**
+(`test_repository_hygiene.py::DeadCapabilityInventoryTests`) — 항목마다 왜 거기
+있는지를 코드에 적어 두었고, 이유 없이 하나가 늘면 실패한다. 그 테스트도 처음에는
+alias를 풀지 않아 **스스로 틀렸고**, 전체 Regression에서 실패해서 잡혔다. 네 번째
+같은 실수였다.
+
+### 18. 진단이 "할 일 없음"이라고 말하는데, 아무도 하지 않는 단계가 남아 있다 (신규, **운영자 오도**)
+
+§17의 목록에서 `bootstrap_dashboard_databases`를 손으로 확인하다 나왔다.
+
+`init_notion.py`는 Notion 셋업이 유일한 일인 명령이다. 그것이 하는 일은
+`bootstrap_database()`(PROJECTS)와 `diagnose_dashboard_bootstrap()`(읽기 전용
+진단)뿐이고, **OPS_* Database를 실제로 만드는 `bootstrap_dashboard_databases()`는
+부르지 않는다.** AST로 확인했다(import alias까지 풀어서): `src/**`와 루트 스크립트
+전체에서 호출 지점 **0**. 어떤 문서에도 이 함수를 실행하라는 안내가 없다.
+
+**그런데 진단의 성공 메시지가 이랬다:**
+
+    다음 할 일 : None — the reference database already lives in a Page;
+                bootstrap_dashboard_databases(client) will use it.
+
+두 절 다 사람을 오도한다. `None`은 할 일이 없다는 뜻으로 읽히고, 뒤 절이 가리키는
+함수는 **아무 명령도 실행하지 않는다.** 행복 경로의 운영자는 이 줄을 읽고 Dashboard
+설정이 끝났다고 결론 내리는데, 실제로는 `NOTION_OPS_RUNS_DATABASE_ID`가 비어 있고
+`.env.example`이 명시하듯 그 상태에서는 **`record_run()`이 매 실행 건너뛰어진다.**
+
+이 저장소가 반복해서 없애 온 "지워지지 않는 경보"의 **정반대**이고 더 나쁘다 —
+하지 않은 일에 대한 *정상* 신호이며, 아무것도 이것을 반박하지 않는다.
+
+**왜 자동화는 SKIP인가:** `bootstrap_dashboard_databases()`를 `init_notion.py`에서
+부르면 **실제 Notion Workspace에 Database 5개를 만든다.** 명시적 SKIP 항목이다.
+
+**승인 없이 한 것: 메시지를 사실로 만들었다.** 세 갈래 모두 (a) 이 저장소의 어떤
+명령도 생성 단계를 수행하지 않는다는 것과 (b) 실제로 켜는 스위치가
+`NOTION_OPS_RUNS_DATABASE_ID`라는 것을 말한다. BUG-55를 *"뭔가 잘못됐다"*에서
+*"이 디렉터리 이름을 바꿔라"*로 만든 것과 같은 작업이다.
+
+**A-16과의 관계:** A-16은 *"Dashboard Database 4종이 영구히 비어 있다"*(5종 중
+`OPS_RUNS`에만 쓴다)를 기록한다. 이것은 그 아래층이다 — **5종 전부 만들어지지
+않는다**, 만드는 함수를 아무도 부르지 않으므로. 두 항목은 같은 결정(A-8: 실제
+Workspace 연결)을 기다린다.
+
+테스트 3건(`test_notion_dashboard.py`) — READY 메시지가 더 이상 "None"이 아님,
+세 갈래 전부가 환경변수 이름을 담고 있음, 그리고 **production에 호출 지점이 0**이라는
+사실 자체(alias 해석 포함). 마지막 것 때문에, 승인이 나서 배선하는 변경은 같은
+커밋에서 이 메시지들을 다시 쓰도록 강제된다.
+
+### 19. DEGRADED 단계가 CRITICAL 단계를 중단시킨다 — 두 번째 자리 (신규, **P0**)
+
+Failure Isolation 감사를 배치 루프 전체에 돌리다 나왔다. 대부분은 per-item
+try/except가 있거나(Collector·outbox·reconciliation) 중단이 **의도된**
+곳이다(Scheduler §30, History Filter의 BUG-20 특성화). 하나가 아니었다.
+
+Notion Sync 4b단계는 수집된 Event를 `processed/`에서 다시 읽는다:
+
+    event = Event.from_json(processed_file.destination_path.read_text(...))
+
+`_sync_and_record()`의 try는 `notion_sync.sync()`만 감싼다. **이 읽기에는 핸들러가
+하나도 없었다.** AST로 확인: 이 줄을 감싸는 `try`는 둘뿐이고 **둘 다
+`try/finally`(except 없음)** — 예외는 `run_once()` 밖으로 그대로 나간다.
+
+**실측** — 읽기 실패 1건 주입:
+
+    수정 전   run ABORTED: ValueError
+              Daily files : NONE
+              backup state: MISSING
+
+    수정 후   run 계속       Daily files : 13개 기록됨
+              backup state: written
+              notion_sync : FAILED, metrics{processed:1, queued:0, unreadable:1},
+                            retryability UNKNOWN
+              notion_sync.log: NOTION_UNREADABLE <파일명>
+
+Notion Sync는 `Severity.DEGRADED`이고 History·Backup은 CRITICAL이다. 이것은
+`daily/generator.update_daily_history`가 이미 이름 붙인 그 역전이다 —
+*"A component docs/14 §5 classifies as DEGRADED was aborting one it classifies
+as CRITICAL, which inverts the entire point of having the two severities."*
+같은 모양, 다른 단계. 그리고 **그 단계 자신의 주석이 세 줄 위에서** "Notion 실패가
+Runtime을 막지 않는다"고 말하고 있었다.
+
+**도달 경로.** Collector가 몇 분 전에 같은 파일을 읽었으므로 아무도 실패를 예상하지
+않았다. 그러나 이 배포에서 `runtime/`은 OneDrive 아래에 있고(docs/11), sync
+클라이언트나 스캐너가 핸들을 잡고 있으면 Windows에서 정확히 이 예외가 난다.
+
+**수정.** 그 읽기를 `except (OSError, ValueError, EventValidationError)`로 감싸
+파일명을 세고 로그에 남기고 **다음 Event로 넘어간다.** 읽지 못한 파일은 Notion에
+도달하지 못한 Event이므로 기존 분류 `NOTION_SYNC_INCOMPLETE`로 컴포넌트를
+FAILED로 만든다(retryability는 UNKNOWN — 다음 실행이 읽을 수 있을지 이 단계는
+모르고, BUG-13이 바로 그것을 꾸며내지 말라는 항목이다).
+
+**SyncResult를 지어내지 않는다.** 읽지 못한 것이 바로 `event_id`인데 가짜 id를
+만들면 로그와 Manifest에 없는 Event가 들어간다. 개수와 파일명만 기록한다.
+
+**History Filter 쪽(626행)은 일부러 그대로 두었다.** 그쪽은 CRITICAL 단계이고
+중단이 방어 가능한 선택이며, BUG-20이 "이 단계에는 per-event 오류 처리가 없다"를
+특성화로 고정해 두었다. 고친 것은 등급이 뒤집힌 쪽 하나뿐이다.
+
+테스트 6건(`test_runner_failure_paths.py::DegradedStepMustNotAbortCriticalStepsTests`) —
+Daily 도달, Backup 도달, 컴포넌트 metrics, 로그, 깨끗한 실행의 오탐 없음, 그리고
+읽기가 실제로 `except` 안에 있는지를 **AST로** 확인하는 것 하나.
+
+**그리고 네 DEGRADED 단계 전부에 같은 질문을 던졌다 — 둘이 더 걸렸다.**
+정적 분석은 또 틀렸다("단계의 줄 범위가 try 안에 있는가"로 물으니 넷 다 노출로
+나왔는데, 가드가 범위 *안에* 있기 때문이다). 그래서 **주입으로** 답했다:
+
+| 단계 | 등급 | 예외를 주입하면 |
+|---|---|---|
+| `notion_sync` | DEGRADED | **중단됨 → 수정** (위) |
+| `late_update` | DEGRADED | **중단됨, backup_state MISSING → 수정** |
+| `monthly` | DEGRADED | 계속됨 ✓ (이미 가드 있음) |
+| `dashboard` | DEGRADED | 계속됨 ✓ (이미 가드 있음) |
+
+`late_update`는 두 겹으로 새고 있었다. **(1)** Runner의 루프가
+`update_daily_history()`의 *"Never raises for an I/O or rendering failure"*
+docstring을 믿고 자기 가드를 두지 않았다. **(2)** 그 약속 자체가 사실이 아니었다 —
+`select_late_candidates()` 호출이 **두 가드 사이의 틈**에 앉아 있었고, 그것은
+사람이 편집할 수 있는 문서(docs/06 §57)를 파싱한다. 둘 다 닫았다.
+
+수정 후 실측:
+
+    aborted      : None
+    backup_state : written
+    late_update  : FAILED  LATE_EVENT_MERGE_FAILED  {updated:0, failed:1}
+    overall      : DEGRADED  exit 3
+
+DEGRADED 하나가 실패하고 CRITICAL이 전부 성공했을 때 나와야 하는 값 그대로다.
+Monthly의 처우(*"삼키되, 흔적 없이 삼키지는 않는다"*)를 그대로 적용했다.
+
+테스트 5건 추가(`EveryDegradedStepIsContainedTests`) — 네 단계를 하나의 규칙으로
+묶어 주입으로 검사하고, `update_daily_history()`의 약속이 이제 실제로 참인지도
+따로 확인한다.
+
+**그리고 4b를 고치자 기존 테스트 3건이 깨졌고, 그것이 세 번째 구멍을 찾아 줬다.**
+`RetryQueueBatchSaveDurabilityTests`(BUG-24)는 *"Notion 단계 안에서 예외가 나면
+큐 델타는 그래도 저장돼야 한다"*를 지키는데, **자극(stimulus)으로**
+`Event.from_json`이 raise하게 만들고 있었다. 내가 그 경로를 잡아 버리자 자극이
+사라진 것이다 — 지키려던 성질(그 `finally`)은 그대로다.
+
+그래서 "그럼 이 단계에서 아직 무엇이 새어나갈 수 있나"를 물었고,
+**4a단계가 같은 구멍을 갖고 있었다**: `queued_entry.to_event()`는
+`Event.from_json(self.event_data)`인데, `load_queue()`는 큐 파일의 **모양**만
+검사하고 `event_data`가 Event인지는 다시 검증하지 않는다. 손편집·잘린
+`notion_retry_queue.json` 하나가 같은 방식으로 run을 중단시킨다. 4b와 같은 처우로
+닫았다 — 세고, `notion_sync.log`에 이름을 남기고, 건너뛴다. **읽지 못한 항목을
+큐에서 지우지는 않는다**(손상 입력에 대해 이 저장소가 일관되게 지키는 자제).
+
+BUG-24 테스트의 자극은 `retry_queue_upsert`로 옮겼다 — 같은 `try` 안에 있고,
+"이 단계에서 뭔가 터졌다"를 대신하기에 정확히 맞는 지점이며, 아무도 그것이
+raise하지 않는다고 주장한 적이 없다. 테스트가 지키는 성질은 그대로다.
+
+테스트 3건 추가(`CorruptRetryQueueEntryTests`).
+
+### 20. Test Coverage 감사 — 아무도 실행하지 않는 분기 (신규 2건, 둘 다 특성화)
+
+`coverage`는 설치돼 있지 않고 이번 세션에서 환경을 바꾸지 않는다. **표준 라이브러리
+`trace`**로 `daily/`·`monthly/` 모듈을 그 테스트들과 함께 돌려 실행되지 않은
+statement를 뽑았다. 둘이 나왔다.
+
+**(a) `_first_bullet()`의 `return None`과 그것을 받는 `if summary is None: continue`.**
+§1이 이 분기가 *왜* 발화하는지를 좁혔지만(라벨 모양 요약은 더 이상 걸리지 않는다),
+분기 자체는 남아 있고 **어떤 테스트도 도달하지 않았다.** 그리고 그것은 조용한
+유실이다. 손편집으로 도달한다(docs/06 §57) — 산문 bullet만 지우고
+`- Owner:` · `- Event ID:`는 남긴 item block.
+
+    label bullet만 있는 블록 -> items: []   unconsolidated: 1
+
+두 가지를 함께 단언한다: 항목이 실제로 버려진다는 것(오늘의 동작, 무변경)과 그
+유실이 이제 **세어진다**는 것(§16의 카운터가 이 경로도 덮는다). 언젠가 이 drop을
+고치면 첫 단언이 뒤집혀 기록이 강제로 갱신된다.
+
+**(b) `_metadata_bounds()`의 "다음 `## ` 제목에서 멈춘다" 루프.**
+그 docstring은 *"a file whose Metadata is not last is still handled correctly"*
+라고 단언하는데, 그 문장을 구현하는 루프 본문에 **도달한 테스트가 없었다.** 즉
+검증되지 않은 코드에 대한 주장이었다 — C30이 사냥한 바로 그 모양.
+
+배치가 이상한 것도 아니다. docs/06 §57 · docs/11 §71이 COO의 손편집을 허용하고,
+Metadata 뒤에 메모 절을 붙이는 것이 가장 자연스러운 편집이다. **동작은 옳다 —
+추측이 아니라 실측했다**: bounds가 `## COO Note`에서 정확히 멈추고, Late 절이
+Metadata **앞에** 삽입되며, 손으로 쓴 뒤쪽 절이 **그대로 살아남고**, Metadata
+필드 갱신이 그 절을 넘어가지 않는다. 틀렸다면 사람이 쓴 내용을 잘라먹었을 것이다.
+
+테스트 5건(`test_monthly_history.py` 1 + `test_daily_late_events.py::MetadataNotLastTests` 4).
+
+**(c) 원자적 쓰기의 정리 코드가 14개 모듈 전부에서 한 번도 실행되지 않았다.**
+같은 네 줄이 열네 모듈에 있다:
+
+    except BaseException:
+        try: os.remove(tmp_path)
+        except OSError: pass
+        raise
+
+이것이 **C27의 발견 전체를 막는 가드**다 — 중단된 실행이 남긴 `.tmp-*` 파일을
+소비자 6곳이 산출물로 읽었고, Event로 승격됐고, 잘린 Company History가 원격으로
+push됐다. C27이 고친 것은 *읽는 쪽*(`.tmp-` 건너뛰기)이고, **쓰는 쪽의 절반은
+아무도 검사하지 않고 있었다.**
+
+`os.replace`(모든 writer의 마지막 단계이자 temp 파일이 존재한 뒤 실패할 수 있는
+유일한 지점)를 실패시켜 writer 9종을 돌렸다. 전부 정리하고 전부 전파한다 — 예외가
+하나 있고 그것도 옳다: `write_summary()`는 **일부러 삼킨다**(Manifest는 이미 끝난
+run에 대한 보고이고, 보고를 못 했다고 run을 실패시키는 것은 README RULE 9의 역전).
+그 하나도 정리는 한다.
+
+테스트가 실제로 판별하는지도 확인했다 — `os.remove`를 무력화하니
+`.tmp-pckehc5r.json`이 남았다.
+
+구조 쪽도 함께 고정했다: `mkstemp`를 쓰면서 `except BaseException` 정리가 없는
+함수를 AST로 금지한다. 새 writer가 정리 없이 생기면 목록에 없다는 이유로 위
+테스트를 통과해 버리기 때문이다.
+
+테스트 2건(`test_repository_hygiene.py::AtomicWriteLeavesNoResidueTests`, subtests 9).
+
+### 21. Monthly parser를 fuzz로 닫았다 — 열거된 케이스가 놓친 것 둘 (신규, **데이터 유실 / 무결성**)
+
+§16에서 "왕복 + 적대적 입력"까지 갔지만 그것도 **열거한 모양들**이다. 마지막으로
+**seed 고정 fuzz**를 돌렸다 — 두 모집단, 서로 다른 약속:
+
+    benign       렌더러가 평범한 Event에서 만드는 것 -> **정확히** 왕복해야 한다
+    adversarial  개행·제목이 든 summary/project_id(BUG-11/27, §16) -> 유실은
+                 예상되지만 **세어지지 않는 것**은 안 된다
+
+**benign 4,000건 중 641건이 항목을 잃고 있었다.** 열거 테스트는 전부 통과하는데.
+(silent는 0이었다 — §16의 카운터가 전부 잡았다. 그래서 조용하지는 않았지만
+**잃고 있었다.**)
+
+**원인 1 — 요약이 렌더러의 라벨 이름으로 시작할 수 있다.**
+§1이 shape 검사(`^[A-Z][A-Za-z ]+:`)를 정확한 라벨 집합으로 좁혀 `Fixed: `를
+고쳤는데, **진짜 라벨 이름 일곱 개는 전부 여전히 항목을 잃고 있었다.** 실측:
+
+    Owner: …  Event ID: …  Category: …  Decision Context: …
+    Expected Outcome: …  Actual Outcome: …  Lessons Learned: …   전부 LOST
+
+넷은 이 도메인에서 자연스러운 문장 시작이다 — `Lessons Learned: …`는 LEARNING
+항목의 요약이 실제로 읽히는 방식이고 `Decision Context: …`는 DECISION이 그렇다.
+docs/05가 그 카테고리들에 준 어휘 자체다.
+
+**추측하지 않고 순서로 판정한다.** 렌더러는 라벨을 **한 번씩, 정해진 순서로** 쓴다
+(`_ITEM_LABELS`). 따라서 첫 bullet의 라벨이 그 아래 라벨보다 **순서상 뒤**이거나,
+아래에 **같은 라벨이 또** 있으면, 그것은 렌더러가 쓸 수 없는 배치다 — 남는 설명은
+산문뿐이다. 세 경우 전부 실측:
+
+    - Lessons Learned: …   - Owner: …        6 앞에 0  -> 산문
+    - Owner: …             - real summary    손편집     -> 건너뛰고 산문
+    - Owner: …             - Event ID: …     0 앞에 1  -> 요약 없음(§20a 유지)
+
+`Owner:`는 순서 0이라 앞설 것이 없다 — **중복** 규칙이 그것을 살린다(블록에
+`Owner:` bullet이 둘이면 첫째가 산문이다).
+
+**원인 2 — 그 요약이 자기 항목의 `event_id`를 가로챈다.** `Event ID: measured it.`이
+요약이면 그것이 블록의 **첫 `- Event ID:` 줄**이므로, 항목이
+`event_id="measured it."`로 통합된다 — 그리고 docs/09 §59는 그 값으로 중복 제거를
+한다. 유실이 아니라 **잘못된 신원**이라 더 나쁘다. 라벨 스캔이 `_first_bullet()`이
+산문으로 판정한 **그 한 줄만** 건너뛰도록 고쳤다.
+
+**결과:**
+
+    benign       4,000건  유실 641 -> **0**
+    adversarial  4,000건  유실 2,235  **silent 0** (BUG-11/27의 열린 결정)
+
+개행이 든 요약이 만드는 **별도 줄**은 여전히 BUG-11/27이다 — 그것은 파서가
+구분할 수 없고, 세어질 뿐이다.
+
+테스트 9건(`LabelNamedSummaryTests` 6 + `RendererParserFuzzTests` 3). fuzz는 seed
+고정이라 어느 머신 어느 날에 돌려도 같은 문서 8,000개다 — corpus가 움직이는 fuzz는
+이번 Sprint가 §5(a)에서 제거한 시한폭탄이다. 그리고 adversarial 모집단이 **실제로
+유실을 만드는지**도 단언한다(아니면 위 테스트가 아무것도 검사하지 않고 통과한다).
+셋 다 수정 전 파서에 대해 실패함을 확인했다.
+
+### 22. 같은 뿌리가 인접 경로 넷에 더 있었다 (신규, **데이터 유실 / 무결성 / 거짓 경보**)
+
+§21을 닫고 "수정 → 검증 → **인접 경로 재감사**"의 셋째를 했다. §21의 뿌리는
+파서 버그가 아니라 **포맷**이다 — 렌더러가 요약을 `- {summary}`로 **그대로**
+쓰기 때문에 `Event ID: X`라는 요약은 그 아래 라벨 줄과 **바이트 단위로 같다.**
+그러면 이 파일을 줄 단위로 읽는 **모든** 코드가 같은 방식으로 속는다. 세 곳
+전부 실측으로 재현됐다.
+
+**(a) `daily/late_events.existing_event_ids()` — §38 중복 가드. Late Event 영구 유실.**
+이건 카운터도 로그도 없다. 실측, 평범한 KEEP Candidate 하나:
+
+    요약 "Event ID: EVT-999"
+    existing_event_ids(day)              {'EVT-1', 'EVT-999'}
+    select_late_candidates(day, EVT-999) ()      <- 추가 안 됨
+    append_late_events(...)              파일 그대로
+    `- Event Count: 3`                           <- 실제 Event는 둘
+
+늦게 도착한 EVT-999가 그날 버려지고, **그 날짜를 다시 보는 모든 실행에서 또
+버려진다.** §38은 자기가 제대로 일하고 있다고 믿는다. Event Count 쪽은 정확히
+일치할 필요도 없다 — `Event ID: `로 시작하기만 하면 유령 id가 하나 늘어난다.
+보안 쪽에서 보면 **Event ID spoofing**이다: 한 Event가 요약 한 줄로 나중에 올
+Event를 지목해 막을 수 있다.
+
+seed 고정 fuzz 1,000건(수정 전): **억제된 Late Event 98건, 틀린 Event Count 429건.**
+
+**(b) `monthly/generator._existing_generated_at()` — §58의 `Generated At` 영구 위조.**
+Monthly 항목 요약도 raw로 렌더되고, 항목 섹션은 `## Metadata` **위**에 있다.
+
+    - Generated At: 1999-01-01T00:00:00+09:00   <- 항목의 요약
+    - Generated At: 2026-09-01T02:00:00+09:00   <- 진짜 필드
+    _existing_generated_at() -> '1999-01-01T00:00:00+09:00'
+
+다음 dirty rebuild(§58의 **평범한** 동작)가 그 값을 그 달의 진짜 `Generated At`로
+써 넣고, **되돌아오지 않는다** — 그때부터는 Metadata 블록 자체가 위조본을 들고
+있어서 문제의 Event를 지워도 원래 값은 없다. `Generated At`이 "이 달이 처음
+닫힌 시각"이라는 §58의 의미가 사라진다. **마지막** Metadata 블록을 읽도록 함께
+고쳤다 — 렌더러가 두 경로 모두에서 Metadata를 **마지막에** append하므로 손편집된
+Monthly에 위조 블록이 있어도 진짜가 이긴다. escaping 결정(BUG-11/27)은 건드리지
+않는다.
+
+**(c) `ops_status._monthly_counts_more_than_it_shows()` — 자기 docstring을 어겼다.**
+그 함수는 "**silence는 될 수 있어도 거짓 경보는 못 한다**"고 적어두고 있었는데,
+절반이 사실이 아니었다. 실측, 아무것도 잃지 않은 달 하나:
+
+    요약 `Consolidated Items: 999`  ->  ('2026-08', 999, 1)
+    요약 `Event ID: EXTRA`          ->  ()   (진짜 shortfall을 가림)
+
+첫째는 멀쩡한 달에 대고 "998건을 적게 기록했다"를 운영자 앞에 세운다. 상시
+거짓 ATTENTION 한 줄은 운영자가 그 섹션을 **안 읽게** 만드는 방식이고, 그 손해가
+이 검사의 값어치보다 크다. docstring이 근거로 든 newline 경로도 다시 재봤다 —
+`monthly/parser.py`가 줄 단위라 **파이프라인으로는 도달할 수 없고**(요약에 개행이
+있으면 항목 자체가 통째로 떨어지고 `unconsolidated`로 세어진다) 손편집된 Monthly가
+필요하다. 그 문장도 같이 고쳤다.
+
+**(d) `ops_status._kept_but_not_rendered()` — 유실 탐지기 자체가 눈이 멀었다.**
+E-17의 모양(KEEP Candidate가 저장돼 있는데 Daily 파일에 없다)을 잡는 **유일한**
+검사다. 실측 — EVT-A가 그 요약으로 렌더되고 EVT-B는 정말로 파일에 없을 때:
+
+    요약 `Event ID: EVT-B`   ->  ()
+    요약 `Shipped it.`       ->  ('EVT-B (2026-08-05)',)
+
+평범한 요약 한 줄이 자기가 지목한 Candidate에 대해 유실 탐지기를 꺼버렸다.
+방향은 silence뿐이지만(요약은 줄을 더할 뿐 지우지 못한다), **부재를 알아채는 것이
+일 전부인 검사에서 silence가 곧 피해다.**
+
+**규칙을 한 곳에 뒀다 — 다만 두 벌이다.** `daily/markdown.summary_line_indices()`가
+"어느 bullet이 요약인가"를 렌더러 옆에서 답한다(모호함을 만드는 쪽이 규칙을
+가진다). `monthly/parser.py`는 **import하지 않는다** — 그 패키지는
+`ALLOWED["monthly"] == set()`인 선언된 leaf이고, 그건 Monthly 통합이 Daily
+*텍스트* 너머 `history`/`events`로 손을 뻗지 못하게 하는 docs/09 §12-13의 장치다
+(§8의 계약 변경은 승인 대상이라 건드리지 않는다). 그래서 한 규칙 두 구현이고,
+**행동 동등성 테스트**가 둘을 묶는다 — 라벨 튜플 비교는 이름 변경을 잡고,
+블록 배열 8종에 대한 `_first_bullet()` vs `summary_line_indices()` 비교는 규칙이
+갈라지는 것을 잡는다. 중복 규칙을 뺀 구현으로 실제 실패함을 확인했다.
+
+**성능.** 측정했다.
+
+    existing_event_ids     12 Event(97줄)    0.016 -> 0.030 ms  (하루치 현실 규모)
+                         1000 Event(7013줄)  1.105 -> 2.357 ms
+    _kept_but_not_rendered 14일 x 5건         0.84  -> 0.99 ms
+                          365일 x 10건       24.09 -> 30.05 ms
+    summary_line_indices  24개월 x 30항목   스캔 0.24 ms + 1.14 ms
+    (ops_status, CPU만)  120개월 x 60항목   스캔 2.28 ms + 11.38 ms
+
+2년 규모에서 Monthly 검사 전체는 ~5.9 ms로 그대로다. 10년이면 ~17 ms 늘어난다.
+2단 fast path(싼 스캔 먼저, 보고 직전 파일만 정밀 재계산)는 **버렸다** — 10년 뒤
+규모의 절약을 위해 silence 방향을 다시 열어주는 거래다.
+
+**이 머신의 실제 runtime에서 잰 전체 비용**(추정이 아니라 두 경로를 다 지나는
+`_print_company` + `_print_history`, n=20):
+
+    summary_line_indices 있음   min 44.05 ms   median 45.33 ms
+    없음(수정 전)               min 43.97 ms   median 45.08 ms
+
+**+0.08 ms — noise 안이다.** `ops_status.py` 전체 명령은 203 ms(n=7)이고 그
+대부분은 인터프리터 기동이다.
+
+테스트 24건. 넷 다 수정 전 구현에 대해 실패함을 확인했고(late 6/11, Monthly 3/6,
+ops_status shortfall 2/4, stranded 1/4 — 나머지는 "여전히 동작한다" 가드와 범위를
+정직하게 적은 것),
+그 과정에서 **아무것도 검사하지 않고 통과하던 테스트 하나를 발견해 지웠다**
+(shortfall이 없으면 `Event ID:` 위조가 바꾸는 게 없다 — 가리는 방향은 가릴 것이
+있을 때만 드러난다).
+
+### 23. 인용이 가리키는 곳이 실제로 있는지 아무도 확인한 적이 없다 (신규, **문서 무결성**)
+
+이 저장소는 결정을 산문으로 정당화하지 않고 **인용**한다. `docs/NN §M` 807건,
+`BUG-NN` 618건, `README RULE N` 39건. 인용을 따라간 독자는 근거에 도착해야 한다.
+**아무것도 그것을 검사하지 않고 있었다.**
+
+**(a) `docs/NN §M` 807건 중 하나가 존재하지 않는 절을 가리켰다.**
+`scheduler.py`가 "수동 실행도 동일한 Lock과 State 규칙을 따른다"의 근거로
+docs/07의 951번 절을 들었는데, **951은 그 문장의 줄 번호다.** 절은 §44(Manual
+Run)다. 807분의 1은 좋은 비율이고, 동시에 **보는 사람이 없으면 쌓이기만 하는**
+종류의 오류다. 테스트로 고정했다 — 절이 존재하는지만 보고, 인용한 주석이 주장하는
+내용까지 맞는지는 보지 않는다. 후자는 테스트로 결정할 수 없고, 결정할 수 있는 척하는
+검사가 바로 이 프로젝트가 없애려는 낡은 주장이다.
+
+(그 테스트는 **자기 파일과 이 파일을 읽는다.** 처음 실행에서 제일 먼저 잡은 것이
+잘못된 인용을 예시로 적어둔 자기 docstring이었고, 두 번째가 이 절이었다. 둘 다
+예시가 인용으로 읽히지 않게 다시 썼다 — 검사가 자기 자신에게도 적용된다는
+증거이기도 하다.)
+
+**(b) `BUG-NN` 15개가 아무 데도 없다 — 65건이 그것을 가리킨다.**
+초기 Audit이 번호를 매긴 발견들인데 BACKLOG에 옮겨진 적이 없다. 정보가 사라진
+것은 아니다 — 인용하는 docstring 각각이 결함을 **전부** 적고 있다. 사라진 것은
+**id로 찾아갈 방법**이고, 독자는 BUG-18이 열려 있는지 닫혀 있는지 알 수 없다.
+
+65건을 고쳐 쓰지 않았다. id는 역사적 흔적이고, 지우면 그 흔적이 없어진다. 대신
+**색인을 만들어 포인터가 다시 풀리게 했다.** 설명은 전부 인용처에서 가져온 것이고
+새로 지어낸 것은 없다.
+
+| id | 인용 | 전체 설명이 있는 곳 | 한 줄 |
+|----|------|--------------------|-------|
+| BUG-1 | 3 | `src/backup/runner.py:168` | push만 실패한 뒤 `git status`가 깨끗하면 NOT_REQUIRED로 끝나 §19의 "다음 Runner에서 재시도"가 영원히 오지 않는다 |
+| BUG-2 | 3 | `src/history/file_repository.py:59` | `event_id`가 경로로 쓰여 `../../../PWNED`가 저장소 밖에 썼다 |
+| BUG-5 | — | 같은 곳 | 위와 함께: Windows가 금지하는 문자가 든 id가 Runner 전체를 OSError로 중단시켰다 |
+| BUG-7 | 3 | `tests/test_runner_failure_paths.py:3464` | Secret Scan은 파일명만 본다 — 현실적인 secret 12개 중 **3개**를 잡았다 |
+| BUG-8 | 1 | `tests/test_e2e_disaster_scenarios.py:209` | 거절된 push에는 인증 표시가 없어 PENDING으로 분류되고, §62가 금지한 영구 재시도 루프가 된다 |
+| BUG-9 | 11 | `src/collector/runtime.py:200` | 파일 이동이 성공하기 전에 `mark_seen()`이 저장돼, 재시도가 DUPLICATE만 만들고 Candidate가 영구 유실된다 |
+| BUG-10 | 2 | `tests/test_runner_failure_paths.py:25` | 재저장 시 FileExistsError가 Runner를 중단시킨다 |
+| BUG-12 | 4 | `tests/test_repository_hygiene.py:8` | 문서 공백 — README/docs는 명세라 그 Sprint가 고칠 수 없었다 |
+| BUG-14 | 7 | `tests/test_e2e_operations_scenarios.py:19` | Notion이 날짜만 든 "Last Updated"를 주면 Late Event 가드가 깨진다 |
+| BUG-15 | 3 | `src/transport/onedrive.py:43` | `event_id`가 경로에 그대로 들어가 `../target/X`가 OneDrive 감시 폴더 **밖**에 썼다 |
+| BUG-16 | 2 | `tests/test_repository_hygiene.py:18` | README §12의 문서 목록과 실제 docs/ 불일치, 낡은 절대경로 헤더 |
+| BUG-18 | 15 | `tests/test_architecture_invariants.py:591` | Runner Lock이 원자적이지 않아 상호배제가 보장되지 않았다 |
+| BUG-19 | 8 | `tests/test_architecture_invariants.py:758` | 경합 중 `os.replace()`가 Windows에서 PermissionError를 던지는데 **어느 writer도 잡지 않는다** (무결성은 지켜지고 가용성이 깨진다) |
+| BUG-23 | 1 | `tests/test_untrusted_event_input.py:409` | ~250자 `event_id`가 Windows가 거부하는 경로를 만들어 발신 시점에 조용히 유실된다 |
+| BUG-34 | 2 | `tests/test_spec_conformance.py:892` | 렌더러가 모르는 category의 항목이 본문에서 빠지는데 Metadata에는 세어진다 |
+| BUG-35 | 1 | `tests/test_architecture_invariants.py:1091` | `InMemoryNotionTransport`가 실제 API보다 관대해서 Notion 테스트가 증명할 수 있는 범위가 제한된다 |
+
+이 표는 **닫혔다는 주장이 아니다.** BUG-19와 BUG-34는 이 Sprint에서 다시
+확인했고 열려 있다(전자는 BACKLOG BUG-19가 없어서 아무도 몰랐다). 나머지는
+인용처 docstring이 CHARACTERIZATION인지 수정인지 스스로 밝히고 있다.
+
+**(c) `README RULE N` 39건은 전부 존재한다**(RULE 1-12). 문제 없음.
+
+새 dangling id가 조용히 들어오지 못하도록 테스트로 고정했다. 인용 패턴이 매칭을
+멈추면(예: 표기가 바뀌면) 그것도 실패한다 — 아무것도 안 세면서 통과하는 검사는
+§21에서 이미 한 번 만들어 봤다.
+
+### 24. `.tmp-` 잔여물을 세 디렉터리 중 둘만 제대로 부르고 있었다 (신규, **거짓 경보**)
+
+C27이 세운 규칙은 "atomic write가 staging하는 디렉터리를 읽는 쪽은
+`is_incomplete_write()` 이름을 건너뛴다"이다. 그 규칙이 **전수 적용됐는지** 아무도
+본 적이 없어서, `glob`/`iterdir` 22곳을 전부 대조했다. (pathlib의 `*`는 dotfile을
+매칭하므로 `.tmp-….json`은 `glob("*.json")`에 그대로 걸린다.)
+
+대부분은 걸러지고 있었다. 진짜 구멍은 **`incoming/`** 하나다 — 그리고 하필
+`write_event_json()`이 실제로 staging하는 디렉터리다. `.tmp-` 잔여물을 담을 수
+있는 디렉터리는 셋인데 둘은 제 이름으로 부르고 있었다:
+
+    transport/   incomplete                  (이미 있음)
+    rejected/    rejected_incomplete_write   (C31 §17에서 이미 고침)
+    incoming/    **"수집을 기다리는 Event"**   <- 여기
+
+실측, 런타임 전체에 staging 파일 하나뿐일 때:
+
+    awaiting_collection=1   is_clear=False
+    -> ATTENTION "Collector가 아직 가져가지 않은 Event 1건"
+
+`awaiting_collection`의 정의는 *intake가 promote했지만 수집되지 않은 것*이고,
+staging 파일은 **promote된 적이 없다** — Desktop 4의 reporter가 `incoming/`에
+직접 쓴 것이다. 느슨하게 보고된 숫자가 아니라 **그 숫자에 속하지 않는 파일**이다.
+
+두 형제와 다른 점 하나는 정직하게 적었다: 이건 **다음 실행에서 저절로 사라진다**
+(Collector가 소비해서 `rejected/`로 옮기고, 거기서는 이미 제 이름으로 불린다).
+잘못된 이름이 한 실행 동안만 붙는다 — 다만 그 한 실행이 **crash 직후**, 즉 사람이
+이 화면을 보는 바로 그 때다. 파이프라인은 손대지 않았다(§17과 같은 이유로 docs/03
+결정이다). C27이 그은 Collector 경계 테스트도 그대로다.
+
+**그 과정에서 내가 만든 회귀를 기존 테스트가 잡았다.** `name_collision`을 필터된
+목록으로 계산하도록 바꿨는데, `test_a_staging_name_still_blocks_the_name_in_incoming`의
+docstring이 *"Splitting the count must not narrow that check (BUG-43)"*라고 정확히
+그것을 금지하고 있었다. `run_once()`는 목적지 이름이 차 있으면 원본이 무엇이든
+거부하므로, staging 파일도 Event와 똑같이 영구히 막힌다. 세는 쪽만 좁히고 검사는
+`all_incoming_paths`로 되돌렸다 — `rejected/` 쪽이 이미 같은 이유로 그렇게 하고 있었다.
+
+테스트 5건(기존 `RejectedStagingResidueTests`를 상속해서 같은 fixture를 쓴다 —
+한 파일에 대한 두 반쪽이 서로 다른 것을 검사하게 갈라지지 않도록). 전부 수정 전
+구현에 대해 실패함을 확인했다.
+
+### 25. 내가 §21에서 만든 blind spot — 규칙의 전제가 틀렸다 (신규, **중복 / 유실**)
+
+§21의 라벨 순서 규칙은 이렇게 추론했다: *렌더러는 라벨을 한 번씩 순서대로,
+요약 뒤에 쓴다 → 첫 bullet의 라벨이 아래 라벨보다 순서상 뒤면 렌더러가 쓴 것이
+아니다 → **남는 설명은 산문뿐이다.*** 마지막 단계가 틀렸다. **docs/06 §57은
+손편집을 허용하고, 손편집은 라벨 bullet을 요약 위로 옮길 수 있다** — 똑같은 배치다.
+
+실측, `- Event ID: EVT-H`를 `- Owner:` 위로 옮긴 블록:
+
+    existing_event_ids()        set()       <- 블록의 id가 사라진다
+    select_late_candidates()    ['EVT-H']   <- **매 실행 다시 추가**
+    Monthly                     통째로 drop
+
+Company History 파일이 무한히 자란다 — §2가 닫은 결함(§38 가드가 렌더러가 쓴
+것을 되읽지 못한다)이 다른 문으로 들어온 것이다. **순서 규칙이 생기기 전에는 이
+reader가 id를 찾았으므로, 이건 §21이 만든 회귀다.**
+
+**수정은 override 하나이고, 휴리스틱이 아니라 결정 가능하다:
+어떤 exclusion도 블록에서 식별자를 전부 없애서는 안 된다.** 산문이라고 부르려는
+그 bullet이 블록의 **유일한** `Event ID:`를 들고 있으면 그것은 라벨이다 —
+블록 안에 다른 후보가 없기 때문이다. 아래에 두 번째 `Event ID:` bullet이 있으면
+첫째는 정말 산문이고(그게 순서 규칙이 쓰인 이유다) 그대로 유지된다.
+
+**덜 틀린 게 아니라 더 낫다.** 전에는 통째로 잃던 블록이 세 필드를 다 되찾는다:
+
+    - Event ID: E1 / - Owner: COO / - the summary
+        before  item dropped        after  (E1, COO, "the summary")
+
+**같은 뿌리를 쓰는 reader 넷 전부에 적용된다** — `existing_event_ids()`,
+`monthly/parser._first_bullet()`, `ops_status._kept_but_not_rendered()`,
+`_monthly_counts_more_than_it_shows()`. 뒤의 둘은 손편집된 블록에서 유일한 id를
+빼앗겨 **거짓 경보**를 냈을 경로였고(전자는 멀쩡한 Candidate를 "영구 유실"이라
+보고, 후자는 멀쩡한 달을 shortfall로 보고), 실측으로 둘 다 `()`임을 확인했다.
+`monthly`는 여전히 선언된 leaf라 두 벌이고, 행동 동등성 테스트의 배열 corpus에
+이 override의 양쪽을 추가했다.
+
+**그 김에 카운터의 거짓 경보 하나도 닫았다.** `unconsolidated`는 `- Event ID:`
+줄을 items와 대조하는데, `Event ID: measured it.`라는 요약도 그런 줄이다.
+파서가 **스스로 산문이라고 판정한** 줄을 유실로 세면, 아무것도 잃지 않은 문서에
+대해 손실을 보고한다(실측 1 → 0). 걷어낸 것은 그 줄뿐이다 — walk 밖에 있는 줄은
+여전히 걸러지지 않고 세어진다(섹션이 일찍 닫히는 실패가 이 카운터의 존재 이유다).
+
+seed 고정 fuzz 3,000건 재실행: benign 유실 0, Late 억제 0, 비멱등 0,
+Event Count 오류 0, Monthly 도달 실패 0. 테스트 7건 중 5건이 override 없이는
+실패함을 확인했다(나머지 둘은 "§21의 수정을 되돌리지 않는다" 가드다).
+
+### 26. 운영자에게 하는 말이 코드보다 세다 — ATTENTION 41줄 전수 대조 (신규, **관측성**)
+
+ATTENTION은 AGENT.md §6이 **가장 먼저 읽으라고** 시키는 화면이고, 각 줄은 사실만
+말하는 게 아니라 **원인과 조치를 단언**한다. 그 단언들을 코드와 대조한 적이 없어서
+41줄을 전부 훑었다. 셋이 코드보다 셌다.
+
+**(a) E-17 경보 — "어떤 실행도 이것을 넣지 않는다"는 틀렸다.** 전제는 맞다(6.5단계의
+대상은 그 실행이 수집한 날짜뿐이다). 결론이 한 칸 더 갔다. 같은 날짜의 Event가
+**하나라도 더** 수집되면 그 날짜가 `kept_dates`에 들어가고,
+`select_late_candidates()`는 저장소의 **그 날짜 전체**를 보므로 방치돼 있던 것이
+함께 들어간다. 실측:
+
+    EVT-A 저장 -> Daily Close      2026-08-05.md 생성
+    EVT-S 저장 (닫힌 뒤)           탐지기 ('EVT-S (2026-08-05)',)
+    EVT-N 저장 (같은 날짜, 나중)   UPDATED_LATE_EVENT
+                                   added_event_ids=('EVT-S', 'EVT-N')
+                                   탐지기 ()
+
+**자기 힘으로는 못 들어가고, 같은 날짜 동행이 생기면 들어간다.** 지난 날짜에
+동행이 오지 않는 것이 보통이라 경보 자체는 옳지만, "어떤 실행도"는 **사람이 할
+조치를 바꾼다** — 나중 실행이 고쳐줄 것을 손으로 Company History 파일을 고치게
+만든다. 이 유일한 자동 복구 경로를 **아무 테스트도 지나지 않고 있었다**(테스트 4건
+추가, 전제인 `for kept_date in sorted(kept_dates)`도 AST로 고정했다 — 6.5의 날짜
+출처가 바뀌면 이 발견 전체가 달라지므로 주석을 읽어서 알게 되면 안 된다).
+
+**(b) Monthly shortfall 경보 — 원인 하나를 단정하고 틀린 조치를 지시했다.**
+"`- Category:` 줄이 네 값 중 하나인지 확인하라 — **다시 만들어도 같은 결과다**"라고
+끝났는데, 원인은 둘이고 조치가 반대다. 실측:
+
+    Category 원인      강제 rebuild 후에도 ('2026-08', 1, 0)   -> 맞다
+    손편집 블록 삭제   그냥 재실행은 그대로, 강제 rebuild가 **복구**
+
+docs/06 §57 / docs/11 §71이 허용하는 손편집이 똑같은 불일치를 만드는데, 그쪽은
+rebuild가 고친다. 운영자를 한 달치 Daily에서 있지도 않은 잘못된 Category를 찾게
+보내고 있었다. 두 원인과 각각의 조치를 적고, **이 검사는 둘 중 어느 쪽인지 말할 수
+없다**는 것도 같이 적었다. 테스트 6건.
+
+**(c) 그 검사의 docstring — "false-positive case to caveat 없음"도 과했다.**
+`Consolidated Items`와 렌더된 항목 수는 **생성 시점에는** 어긋날 수 없지만, 파일은
+그 뒤 디스크에서 산다. 손으로 항목 블록 하나를 지우면 `('2026-08', 3, 2)`가 뜬다.
+보고하는 것 자체는 옳다(파일이 자기 총계와 모순된다) — 다만 파이프라인이 낸 유실이
+아니고, 숫자를 고칠 때까지 화면에 남는다. "as generated"까지가 그 보증의 전부라고
+고쳐 적었다.
+
+나머지 38줄은 대조 결과 코드와 일치했다.
+
+### 27. `.exists()` 전수 재조사 — C31의 스윕이 하나를 놓쳤고, 하나를 잘못 분류했다 (신규)
+
+C31이 여섯 곳을 `.is_file()`로 바꿨다. **그 스윕이 실제로 전수였는지 아무도
+확인하지 않았다.** `src/`와 루트의 `.exists()` 31곳을 전부 분류했다.
+
+분류 기준은 그 호출이 **무슨 질문**을 하느냐다:
+
+    "이름이 차 있나"        -> exists()가 맞다. 디렉터리도 이름을 차지한다.
+    "이 산출물이 있나"      -> is_file()이어야 한다. 디렉터리는 산출물이 아니다.
+    "state 파일이 없으면 기본값" -> 디렉터리면 read_text가 OSError를 내고
+                              선언된 오류 타입으로 잡힌다. 시끄럽게 실패하므로 무해.
+
+**놓친 것 하나 — `agent/outbox.stage()`.** 함수 첫 줄이 "Persist `event` in the
+outbox"라고 약속하는데, Event 이름을 쓴 **디렉터리**가 있으면 그 경로를 돌려주고
+**아무것도 쓰지 않았다.** 실측:
+
+    outbox/EVT-1.json 이 디렉터리일 때
+    stage() 반환                     EVT-1.json   <- 성공 보고
+    (outbox/EVT-1.json).is_file()    False
+
+outbox 쓰기는 Agent의 **내구성 경계**다 — `_collect_one_date()`가 `OSError`를 잡는
+자리에 그렇게 적혀 있다: *"실패하면 Event는 아직 존재하지 않으므로 그 날짜는 수집된
+것이 아니고 그렇게 표시해서도 안 된다."* 성공을 보고하는 `stage()`는 그 분기를
+통째로 건너뛴다.
+
+**차단돼 있었다** — 그래서 안 보였다. `drain()`이 그 항목을 `unreadable`로 잡고
+`is_clear`가 False가 되어 날짜가 전진하지 않는다. 다만 운영자에게 뜬 것은
+"outbox에 읽을 수 없는 파일 (Permission denied)"이었지 **어느 날짜가 수집에
+실패했는지**가 아니었고, 그 차단은 설계가 아니라 운이었다 — 바로 아래
+`except FileExistsError` 분기는 race 케이스를 위해 이미 단단히 해뒀는데 그 위의
+fast path만 그대로였다. 둘 다 `is_file()`로 바꾸니 `write_event_json()`이 점유된
+이름을 거부하고 `FileExistsError`가 호출자에 도달해 **`DateOutcome.FAILED`**가 된다.
+
+**잘못 분류한 것 하나 — 그것도 내가 C31에서 했다.**
+`test_name_taken_questions_still_use_exists`가 `stage()`를 "이름이 차 있나" 쪽으로
+분류하고 `existing.exists()`를 **유지하라고 고정**하고 있었다. 그 테스트가 적어둔
+근거는 *"is_file()로 좁히면 실행이 디렉터리를 덮어쓰려 들 것"* 인데, 실측하면 그런
+일은 없다 — 거부는 한 단계 아래 `write_event_json()`이 하고 거기는 여전히
+`exists()`다. `stage()`의 이른 반환은 거부 가드가 아니라 **"이미 됐으니 건너뛴다"**
+fast path이고, "이미 됐다"는 진짜 파일이어야 한다. 테스트를 정정하고 두 절반이
+계속 구분되도록 양쪽을 다 단언하게 했다.
+
+나머지 29곳은 분류상 맞다. 특히 `collector/runtime.run_once()`의 목적지 가드,
+`transport/intake`의 중복 검사, `desktop_activity`의 downstream 이름 검사는
+**디렉터리도 이름을 차지한다**가 정확히 의도(BUG-53)이고, `agent/delivery.py`는
+`.exists()` 뒤에서 `_problem()`이 `NOT_A_FILE`을 따로 돌려주고 있었다.
+
+테스트 6건(그 중 2건은 수정 전 구현에서 실패함을 확인, 나머지는 "멱등 재stage는
+여전히 no-op"과 "이미 있던 blocker는 예전대로 실행 전체를 막는다" 가드).
+`review_cli`만 쓰는 `FileHistoryRepository.get()`은 디렉터리에서 OSError로 죽지만
+사람이 앞에 있는 대화형 도구라 그대로 뒀다.
+
+### 28. 중복 결함 전부가 위반하는 성질 하나를 아무도 단언하지 않고 있었다 (테스트 공백)
+
+이 프로젝트가 겪은 중복 결함은 전부 같은 성질의 위반이다 — 매 실행 다시 붙는
+Late Event, 다시 큐에 들어가는 Notion Event, 다시 통합되는 달, 커밋할 게 없는데
+만들어지는 커밋. **각각 따로 발견돼 따로 고쳐졌고, 성질 자체를 단언한 것은
+아무것도 없었다.** 그러면 다음에 그것을 깨는 컴포넌트도 같은 방식으로 — 누가
+파일이 커지는 걸 눈치채서 — 발견된다.
+
+전체 파이프라인 3연속 실행을 트리 해시로 대조했다(로그와 Run Manifest는 이름으로
+제외 — 전자는 커지는 게 일이고 후자는 이번 실행을 기술하므로 같으면 오히려 이상하다).
+결과는 **완전 멱등**이었다:
+
+    run1 -> run2   added [] removed [] changed []
+    run2 -> run3   added [] removed [] changed []
+    commits 2 (fixture의 init + 진짜 backup 1)   unpushed 0
+    backup_status  SUCCESS -> NOT_REQUIRED -> NOT_REQUIRED
+    seen store     항목 그대로
+
+**그런데 그 테스트에 이빨이 없었다.** §38의 중복 가드를 눈멀게 하고
+(`existing_event_ids()` -> `set()`) 돌렸더니 **한 건도 실패하지 않았다.** 이유는
+6.5단계의 대상이 *그 실행이 수집한 날짜*뿐이라, 새 입력이 없는 반복 실행에서는
+그 단계가 **아예 실행되지 않기** 때문이다. 즉 "반복 실행이 멱등이다"는 중복
+경로를 거의 지나가지 않는다.
+
+이빨이 있는 모양은 **연속 실행이 각각 같은 (이미 닫힌) 날짜의 Event를 수집하는**
+경우다. 실측, 2026-08-01자 Event를 세 실행이 하나씩 추가:
+
+    수정본   `- Event ID:` 3줄   Late Events Added 2   Event Count 3
+    눈먼 것  `- Event ID:` 7줄   Late Events Added 6   Event Count 0
+
+Company History 파일의 무한 증가이고, 그 안의 Metadata 두 숫자가 서로 모순된다.
+그 케이스를 추가하고 나서야 눈먼 가드에 대해 실패한다. 클래스 docstring의
+과장("모든 중복 결함이 이 성질의 위반")도 실제로 무엇을 지나가는지로 고쳐 적었다.
+
+테스트 6건. 파이프라인 무변경 — 멱등성은 이미 성립하고 있었고, 없던 것은 그것을
+지키는 장치다.
+
+### 29. Mutation Testing — 핵심 가드 17개를 부러뜨려 스위트에게 물었다 (검증, 결함 없음)
+
+§28에서 **이빨 없는 테스트**를 하나 잡고 나니 같은 질문이 남는다: *다른 가드들은
+실제로 덮여 있나, 아니면 이름만 그런가?* 이 프로젝트의 규칙("테스트가 있다를
+믿지 않는다")을 스위트 전체에 적용하는 방법은 하나뿐이다 — **가드를 부러뜨리고
+스위트가 알아채는지 본다.**
+
+pytest 플러그인 하나로 가드를 하나씩 무력화하고 전체 스위트를 돌렸다. 17개 전부
+**잡혔다.**
+
+    is_incomplete_write      one_line              redact
+    _looks_like_secret       safe_candidate_filename  safe_event_filename
+    summary_line_indices     _is_sole_identifier   bounded
+    try_acquire_lock         is_seen               _is_stable
+    existing_event_ids       validate_event        overall_status
+    _EXIT_CODES              _SEVERITY
+
+**방법론 함정 하나를 기록해 둔다.** `-x`는 **가장 먼저** 실패한 테스트를 보여주는데,
+그게 행동 테스트가 아니라 **구조/인벤토리 테스트일 수 있다.** `_SEVERITY`와
+`overall_status`는 둘 다 `DeadCapabilityInventoryTests`가 먼저 잡았다 — 함수 객체가
+lambda로 바뀐 것을 **정체성으로** 알아챈 것이지 동작으로 알아챈 게 아니다.
+그 테스트를 deselect하고 다시 돌려야 진짜 답이 나온다:
+
+    _SEVERITY (구조 테스트 제외)  -> test_run_contract.py::FailureClassificationTests
+                                     ::test_a_daily_close_failure_fails_the_run
+
+즉 CRITICAL 컴포넌트가 전부 DEGRADED가 되면(잃어버린 Daily Close가 exit 2 대신
+exit 3을 보고하게 된다) **행동 테스트가 잡는다.** 그리고 그것을 확인하려면
+`-x` 없이 돌려야 한다. 함수 객체를 바꾸는 대신 **테이블 값만** 바꾸는 변이가
+이 함정을 피한다(`_EXIT_CODES`를 전부 0으로 만든 변이는 곧바로
+`ExitCodeContractTests::test_every_overall_status_maps_to_exactly_one_exit_code`가
+잡았다).
+
+결함 없음. 파이프라인 무변경. 플러그인은 저장소에 남기지 않았다(루트에 추적되지
+않는 파일을 더하지 않는다) — 재현에 필요한 것은 위 목록과 이 방법이 전부다.
+
+### 30. Daily 시퀀스에 구멍이 나도 모든 지표가 정상을 보고한다 (신규, **데이터 유실**, 탐지)
+
+Recovery/DR 감사에서 나왔다. **Local Master를 git에서 이전 시점으로 부분 복원하면
+Daily 시퀀스 가운데가 비는데, 그것을 보는 것이 아무것도 없다.** 실측, 열흘이 닫힌
+상태에서 08-04~08-06을 지우고:
+
+    check_state_consistency()   CONSISTENT
+    ATTENTION                   그 사흘에 대해 아무 말도 없음
+    Scheduler 다음 실행          last_close+1부터 시작 — 영원히 돌아오지 않는다
+
+**Company History 사흘이 영구히 사라졌는데 모든 지표가 건강하다.**
+`check_state_consistency()`가 틀린 게 아니다 — §47이 그것에게 묻는 것은 *마지막*
+닫힌 날에 파일이 있느냐이고 답은 예다. **가운데를 보는 눈이 없었을 뿐이다.**
+
+**판정은 파일만으로 결정 가능하다.** docs/07 §30이 순서대로 닫고 건너뛰지 않으며,
+`generate_daily_history()`는 **일이 없는 날에도 파일을 쓴다**(빈 달 파일이 있는
+것과 같은 이유, docs/09 §72). 따라서 Daily 파일명은 **끊기지 않는 날짜 구간**이어야
+하고, 파일이 있는 두 날짜 **사이**의 빈 날짜는 파일이 있었다가 사라진 것이다.
+정책 결정도, 새 설정도 필요 없다.
+
+`COMPANY_OPS_HISTORY_START_DATE`로 구간을 잡지 않았다 — 자주 미설정이고
+(`_history_start_date()` 참고) 그러면 검사가 통째로 사라진다. **가장 이른 파일**이
+설정 없이도 옳은 하한이다: 그 앞은 이 머신의 History가 아니고, 두 파일 사이의
+공백은 그렇지 않다.
+
+**꼬리 결손은 보고하지 않는다.** 중간에 실패한 실행이 남기는 정상적인 재시도
+모양이고 다음 실행이 채운다. 가운데만 본다.
+
+**진단이 아니라 조치가 되게 했다.** Backup Working Copy는 바로 옆에 있고 미백업
+검사가 이미 그 트리를 훑는다. 사라진 날 중 **거기 아직 남아 있는 것**을 이름으로
+집어 준다:
+
+    구멍 3일: 2026-08-04, 2026-08-05, 2026-08-06 — … 그 중 2건은 Backup Working
+    Copy에 아직 있다(2026-08-04, 2026-08-05)
+
+**쓰기 전에 이 머신의 실 runtime으로 전제를 확인했다:** `local_master/daily`와
+`backup_working_copy/daily` 둘 다 2026-08-05..2026-08-10이 빈틈없다 — 이 검사가
+기대는 성질이 fixture가 아니라 실제 트리에서 참이다. 오탐 0.
+
+**성능 — 측정 후 결정했다.** 처음엔 `glob("*.md")` + `is_file()`이었는데 파일당
+stat이 한 번 더 든다:
+
+     730개(2년)    glob+is_file 10.90 ms    scandir 0.69 ms   (16배)
+    3650개(10년)   glob+is_file 58.75 ms    scandir 3.48 ms   (17배)
+
+10년치가 whole-view 기준선(~44 ms)보다 커지므로 `os.scandir`로 바꿨다(두 형태가
+같은 리스트를 돌려주는 것을 먼저 단언했다). 이 머신 실 runtime에서 검사 추가분은
+**+0.17 ms — noise 안**이다.
+
+테스트 10건. 디렉터리가 날짜 이름을 쓰고 있으면 **없는 것으로 센다**(C31이 다른
+여섯 곳에 적용한 규칙 그대로), `notes.md`와 `.tmp-` 잔여물은 무시, 꼬리 결손·단일
+파일·빈 트리는 조용하다. 파이프라인 무변경 — **탐지만** 추가했다(무엇을 복원할지는
+docs/10 §64의 운영자 결정이다).
+
+### 31. Monthly 시퀀스에도 같은 구멍이 있다 — 다만 이쪽은 복구된다 (신규, 탐지)
+
+§30의 정확한 형제다. `pending_months()`는 오래된 달부터 건너뛰지 않고 통합하고,
+docs/09 §72는 **중요한 일이 없던 달에도 파일을 쓴다**("아무 일 없었다"와 "잊었다"를
+구분하려고 존재하는 규칙이다). 따라서 Monthly 파일명도 끊기지 않는 달 구간이어야
+하고, 가운데의 빈 달은 파일이 있었다가 사라진 것이다.
+
+실측, 2026-01~2026-08이 통합된 상태에서 04·05를 지우고: **어떤 ATTENTION도
+언급하지 않는다.** `pending_months()`는 마지막 통합한 달 **다음**부터 시작하고,
+state-대-history 검사는 마지막 달만 묻는다 — §30과 같은 모양이다.
+
+**다만 조치가 Daily보다 낫고, 그게 정확해서 문장에 적었다.** Monthly는 Daily에서만
+파생되므로(docs/09 §12-13) 되만들 수 있다. 실측 end-to-end:
+
+    2026-07.md 삭제      그냥 재실행: statuses []  — 그대로 없음
+    mark_month_dirty()   MONTHLY_GENERATED — 파일과 **내용까지** 복귀(EVT-1 포함)
+
+Daily는 그런 약속을 할 수 없고, 이 메시지도 그런 척하지 않는다.
+
+달 산술은 문자열이 아니라 진짜 산술로 했다 — 2025-12 → 2026-02는 한 달 빠진
+것이고 키를 텍스트로 비교하면 그렇게 나오지 않는다. 테스트 7건(연말 경계, 꼬리
+결손, 단일 달, 디렉터리가 달 이름을 쓴 경우, `notes.md`/`.tmp-` 무시, 그리고
+위 복구 경로를 실제로 돌리는 것 하나).
+
+### 32. 삭제된 Company History가 Run Manifest에 이름조차 남지 않았다 (신규, **관측성**)
+
+§31을 조사하다 나왔다. Local Master에서 파일이 사라지면
+`sync_to_working_copy()`가 add/commit/push를 **통째로 막고** BACKUP_FAILED로
+끝낸다 — 설계가 훌륭하다. 삭제는 원격으로 전파되지 않고, Backup은 CRITICAL이라
+run이 FAILED가 되고 exit 2가 나간다. 여기까지는 다 맞다.
+
+**그런데 Manifest에 그 사실이 없다.** 실측, Daily 하루치를 지우고 실행:
+
+    classification  BACKUP_FAILED
+    reason          ""              <- 비어 있다
+    metrics         changed_files=1
+
+`deleted_files`는 **성공 분기에만** 실려 있었고, 삭제 분기는 `push_result`가
+None이라 `reason`도 비었다. `last_run.json`만 읽어서는 **Company History가
+지워졌다는 사실 자체를 알 수 없고**, 자격증명 실패와도 구별되지 않는다 — 둘 다
+`BACKUP_FAILED`/`PERMANENT`/`CRITICAL`이다. docs/14 §3이 Manifest에게 요구하는
+것이 정확히 "무슨 일이 있었고 자세한 건 어디 있는지" 한 줄인데, 이 실행에서
+일어날 수 있는 가장 무거운 일에 대해 그 한 줄이 비어 있었다.
+
+`deleted_files` metric을 삭제 분기에도 싣고, `reason`에 사실을 적었다:
+
+    reason: "Local Master에서 파일 1건이 사라져 Backup이 add/commit/push를
+             중단했다 (docs/08 §31): daily\2026-08-01.md"
+
+**새 classification 값은 만들지 않았다.** 그 어휘는 docs/14 §5의 것이고 §5의
+예시가 `BACKUP_FAILED`를 인증 실패에 묶고 있다 — 값을 늘리는 것은 Run Contract
+변경이라 §6에 따라 SKIP한다(아래 SKIP 항목 참조). `reason`은 `Failure`의
+docstring이 자유 텍스트라고 명시한 필드이므로 계약을 건드리지 않고 사실을 담을 수
+있다. Severity/Retryability/Overall/Exit은 그대로임을 테스트로 고정했다.
+
+테스트 5건. 삭제가 원격으로 전파되지 않는다는 §31의 본래 성질(Working Copy에
+파일이 남아 있고 unpushed 0)과, 평범한 백업은 `deleted_files`가 0이라는 반대
+방향도 같이 고정했다.
+
+### 33. 확인했고 결함이 없던 것 (같은 조사를 다시 하지 않기 위해)
+
+**(a) git push 실패 메시지가 remote URL의 자격증명을 흘리는가 — 아니다.**
+운영자가 PAT를 remote URL에 직접 박는 것(`https://ghp_…@github.com/o/r.git`)은
+흔한 셋업이고, 그러면 push 실패 메시지가 그 URL을 인용한다. `_report_backup_failure()`는
+그것을 stderr로 찍고 스케줄러 로그가 그것을 캡처한다. 실측:
+
+    fatal: unable to access 'https://127.0.0.1:1/o/r.git/': Failed to connect …
+    token present: False
+
+**git 자신이 URL에서 자격증명을 지운 뒤 메시지를 만든다.** §11의 Notion 경로와
+결정적으로 다른 점이고, 그래서 여기에는 아무것도 걸지 않았다.
+
+**(a0) Multi-Desktop 동시 실행 — 한 폴더에 쓰기와 읽기를 동시에, 결함 없음.**
+Desktop 4는 Agent와 Runner를 **같은 머신에서** 돌리고, 단일 머신 구성에서는
+Agent의 sync 폴더와 Runner의 transport 폴더가 같은 디렉터리다(B절 3번). 두 스레드로
+실제 경합을 만들었다 — 한쪽은 `OneDriveTransport.send()`로 200건을 쓰고, 다른 쪽은
+같은 디렉터리에 대해 `run_intake()`를 60회 돌린다:
+
+    errors            없음
+    보낸 것            200
+    incoming/에 도착   200
+    sync/에 남은 것    0   (staging 잔여물 0)
+    이름 깨짐          없음
+    잘린 파일          없음
+
+`stable_after_seconds=0`으로 **안정화 창을 꺼 놓고** 쟀다 — 경합을 가려 줄 가드를
+일부러 제거한 것이다. 그래도 200/200이 온전한 이유는 창이 아니라 **쓰기 쪽의
+원자성**(mkstemp + `os.replace`)과 intake가 `.tmp-`를 건너뛰는 규칙이다. 즉 이
+보장은 타이밍에 기대고 있지 않다.
+
+**(a2) Recovery / DR — 양방향 실측, 결함 없음.** §15의 수정이 §28의 복구 경로
+(*"이전 실행이 파일을 쓰고 state를 저장하기 전에 죽은 경우"*) 위에 정확히 앉아 있어서
+그 경로를 실제로 돌려 봤다.
+
+    state 유실 / History 생존
+      run 1                COMPLETED, 10일 생성, 포인터 2026-08-10
+      state 파일 삭제 후 run 2
+                           COMPLETED, 포인터 2026-08-10으로 복원
+      파일 byte 동일       True     중복 0건     개수 10 -> 10
+
+    History 유실 / state 생존 (오래된 백업에서 복원)
+      최근 3일 삭제
+      consistency          STATE_INCONSISTENCY   (보고됨)
+      다음 실행            COMPLETED, regenerated=[]  (조용히 되만들지 않음)
+
+두 방향 다 옳다. state는 산출물로부터 완전히 복구되고 덮어쓰기·중복이 없으며,
+반대로 History가 없어진 경우는 **보고하되 프로그램이 임의로 다시 만들지 않는다**
+(docs/10 §46 금지, §49 "History가 State보다 우선", §64 운영자 판단). 그리고 오래된
+백업에서 복원하면 **가장 최근 날짜가 빠지는데 그것이 정확히 watermark 검사가 보는
+날**이라, §48의 좁은 범위가 이 DR 경로에서는 제대로 발화한다.
+
+**(b) Windows 예약 장치 이름(`NUL`/`CON`/`COM1`…)이 Event를 삼키는가 — 아니다,
+그러나 이유가 sanitiser가 아니다.** `_UNSAFE_FILENAME_CHARS`는 문자 화이트리스트라
+`event_id="NUL"`을 손대지 않고 통과시킨다. Win32에서 그 base name은 **장치**이고,
+거기에 쓰면 성공하면서 바이트는 사라진다 — 이 저장소가 가장 두려워하는 실패 모양
+(docs/11 §50 "History 손실"을 성공으로 보고). 직접 실측:
+
+    NUL        쓰기 -> exists=True, size=0,  디렉터리 목록에 **없음**
+    NUL.json   쓰기 -> exists=True, size=10, 있음
+
+**확장자가 막고 있다.** 이 프로젝트가 신뢰할 수 없는 id에서 만드는 모든 파일명은
+`.json`으로 끝나고(`safe_event_filename` · `safe_candidate_filename`),
+`NUL.json`은 평범한 파일이다. 예약 이름 5종을 실제 `write_event_json()` /
+`read_event_json()`으로 왕복시켜 확인했다 — 실제 파일, 실제 내용, 정확한 왕복.
+
+고칠 것은 없고 **고정할 것이 하나** 있었다: 언젠가 확장자 없는 이름을 파생하면
+다른 가드가 하나도 없다. 테스트 3건으로 그 성질을 고정했다
+(`test_untrusted_event_input.py::ReservedDeviceNameTests`).
+
+**(c) Lock liveness 판정이 로케일에 매여 있는가 — 매여 있지만 오늘은 안전하다.
+가정을 처음으로 고정했다.** `_is_process_running()`은 Windows에서
+`str(pid) in tasklist_stdout`를 묻는다 — **번역되는** subprocess 출력에 대한
+substring 매칭이다. no-match 메시지에 숫자가 하나라도 들어가면 **죽은 pid가
+살아 있다고 답하고**, 그러면 stale lock이 영원히 인수되지 않아 모든 실행이 조용히
+건너뛰어진다(BUG-42의 결과, 다른 경로).
+
+기존 테스트는 이 probe가 *"pid 숫자를 찾으므로 로케일 독립적"*이라고 적어 두었다.
+**맞지만 읽히는 것보다 좁다** — no-match 메시지에 숫자가 없다는 데 의존한다.
+이 머신(UI culture ko-KR) 실측:
+
+    정보: 실행 중인 작업 중 지정된 조건에 일치하는 작업이 없습니다.   (숫자 0개)
+
+그 성질을 **주장이 아니라 단언으로** 바꿨다 — suite가 실제로 도는 로케일이 무엇이든
+그 출력에 숫자가 없음을 확인한다(ko-KR·en-US 양쪽에서 통과 확인). 언젠가 "0 tasks
+found" 같은 문구로 바뀌면 Runner가 멈추는 대신 이 테스트가 먼저 깨진다.
+동작 변경 없음(`test_lock_atomicity.py::ProcessProbeFailureTests::
+test_the_property_that_makes_it_locale_independent`).
+
+**(d) Agent의 오류 문자열은 원천에서 이미 `redact()`된다** — `agent.py`의 세 지점
+(456·484·497행)이 전부 `redact(...)`를 통과시킨다. §12에서 `one_line`만 추가한
+이유가 이것이다(§7·§9의 다른 "형제 없음" 결과는 그쪽에 적혀 있다).
+
+**(e) 로케일 의존 단언 전수 조사.** §5(b)를 찾은 뒤 테스트 전체에서 OS/셸 메시지
+문자열에 매인 단언을 훑었다. `test_oplog.py`의 `assertIn("denied")`는 테스트 자신이
+만든 `PermissionError("denied")`이고, `test_install_agent_task_script.py:411`의
+"Access is denied"는 docstring의 실측 기록이지 단언이 아니다. **형제 없음.**
 
 ---
 
@@ -1459,7 +3524,25 @@ C20이 분류를 정정해(RETRYABLE → PERMANENT) **실패한 그 실행**은 
 Candidate를 쓰고, 6단계가 Scheduler가 닫은 날짜를 렌더링하고, 6.5단계가 이미
 닫힌 날짜에 떨어진 것을 병합한다 — 전부 **한 실행 안에서**. 따라서 실행이
 끝난 뒤, Daily 파일이 **존재하는데** 자기 `event_id`가 없는 Candidate는 병합되지
-않은 것이고, 재시도할 주체가 없다(6.5의 대상은 그 실행이 수집한 날짜뿐이다).
+않은 것이다.
+
+**C31 정정 — 그 다음 문장이 과했다.** 여기에는 "재시도할 주체가 없다"라고
+적혀 있었고 ATTENTION도 "**어떤 실행도 이것을 넣지 않는다**"라고 말하고 있었다.
+괄호 안의 전제("6.5의 대상은 그 실행이 수집한 날짜뿐이다")는 맞지만 결론이
+한 칸 더 갔다. 그 날짜의 Event가 **하나라도 더** 수집되면 그 날짜가 `kept_dates`에
+들어가고, `select_late_candidates()`는 저장소에 있는 **그 날짜의 모든** 후보를
+보므로 방치돼 있던 것이 함께 들어간다. 실측:
+
+    EVT-A 저장 -> Daily Close        (2026-08-05.md 생성)
+    EVT-S 저장 (닫힌 뒤)             -> 탐지기: ('EVT-S (2026-08-05)',)
+    EVT-N 저장 (같은 날짜, 나중)     -> UPDATED_LATE_EVENT
+                                        added_event_ids=('EVT-S', 'EVT-N')
+                                        탐지기: ()
+
+즉 **자기 힘으로는 못 들어가고, 같은 날짜 동행이 생기면 들어간다.** 지난 날짜에는
+그런 동행이 오지 않는 것이 보통이라 경보 자체는 옳지만, "어떤 실행도"는 사람이
+할 조치를 바꿀 만큼 틀린 문장이었다 — 자동으로 복구될 수 있는 것을 손으로 고치게
+만든다. 두 곳 다 실측 문장으로 바꿨고 회귀 테스트로 고정했다.
 
 Daily 파일이 **없는** 후보는 제외한다 — 아직 렌더링 전(Scheduler 창)이거나
 BUG-46의 시작일 이전 경우이고, 후자는 §6이 자기 방식으로 보고한다.

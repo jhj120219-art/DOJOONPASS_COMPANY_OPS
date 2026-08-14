@@ -91,6 +91,81 @@ class EventIdParsingTests(unittest.TestCase):
         self.assertEqual(existing_event_ids(""), set())
 
 
+class EmptyEventIdIsStillAnEventIdTests(LateUpdateTestCase):
+    """REGRESSION. §38's duplicate guard could not read what §18's renderer
+    wrote, and the result was unbounded growth of a Company History file.
+
+    `validate_event()` rejects only a *missing* `event_id`
+    (`data.get(field) is None`), so `""` is a valid Event today. Whether it
+    should be is docs/02's decision (BACKLOG A-15) and is not touched here.
+
+    `daily/markdown.py` renders it as `- Event ID: ` -- the line exists, the
+    value is empty. `existing_event_ids()` matched `(\\S.*)`, which requires
+    at least one non-space character, so it saw no id there. Measured, one
+    such Candidate on an already-closed date, three ordinary runs:
+
+        run 1  UPDATED_LATE_EVENT ('',)
+        run 2  UPDATED_LATE_EVENT ('',)
+        run 3  UPDATED_LATE_EVENT ('',)
+        -> 3 identical `## Late Events` blocks for ONE Candidate
+        -> `- Late Events Added: 3` beside `- Event Count: 1`
+
+    Rendered every time, recognised none of the times. `total_events` is
+    computed from the same function, so the file's own two Metadata numbers
+    contradicted each other inside it.
+    """
+
+    def test_an_empty_event_id_is_read_back_from_the_rendered_line(self):
+        self.assertEqual(existing_event_ids("- Event ID: \n"), {""})
+        self.assertEqual(existing_event_ids("- Event ID:\n"), {""})
+
+    def test_an_ordinary_id_is_unaffected(self):
+        markdown = "### P\n\n- did a thing\n- Owner: COO\n- Event ID: EVT-1\n"
+        self.assertEqual(existing_event_ids(markdown), {"EVT-1"})
+
+    def test_evidence_lines_are_still_not_mistaken_for_item_blocks(self):
+        """The loosened group must not loosen what the line has to start
+        with — Evidence renders as `- <event_id>: <text>`."""
+        self.assertEqual(existing_event_ids("## Evidence\n\n- EVT-9: pytest PASS\n"), set())
+
+    def _three_runs(self):
+        """One stored Candidate, three runs that revisit the date. Saving it
+        once is the point — the duplication came from the *file*, not from
+        the Repository holding three records."""
+        self.close_day(candidate("EVT-OK"))
+        self.repo.save(candidate(""))
+        return [
+            update_daily_history(
+                self.repo,
+                DAY,
+                output_dir=self.daily_dir,
+                now=datetime(2026, 8, 3 + offset, 11, 0).astimezone(),
+            )
+            for offset in range(3)
+        ]
+
+    def test_it_is_added_once_and_not_again(self):
+        outcomes = self._three_runs()
+
+        self.assertEqual(
+            [o.outcome for o in outcomes],
+            [
+                LateUpdateOutcome.UPDATED_LATE_EVENT,
+                LateUpdateOutcome.NO_LATE_EVENTS,
+                LateUpdateOutcome.NO_LATE_EVENTS,
+            ],
+        )
+
+    def test_the_file_carries_one_block_and_a_matching_count(self):
+        self._three_runs()
+
+        text = (self.daily_dir / f"{DAY.isoformat()}.md").read_text(encoding="utf-8")
+
+        self.assertEqual(text.count("- Event ID:"), 2)
+        self.assertIn("- Late Events Added: 1", text)
+        self.assertIn("- Event Count: 2", text)
+
+
 class SelectionTests(unittest.TestCase):
     def test_an_event_already_in_the_file_is_not_selected(self):
         markdown = "- Event ID: EVT-1\n"
@@ -358,3 +433,262 @@ class PureFunctionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetadataNotLastTests(LateUpdateTestCase):
+    """`_metadata_bounds()` claims to handle a file whose `## Metadata` is not
+    the last section. Nothing executed that claim.
+
+    Its docstring says: *"`end` is exclusive and stops at the next `## `
+    heading so a file whose Metadata is not last is still handled
+    correctly."* Found by tracing which `src/` lines the suite runs — the
+    loop body that implements "stop at the next heading" was never reached,
+    so the sentence was an assertion about untested code.
+
+    It is not a hypothetical arrangement. docs/06 §57 and docs/11 §71 let the
+    COO edit a Daily by hand, and appending a note section after Metadata is
+    the most natural way to do that.
+
+    Behaviour is correct — measured, not assumed. Pinned so it stays that
+    way, because getting it wrong would rewrite or truncate whatever a human
+    put after the Metadata block.
+    """
+
+    HAND_EDITED = (
+        "# DOJOONPASS Company History — 2026-08-01\n"
+        "\n"
+        "## Metadata\n"
+        "\n"
+        "- History Date: 2026-08-01\n"
+        "- Generated At: 2026-08-02T11:00:00+09:00\n"
+        "- Event Count: 0\n"
+        "\n"
+        "## COO Note\n"
+        "\n"
+        "이 아래는 사람이 직접 쓴 것이다.\n"
+    )
+
+    def test_the_metadata_block_ends_at_the_next_heading(self):
+        from daily.late_events import _metadata_bounds
+
+        lines = self.HAND_EDITED.splitlines()
+
+        start, end = _metadata_bounds(lines)
+
+        self.assertEqual(lines[start].strip(), "## Metadata")
+        self.assertEqual(lines[end].strip(), "## COO Note")
+
+    def test_the_late_section_is_inserted_before_metadata(self):
+        updated = append_late_events(
+            self.HAND_EDITED, (candidate("EVT-LATE"),), now_iso=NOW.isoformat()
+        )
+
+        self.assertLess(updated.index(LATE_SECTION_TITLE), updated.index("## Metadata"))
+
+    def test_the_hand_written_trailing_section_is_untouched(self):
+        """§57's whole point: a re-render would discard it."""
+        updated = append_late_events(
+            self.HAND_EDITED, (candidate("EVT-LATE"),), now_iso=NOW.isoformat()
+        )
+
+        self.assertIn("## COO Note", updated)
+        self.assertIn("이 아래는 사람이 직접 쓴 것이다.", updated)
+
+    def test_the_metadata_fields_are_updated_in_place_not_appended_after_it(self):
+        updated = append_late_events(
+            self.HAND_EDITED, (candidate("EVT-LATE"),), now_iso=NOW.isoformat()
+        )
+        lines = updated.splitlines()
+        note_at = next(i for i, line in enumerate(lines) if line.strip() == "## COO Note")
+
+        for field in ("- Last Updated At:", "- Late Events Added:", "- Event Count:"):
+            with self.subTest(field=field):
+                at = next(i for i, line in enumerate(lines) if line.startswith(field))
+                self.assertLess(at, note_at, f"{field} landed after the hand-written section")
+
+
+class SummaryShapedLikeALabelTests(unittest.TestCase):
+    """§38's duplicate guard reads `- Event ID:` lines out of the rendered
+    file -- and the renderer writes the summary raw, as the block's first
+    bullet. A summary of `Event ID: EVT-999` is therefore byte-identical to
+    the label bullet below it.
+
+    Measured before the fix, one ordinary KEEP Candidate:
+
+        existing_event_ids(day)              {'EVT-1', 'EVT-999'}
+        select_late_candidates(day, EVT-999) ()        <- never appended
+        append_late_events(...)              file unchanged
+        `- Event Count: 3`                             <- two real Events
+
+    A genuinely late EVT-999 is dropped on arrival and on every run that
+    revisits the date, with no counter and no log line -- §38 believes it is
+    doing its job. Nothing about the summary is crafted; `Event ID: EVT-999`
+    is also just how someone writes a note to themselves. Seen from the
+    security side it is Event ID spoofing: one Event can suppress a later
+    one by naming it.
+
+    Fixed in `daily/markdown.summary_line_indices()`, which is the renderer's
+    own rule for which bullet is the summary.
+    """
+
+    def _closed_day(self, summary):
+        from daily.markdown import render_daily_markdown
+
+        return render_daily_markdown(DAY, [candidate("EVT-1", summary=summary)], "gen")
+
+    def test_a_summary_naming_another_event_does_not_suppress_it(self):
+        for summary in (
+            "Event ID: EVT-999",
+            "Event ID:  EVT-999 ",
+            "Event ID:\tEVT-999",
+        ):
+            with self.subTest(summary=summary):
+                day = self._closed_day(summary)
+
+                selected = select_late_candidates(day, [candidate("EVT-999")])
+
+                self.assertEqual([c.event_id for c in selected], ["EVT-999"])
+                self.assertNotIn("EVT-999", existing_event_ids(day))
+
+    def test_the_late_event_actually_reaches_the_file(self):
+        day = self._closed_day("Event ID: EVT-999")
+
+        updated = append_late_events(
+            day, select_late_candidates(day, [candidate("EVT-999")]), now_iso="X"
+        )
+
+        self.assertNotEqual(updated, day)
+        self.assertIn(LATE_SECTION_TITLE, updated)
+
+    def test_event_count_is_not_inflated(self):
+        """This half needs no exact match -- any summary opening
+        `Event ID: ` used to add a phantom id to the set."""
+        day = self._closed_day("Event ID: EVT-999 was the blocker.")
+
+        updated = append_late_events(
+            day, select_late_candidates(day, [candidate("EVT-2")]), now_iso="X"
+        )
+
+        self.assertIn("- Event Count: 2", updated)
+
+    def test_a_late_item_can_carry_the_same_shape(self):
+        """The `## Late Events` section's blocks also open with `### `, so
+        the rule has to reach them too."""
+        day = self._closed_day("Shipped it.")
+        updated = append_late_events(
+            day, [candidate("EVT-2", summary="Event ID: EVT-3")], now_iso="X"
+        )
+
+        self.assertEqual(existing_event_ids(updated), {"EVT-1", "EVT-2"})
+        self.assertEqual(
+            [c.event_id for c in select_late_candidates(updated, [candidate("EVT-3")])],
+            ["EVT-3"],
+        )
+
+    def test_a_real_duplicate_is_still_suppressed(self):
+        """The guard must still guard -- the fix narrows it, not disables
+        it."""
+        day = self._closed_day("Event ID: EVT-999")
+
+        self.assertEqual(select_late_candidates(day, [candidate("EVT-1")]), ())
+
+    def test_a_hand_edited_block_still_yields_its_event_id(self):
+        """docs/06 §57. A label bullet moved above the summary is still a
+        label; the block's real id must not go missing, or the item would be
+        appended a second time."""
+        markdown = (
+            "# T\n\n## Milestones\n\n### P\n\n"
+            "- Owner: CTO Backend\n- the real summary\n- Event ID: EVT-H\n"
+        )
+
+        self.assertEqual(existing_event_ids(markdown), {"EVT-H"})
+
+
+class LateSeamFuzzTests(unittest.TestCase):
+    """Seeded fuzz over render -> select -> append -> parse, the whole seam.
+
+    Three properties, all of which the enumerated tests above check one
+    example of:
+
+        no real late Event is suppressed
+        a second late update on the same file is a no-op   (§38)
+        `- Event Count:` equals the number of real Events
+
+    plus the Monthly parser recovering every Event from the result, since
+    that is what the Daily file exists for.
+
+    Pre-fix, over these same 1,000 documents: **98 suppressed late Events
+    and 429 wrong Event Counts.** Seeded, so it is the same documents on
+    every machine and every day.
+    """
+
+    SEED = 20260814
+    SUMMARIES = (
+        "Shipped it.", "Fixed: login token refresh loop.", "Note: paused.",
+        "한글 요약입니다.", "Owner: measured it.", "Event ID: measured it.",
+        "Category: measured it.", "Decision Context: measured it.",
+        "Expected Outcome: measured it.", "Actual Outcome: measured it.",
+        "Lessons Learned: measured it.", "Event ID: E3", "Event ID: L1",
+        "Owner: CTO Backend", "- leading dash", "## prose hash",
+    )
+    PROJECTS = ("SEARCH_BACKEND", "content_os", "한글프로젝트")
+    CATEGORIES = ("DECISION", "MILESTONE", "ISSUE", "LEARNING")
+    TRIALS = 1000
+
+    def _trials(self):
+        import random
+
+        from daily.markdown import render_daily_markdown
+
+        rng = random.Random(self.SEED)
+        for _ in range(self.TRIALS):
+            def make(event_id):
+                return candidate(
+                    event_id,
+                    summary=rng.choice(self.SUMMARIES),
+                    hour=rng.randint(0, 23),
+                    category=rng.choice(self.CATEGORIES),
+                    project=rng.choice(self.PROJECTS),
+                )
+
+            closed = [make("E%d" % i) for i in range(rng.randint(1, 4))]
+            late = [make("L%d" % i) for i in range(rng.randint(1, 3))]
+            yield closed, late, render_daily_markdown(DAY, closed, "gen")
+
+    def test_no_real_late_event_is_suppressed(self):
+        suppressed = [
+            sorted({c.event_id for c in late} - {c.event_id for c in selected})
+            for _closed, late, day in self._trials()
+            for selected in [select_late_candidates(day, late)]
+            if {c.event_id for c in selected} != {c.event_id for c in late}
+        ]
+
+        self.assertEqual(
+            suppressed[:5], [], "%d of %d documents suppressed a real late Event"
+            % (len(suppressed), self.TRIALS)
+        )
+
+    def test_a_second_late_update_is_a_no_op_and_the_count_is_right(self):
+        from monthly.parser import parse_daily_markdown
+
+        repeated, miscounted, unparsed = [], [], []
+        for closed, late, day in self._trials():
+            updated = append_late_events(
+                day, select_late_candidates(day, late), now_iso="X"
+            )
+            again = select_late_candidates(updated, late)
+            if again:
+                repeated.append(sorted(c.event_id for c in again))
+            real = {c.event_id for c in closed} | {c.event_id for c in late}
+            line = next(
+                l for l in updated.splitlines() if l.startswith("- Event Count:")
+            )
+            if int(line.split(":")[1]) != len(real):
+                miscounted.append((line, len(real)))
+            document = parse_daily_markdown(updated, target_date=DAY)
+            if {i.event_id for i in document.items} != real:
+                unparsed.append(sorted(real - {i.event_id for i in document.items}))
+
+        self.assertEqual(repeated[:5], [], "%d re-added a late Event" % len(repeated))
+        self.assertEqual(miscounted[:5], [], "%d wrong Event Count" % len(miscounted))
+        self.assertEqual(unparsed[:5], [], "%d lost before Monthly" % len(unparsed))

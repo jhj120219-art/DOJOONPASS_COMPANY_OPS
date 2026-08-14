@@ -306,6 +306,51 @@ class IntakeBacklog:
     # leaves `incoming/` on the first run, so counting it here would report
     # a file that is on its way out as stuck.
     unreadable_incoming: int = 0
+    # The same staging files one directory earlier, in `incoming/` — the
+    # window between the reporter dying and the next Collector run moving
+    # them to `rejected/`.
+    #
+    # Three directories can hold `.tmp-…json` residue and two of them were
+    # already naming it correctly (`incomplete` for `transport/`,
+    # `rejected_incomplete_write` for `rejected/`). `incoming/` — the one
+    # `write_event_json()` actually stages into — called it an Event.
+    # Measured, one staging file and nothing else:
+    #
+    #     awaiting_collection=1  is_clear=False
+    #     -> ATTENTION "Collector가 아직 가져가지 않은 Event 1건"
+    #
+    # `awaiting_collection` means *promoted by intake but not collected*,
+    # and a staging file was never promoted — the local reporter wrote it
+    # straight into `incoming/`. So it is not that number being reported
+    # loosely; it is a file that does not belong in that number at all.
+    #
+    # Unlike its two siblings this one clears on the next run, because
+    # `collector/runtime.run_once()` does consume it (docs/03's decision,
+    # not a reader-side filter). One run of a wrong name, in the window
+    # right after a crash — which is exactly when someone is reading this.
+    incoming_incomplete_write: int = 0
+    # Staging files (`.tmp-…json`) sitting in `rejected/`, which are not
+    # rejected Events.
+    #
+    # C27 §8 measured this and left it named wrong. `write_event_json()`'s
+    # default directory is `runtime/events/incoming/` and it `mkstemp`s
+    # there, so a Desktop 4 reporter killed mid-write leaves a staging file
+    # in the directory the Collector reads. `collector/runtime.run_once()`
+    # deliberately does not skip it (docs/03's pipeline decides what it
+    # consumes, and changing that is not a reader-side filter), so a
+    # truncated one is REJECTED and moved here under its staging name.
+    #
+    # C27's own words for what remains: *"남는 것은 잘못 이름 붙은 경보
+    # 하나"* — ATTENTION said "Collector가 거부한 Event 1건", and no Event
+    # was rejected; a write stopped. Separating the count needs none of the
+    # pipeline decision C27 was blocked on: it changes what the report is
+    # called, not what the Collector consumes.
+    #
+    # Excluded from `rejected` rather than added to it, for `unparseable`'s
+    # reason: the two need different sentences. A rejected Event means a
+    # Desktop sent something the schema refused; this means a write on this
+    # machine never finished, and the file is safe to delete.
+    rejected_incomplete_write: int = 0
     # Which Desktop each of the three in-flight piles came from. The totals
     # above are unchanged and remain the authority; these only say who.
     #
@@ -328,17 +373,25 @@ class IntakeBacklog:
     def is_clear(self) -> bool:
         """Nothing is in flight.
 
-        Five of the counts above are deliberately outside this: those files
+        Six of the counts above are deliberately outside this: those files
         are not in flight, they are parked, and including them would make
         `is_clear` permanently False for a condition no run can resolve.
 
-            unparseable           intake judged it and will not promote it
-            incomplete            a write that never committed; not an Event
-            already_collected     the same Event, already handled
-            suppressed            blocked by a name that is not it
-            unreadable_incoming   the Collector cannot read it at all
+            unparseable               intake judged it and will not promote it
+            incomplete                a write that never committed; not an Event
+            already_collected         the same Event, already handled
+            suppressed                blocked by a name that is not it
+            unreadable_incoming       the Collector cannot read it at all
+            incoming_incomplete_write the same non-Event as `incomplete`,
+                                      one directory further along
 
-        The last three joined `unparseable` here rather than `future_dated`
+        `incoming_incomplete_write` is the one exception to the "no run can
+        resolve it" reasoning: the next Collector run does move it. It is
+        excluded anyway, because `is_clear` asks whether work is in flight
+        and a write that never committed is not work — the same answer
+        `incomplete` already gets for the same file in `transport/`.
+
+        Three of these joined `unparseable` here rather than `future_dated`
         and `name_collision`, which stay counted: those two are stuck on
         open decisions (BUG-30 / BUG-43), so what "in flight" means for them
         is not settled. For these five it is — nothing pending will move
@@ -696,8 +749,21 @@ def read_company_activity(
         # `transport.run_intake()`'s own `already_elsewhere` check.
         (incoming_dir, processed_dir, rejected_dir),
     )
-    incoming_paths = _json_paths(incoming_dir)
-    rejected_paths = _json_paths(rejected_dir)
+    all_incoming_paths = _json_paths(incoming_dir)
+    # A staging file in `incoming/` is not an Event awaiting collection —
+    # see `IntakeBacklog.incoming_incomplete_write`. Same split, and for the
+    # same reason, as `rejected_paths` below.
+    incoming_paths = [
+        p for p in all_incoming_paths if not _is_incomplete_write(p.name)
+    ]
+    incoming_incomplete = len(all_incoming_paths) - len(incoming_paths)
+    all_rejected_paths = _json_paths(rejected_dir)
+    # A staging file that was rejected is not a rejected Event — see
+    # `IntakeBacklog.rejected_incomplete_write`. Split here rather than at
+    # the two use sites below so the count and the attribution cannot
+    # disagree about which files they describe.
+    rejected_paths = [p for p in all_rejected_paths if not _is_incomplete_write(p.name)]
+    rejected_incomplete = len(all_rejected_paths) - len(rejected_paths)
 
     # Files in `incoming/` that the Collector can never move, because
     # `collector/runtime.run_once()` refuses a destination whose name is
@@ -714,10 +780,19 @@ def read_company_activity(
     # Reconciling the two notions of "already handled" is the decision
     # BUG-43 records; the missing information was the reason the number
     # never moves.
+    # `all_rejected_paths`, not the filtered list: a name is taken in
+    # `rejected/` whether or not the file that took it is a staging one, and
+    # `run_once()` refuses the destination either way.
     taken_names = {path.name for path in processed_paths} | {
-        path.name for path in rejected_paths
+        path.name for path in all_rejected_paths
     }
-    name_collision = sum(1 for path in incoming_paths if path.name in taken_names)
+    # `all_incoming_paths`, not the filtered list, for the mirror image of
+    # the reason `all_rejected_paths` is used just above: `run_once()`
+    # refuses a taken destination whatever the source file is, so a staging
+    # file in `incoming/` is stuck on this forever exactly as an Event would
+    # be. Narrowing the *count* of Events awaiting collection must not
+    # narrow this check.
+    name_collision = sum(1 for path in all_incoming_paths if path.name in taken_names)
 
     # Files the Collector cannot read at all, asked with the Collector's own
     # read. Split out of `awaiting_collection` rather than added to it: they
@@ -745,6 +820,8 @@ def read_company_activity(
             unreadable_incoming=len(unreadable_incoming_paths),
             name_collision=name_collision,
             rejected=len(rejected_paths),
+            incoming_incomplete_write=incoming_incomplete,
+            rejected_incomplete_write=rejected_incomplete,
             awaiting_intake_sources=promotable_sources,
             # Attributed over the same set the count above uses, so
             # `SourceBreakdown.total` keeps its promise of equalling it.

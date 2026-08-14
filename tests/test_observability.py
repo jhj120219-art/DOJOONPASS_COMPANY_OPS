@@ -468,11 +468,26 @@ class ArrivalVersusWorkDateTests(CompanyActivityTestCase):
     """
 
     def _age_file(self, event_id: str, *, days_ago: int):
+        """Set the file's arrival time to `days_ago` days before **NOW**.
+
+        Anchored to NOW, not to `time.time()`. Every assertion in this class
+        is made against NOW (2026-08-10), so aging against the wall clock
+        made the arrival age depend on the calendar date the suite happened
+        to run on: `days_ago=6` meant "2026-08-04" on 2026-08-10 and
+        "2026-08-08" on 2026-08-14, which is 2 days before NOW rather than
+        6 after. Measured -- `test_a_desktop_that_caught_up_is_distinguished_
+        from_a_dead_one` passed every day up to 2026-08-13 and failed on
+        2026-08-14 with no code change, because `caught_up_recently(NOW,
+        days=3)` compares `3 > arrival` and the drifting arrival crossed 3.
+
+        Same class of fixture defect C27 section 12 fixed elsewhere; this one
+        was missed because the wall clock only had to move four days for it
+        to appear.
+        """
         import os
-        import time
 
         path = self.processed / f"{event_id}.json"
-        when = time.time() - days_ago * 86400
+        when = NOW.timestamp() - days_ago * 86400
         os.utime(path, (when, when))
 
     def test_arrival_time_is_reported_separately_from_work_date(self):
@@ -3206,8 +3221,11 @@ class AgentLockIsReportedTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("ops_status_agent_lock", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        # `RUNTIME_DIR` alone. `AGENT_DIR` used to have to be set here too,
+        # and setting only one of them silently pointed the AGENT block at
+        # the developer's real `runtime/agent` — see
+        # `RuntimeDirIsTheOnlyKnobTests`.
         module.RUNTIME_DIR = self.runtime
-        module.AGENT_DIR = self.agent_dir
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             attention = module._print_agent(now or NOW)
@@ -4552,6 +4570,48 @@ class SecretAlreadyInHistoryTests(unittest.TestCase):
             [a for a in items if "Secret 형태의 파일" in a],
         )
 
+    def _case_variants(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_history_case", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        with contextlib.redirect_stdout(io.StringIO()):
+            items = module._print_history(NOW)
+        return [a for a in items if "알아보지 못하는" in a]
+
+    def test_the_case_variant_report_asks_git_before_naming_a_file(self):
+        """E-24's Working Copy half, held to C26's rule.
+
+        The present-file report goes through `_would_reach_the_commit()`
+        exactly as the E-21 line does. Without it, a Working Copy carrying
+        docs/08 §28's `.gitignore` — the *correct* setup — would get a
+        standing alert for a file git is refusing to commit, which is the
+        alert-that-cannot-clear C26 removed once already.
+        """
+        self._init(gitignore="*.PEM\n")
+        self._plant("notes/ID_RSA")   # git will commit this
+        self._plant("IGNORED.PEM")    # git will not
+
+        alerts = self._case_variants()
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("ID_RSA", alerts[0])
+        self.assertNotIn("IGNORED.PEM", alerts[0])
+
+    def test_git_s_own_storage_is_not_named_as_a_working_copy_secret(self):
+        self._init()
+        self._plant("notes/ID_RSA")
+        self._commit()
+
+        alerts = self._case_variants()
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertNotIn(".git", alerts[0])
+
     # ---- the defect ----------------------------------------------------
 
     def test_deleting_the_file_does_not_clear_the_history_exposure(self):
@@ -4689,6 +4749,43 @@ class SecretAlreadyInHistoryTests(unittest.TestCase):
         spec.loader.exec_module(module)
 
         self.assertEqual(module._secrets_ever_committed(self.wc), ("notes/id_rsa",))
+
+    def test_a_case_variant_already_in_history_is_reported(self):
+        """E-24. The gate's comparison is case-sensitive and Windows is not,
+        so `daily/ID_RSA` is precisely the path that reaches the remote —
+        measured, BACKUP_SUCCESS with the key readable via `git show`.
+        Matching only the exact spelling left this report blind at the one
+        place the leak actually happens.
+
+        Widening the report is not widening the gate: `scan_for_secrets()`
+        is untouched and nothing here can fail a backup, which is the
+        property that keeps E-24's real fix behind a decision.
+        """
+        self._init(gitignore=self.SECTION_28)
+        self._plant("daily/ID_RSA")
+        self._commit()
+
+        history, _reaching = self._attention()
+
+        self.assertEqual(len(history), 1, history)
+        self.assertIn("daily/ID_RSA", history[0])
+
+    def test_an_ordinary_history_file_is_still_not_reported(self):
+        """The guard on the widening. Case-folding must not start matching
+        names that are not on the gate's list in any case."""
+        import importlib.util
+
+        self._init()
+        self._plant("daily/2026-08-13.md")
+        self._plant("daily/README.MD")
+        self._commit()
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_probe_case", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module._secrets_ever_committed(self.wc), ())
 
 
 class CaseFoldedScopeDirectoryTests(unittest.TestCase):
@@ -5388,6 +5485,13 @@ class KeptButNotRenderedTests(unittest.TestCase):
 
         Whole lines are compared now, which is the same question the renderer
         answers: `daily/markdown.py` writes exactly `- Event ID: {event_id}`.
+
+        C31 changed *how* that comparison is built, not what it asks. C30
+        took the file's lines apart (`startswith(prefix)`, then slice the
+        prefix off); the line is constructed the way the renderer constructs
+        it now, because the prefix that had to be sliced ends in a space and
+        an empty `event_id` therefore fell off the end of it. See
+        `test_an_empty_event_id_that_was_rendered_is_not_reported`.
         """
         runtime = self._runtime()
         self._candidate(runtime, "E-1", "2026-08-05")
@@ -5432,6 +5536,1049 @@ class KeptButNotRenderedTests(unittest.TestCase):
         import daily.markdown as markdown
 
         self.assertIn("Event ID: {candidate.event_id}", inspect.getsource(markdown))
+
+    def test_an_empty_event_id_that_was_rendered_is_not_reported(self):
+        """The false positive C30's own fix introduced.
+
+        C30 took the rendered line apart — `startswith(prefix)` then slice
+        the prefix off — and the prefix it had to slice ends in a space. An
+        `event_id` of `""` (which `validate_event()` accepts, BACKLOG A-15)
+        renders as `- Event ID: `, whose stripped form is `- Event ID:` and
+        does not start with `- Event ID: `. So a Candidate that was in its
+        Daily file was reported as permanently lost, with a message telling
+        the operator that no run will ever fix it.
+
+        The comparison is built the way the renderer builds it now — take the
+        id, make the line — so there is no prefix to fall off the end of.
+        """
+        runtime = self._runtime()
+        self._candidate(runtime, "", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_an_empty_event_id_that_was_not_rendered_is_still_reported(self):
+        """The guard above must not be a blanket exemption — an id of `""`
+        that really is absent is the same loss as any other."""
+        runtime = self._runtime()
+        self._candidate(runtime, "", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-OTHER")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("2026-08-05", alerts[0])
+
+    def test_a_trailing_space_in_an_id_still_matches_its_own_line(self):
+        """Same class, other end: the renderer writes the id verbatim, and
+        Markdown's trailing whitespace does not survive a `strip()` on either
+        side. Constructing the line strips both, so they still meet."""
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-PAD ", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-PAD ")
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+
+class RuntimeDirIsTheOnlyKnobTests(unittest.TestCase):
+    """Redirecting `RUNTIME_DIR` must fully isolate this view.
+
+    It used not to. `AGENT_DIR = RUNTIME_DIR / "agent"` was a module-level
+    constant, so it froze at import: a caller that redirected `RUNTIME_DIR`
+    got a fixture for three blocks and the **developer's real machine** for
+    the AGENT block, with nothing saying so.
+
+    Measured during C31, and not hypothetically — a probe pointed
+    `RUNTIME_DIR` at a temp tree holding a future-dated `agent_state.json`,
+    read back "agent has not run for 3 day(s)" from this repository's own
+    runtime, and nearly recorded a working check as missing.
+
+    C13's 결함 2 in a second place, and its wording applies verbatim:
+    *"a test calling it directly picked up the repository's own live
+    manifest — which said SUCCESS — and got exit 0 for a Backup failure."*
+
+    Two properties, because either alone can rot. The path has to be derived
+    on call, and no other module-level name may re-freeze it.
+    """
+
+    def _module(self, runtime):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_one_knob", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        return module
+
+    def test_redirecting_runtime_dir_alone_isolates_the_agent_view(self):
+        import contextlib
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        runtime.mkdir()
+
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_agent(NOW)
+
+        # An empty runtime has no agent at all. Reading anything else means
+        # it reached outside the fixture.
+        self.assertIn("Agent가 설정되어 있지 않다", buffer.getvalue())
+        self.assertEqual(attention, [])
+
+    def test_the_agent_lock_path_follows_it_too(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        runtime.mkdir()
+
+        module = self._module(runtime)
+
+        self.assertEqual(
+            module._agent_lock_path(), runtime / "agent" / "locks" / "agent.lock"
+        )
+
+    def test_no_module_level_constant_re_freezes_a_runtime_path(self):
+        """The structural half. A new `FOO = RUNTIME_DIR / ...` at import
+        time would reintroduce exactly this, and would pass every behavioural
+        test above until somebody redirected only `RUNTIME_DIR`."""
+        import ast
+
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+
+        frozen = []
+        for node in tree.body:  # module level only
+            if not isinstance(node, ast.Assign):
+                continue
+            names = {
+                sub.id for sub in ast.walk(node.value) if isinstance(sub, ast.Name)
+            }
+            if "RUNTIME_DIR" in names:
+                frozen.extend(
+                    t.id for t in node.targets if isinstance(t, ast.Name)
+                )
+
+        self.assertEqual(
+            frozen,
+            [],
+            "these freeze a path from RUNTIME_DIR at import time; derive them "
+            f"in a function instead (see `_agent_dir()`): {frozen}",
+        )
+
+
+class FutureDatedStatePointerTests(unittest.TestCase):
+    """NEW. A state pointer dated ahead of the calendar stops Company History
+    permanently, and every existing indicator calls it healthy.
+
+    C17 found and reported this shape for the **Agent's** state file, and
+    `agent/status.py` still says it in these words: *"agent state says it has
+    collected through X, which is in the future … nothing will be collected
+    until that date arrives"*. The Runner's own two state files make the
+    identical claim and nobody had asked them.
+
+    `scheduler._generate_pending_dates()` computes `start = pointer + 1 day`
+    and `end = yesterday`, so a future pointer makes `start > end` and the
+    loop runs zero times. `monthly.pending_months()` does the same one
+    granularity up. Neither walks backwards — which is correct, and which is
+    exactly why nothing recovers on its own.
+
+    `check_state_consistency()` cannot see it: it asks only whether the
+    claimed Daily file **exists**, and in the reachable version of this it
+    does — the Scheduler wrote it while the clock was skewed.
+
+    Measured end to end, pointer `2026-12-25` with that file present, "now"
+    2026-08-14, one KEEP Candidate waiting for 2026-08-12:
+
+        scheduler.run_once()   COMPLETED, generated=()
+        state consistency      CONSISTENT
+        ATTENTION              (nothing)
+
+    Four months of Company History would not be written, and the Candidates
+    would pile up unrendered with every signal green.
+
+    Reachable through clock skew later corrected (a dead CMOS battery, an NTP
+    jump, a VM resumed with a stale clock) or a state file restored from a
+    machine that had one — the two causes C17 records for the Agent side.
+
+    Detection only. Repairing means deciding which date Company History
+    resumes from: docs/10 §46's prohibition and §64's operator call.
+    """
+
+    NOW = datetime(2026, 8, 14, 11, 0).astimezone()
+
+    def _runtime(self, *, daily_pointer=None, monthly_pointer=None):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "local_master/daily", "local_master/monthly", "state",
+                    "events/processed", "events/incoming", "events/transport",
+                    "events/rejected", "locks"):
+            (runtime / rel).mkdir(parents=True)
+        if daily_pointer is not None:
+            (runtime / "local_master" / "daily" / f"{daily_pointer}.md").write_text(
+                "# d\n", encoding="utf-8"
+            )
+            (runtime / "state" / "daily_history_state.json").write_text(
+                json.dumps({"last_successful_daily_close": daily_pointer}),
+                encoding="utf-8",
+            )
+        if monthly_pointer is not None:
+            (runtime / "local_master" / "monthly" / f"{monthly_pointer}.md").write_text(
+                "# m\n\n## Metadata\n\n- Consolidated Items: 0\n", encoding="utf-8"
+            )
+            (runtime / "state" / "monthly_history_state.json").write_text(
+                json.dumps(
+                    {"last_successful_monthly_close": monthly_pointer, "dirty_months": []}
+                ),
+                encoding="utf-8",
+            )
+        return runtime
+
+    def _alerts(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_future", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(self.NOW)
+        return buffer.getvalue(), [a for a in attention if "미래" in a]
+
+    # ---- the defect, through the real Scheduler --------------------------
+
+    def test_the_scheduler_really_does_stop_and_report_success(self):
+        """Reachability, not a fixture. This is why the alert is needed."""
+        from history import HistoryCandidate, HistoryDecision
+        from history.file_repository import FileHistoryRepository
+        from scheduler import run_once as scheduler_run_once
+        from scheduler.consistency import check_state_consistency
+
+        runtime = self._runtime(daily_pointer="2026-12-25")
+        daily_dir = runtime / "local_master" / "daily"
+        state_path = runtime / "state" / "daily_history_state.json"
+        repository = FileHistoryRepository(
+            keep_dir=runtime / "history_candidates" / "keep",
+            review_dir=runtime / "history_candidates" / "review",
+        )
+        repository.save(
+            HistoryCandidate(
+                history_id="HIST-A", event_id="EVT-A",
+                timestamp="2026-08-12T10:00:00+09:00", category="MILESTONE",
+                project_id="P", role="COO", summary="real work",
+                evidence=(), filter_result=HistoryDecision.KEEP,
+            )
+        )
+
+        result = scheduler_run_once(
+            repository,
+            history_start_date=date(2026, 8, 1),
+            now=self.NOW,
+            state_path=state_path,
+            daily_output_dir=daily_dir,
+            already_locked=True,
+        )
+        consistency = check_state_consistency(state_path, daily_dir)
+
+        self.assertEqual(result.generated_dates, ())
+        self.assertEqual(result.status.value, "COMPLETED")
+        self.assertEqual(consistency.status.value, "CONSISTENT")
+        self.assertFalse((daily_dir / "2026-08-12.md").exists())
+
+    def test_a_future_daily_pointer_is_reported(self):
+        runtime = self._runtime(daily_pointer="2026-12-25")
+
+        output, alerts = self._alerts(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("2026-12-25", alerts[0])
+        self.assertIn("2026-08-14", alerts[0])
+        self.assertIn("미래 날짜", output)
+
+    def test_a_future_monthly_pointer_is_reported(self):
+        runtime = self._runtime(monthly_pointer="2027-06")
+
+        output, alerts = self._alerts(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("2027-06", alerts[0])
+        self.assertIn("미래 달", output)
+
+    def test_both_are_reported_separately(self):
+        runtime = self._runtime(daily_pointer="2026-12-25", monthly_pointer="2027-06")
+
+        _output, alerts = self._alerts(runtime)
+
+        self.assertEqual(len(alerts), 2, alerts)
+
+    def test_the_message_says_no_run_will_resolve_it(self):
+        runtime = self._runtime(daily_pointer="2026-12-25")
+
+        _output, alerts = self._alerts(runtime)
+
+        self.assertIn("사람이", alerts[0])
+        self.assertIn("생성되지 않는다", alerts[0])
+
+    # ---- the false-alarm guards ----------------------------------------
+
+    def test_a_healthy_pair_is_not_reported(self):
+        runtime = self._runtime(daily_pointer="2026-08-13", monthly_pointer="2026-07")
+
+        _output, alerts = self._alerts(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_the_boundary_is_not_reported(self):
+        """`end` is always yesterday and §49 forbids the current month, so a
+        pointer AT today / at this month cannot come from a healthy run
+        either — but it also causes no permanent stop, and a check that fires
+        one day early on a boundary is how a section stops being read."""
+        runtime = self._runtime(daily_pointer="2026-08-14", monthly_pointer="2026-08")
+
+        _output, alerts = self._alerts(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_no_state_at_all_is_not_reported(self):
+        runtime = self._runtime()
+
+        _output, alerts = self._alerts(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_the_agent_side_already_answered_this_question(self):
+        """Pins the precedent this applies. If the Agent check is ever
+        removed, that is a policy change and this stops being "applying an
+        answer the project already gave"."""
+        import inspect
+
+        from agent.status import AgentStatusSnapshot
+
+        source = inspect.getsource(AgentStatusSnapshot.needs_attention)
+
+        self.assertIn("which is in the future", source)
+
+    # ---- the third member: a future timestamp that BLINDS a check --------
+    #
+    # `backup_state.last_successful_backup` is compared against the **real**
+    # clock, not this class's pinned `NOW` — it and the file mtimes it is
+    # weighed against are both real-time measurements, and mixing the two is
+    # the trap `_healthy_backup_state()` names. So these two fixtures are
+    # unconditionally past and unconditionally future, at any date this
+    # suite could ever run on. A value chosen relative to today is precisely
+    # the time bomb this sprint removed from `ArrivalVersusWorkDateTests`.
+    FAR_FUTURE_ISO = "9999-01-01T09:00:00+09:00"
+    FAR_PAST_ISO = "2000-01-01T09:00:00+09:00"
+
+    def _backup_runtime(self, last_backup_iso):
+        runtime = self._runtime()
+        (runtime / "local_master" / "daily" / "2026-08-13.md").write_text(
+            "# a real, never-pushed day\n", encoding="utf-8"
+        )
+        (runtime / "state" / "backup_state.json").write_text(
+            json.dumps(
+                {
+                    "last_successful_backup": last_backup_iso,
+                    "backup_status": "BACKUP_SUCCESS",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return runtime
+
+    def _backup_alerts(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_backup_future", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(self.NOW)
+        return (
+            [a for a in attention if "미래 시각" in a],
+            [a for a in attention if "원격 백업에 도달하지 않은" in a],
+        )
+
+    def test_a_future_backup_timestamp_silences_the_unbacked_history_check(self):
+        """CHARACTERIZATION of the damage — the worst member of this family.
+
+        The two state pointers stop *work*; this one silences a *safety
+        check*. `_history_newer_than_the_last_backup()` asks "was this written
+        after the last successful push", and a timestamp ahead of the calendar
+        makes that true of nothing. Measured with one real never-pushed Daily
+        present:
+
+            last_successful_backup 2026-08-01  -> 1 alert  (correct)
+            last_successful_backup 2027-05-01  -> 0 alerts
+
+        Company History that is only on this machine reads as safe.
+        """
+        _future, unbacked = self._backup_alerts(
+            self._backup_runtime(self.FAR_FUTURE_ISO)
+        )
+
+        self.assertEqual(unbacked, [])
+
+    def test_the_operator_is_told_why_that_check_is_silent(self):
+        """The fix: the silence itself is reported, before the silent line."""
+        future, unbacked = self._backup_alerts(
+            self._backup_runtime(self.FAR_FUTURE_ISO)
+        )
+
+        self.assertEqual(len(future), 1, future)
+        self.assertIn("9999-01-01", future[0])
+        self.assertIn("안전하다는 뜻이 아니다", future[0])
+        self.assertEqual(unbacked, [])
+
+    def test_an_ordinary_backup_timestamp_is_not_reported(self):
+        future, unbacked = self._backup_alerts(
+            self._backup_runtime(self.FAR_PAST_ISO)
+        )
+
+        self.assertEqual(future, [])
+        self.assertEqual(len(unbacked), 1, "the real check must still work")
+
+    def test_a_runner_finishing_a_moment_later_is_not_skew(self):
+        """The false alarm this check nearly shipped with, and the reason for
+        the tolerance.
+
+        `ops_status.py` promises it is safe to run while the Runner is
+        running, and `main()` takes its clock reading once at the top. A
+        Backup that completes a few hundred milliseconds later legitimately
+        writes a `last_successful_backup` after that reading. Reporting it as
+        clock skew would put a line in ATTENTION on a perfectly healthy
+        machine, every time an operator ran the two together.
+
+        Caught by two existing "needs no attention" fixtures failing, not by
+        reading the code — `_healthy_backup_state()` writes real-clock now on
+        purpose, which is the same situation one second wide.
+
+        The harm scales with the distance, so the tolerance is the right
+        instrument: an hour ahead blinds the unbacked-History check for an
+        hour and heals itself; months ahead is what the alert is for.
+        """
+        import contextlib
+        import importlib.util
+        from datetime import timedelta
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+
+        for label, delta, expected in (
+            ("runner finishing", timedelta(seconds=1), 0),
+            ("minor jitter", timedelta(minutes=5), 0),
+            ("just inside", timedelta(minutes=59), 0),
+            ("real skew", timedelta(hours=3), 1),
+            ("gross skew", timedelta(days=300), 1),
+        ):
+            with self.subTest(case=label):
+                stamp = (datetime.now().astimezone() + delta).isoformat()
+                runtime = self._backup_runtime(stamp)
+                spec = importlib.util.spec_from_file_location(
+                    f"ops_status_tolerance_{label.replace(' ', '_')}", path
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                module.RUNTIME_DIR = runtime
+                with contextlib.redirect_stdout(io.StringIO()):
+                    attention = module._print_history(datetime.now().astimezone())
+
+                self.assertEqual(
+                    len([a for a in attention if "미래 시각" in a]), expected
+                )
+
+    def test_a_naive_timestamp_is_compared_without_raising(self):
+        """`backup_state.json` can carry an offset-less timestamp through a
+        hand edit, and comparing naive to aware raises TypeError — the same
+        guard `_history_newer_than_the_last_backup()` already applies."""
+        for iso, expect_future in (
+            (self.FAR_FUTURE_ISO.removesuffix("+09:00"), 1),
+            (self.FAR_PAST_ISO.removesuffix("+09:00"), 0),
+        ):
+            with self.subTest(iso=iso):
+                future, _unbacked = self._backup_alerts(self._backup_runtime(iso))
+
+                self.assertEqual(len(future), expect_future, future)
+
+
+class AttentionLineForgeryTests(unittest.TestCase):
+    """NEW, **security**. BUG-6's shape in the view an operator reads first.
+
+    `event_id` crosses the OneDrive transport from another Desktop and
+    docs/02 constrains it only to "present and non-null" (BACKLOG A-15), so a
+    newline inside one is accepted, stored, and interpolated into
+    `ops_status.py`'s ATTENTION messages by `_kept_but_not_rendered()`,
+    `find_orphaned_events()` and `_candidates_before()`.
+
+    Measured before the fix — one KEEP Candidate whose `event_id` began
+    ``"X\\n  ! 모든 검사 통과 — 사람이 지금 할 일은 없다"``:
+
+        ! KEEP Candidate 1건이 저장돼 있는데 … 없다: X
+        ! 모든 검사 통과 — 사람이 지금 할 일은 없다 (2026-08-05) — …
+
+    The second line is entirely attacker-authored, sits inside ATTENTION with
+    the same `  ! ` prefix as a genuine finding, and says the opposite of what
+    the section is reporting. AGENT.md §6 tells an operator to read this view
+    **first**, which makes it the highest-value place in the system to forge
+    a line.
+
+    `oplog.one_line()` closed exactly this for `collector.log` (BUG-6 / C10)
+    and this file already accepted the argument for Run Manifest metrics —
+    *"the rule that nothing read back from disk can forge a line should not
+    depend on today's metric list staying the way it is"*. The metrics were
+    the smaller half; the ATTENTION lines carry the untrusted ids.
+
+    Guarded at the sink (`main()`'s print loop), so a message added later is
+    covered without its author having to know.
+    """
+
+    FORGED_TAIL = "  ! 모든 검사 통과 — 사람이 지금 할 일은 없다"
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "local_master/daily", "local_master/monthly", "state",
+                    "events/processed", "events/incoming", "events/transport",
+                    "events/rejected", "locks"):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _module(self, runtime):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_forgery", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        return module
+
+    def _plant_candidate(self, runtime, event_id):
+        (runtime / "history_candidates" / "keep" / "HIST-FORGE.json").write_text(
+            json.dumps(
+                {
+                    "history_id": "HIST-FORGE", "event_id": event_id,
+                    "timestamp": "2026-08-05T10:00:00+09:00", "category": "MILESTONE",
+                    "project_id": "P", "role": "COO", "summary": "s",
+                    "evidence": [], "filter_result": "KEEP",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (runtime / "local_master" / "daily" / "2026-08-05.md").write_text(
+            "# H\n\n## Milestones\n\n- Event ID: OTHER\n", encoding="utf-8"
+        )
+
+    def _main_output(self, runtime):
+        import contextlib
+
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module.main()
+        return buffer.getvalue()
+
+    # ---- the defect ------------------------------------------------------
+
+    def test_a_newline_in_an_event_id_cannot_forge_an_attention_line(self):
+        runtime = self._runtime()
+        self._plant_candidate(runtime, "X\n" + self.FORGED_TAIL)
+
+        printed = self._main_output(runtime)
+
+        forged = [
+            line for line in printed.splitlines() if line == self.FORGED_TAIL
+        ]
+        self.assertEqual(forged, [], printed)
+        # The id is escaped, not stripped — the message still names it.
+        self.assertIn("\\n", printed)
+
+    def test_every_attention_line_starts_with_the_marker(self):
+        """The structural property, stated once: inside the ATTENTION block
+        there is exactly one line per item and each carries the prefix."""
+        runtime = self._runtime()
+        self._plant_candidate(runtime, "X\n" + self.FORGED_TAIL)
+
+        printed = self._main_output(runtime)
+        block = printed.split("ATTENTION\n", 1)[1].splitlines()[1:]
+
+        self.assertTrue(block)
+        for line in block:
+            with self.subTest(line=line[:40]):
+                self.assertTrue(line.startswith("  ! "), line)
+
+    def test_other_line_breaking_characters_are_covered_too(self):
+        """`one_line()` escapes every character `str.splitlines()` breaks on,
+        not just `\\n` — the reason it exists rather than a `replace()`."""
+        for raw in ("A\rB", "A\x0bB", "A\x0cB", "A\x1cB", "A B", "AB"):
+            with self.subTest(raw=repr(raw)):
+                runtime = self._runtime()
+                self._plant_candidate(runtime, raw)
+
+                printed = self._main_output(runtime)
+                block = printed.split("ATTENTION\n", 1)[1].splitlines()[1:]
+
+                for line in block:
+                    self.assertTrue(line.startswith("  ! "), line)
+
+    def test_an_ordinary_id_is_printed_unchanged(self):
+        """The guard must not rewrite normal messages."""
+        runtime = self._runtime()
+        self._plant_candidate(runtime, "EVT-ORDINARY")
+
+        printed = self._main_output(runtime)
+
+        self.assertIn("EVT-ORDINARY (2026-08-05)", printed)
+        self.assertNotIn("\\n", printed)
+
+    def test_the_orphaned_event_block_is_guarded_too(self):
+        """Not only ATTENTION: the HISTORY block prints orphaned ids with the
+        same `!` prefix and fixed indentation a forged line would imitate."""
+        runtime = self._runtime()
+        (runtime / "events" / "processed" / "EVT.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0", "event_id": "X\n" + self.FORGED_TAIL,
+                    "timestamp": "2026-08-05T10:00:00+09:00", "source": "DESKTOP_1",
+                    "role": "CTO_BACKEND", "project_id": "P",
+                    "event_type": "MILESTONE_COMPLETED", "status": "IN_PROGRESS",
+                    "summary": "s", "history_candidate": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        printed = self._main_output(runtime)
+
+        self.assertEqual(
+            [line for line in printed.splitlines() if line == self.FORGED_TAIL],
+            [],
+            printed,
+        )
+
+
+class RejectedStagingResidueTests(unittest.TestCase):
+    """An alert that named the wrong thing, corrected without touching the
+    pipeline it was blamed on.
+
+    C27 §8 measured this and left it: `write_event_json()`'s default
+    directory is `runtime/events/incoming/` and it `mkstemp`s there, so a
+    Desktop 4 reporter killed mid-write leaves `.tmp-….json` in the one
+    directory the Collector reads. `collector/runtime.run_once()`
+    deliberately does not skip it, so a truncated one is REJECTED and moves
+    to `rejected/` under its staging name — and ATTENTION then said
+
+        Collector가 거부한 Event 1건 — 사람이 확인해야 한다
+
+    C27's own summary of what remained: *"남는 것은 잘못 이름 붙은 경보
+    하나"*. Nothing was rejected. A write on this machine stopped, no
+    Desktop sent anything, and the sentence sends an operator to look at the
+    wrong machine.
+
+    C27 judged that correcting it "means changing what the Collector consumes
+    from `incoming/`, which is docs/03's processing pipeline rather than a
+    reader's filter". That is true of *stopping* the Collector from consuming
+    them, and this sprint changed none of it — `ArchitectureInvariant`'s
+    boundary test still pins that `run_once()` consumes them. It is not true
+    of what the **report** calls the result.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("events/transport", "events/incoming", "events/processed",
+                    "events/rejected", "history_candidates/keep",
+                    "history_candidates/review", "local_master/daily",
+                    "local_master/monthly", "state", "locks"):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _snapshot(self, runtime):
+        from app.desktop_activity import read_company_activity
+
+        return read_company_activity(
+            processed_dir=runtime / "events" / "processed",
+            transport_dir=runtime / "events" / "transport",
+            incoming_dir=runtime / "events" / "incoming",
+            rejected_dir=runtime / "events" / "rejected",
+        )
+
+    def _alerts(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_residue", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_company(NOW)
+        return buffer.getvalue(), attention
+
+    def test_a_staging_file_in_rejected_is_not_a_rejected_event(self):
+        runtime = self._runtime()
+        (runtime / "events" / "rejected" / ".tmp-abandoned.json").write_text(
+            '{"event_id": "EV', encoding="utf-8"
+        )
+
+        backlog = self._snapshot(runtime).backlog
+
+        self.assertEqual(backlog.rejected, 0)
+        self.assertEqual(backlog.rejected_incomplete_write, 1)
+
+    def test_the_alert_no_longer_claims_an_event_was_rejected(self):
+        runtime = self._runtime()
+        (runtime / "events" / "rejected" / ".tmp-abandoned.json").write_text(
+            '{"event_id": "EV', encoding="utf-8"
+        )
+
+        output, attention = self._alerts(runtime)
+
+        rejected_event_alerts = [a for a in attention if "거부한 Event" in a]
+        residue_alerts = [a for a in attention if "중단된 쓰기 잔여물" in a]
+        self.assertEqual(rejected_event_alerts, [])
+        self.assertEqual(len(residue_alerts), 1, attention)
+        self.assertIn("지워도", residue_alerts[0])
+        self.assertIn("rejected_incomplete_write=1", output)
+
+    def test_a_real_rejected_event_still_gets_its_own_sentence(self):
+        """The guard on the split: the message that was right must stay."""
+        runtime = self._runtime()
+        (runtime / "events" / "rejected" / "badrole.json").write_text(
+            json.dumps({"event_id": "EVT-BAD", "source": "DESKTOP_1"}), encoding="utf-8"
+        )
+
+        _output, attention = self._alerts(runtime)
+
+        rejected_event_alerts = [a for a in attention if "거부한 Event" in a]
+        self.assertEqual(len(rejected_event_alerts), 1, attention)
+        self.assertIn("1건", rejected_event_alerts[0])
+        self.assertEqual([a for a in attention if "중단된 쓰기 잔여물" in a], [])
+
+    def test_both_kinds_are_reported_separately(self):
+        runtime = self._runtime()
+        (runtime / "events" / "rejected" / "badrole.json").write_text(
+            json.dumps({"event_id": "EVT-BAD", "source": "DESKTOP_1"}), encoding="utf-8"
+        )
+        (runtime / "events" / "rejected" / ".tmp-abandoned.json").write_text(
+            '{"event_id": "EV', encoding="utf-8"
+        )
+
+        backlog = self._snapshot(runtime).backlog
+
+        self.assertEqual(backlog.rejected, 1)
+        self.assertEqual(backlog.rejected_incomplete_write, 1)
+        # The attribution describes the same set the count does.
+        self.assertEqual(backlog.rejected_sources.total, 1)
+
+    def test_a_staging_name_still_blocks_the_name_in_incoming(self):
+        """`name_collision` asks a different question — whether the
+        destination name is taken — and a staging file takes it just as
+        firmly. Splitting the *count* must not narrow that check (BUG-43)."""
+        runtime = self._runtime()
+        (runtime / "events" / "rejected" / ".tmp-abandoned.json").write_text(
+            '{"event_id": "EV', encoding="utf-8"
+        )
+        (runtime / "events" / "incoming" / ".tmp-abandoned.json").write_text(
+            '{"event_id": "EV', encoding="utf-8"
+        )
+
+        backlog = self._snapshot(runtime).backlog
+
+        self.assertEqual(backlog.name_collision, 1)
+
+    def test_the_collector_boundary_is_unchanged(self):
+        """This sprint changed the report, not what the Collector consumes.
+        The boundary itself stays pinned where C27 put it."""
+        import inspect
+
+        from collector import runtime as collector_runtime
+
+        source = inspect.getsource(collector_runtime.run_once)
+
+        self.assertNotIn("is_incomplete_write", source)
+
+
+class MonthlyCountsMoreThanItShowsTests(unittest.TestCase):
+    """A Monthly History that counted an item it did not write down.
+
+    The Daily-side sibling of this drop is already characterized
+    (`test_daily_history.py::
+    test_a_category_less_keep_candidate_silently_loses_its_detail`): a
+    candidate whose category is not one of the four is filed under no
+    section. Nobody had aimed the same question at Monthly, where it is
+    strictly worse -- Daily at least leaves the bare summary in `## Summary`
+    and the id in `## Evidence`, and Monthly has neither, so the Event
+    disappears completely.
+
+    Measured, `render_monthly_markdown()` with two items, one carrying
+    `category="Decision"`:
+
+        - Consolidated Items: 2
+        sections            : Major Decisions, Source Records, Metadata
+        `EVT-2` in the file : False
+
+    and `consolidate_month()` returned `MONTHLY_GENERATED, item_count=2`.
+    Every indicator healthy, one month of Company History one Event short.
+
+    Reachable without corruption or an attacker. A `## Late Events` item
+    states its own category on a `- Category:` bullet in the Daily file
+    (docs/06 §37), `monthly/parser.py` reads that bullet verbatim, and
+    docs/06 §57 / docs/11 §71 explicitly permit the COO to edit a Daily
+    History by hand. One hand-typed `- Category: Decision` deletes that Event
+    from the month, permanently -- rebuilding produces the same file.
+
+    NOT FIXED, reported. Which section an unrecognised category belongs in is
+    a docs/09 §14 rendering decision. What needed no decision is that the
+    file states its own total two lines below the items it dropped.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "local_master/daily", "local_master/monthly", "state",
+                    "events/processed", "locks"):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _monthly(self, runtime, key, *, claimed, event_ids):
+        body = ["# DOJOONPASS Company History — " + key, "", "## Major Decisions", ""]
+        for event_id in event_ids:
+            body.extend([f"### P", "", "- s", f"- Event ID: {event_id}", ""])
+        body.extend(["## Metadata", "", f"- History Month: {key}",
+                     f"- Consolidated Items: {claimed}"])
+        (runtime / "local_master" / "monthly" / f"{key}.md").write_text(
+            "\n".join(body) + "\n", encoding="utf-8"
+        )
+
+    def _run(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_monthly_short", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "적게 기록한 달" in a]
+
+    # ---- the defect, through the real renderer --------------------------
+
+    def test_the_real_renderer_drops_an_unrecognised_category_and_still_counts_it(self):
+        """Reachability, not a hand-built fixture. This is the defect."""
+        from monthly.markdown import MonthlyItem, render_monthly_markdown
+
+        items = [
+            MonthlyItem(event_id="EVT-1", category="DECISION", project="Ops",
+                        summary="kept", owner="COO", source_date=date(2026, 8, 5)),
+            MonthlyItem(event_id="EVT-2", category="Decision", project="Ops",
+                        summary="lost", owner="COO", source_date=date(2026, 8, 6)),
+        ]
+        text = render_monthly_markdown(
+            year=2026, month=8, items=items,
+            source_dates=[date(2026, 8, 5), date(2026, 8, 6)],
+            generated_at="2026-09-01T11:00:00+09:00", coverage="COMPLETE",
+        )
+
+        self.assertIn("- Consolidated Items: 2", text)
+        self.assertNotIn("EVT-2", text)
+        self.assertNotIn("lost", text)
+        self.assertEqual(text.count("- Event ID: "), 1)
+
+    def test_a_shortfall_is_reported(self):
+        runtime = self._runtime()
+        self._monthly(runtime, "2026-08", claimed=2, event_ids=("EVT-1",))
+
+        output, alerts = self._run(runtime)
+
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("2026-08(2→1)", alerts[0])
+        self.assertIn("Monthly 항목 누락", output)
+
+    def test_the_message_says_a_rebuild_will_not_help(self):
+        """The one thing an operator would try first, and it produces the
+        same file — the category is in the Daily, not in the run."""
+        runtime = self._runtime()
+        self._monthly(runtime, "2026-08", claimed=3, event_ids=("EVT-1",))
+
+        _output, alerts = self._run(runtime)
+
+        self.assertIn("다시 만들어도 같은 결과", alerts[0])
+        self.assertIn("- Category:", alerts[0])
+
+    # ---- the false-alarm guards ----------------------------------------
+
+    def test_a_consistent_month_is_not_reported(self):
+        runtime = self._runtime()
+        self._monthly(runtime, "2026-08", claimed=2, event_ids=("EVT-1", "EVT-2"))
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_an_empty_month_is_not_reported(self):
+        """docs/09 §71-73: a month with nothing material still gets a file,
+        with zero items and zero Event ID lines."""
+        runtime = self._runtime()
+        (runtime / "local_master" / "monthly" / "2026-07.md").write_text(
+            "# DOJOONPASS Company History — 2026-07\n\n"
+            "## Executive Summary\n\n"
+            "No material company-level changes were recorded during this month.\n\n"
+            "## Metadata\n\n- Consolidated Items: 0\n",
+            encoding="utf-8",
+        )
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_a_hand_added_entry_is_not_reported(self):
+        """docs/06 §57's Monthly equivalent. More items than the count is an
+        edit, not a loss, and a standing line for doing what the spec allows
+        is the alert-that-cannot-clear this project keeps removing."""
+        runtime = self._runtime()
+        self._monthly(runtime, "2026-08", claimed=1, event_ids=("EVT-1", "EVT-HAND"))
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_a_month_with_no_count_line_is_skipped(self):
+        runtime = self._runtime()
+        (runtime / "local_master" / "monthly" / "2026-08.md").write_text(
+            "# Title\n\n## Major Decisions\n\n- Event ID: EVT-1\n\n## Metadata\n\n"
+            "- History Month: 2026-08\n",
+            encoding="utf-8",
+        )
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_an_unparseable_count_is_skipped_not_guessed(self):
+        runtime = self._runtime()
+        (runtime / "local_master" / "monthly" / "2026-08.md").write_text(
+            "# Title\n\n## Metadata\n\n- Consolidated Items: many\n", encoding="utf-8"
+        )
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_a_staging_file_is_not_a_month(self):
+        """`.tmp-*.md` is an unfinished write (C27), and a truncated one is
+        exactly "claims more than it shows" by construction."""
+        runtime = self._runtime()
+        (runtime / "local_master" / "monthly" / ".tmp-2026-08.md").write_text(
+            "# Title\n\n## Metadata\n\n- Consolidated Items: 9\n", encoding="utf-8"
+        )
+
+        _output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+
+    def test_an_undecodable_month_does_not_break_the_view(self):
+        runtime = self._runtime()
+        (runtime / "local_master" / "monthly" / "2026-08.md").write_bytes(
+            b"\xff\xfe\x00 not utf-8 \xff"
+        )
+
+        output, alerts = self._run(runtime)
+
+        self.assertEqual(alerts, [])
+        self.assertIn("HISTORY", output)
+
+    def test_a_forged_event_id_line_in_a_summary_hides_a_real_shortfall(self):
+        """CHARACTERIZATION of this check's own limit — asked of it the same
+        way every other detector in this repository is asked of itself.
+
+        A summary is rendered unescaped (BUG-11/27, an open docs/06 rendering
+        decision), so a summary carrying a newline and `- Event ID: …` adds a
+        line this check counts. Measured, two items — one dropped for its
+        category, one whose summary forges a line:
+
+            - Consolidated Items: 2
+            `- Event ID: ` lines    2
+            EVT-2 in the file       False
+            this check              () -- silent
+
+        The direction matters and is the reason this is acceptable rather
+        than a defect in the check: a forgery can only RAISE `rendered`, so
+        it can silence this check and can never make it cry wolf. Counting
+        `### ` headings instead is defeated by the same root — the defect is
+        that a summary can write arbitrary Markdown at all.
+
+        If this starts failing, either BUG-11/27 was closed (summaries are
+        escaped) or the counting changed; both need BACKLOG updated.
+        """
+        from monthly.markdown import MonthlyItem, render_monthly_markdown
+
+        runtime = self._runtime()
+        text = render_monthly_markdown(
+            year=2026,
+            month=8,
+            items=[
+                MonthlyItem(event_id="EVT-1", category="DECISION", project="Ops",
+                            summary="ok\n- Event ID: FORGED", owner="COO",
+                            source_date=date(2026, 8, 5)),
+                MonthlyItem(event_id="EVT-2", category="Decision", project="Ops",
+                            summary="dropped by category", owner="COO",
+                            source_date=date(2026, 8, 6)),
+            ],
+            source_dates=[date(2026, 8, 5)],
+            generated_at="2026-09-01T11:00:00+09:00",
+            coverage="COMPLETE",
+        )
+        (runtime / "local_master" / "monthly" / "2026-08.md").write_text(
+            text, encoding="utf-8"
+        )
+
+        # The loss is real...
+        self.assertIn("- Consolidated Items: 2", text)
+        self.assertNotIn("EVT-2", text)
+        # ...and this check cannot see it.
+        _output, alerts = self._run(runtime)
+        self.assertEqual(alerts, [])
+
+    def test_the_count_line_matches_what_the_monthly_renderer_writes(self):
+        """Both literals this check reads are the renderer's. If either moves,
+        the check goes quiet rather than wrong, which is the failure mode
+        worth a test."""
+        import inspect
+
+        import monthly.markdown as monthly_markdown
+
+        source = inspect.getsource(monthly_markdown)
+
+        self.assertIn("- Consolidated Items: {item_count}", source)
+        self.assertIn("- Event ID: {item.event_id}", source)
 
 
 class JunctionInBackupScopeTests(unittest.TestCase):
@@ -5575,3 +6722,772 @@ class JunctionInBackupScopeTests(unittest.TestCase):
             self.assertEqual(
                 module._junctions_in_scope(runtime / "local_master"), ()
             )
+
+
+class MonthlyShortfallSummaryForgeryTests(unittest.TestCase):
+    """The check above states it "can be silenced but cannot cry wolf". Half
+    of that was false, and neither half needed a newline or a hand edit.
+
+    An item's summary is rendered raw as its block's first bullet, so a
+    summary reading `Consolidated Items: 999` is byte-identical to the
+    metadata line the check reads -- and it comes first in the file, which
+    is the one the check took. Measured, one perfectly good month, one item:
+
+        summary `Consolidated Items: 999`  ->  ('2026-08', 999, 1)
+        summary `Event ID: EXTRA`          ->  ()   (a shortfall hidden)
+
+    The first put "a month recorded 998 items fewer than it counted" in
+    front of an operator, on a month that lost nothing. A standing false
+    ATTENTION line is how an operator learns to stop reading the section,
+    which costs more than the check is worth.
+
+    Both are closed by `daily/markdown.summary_line_indices()` -- the
+    renderer's own rule for which bullet is a summary. The BUG-11/27 route
+    (a summary carrying a real newline) stays open in the silencing
+    direction and stays documented there; it needs a hand-edited Monthly,
+    because `monthly/parser.py` is line-based.
+    """
+
+    def _detect(self, summaries):
+        from monthly.markdown import MonthlyItem, render_monthly_markdown
+        from ops_status import _monthly_counts_more_than_it_shows
+
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        items = [
+            MonthlyItem(event_id=f"EVT-{i}", category="DECISION", project="Ops",
+                        summary=summary, owner="COO", source_date=date(2026, 8, 5))
+            for i, summary in enumerate(summaries)
+        ]
+        (directory / "2026-08.md").write_text(
+            render_monthly_markdown(
+                year=2026, month=8, items=items,
+                source_dates=[date(2026, 8, 5)],
+                generated_at="2026-09-01T02:00:00+09:00", coverage="1/31",
+            ),
+            encoding="utf-8",
+        )
+        return _monthly_counts_more_than_it_shows(directory)
+
+    def test_a_summary_cannot_forge_the_claimed_total(self):
+        self.assertEqual(self._detect(["Consolidated Items: 999"]), ())
+
+    def test_an_ordinary_month_is_still_quiet(self):
+        self.assertEqual(self._detect(["shipped it", "and this"]), ())
+
+    def test_a_real_shortfall_is_still_reported(self):
+        """The fix narrows the read; the check must still fire."""
+        from monthly.markdown import MonthlyItem, render_monthly_markdown
+        from ops_status import _monthly_counts_more_than_it_shows
+
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        items = [
+            MonthlyItem(event_id="EVT-1", category="DECISION", project="Ops",
+                        summary="kept", owner="COO", source_date=date(2026, 8, 5)),
+            MonthlyItem(event_id="EVT-2", category="Decision", project="Ops",
+                        summary="dropped", owner="COO", source_date=date(2026, 8, 5)),
+        ]
+        (directory / "2026-08.md").write_text(
+            render_monthly_markdown(
+                year=2026, month=8, items=items,
+                source_dates=[date(2026, 8, 5)],
+                generated_at="2026-09-01T02:00:00+09:00", coverage="1/31",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            _monthly_counts_more_than_it_shows(directory), (("2026-08", 2, 1),)
+        )
+
+    def test_a_real_shortfall_is_reported_even_beside_a_forged_summary(self):
+        """The other direction, which only shows up when there IS something
+        to hide: an extra `- Event ID:` line raises `rendered` past the
+        genuine shortfall and the check goes quiet. Without the shortfall
+        the same summary changes nothing, so this is the case that has to
+        carry it."""
+        from monthly.markdown import MonthlyItem, render_monthly_markdown
+        from ops_status import _monthly_counts_more_than_it_shows
+
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        items = [
+            MonthlyItem(event_id="EVT-1", category="DECISION", project="Ops",
+                        summary="Event ID: EXTRA", owner="COO",
+                        source_date=date(2026, 8, 5)),
+            MonthlyItem(event_id="EVT-2", category="Decision", project="Ops",
+                        summary="dropped", owner="COO", source_date=date(2026, 8, 5)),
+        ]
+        (directory / "2026-08.md").write_text(
+            render_monthly_markdown(
+                year=2026, month=8, items=items,
+                source_dates=[date(2026, 8, 5)],
+                generated_at="2026-09-01T02:00:00+09:00", coverage="1/31",
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            _monthly_counts_more_than_it_shows(directory), (("2026-08", 2, 1),)
+        )
+
+
+class StrandedCandidateHiddenByASummaryTests(unittest.TestCase):
+    """`_kept_but_not_rendered()` is the detector for a KEEP Candidate that
+    is stored but never reached its Daily file -- E-17's shape, and the one
+    kind of loss no other check sees. It answers by looking for the exact
+    line the renderer would have written for that `event_id`.
+
+    The renderer writes a summary raw as its block's first bullet, so a
+    Candidate whose summary reads `Event ID: EVT-B` renders that same line.
+    Measured -- EVT-A rendered with that summary, EVT-B stored and genuinely
+    absent from the file:
+
+        summary `Event ID: EVT-B`   ->  ()
+        summary `Shipped it.`       ->  ('EVT-B (2026-08-05)',)
+
+    One ordinary summary switched the loss detector off for the Candidate it
+    named. Silencing only -- a summary can add a line, never remove one --
+    but for a detector whose whole job is to notice an absence, silencing is
+    the harm.
+
+    Fixed by excluding summary lines, which cannot go the other way: a
+    summary is never the renderer's label line, so nothing genuinely
+    rendered leaves the set. C30's empty-`event_id` case (BACKLOG A-15) is
+    re-checked below for the same reason it was written -- this function has
+    already been broken once by a change to how the line is matched.
+    """
+
+    def _candidate(self, event_id, summary):
+        from history import HistoryCandidate, HistoryDecision
+
+        return HistoryCandidate(
+            history_id="HIST-" + event_id,
+            event_id=event_id,
+            timestamp="2026-08-05T10:00:00+09:00",
+            category="DECISION",
+            project_id="OPS",
+            role="COO",
+            summary=summary,
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _stranded(self, rendered, stored):
+        from daily.markdown import render_daily_markdown
+        from ops_status import _kept_but_not_rendered
+
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "2026-08-05.md").write_text(
+            render_daily_markdown(date(2026, 8, 5), rendered, "gen"),
+            encoding="utf-8",
+        )
+        return _kept_but_not_rendered(
+            tuple((f"s{i}", e, date(2026, 8, 5)) for i, e in enumerate(stored)),
+            directory,
+        )
+
+    def test_a_summary_cannot_hide_a_stranded_candidate(self):
+        found = self._stranded(
+            [self._candidate("EVT-A", "Event ID: EVT-B")], ["EVT-A", "EVT-B"]
+        )
+
+        self.assertEqual(found, ("EVT-B (2026-08-05)",))
+
+    def test_the_ordinary_case_reports_the_same_thing(self):
+        """The forged summary must change nothing at all, not merely stop
+        hiding -- same finding, same wording."""
+        found = self._stranded(
+            [self._candidate("EVT-A", "Shipped it.")], ["EVT-A", "EVT-B"]
+        )
+
+        self.assertEqual(found, ("EVT-B (2026-08-05)",))
+
+    def test_nothing_is_reported_when_both_are_rendered(self):
+        found = self._stranded(
+            [
+                self._candidate("EVT-A", "Event ID: EVT-B"),
+                self._candidate("EVT-B", "and this"),
+            ],
+            ["EVT-A", "EVT-B"],
+        )
+
+        self.assertEqual(found, ())
+
+    def test_an_empty_event_id_is_still_found_in_its_file(self):
+        """C30's regression: `validate_event()` accepts `event_id=""`
+        (BACKLOG A-15), and a matcher that slices a prefix ending in a space
+        reported that Candidate as permanently lost while it sat in its own
+        Daily file."""
+        found = self._stranded([self._candidate("", "empty id")], [""])
+
+        self.assertEqual(found, ())
+
+
+class IncomingStagingResidueTests(RejectedStagingResidueTests):
+    """The same residue one directory earlier, which the sprint that fixed
+    `rejected/` did not look at.
+
+    Three directories can hold `.tmp-….json` and two of them named it
+    correctly: `incomplete` for `transport/`, `rejected_incomplete_write`
+    for `rejected/`. `incoming/` -- the one `write_event_json()` actually
+    stages into -- called it an Event. Measured, one staging file and
+    nothing else in the whole runtime:
+
+        awaiting_collection=1   is_clear=False
+        -> ATTENTION "Collector가 아직 가져가지 않은 Event 1건"
+
+    `awaiting_collection` is defined as *promoted by intake but not
+    collected*, and a staging file was never promoted -- the local reporter
+    wrote it straight into `incoming/`. So this is not a number reported
+    loosely; it is a file that does not belong in that number.
+
+    Unlike its two siblings this one clears by itself: the next Collector
+    run consumes it (docs/03's decision, untouched here) and moves it to
+    `rejected/`, where the sentence above already names it correctly. One
+    run of a wrong name -- in the window right after a crash, which is
+    exactly when someone is reading this view.
+
+    Inherits the fixtures from the class above deliberately: same runtime,
+    same snapshot, same alert capture, so the two halves cannot drift into
+    testing different things about one file.
+    """
+
+    def _made(self, event_id):
+        return create_event(
+            source="DESKTOP_1", role="COO", project_id="OPS",
+            event_type="COMPLETED", status="COMPLETED", summary="s",
+            history_candidate=True, event_id=event_id,
+        )
+
+    def test_a_staging_file_in_incoming_is_not_an_awaiting_event(self):
+        runtime = self._runtime()
+        (runtime / "events" / "incoming" / ".tmp-abandoned.json").write_text(
+            '{"event_id": "EV', encoding="utf-8"
+        )
+
+        backlog = self._snapshot(runtime).backlog
+
+        self.assertEqual(backlog.awaiting_collection, 0)
+        self.assertEqual(backlog.incoming_incomplete_write, 1)
+        self.assertEqual(backlog.unreadable_incoming, 0)
+
+    def test_a_complete_staging_file_counts_the_same(self):
+        """The crash window is *after* the write and before `os.replace`, so
+        the residue is usually valid JSON. It is still not an Event that
+        intake promoted."""
+        runtime = self._runtime()
+        (runtime / "events" / "incoming" / ".tmp-whole.json").write_text(
+            self._made("EVT-W").to_json(), encoding="utf-8"
+        )
+
+        backlog = self._snapshot(runtime).backlog
+
+        self.assertEqual(backlog.awaiting_collection, 0)
+        self.assertEqual(backlog.incoming_incomplete_write, 1)
+
+    def test_it_does_not_hold_is_clear_false_on_its_own(self):
+        runtime = self._runtime()
+        (runtime / "events" / "incoming" / ".tmp-abandoned.json").write_text(
+            "x", encoding="utf-8"
+        )
+
+        self.assertTrue(self._snapshot(runtime).backlog.is_clear)
+
+    def test_a_real_event_beside_it_is_still_counted(self):
+        """The fix narrows the count; it must not empty it. The source
+        breakdown has to agree with the narrowed count too --
+        `SourceBreakdown.total` promises to equal it."""
+        runtime = self._runtime()
+        incoming = runtime / "events" / "incoming"
+        (incoming / ".tmp-abandoned.json").write_text("x", encoding="utf-8")
+        (incoming / "EVT-R.json").write_text(
+            self._made("EVT-R").to_json(), encoding="utf-8"
+        )
+
+        backlog = self._snapshot(runtime).backlog
+
+        self.assertEqual(backlog.awaiting_collection, 1)
+        self.assertEqual(backlog.incoming_incomplete_write, 1)
+        self.assertFalse(backlog.is_clear)
+        self.assertEqual(backlog.awaiting_collection_sources.total, 1)
+
+    def test_the_operator_is_told_what_it_actually_is(self):
+        runtime = self._runtime()
+        (runtime / "events" / "incoming" / ".tmp-abandoned.json").write_text(
+            "x", encoding="utf-8"
+        )
+
+        _printed, attention = self._alerts(runtime)
+
+        residue = [line for line in attention if "incoming/에 중단된 쓰기 잔여물" in line]
+        self.assertEqual(len(residue), 1, attention)
+        self.assertIn("Event가 아니다", residue[0])
+        self.assertEqual(
+            [line for line in attention if "가져가지 않은 Event" in line], []
+        )
+
+
+class AStrandedCandidateIsRecoveredByACompanionTests(unittest.TestCase):
+    """E-17's alert said "no run will insert this" and BACKLOG said "nothing
+    will retry it". The premise under both is right -- step 6.5's targets
+    are only the dates *that run* collected -- and the conclusion is one
+    step too far.
+
+    If any further Event dated that same day is collected later, the date
+    joins `kept_dates`, and `select_late_candidates()` looks at **every**
+    stored candidate for that date, not just the new one. The stranded one
+    goes in with it. Measured:
+
+        EVT-A stored -> Daily Close      2026-08-05.md written
+        EVT-S stored after the close     detector: ('EVT-S (2026-08-05)',)
+        EVT-N stored, same date, later   UPDATED_LATE_EVENT
+                                         added_event_ids=('EVT-S', 'EVT-N')
+                                         detector: ()
+
+    So it cannot get in under its own power, and it does get in if a
+    companion arrives. For a past date a companion usually never arrives,
+    which is why the alert is right to exist -- but "no run will ever insert
+    this" changes what a person does about it, and sends them to hand-edit a
+    Company History file that a later run would have repaired.
+
+    Nothing tested this path. It is the only automatic recovery E-17 has.
+    """
+
+    def setUp(self):
+        from history import HistoryCandidate, HistoryDecision  # noqa: F401
+        from history.file_repository import FileHistoryRepository
+
+        self.FileHistoryRepository = FileHistoryRepository
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.repo = self.FileHistoryRepository(
+            keep_dir=self.root / "keep", review_dir=self.root / "review"
+        )
+        self.daily_dir = self.root / "daily"
+
+    def _candidate(self, event_id, hour):
+        from history import HistoryCandidate, HistoryDecision
+
+        return HistoryCandidate(
+            history_id="HIST-" + event_id, event_id=event_id,
+            timestamp=f"2026-08-05T{hour:02d}:00:00+09:00", category="MILESTONE",
+            project_id="P", role="COO", summary="s " + event_id, evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _detector(self, event_id):
+        from ops_status import _kept_but_not_rendered
+
+        return _kept_but_not_rendered(
+            ((f"HIST-{event_id}", event_id, date(2026, 8, 5)),), self.daily_dir
+        )
+
+    def _close_the_day_then_strand(self):
+        from daily import generate_daily_history
+
+        self.repo.save(self._candidate("EVT-A", 10))
+        generate_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir, generated_at="gen"
+        )
+        self.repo.save(self._candidate("EVT-S", 11))
+
+    def test_the_stranded_candidate_is_detected(self):
+        self._close_the_day_then_strand()
+
+        self.assertEqual(self._detector("EVT-S"), ("EVT-S (2026-08-05)",))
+
+    def test_a_companion_on_the_same_date_carries_it_in(self):
+        from daily import update_daily_history
+
+        self._close_the_day_then_strand()
+        self.repo.save(self._candidate("EVT-N", 12))
+
+        result = update_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir,
+            now=datetime(2026, 8, 9, 10, 0).astimezone(),
+        )
+
+        self.assertEqual(result.added_event_ids, ("EVT-S", "EVT-N"))
+        self.assertEqual(self._detector("EVT-S"), ())
+
+    def test_it_does_not_get_in_under_its_own_power(self):
+        """The half the alert is right about: with no companion, running the
+        late update for that date changes nothing, because nothing puts the
+        date into `kept_dates` in the first place. Asserted at the step
+        below that, so the test does not depend on how the Runner builds
+        `kept_dates`."""
+        from daily import LateUpdateOutcome, update_daily_history
+
+        self.repo.save(self._candidate("EVT-A", 10))
+        from daily import generate_daily_history
+
+        generate_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir, generated_at="gen"
+        )
+        before = (self.daily_dir / "2026-08-05.md").read_text(encoding="utf-8")
+
+        result = update_daily_history(
+            self.repo, date(2026, 8, 5), output_dir=self.daily_dir,
+            now=datetime(2026, 8, 9, 10, 0).astimezone(),
+        )
+
+        self.assertIs(result.outcome, LateUpdateOutcome.NO_LATE_EVENTS)
+        self.assertEqual(
+            (self.daily_dir / "2026-08-05.md").read_text(encoding="utf-8"), before
+        )
+
+    def test_the_runner_only_visits_dates_it_collected(self):
+        """The premise, pinned where it lives. If step 6.5 ever grew a
+        different date source this whole finding changes, and that should
+        fail here rather than be discovered by reading the comment."""
+        import ast
+        import inspect
+
+        from app import runner
+
+        source = inspect.getsource(runner.run_once)
+        tree = ast.parse(inspect.cleandoc(source))
+        loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "kept_date"
+        ]
+
+        self.assertEqual(len(loops), 1, "step 6.5's loop moved or was renamed")
+        self.assertEqual(
+            ast.unparse(loops[0].iter), "sorted(kept_dates)",
+            "step 6.5 no longer iterates the dates this run collected",
+        )
+
+
+class HoleInTheDailySequenceTests(unittest.TestCase):
+    """Days of Company History that were closed, had a file, and no longer
+    do -- with every indicator reporting health.
+
+    docs/07 §30 closes days in order and never skips, and
+    `generate_daily_history()` writes a file for a day with no work too, so
+    the Daily filenames must form an unbroken run of dates. A date sitting
+    *between* two days that do have files is therefore a day whose file was
+    removed.
+
+    Measured on ten closed days with 08-04..08-06 deleted -- the shape a
+    partial restore, a half-synced OneDrive folder, or a hand deletion
+    (docs/06 §57 permits editing, and deleting is an edit) leaves:
+
+        check_state_consistency()   CONSISTENT
+        ATTENTION                   nothing about the three days
+        Scheduler next run          starts at last_close + 1, never returns
+
+    Three days gone, permanently, silently. `check_state_consistency()` is
+    not wrong -- §47 asks it whether the *last* closed day has a file, and
+    it does. Nothing had the interior in view.
+
+    Only the interior. A missing suffix is what a run that failed part-way
+    leaves, it is the normal retry shape, and the next run fills it.
+    """
+
+    def _runtime(self, present, *, backup=()):
+        from scheduler.state import SchedulerState
+        from scheduler.state import save_state as save_scheduler_state
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "backup_working_copy/daily", "state",
+            "locks", "runs", "logs",
+        ):
+            (runtime / rel).mkdir(parents=True)
+        for day in present:
+            (runtime / "local_master" / "daily" / f"{day}.md").write_text(
+                "history", encoding="utf-8"
+            )
+        for day in backup:
+            (runtime / "backup_working_copy" / "daily" / f"{day}.md").write_text(
+                "history", encoding="utf-8"
+            )
+        save_scheduler_state(
+            runtime / "state" / "daily_history_state.json",
+            SchedulerState(last_successful_daily_close=date(2026, 8, 10)),
+        )
+        return runtime
+
+    def _run(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_holes", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "시퀀스에 구멍" in a]
+
+    ALL = tuple(f"2026-08-{d:02d}" for d in range(1, 11))
+
+    def test_an_interior_hole_is_reported(self):
+        present = [d for d in self.ALL if d not in ("2026-08-04", "2026-08-05")]
+
+        printed, holes = self._run(self._runtime(present))
+
+        self.assertEqual(len(holes), 1, holes)
+        self.assertIn("2026-08-04", holes[0])
+        self.assertIn("2026-08-05", holes[0])
+        self.assertIn("Daily 시퀀스 구멍   : 2", printed)
+
+    def test_the_consistency_check_still_says_consistent(self):
+        """The reason this had to be its own check rather than an extension
+        of that one: §47's question is answered correctly and the days are
+        still gone."""
+        from scheduler.consistency import ConsistencyStatus, check_state_consistency
+
+        runtime = self._runtime([d for d in self.ALL if d != "2026-08-04"])
+
+        result = check_state_consistency(
+            runtime / "state" / "daily_history_state.json",
+            runtime / "local_master" / "daily",
+        )
+
+        self.assertIs(result.status, ConsistencyStatus.CONSISTENT)
+        self.assertEqual(len(self._run(runtime)[1]), 1)
+
+    def test_a_complete_sequence_is_quiet(self):
+        printed, holes = self._run(self._runtime(self.ALL))
+
+        self.assertEqual(holes, [])
+        self.assertNotIn("시퀀스 구멍", printed)
+
+    def test_a_missing_suffix_is_not_a_hole(self):
+        """A run that failed part-way leaves this, and the next run fills
+        it. Reporting it would be a standing alert on the normal case."""
+        printed, holes = self._run(
+            self._runtime([d for d in self.ALL if d < "2026-08-09"])
+        )
+
+        self.assertEqual(holes, [])
+
+    def test_a_single_day_is_not_a_hole(self):
+        self.assertEqual(self._run(self._runtime(["2026-08-05"]))[1], [])
+
+    def test_an_empty_tree_is_quiet(self):
+        self.assertEqual(self._run(self._runtime([]))[1], [])
+
+    def test_the_message_says_where_the_days_might_still_be(self):
+        """A diagnosis an operator cannot act on is half a finding. The
+        Backup Working Copy is already on disk and already listed for the
+        un-backed check."""
+        present = [d for d in self.ALL if d not in ("2026-08-04", "2026-08-05")]
+
+        _printed, holes = self._run(
+            self._runtime(present, backup=["2026-08-04"])
+        )
+
+        self.assertIn("Backup Working Copy에 아직 있다", holes[0])
+        self.assertIn("2026-08-04", holes[0].split("아직 있다")[1])
+
+    def test_it_says_so_when_the_backup_does_not_have_them_either(self):
+        present = [d for d in self.ALL if d != "2026-08-04"]
+
+        _printed, holes = self._run(self._runtime(present))
+
+        self.assertIn("Backup Working Copy에도 없다", holes[0])
+
+    def test_a_directory_wearing_a_days_name_counts_as_missing(self):
+        """C31's rule across six other call sites: it exists, and it is not
+        a day of Company History."""
+        import importlib.util
+
+        runtime = self._runtime([d for d in self.ALL if d != "2026-08-04"])
+        (runtime / "local_master" / "daily" / "2026-08-04.md").mkdir()
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_holes_dir", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(
+            module._holes_in_the_daily_sequence(
+                runtime / "local_master" / "daily"
+            ),
+            ("2026-08-04",),
+        )
+
+    def test_non_date_and_staging_names_are_ignored(self):
+        import importlib.util
+
+        runtime = self._runtime(self.ALL)
+        daily = runtime / "local_master" / "daily"
+        (daily / "notes.md").write_text("a hand-written note", encoding="utf-8")
+        (daily / ".tmp-abandoned.md").write_text("residue", encoding="utf-8")
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_holes_odd", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module._holes_in_the_daily_sequence(daily), ())
+        self.assertEqual(len(module._daily_dates(daily)), 10)
+
+
+class HoleInTheMonthlySequenceTests(unittest.TestCase):
+    """The exact sibling of the Daily hole, one level up, and it was equally
+    unwatched.
+
+    `pending_months()` consolidates oldest-first without skipping and
+    docs/09 §72 writes a file for a month with no material history too --
+    precisely so "nothing happened" and "we forgot" stay distinguishable.
+    So the Monthly filenames are a contiguous run of months, and an interior
+    gap is a file that was there.
+
+    Measured with 2026-01..2026-08 consolidated and 04/05 deleted: no
+    ATTENTION line mentioned them, `pending_months()` starts *after*
+    `last_successful_monthly_close` so nothing revisits them, and the
+    state-vs-history check asks only about the last closed month.
+
+    The remedy is exact, unlike Daily's, and the message says so because it
+    was measured end to end: Monthly is derived wholly from the Daily files
+    (docs/09 §12-13), so `mark_month_dirty()` plus a run rebuilds it,
+    content included.
+    """
+
+    MONTHS = tuple(f"2026-{m:02d}" for m in range(1, 9))
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_month_holes", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _monthly_dir(self, present):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        for key in present:
+            (directory / f"{key}.md").write_text(
+                "# x\n\n## Metadata\n\n- Consolidated Items: 0\n", encoding="utf-8"
+            )
+        return directory
+
+    def test_an_interior_hole_is_reported(self):
+        present = [m for m in self.MONTHS if m not in ("2026-04", "2026-05")]
+
+        holes = self._module()._holes_in_the_monthly_sequence(
+            self._monthly_dir(present)
+        )
+
+        self.assertEqual(holes, ("2026-04", "2026-05"))
+
+    def test_a_complete_sequence_is_quiet(self):
+        self.assertEqual(
+            self._module()._holes_in_the_monthly_sequence(
+                self._monthly_dir(self.MONTHS)
+            ),
+            (),
+        )
+
+    def test_a_missing_suffix_is_not_a_hole(self):
+        present = [m for m in self.MONTHS if m < "2026-07"]
+
+        self.assertEqual(
+            self._module()._holes_in_the_monthly_sequence(
+                self._monthly_dir(present)
+            ),
+            (),
+        )
+
+    def test_the_gap_is_counted_across_a_year_boundary(self):
+        """Month arithmetic, not string arithmetic: 2025-12 -> 2026-02 is
+        one missing month, and comparing keys as text would say otherwise."""
+        holes = self._module()._holes_in_the_monthly_sequence(
+            self._monthly_dir(["2025-11", "2025-12", "2026-02"])
+        )
+
+        self.assertEqual(holes, ("2026-01",))
+
+    def test_a_single_month_and_an_empty_tree_are_quiet(self):
+        module = self._module()
+
+        self.assertEqual(
+            module._holes_in_the_monthly_sequence(self._monthly_dir(["2026-03"])), ()
+        )
+        self.assertEqual(
+            module._holes_in_the_monthly_sequence(self._monthly_dir([])), ()
+        )
+        self.assertEqual(
+            module._holes_in_the_monthly_sequence(Path("no-such-directory")), ()
+        )
+
+    def test_a_directory_and_odd_names_are_handled(self):
+        present = [m for m in self.MONTHS if m != "2026-04"]
+        directory = self._monthly_dir(present)
+        (directory / "2026-04.md").mkdir()
+        (directory / "notes.md").write_text("a note", encoding="utf-8")
+        (directory / ".tmp-abandoned.md").write_text("residue", encoding="utf-8")
+
+        self.assertEqual(
+            self._module()._holes_in_the_monthly_sequence(directory), ("2026-04",)
+        )
+
+    def test_the_message_names_the_remedy_that_was_measured(self):
+        """`mark_month_dirty()` plus a run restores a deleted Monthly, file
+        and content. Verified below rather than asserted in prose."""
+        import calendar
+
+        from daily import generate_daily_history
+        from history import HistoryCandidate, HistoryDecision
+        from history.file_repository import FileHistoryRepository
+        from monthly import mark_month_dirty
+        from monthly.generator import run_once as monthly_run_once
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        repository = FileHistoryRepository(
+            keep_dir=root / "keep", review_dir=root / "review"
+        )
+        repository.save(
+            HistoryCandidate(
+                history_id="H1", event_id="EVT-1",
+                timestamp="2026-07-05T10:00:00+09:00", category="DECISION",
+                project_id="P", role="COO", summary="july work", evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+        )
+        for month in (7, 8):
+            for day in range(1, calendar.monthrange(2026, month)[1] + 1):
+                generate_daily_history(
+                    repository, date(2026, month, day),
+                    output_dir=root / "daily", generated_at="gen",
+                )
+        state_path = root / "state" / "monthly.json"
+
+        def run(now):
+            return monthly_run_once(
+                daily_dir=root / "daily", monthly_dir=root / "monthly",
+                history_start_date=date(2026, 7, 1), now=now, state_path=state_path,
+            )
+
+        run(datetime(2026, 9, 1, 11, 0).astimezone())
+        (root / "monthly" / "2026-07.md").unlink()
+
+        plain = run(datetime(2026, 9, 2, 11, 0).astimezone())
+        self.assertEqual([r.status for r in plain.results], [])
+        self.assertFalse((root / "monthly" / "2026-07.md").exists())
+
+        mark_month_dirty(state_path, date(2026, 7, 5))
+        run(datetime(2026, 9, 3, 11, 0).astimezone())
+
+        restored = (root / "monthly" / "2026-07.md").read_text(encoding="utf-8")
+        self.assertIn("EVT-1", restored)

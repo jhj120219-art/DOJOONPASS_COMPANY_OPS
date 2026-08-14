@@ -63,7 +63,7 @@ def run_once(
     (a same-path collision self-deadlocks into SKIPPED_ALREADY_RUNNING;
     Runtime Stabilization Sprint found and fixed exactly this).
 
-    Standalone/manual invocation (docs/07 §951 "수동 실행도 동일한 Lock과
+    Standalone/manual invocation (docs/07 §44 "수동 실행도 동일한 Lock과
     State 규칙을 따른다") must leave this False (the default) — Scheduler
     then still protects itself with its own lock exactly as before.
     """
@@ -154,7 +154,23 @@ def _generate_pending_dates(
     generated: list[date] = []
     for target_date in pending_dates:
         final_path = daily_dir / f"{target_date.isoformat()}.md"
-        if not final_path.exists():
+        # `is_file()`, not `exists()`. The question here is "is this day's
+        # Company History already written", and a directory named
+        # `2026-08-12.md` is not a day of Company History — but it does
+        # exist. Measured, with one KEEP Candidate waiting for that date:
+        #
+        #     COMPLETED, generated=['2026-08-12', '2026-08-13']
+        #     check_state_consistency()            CONSISTENT
+        #     (daily/'2026-08-12.md').is_file()    False
+        #
+        # The run reported generating a day it never wrote, advanced
+        # `last_successful_daily_close` past it, and the Candidate is now
+        # unreachable — §30's "close in order, leave no gap" defeated by a
+        # gap the loop could not see. With `is_file()` the date is attempted,
+        # `generate_daily_history()` refuses to write over a non-file, and
+        # the run stops there with `failed_date` naming it, which is what
+        # §30 asks for.
+        if not final_path.is_file():
             try:
                 generate_daily_history(
                     repository, target_date, output_dir=daily_dir, keep_index=keep_index

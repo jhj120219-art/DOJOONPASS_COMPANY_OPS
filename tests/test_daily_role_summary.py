@@ -332,3 +332,83 @@ class MixedOffsetOrderingTests(unittest.TestCase):
         ordered = sorted(candidates, key=lambda c: c.chronological_key)
 
         self.assertEqual(len(ordered), len(shapes))
+
+
+class NoProductionCallerTests(unittest.TestCase):
+    """A-3's partial implementation reaches no operator, verified rather than
+    remembered.
+
+    BACKLOG A-3 records the SKIP correctly — a per-role taxonomy needs a
+    docs/05 classification policy — and then says `role_summary.py`
+    "제공한다" the grouping it *can* do with the existing vocabulary. True of
+    the function; not true of the system. **Nothing in production calls it**,
+    so no operator has ever seen a role summary.
+
+    That is A-16 / E-20's shape (implemented, exported, never invoked), and
+    C29 §3 established how to check it: with AST, because grep was wrong once
+    before and mistook an export for a call. Here the only calls that exist
+    are the module's own two constructors, inside the function itself.
+
+    Wiring it up is not available without approval — *where* a role summary
+    would be rendered is A-3/A-4, a docs/06 change. What this test does is
+    stop the record from drifting: if a caller ever appears, this fails and
+    A-3 must be rewritten to say so.
+    """
+
+    TARGETS = {"build_role_summary", "DailyRoleSummary", "RoleActivity"}
+
+    def _production_files(self):
+        root = Path(__file__).resolve().parents[1]
+        return [
+            p
+            for p in list((root / "src").glob("**/*.py")) + list(root.glob("*.py"))
+            if "__pycache__" not in str(p)
+        ]
+
+    def test_nothing_in_production_calls_the_role_summary(self):
+        import ast
+
+        callers = []
+        for path in self._production_files():
+            if path.name == "role_summary.py":
+                continue  # its own constructors
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else getattr(func, "attr", None)
+                )
+                if name in self.TARGETS:
+                    callers.append(f"{path.name}:{node.lineno}")
+
+        self.assertEqual(
+            callers,
+            [],
+            "a production caller appeared — BACKLOG A-3 says there is none",
+        )
+
+    def test_it_is_nonetheless_exported(self):
+        """The half that makes the claim easy to misread: it is importable
+        and re-exported, which looks like availability."""
+        import daily
+
+        self.assertIn("build_role_summary", daily.__all__)
+        self.assertTrue(callable(daily.build_role_summary))
+
+    def test_and_it_works_when_called(self):
+        """So the record says "unwired", not "broken"."""
+        candidate = HistoryCandidate(
+            history_id="H", event_id="E", timestamp="2026-08-05T10:00:00+09:00",
+            category="MILESTONE", project_id="P", role="COO", summary="s",
+            evidence=(), filter_result=HistoryDecision.KEEP,
+        )
+
+        summary = build_role_summary([candidate], date(2026, 8, 5))
+
+        self.assertEqual(summary.active_roles, ("COO",))
+        self.assertEqual(
+            set(summary.silent_roles), set(ROLE_ORDER) - {"COO"}
+        )

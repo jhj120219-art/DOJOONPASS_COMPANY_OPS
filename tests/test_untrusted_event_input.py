@@ -296,6 +296,75 @@ class HistoryRepositoryPathEscapeTests(unittest.TestCase):
         self.assertEqual(self._files_outside_keep(), [])
 
 
+class ReservedDeviceNameTests(unittest.TestCase):
+    """Windows reserved device names, measured rather than assumed.
+
+    `_UNSAFE_FILENAME_CHARS` is a character whitelist, so an `event_id` of
+    `NUL` / `CON` / `COM1` passes it untouched — those are legal characters.
+    On Win32 those base names are *devices*: writing to one succeeds and
+    discards the bytes, which is this repository's worst failure shape
+    (docs/11 §50 "History 손실", reported as success).
+
+    Measured on this machine, directly, both shapes:
+
+        NUL         written -> exists=True, size=0, ABSENT from the listing
+        NUL.json    written -> exists=True, size=10, present
+
+    **The extension is what saves the pipeline, not the sanitiser.** Every
+    filename this project derives from an untrusted id ends in `.json`
+    (`safe_event_filename()`, `safe_candidate_filename()`), and `NUL.json` is
+    an ordinary file. Verified end to end through `write_event_json()` /
+    `read_event_json()` for five reserved names: real files, real content,
+    exact round-trip.
+
+    So there is nothing to fix — and one thing to pin. If a derivation ever
+    drops the extension, the device path opens with no other guard in the
+    way. This test is that guard.
+    """
+
+    RESERVED = ("NUL", "CON", "AUX", "PRN", "COM1", "LPT1", "nul", "Con")
+
+    def test_every_derived_event_filename_keeps_an_extension(self):
+        for event_id in self.RESERVED:
+            with self.subTest(event_id=event_id):
+                self.assertTrue(safe_event_filename(event_id).endswith(".json"))
+
+    def test_every_derived_candidate_filename_keeps_an_extension(self):
+        from history.file_repository import safe_candidate_filename
+
+        for event_id in self.RESERVED:
+            with self.subTest(event_id=event_id):
+                self.assertTrue(
+                    safe_candidate_filename(f"HIST-{event_id}").endswith(".json")
+                )
+
+    def test_a_reserved_name_round_trips_through_the_real_writer(self):
+        """The property the extension buys: a real file with real content."""
+        from events import create_event
+        from reporter.local_output import read_event_json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for event_id in ("NUL", "CON", "COM1", "LPT1", "AUX"):
+                with self.subTest(event_id=event_id):
+                    event = create_event(
+                        source="DESKTOP_1",
+                        role="CTO_BACKEND",
+                        project_id="PRJ",
+                        event_type="MILESTONE_COMPLETED",
+                        status="IN_PROGRESS",
+                        summary="s",
+                        history_candidate=True,
+                        event_id=event_id,
+                    )
+                    path = write_event_json(event, directory=directory)
+
+                    self.assertTrue(path.exists())
+                    self.assertGreater(path.stat().st_size, 0)
+                    self.assertEqual(read_event_json(path).event_id, event_id)
+                    self.assertIn(path.name, [p.name for p in directory.iterdir()])
+
+
 class TransportSanitisationAsymmetryTests(unittest.TestCase):
     """BUG-15 FIXED (CEO-approved B안, sending side).
 
@@ -530,6 +599,144 @@ class SecretScanCoverageTests(unittest.TestCase):
             )
 
         self.assertEqual(scan_for_secrets(self.master), ())
+
+
+class SecretNameCaseTests(unittest.TestCase):
+    """NEW, **security**. The gate's name list is right; its comparison is
+    case-sensitive and the filesystem it runs on is not.
+
+    NOT FIXED — characterization plus a detector. `_looks_like_secret()`
+    compares exactly. Windows treats `ID_RSA` and `id_rsa` as one name, so
+    which of the two an operator happens to create decides whether docs/08
+    §29's gate protects them, and the file is otherwise identical.
+
+    Measured end to end through the real `backup.run_once()`, a real local
+    bare remote, same content, same directory, only the case differing:
+
+        daily/ID_RSA   BACKUP_SUCCESS  push=SUCCESS
+                       remote tree: daily/2026-08-05.md, daily/ID_RSA
+                       `git show main:daily/ID_RSA` returns the key
+        daily/id_rsa   BACKUP_FAILED   "secret files detected: daily\\id_rsa"
+                       remote tree: (empty)
+
+    Same root as BUG-55 (a case-sensitive comparison against a
+    case-insensitive filesystem), a second location: BUG-55 decides which
+    files are *backed up*, this decides which are *blocked*.
+
+    Why it is not fixed here: case-folding the comparison gives the gate a
+    new way to return BACKUP_FAILED, which is exactly E-15's documented harm
+    — a false positive there stops Company History reaching the remote at
+    all. Every candidate fix for that pair is recorded as needing a decision,
+    so this reports (`ops_status._secret_names_the_gate_will_not_recognise()`)
+    and changes nothing.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.master = Path(tmp.name) / "local_master"
+        (self.master / "daily").mkdir(parents=True, exist_ok=True)
+
+    # ---- the defect -----------------------------------------------------
+
+    def test_an_upper_case_variant_of_a_listed_name_is_not_detected(self):
+        """If these start passing, the gate was made case-insensitive."""
+        for name in ("ID_RSA", "CREDENTIALS.JSON", "Token.json", ".ENV"):
+            with self.subTest(name=name):
+                target = self.master / "daily" / name
+                target.write_text("-----BEGIN OPENSSH PRIVATE KEY-----", encoding="utf-8")
+                try:
+                    self.assertEqual(scan_for_secrets(self.master), ())
+                finally:
+                    target.unlink()
+
+    def test_an_upper_case_suffix_is_not_detected_either(self):
+        """`_SECRET_SUFFIXES` is matched with `str.endswith`, same problem."""
+        for name in ("server.PEM", "client.Key", "bundle.P12"):
+            with self.subTest(name=name):
+                target = self.master / "daily" / name
+                target.write_text("secret", encoding="utf-8")
+                try:
+                    self.assertEqual(scan_for_secrets(self.master), ())
+                finally:
+                    target.unlink()
+
+    def test_the_exact_case_is_still_blocked(self):
+        """The control. Only the case differs between this and the above."""
+        (self.master / "daily" / "id_rsa").write_text("secret", encoding="utf-8")
+
+        self.assertIn(str(Path("daily") / "id_rsa"), scan_for_secrets(self.master))
+
+    # ---- the detector ---------------------------------------------------
+
+    def test_the_status_view_names_what_the_gate_cannot_see(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_secret_case", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        for name in ("ID_RSA", "CREDENTIALS.JSON", "server.PEM"):
+            (self.master / "daily" / name).write_text("secret", encoding="utf-8")
+        (self.master / "daily" / "2026-08-05.md").write_text("history", encoding="utf-8")
+
+        found = module._secret_names_the_gate_will_not_recognise(self.master)
+
+        self.assertEqual(
+            set(found),
+            {
+                str(Path("daily") / "ID_RSA"),
+                str(Path("daily") / "CREDENTIALS.JSON"),
+                str(Path("daily") / "server.PEM"),
+            },
+        )
+
+    def test_the_detector_stays_silent_on_what_the_gate_already_catches(self):
+        """No duplicate line: the E-21 report already names these, and two
+        alerts for one file is how a section stops being read."""
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_secret_case2", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        (self.master / "daily" / "id_rsa").write_text("secret", encoding="utf-8")
+        (self.master / "daily" / "2026-08-05.md").write_text("history", encoding="utf-8")
+
+        self.assertEqual(module._secret_names_the_gate_will_not_recognise(self.master), ())
+
+    def test_git_s_own_storage_is_not_walked(self):
+        """`.git/` holds no file git will ever list, and on this machine's
+        Working Copy it is 93% of the walk (90 of 97 files) — a share that
+        only grows with backup history. Same exclusion, same reason, as the
+        staging-residue scan directly above it in `ops_status.py`."""
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_secret_case4", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        (self.master / ".git" / "objects").mkdir(parents=True)
+        (self.master / ".git" / "objects" / "ID_RSA").write_text("x", encoding="utf-8")
+
+        self.assertEqual(module._secret_names_the_gate_will_not_recognise(self.master), ())
+
+    def test_the_detector_uses_the_gate_s_own_name_list(self):
+        """A second opinion about what a secret looks like is how the two
+        drift apart — the same rule the import block already states."""
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_secret_case3", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        from backup import working_copy
+
+        self.assertIs(module._looks_like_secret, working_copy._looks_like_secret)
 
 
 class SymlinkSecretExfiltrationTests(unittest.TestCase):

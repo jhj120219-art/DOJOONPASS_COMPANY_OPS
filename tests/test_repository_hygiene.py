@@ -766,3 +766,312 @@ class DashboardDatabasesWithNoWriterTests(unittest.TestCase):
                     hasattr(dashboard, f"build_ops_{database}_properties"),
                     f"build_ops_{database}_properties now exists — A-16 moved",
                 )
+
+
+class DeadCapabilityInventoryTests(unittest.TestCase):
+    """The complete list of public functions nothing in production calls.
+
+    Three separate BACKLOG entries had recorded one instance each of this
+    shape (A-16's `build_ops_backup_properties`, E-20's REVIEW candidates,
+    C31 §16's `build_role_summary`) without anyone ever making the list. This
+    is the list, pinned, so a fourth cannot appear unnoticed and a recorded
+    one cannot quietly get wired up while the record still says it is not.
+
+    Counted by AST Call nodes per name. The two obvious alternatives were
+    tried and are useless — "exported but unused outside its package" flags
+    114 of 180 (normal intra-package calls), and name-based call-graph
+    reachability from the entrypoints flags 64 of 231 including `run_intake`
+    (15 real call sites) and `record_run` (12), because six modules define a
+    `run_once` and the graph cannot tell them apart.
+
+    Two of the four are superseded rather than missing: `Reporter`'s two
+    convenience wrappers bundle report+write / report+send, and the Agent
+    deliberately uses `report()` -> `outbox.stage()` -> `drain()` instead,
+    because the outbox is what makes "an Event that was created is never
+    lost" true. Calling them would bypass that.
+    """
+
+    # Every entry carries why it is here. An addition without a reason is
+    # the thing this test exists to stop.
+    EXPECTED = {
+        # --- recorded as needing a decision -------------------------------
+        "bootstrap_dashboard_databases",  # C31 §18: creates the OPS_* DBs;
+                                          # no entrypoint calls it, and
+                                          # wiring it writes to a real Notion
+                                          # Workspace (A-8)
+        "build_ops_backup_properties",    # A-16: OPS_BACKUP is never written
+        "remove_pending",                 # B-7: deletion is the open decision
+        # --- unwired capability, recorded ---------------------------------
+        "build_role_summary",             # C31 §16 (A-3's record corrected)
+        "for_role",                       # same module, same reason
+        "of_category",                    # same module, same reason
+        # --- superseded by a better mechanism -----------------------------
+        "report_and_write",               # the outbox gives durability
+        "report_and_send",                # the outbox gives durability
+        "enqueue",                        # retry_queue's one-shot API; the
+        "dequeue",                        # Runner uses the batch API (B안)
+        # --- convenience accessors nothing needed yet ---------------------
+        "component",                      # RunSummary lookup; callers iterate
+        "read_event_json",                # local_output read seam
+    }
+
+    def _production_files(self):
+        return [
+            p
+            for p in list((REPO_ROOT / "src").glob("**/*.py")) + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in str(p)
+        ]
+
+    def test_the_inventory_is_exactly_what_is_recorded(self):
+        import ast
+
+        files = self._production_files()
+        defined, called = {}, set()
+        for path in files:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            # Import aliases resolved. `app/runner.py` imports
+            # `build_index as build_retry_queue_index` and calls the alias, so
+            # a detector that matches on the called name alone reports a
+            # heavily-used function as dead. That mistake was made — and
+            # caught by this very test failing — before this line existed.
+            aliases = {
+                alias.asname: alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                for alias in node.names
+                if alias.asname
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not node.name.startswith("_"):
+                        defined.setdefault(node.name, path.name)
+                elif isinstance(node, ast.Call):
+                    func = node.func
+                    name = (
+                        func.id
+                        if isinstance(func, ast.Name)
+                        else getattr(func, "attr", None)
+                    )
+                    if name:
+                        called.add(aliases.get(name, name))
+                elif isinstance(node, ast.Attribute):
+                    called.add(aliases.get(node.attr, node.attr))
+
+        uncalled = {name for name in defined if name not in called}
+        # Properties are read, not called; they are not capabilities.
+        uncalled -= {
+            name
+            for name in uncalled
+            if self._is_property(files, name)
+        }
+
+        self.assertEqual(
+            uncalled,
+            self.EXPECTED,
+            "the dead-capability inventory changed — update BACKLOG C31 §17 "
+            f"(now: {sorted(uncalled)})",
+        )
+
+    def _is_property(self, files, name):
+        import ast
+
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == name
+                ):
+                    for decorator in node.decorator_list:
+                        target = (
+                            decorator.id
+                            if isinstance(decorator, ast.Name)
+                            else getattr(decorator, "attr", None)
+                        )
+                        if target in ("property", "cached_property"):
+                            return True
+        return False
+
+
+class AtomicWriteLeavesNoResidueTests(unittest.TestCase):
+    """Every atomic writer must clean up its staging file when the write dies.
+
+    Fourteen modules share the same four lines:
+
+        except BaseException:
+            try: os.remove(tmp_path)
+            except OSError: pass
+            raise
+
+    Tracing which `src/` lines the suite executes showed that cleanup was
+    **never reached** in the writers checked. It is the guard that prevents
+    C27's entire finding — a `.tmp-*` file left behind by an interrupted run
+    was read as a finished artifact by six consumers, promoted to an Event,
+    and pushed to the backup remote as a truncated day of Company History.
+    The fix for that was to teach the readers to skip `.tmp-`; this is the
+    other half, and nothing was checking it.
+
+    Driven by making `os.replace` fail, which is the last step of every one
+    of these writers and the only one that can fail after the temp file
+    exists. Two properties per writer: the exception still propagates (the
+    caller must not think the write succeeded), and **no staging file
+    survives**.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    # `write_summary()` is the one writer that must NOT propagate: a manifest
+    # is a report about a run that already finished, and failing the run
+    # because the report could not be filed would invert README RULE 9. It
+    # still has to clean up after itself, which is what this class is about.
+    SWALLOWS = {"runsummary.write_summary"}
+
+    def _writers(self):
+        """`(label, directory, call)` for each writer, ready to invoke."""
+        from datetime import date, datetime
+
+        from agent.state import AgentState, save_state as save_agent
+        from backup.state import BackupState, save_state as save_backup
+        from history import HistoryCandidate, HistoryDecision
+        from history.file_repository import FileHistoryRepository
+        from monthly.state import MonthlyState, save_state as save_monthly
+        from notion.dashboard_pending import PendingDashboardRecord, save_all
+        from notion.retry_queue import RetryQueueEntry, save_queue
+        from reporter.local_output import write_event_json
+        from runsummary import RunSummary, write_summary
+        from scheduler.state import SchedulerState, save_state as save_scheduler
+        from events import create_event
+
+        def area(name):
+            path = self.root / name
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="P",
+            event_type="MILESTONE_COMPLETED", status="IN_PROGRESS",
+            summary="s", history_candidate=True, event_id="EVT-1",
+        )
+        candidate = HistoryCandidate(
+            history_id="HIST-1", event_id="EVT-1",
+            timestamp="2026-08-05T10:00:00+09:00", category="MILESTONE",
+            project_id="P", role="COO", summary="s", evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+        keep = area("keep")
+        return [
+            ("reporter.write_event_json", d := area("reporter"),
+             lambda: write_event_json(event, directory=d)),
+            ("history.FileHistoryRepository.save", keep,
+             lambda: FileHistoryRepository(
+                 keep_dir=keep, review_dir=area("review")
+             ).save(candidate)),
+            ("runsummary.write_summary", (r := area("runs")),
+             lambda: write_summary(
+                 r / "last_run.json",
+                 RunSummary(run_id="R", started_at="a", finished_at="b"),
+             )),
+            ("scheduler.state.save_state", (s := area("sched")),
+             lambda: save_scheduler(
+                 s / "state.json",
+                 SchedulerState(last_successful_daily_close=date(2026, 8, 1)),
+             )),
+            ("monthly.state.save_state", (m := area("mon")),
+             lambda: save_monthly(m / "state.json", MonthlyState())),
+            ("agent.state.save_state", (a := area("agent")),
+             lambda: save_agent(a / "state.json", AgentState(desktop_id="DESKTOP_1"))),
+            ("backup.state.save_state", (b := area("backup")),
+             lambda: save_backup(
+                 b / "state.json", BackupState(last_successful_backup=None)
+             )),
+            ("notion.retry_queue.save_queue", (q := area("queue")),
+             lambda: save_queue(
+                 q / "queue.json",
+                 [RetryQueueEntry(
+                     event_id="EVT-1", project_id="P", event_data=event.to_dict(),
+                     added_at="2026-08-05T10:00:00+09:00", attempt_count=1,
+                 )],
+             )),
+            ("notion.dashboard_pending.save_all", (p := area("pending")),
+             lambda: save_all(
+                 p / "pending.json",
+                 [PendingDashboardRecord(
+                     run_id="R", properties={}, queued_at="2026-08-05T10:00:00+09:00",
+                     attempt_count=1,
+                 )],
+             )),
+        ]
+
+    def test_no_writer_leaves_a_staging_file_when_the_write_dies(self):
+        import os
+        import unittest.mock
+
+        real_replace = os.replace
+
+        for label, directory, call in self._writers():
+            with self.subTest(writer=label):
+                def exploding(src, dst, *, _real=real_replace):
+                    raise OSError("simulated failure at the commit step")
+
+                with unittest.mock.patch("os.replace", exploding):
+                    if label in self.SWALLOWS:
+                        call()  # must not raise — see SWALLOWS
+                    else:
+                        with self.assertRaises(
+                            OSError, msg=f"{label} swallowed the failure"
+                        ):
+                            call()
+
+                residue = [
+                    p.name
+                    for p in directory.iterdir()
+                    if p.name.startswith(".tmp-")
+                ]
+                self.assertEqual(
+                    residue,
+                    [],
+                    f"{label} left staging residue behind: {residue}",
+                )
+
+    def test_the_idiom_is_present_in_every_atomic_writer(self):
+        """The structural half. A writer that grows a `mkstemp` without the
+        cleanup would pass the behavioural test above only because it is not
+        in its list."""
+        import ast
+
+        offenders = []
+        for path in (REPO_ROOT / "src").glob("**/*.py"):
+            if "__pycache__" in str(path):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                calls = {
+                    getattr(inner.func, "attr", None)
+                    for inner in ast.walk(node)
+                    if isinstance(inner, ast.Call)
+                }
+                if "mkstemp" not in calls:
+                    continue
+                cleans = any(
+                    isinstance(inner, ast.Try)
+                    and any(
+                        h.type is not None
+                        and getattr(h.type, "id", None) == "BaseException"
+                        for h in inner.handlers
+                    )
+                    for inner in ast.walk(node)
+                )
+                if not cleans:
+                    offenders.append(f"{path.name}::{node.name}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "these mkstemp writers have no `except BaseException` cleanup, so an "
+            f"interrupted write leaves a .tmp- file behind: {offenders}",
+        )

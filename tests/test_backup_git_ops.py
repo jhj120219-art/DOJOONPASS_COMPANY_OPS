@@ -335,6 +335,67 @@ class NonBlockingGuaranteeTests(unittest.TestCase):
             )
         )
 
+    def test_git_answers_in_the_language_the_markers_are_written_in(self):
+        """`_AUTH_FAILURE_MARKERS` is a list of English phrases, so every
+        classification depends on git speaking English.
+
+        git translates its messages when a catalog for the caller's locale is
+        installed. Where one is, no marker matches a real credential failure,
+        `is_authentication_failure()` answers False, and docs/08 §19 sends the
+        run to BACKUP_PENDING — the unbounded retry loop §62 forbids, reached
+        by the one route the classification cannot see.
+
+        The environment pins the locale, so this asserts the pin and not the
+        packaging of whatever git happens to be installed.
+        """
+        from backup import git_ops
+
+        environment = git_ops._git_environment()
+
+        self.assertEqual(environment["LC_ALL"], "C")
+        self.assertEqual(environment["LANG"], "C")
+
+    def test_a_localised_caller_environment_does_not_reach_git(self):
+        """The pin has to survive an operator (or a Task Scheduler profile)
+        whose own environment names a language. Overriding an inherited
+        value is the whole point — `dict(os.environ)` copies it in first."""
+        import os
+        import unittest.mock
+
+        from backup import git_ops
+
+        with unittest.mock.patch.dict(
+            os.environ, {"LC_ALL": "ko_KR.UTF-8", "LANG": "ko_KR.UTF-8"}
+        ):
+            environment = git_ops._git_environment()
+
+        self.assertEqual(environment["LC_ALL"], "C")
+        self.assertEqual(environment["LANG"], "C")
+
+    def test_the_markers_still_match_under_the_pinned_locale(self):
+        """Pinning the locale is only worth anything if the phrases it
+        guarantees are the phrases the list holds. Real git/GCM output.
+
+        Deliberately only the cases the marker list already catches. Which
+        *other* messages ought to be caught is BUG-52, a classification
+        decision, and it is characterized where it belongs
+        (`test_runner_failure_paths.py::AuthFailureClassificationTests`).
+        The locale pin does not touch it: `remote: Permission to x/y.git
+        denied to user.` is missed in every locale, English included.
+        """
+        from backup import git_ops
+
+        for message in (
+            "remote: Support for password authentication was removed on "
+            "August 13, 2021.",
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+            "git@github.com: Permission denied (publickey).",
+            "fatal: could not read Username for 'https://github.com': "
+            "terminal prompts disabled",
+        ):
+            with self.subTest(message=message[:40]):
+                self.assertTrue(git_ops.is_authentication_failure(message))
+
     def test_the_git_environment_does_not_discard_the_rest_of_the_environment(self):
         """git needs PATH, HOME/USERPROFILE, and on Windows SystemRoot. A
         replaced (rather than extended) environment breaks git itself."""
@@ -569,4 +630,61 @@ class StagingResidueThroughTheRealBackupTests(GitOpsTestCase):
 
         self._backup(master, "RUN-1")
 
+        self.assertEqual(self._remote_files(bare), [".gitkeep"])
+
+    def test_only_the_case_of_a_secret_filename_decides_whether_it_leaks(self):
+        """NEW, **security**. CHARACTERIZATION — asserts today's behaviour.
+
+        Same content, same in-scope directory, same run: `daily/id_rsa` is
+        stopped by docs/08 §29's gate and `daily/ID_RSA` reaches the remote.
+        The name list is right; the comparison is case-sensitive and Windows
+        is not, so which one an operator happens to type decides whether the
+        gate protects them.
+
+        Asserted through the real remote rather than at `scan_for_secrets()`,
+        because the seam cannot answer the question that matters — whether
+        the key is readable from the backup. It is:
+        `git show main:daily/ID_RSA` returns the key material.
+
+        BUG-55's root at a second location. Not fixed here: case-folding the
+        comparison gives the gate a new BACKUP_FAILED condition, which is
+        E-15's documented harm, and that pair is recorded as needing a
+        decision. `ops_status._secret_names_the_gate_will_not_recognise()`
+        reports it meanwhile. If this test starts failing, the gate became
+        case-insensitive and BACKLOG must be updated with it.
+        """
+        from backup.result import BackupStatus
+
+        KEY = "-----BEGIN OPENSSH PRIVATE KEY-----"
+        master, bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-13.md").write_text("# real day\n", encoding="utf-8")
+        (master / "daily" / "ID_RSA").write_text(KEY, encoding="utf-8")
+
+        entry = self._backup(master, "RUN-1")
+
+        self.assertIs(entry.final_status, BackupStatus.SUCCESS)
+        self.assertEqual(entry.push_result, "SUCCESS")
+        self.assertIn("daily/ID_RSA", self._remote_files(bare))
+        self.assertEqual(
+            _run_git(["show", "main:daily/ID_RSA"], cwd=bare).strip(), KEY
+        )
+
+    def test_the_exact_case_of_the_same_file_is_stopped_before_push(self):
+        """The control the test above needs. Only the case differs.
+
+        A separate fixture on purpose: on Windows `ID_RSA` and `id_rsa` are
+        one path, so the two cannot coexist — which is itself the point.
+        """
+        from backup.result import BackupStatus
+
+        master, bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-13.md").write_text("# real day\n", encoding="utf-8")
+        (master / "daily" / "id_rsa").write_text(
+            "-----BEGIN OPENSSH PRIVATE KEY-----", encoding="utf-8"
+        )
+
+        entry = self._backup(master, "RUN-1")
+
+        self.assertIs(entry.final_status, BackupStatus.FAILED)
+        self.assertIn("secret", (entry.push_result or "").lower())
         self.assertEqual(self._remote_files(bare), [".gitkeep"])

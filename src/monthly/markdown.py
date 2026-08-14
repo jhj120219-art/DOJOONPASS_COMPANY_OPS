@@ -52,6 +52,11 @@ SECTION_TITLE_BY_CATEGORY = {
     "LEARNING": "Key Learnings",
 }
 
+# Shared with `generator._existing_generated_at()`, which has to read a field
+# back out of a rendered file and must find the block rather than the first
+# line that looks like it — see there.
+METADATA_TITLE = "## Metadata"
+
 # docs/09 §71, verbatim.
 NO_MATERIAL_HISTORY_SENTENCE = (
     "No material company-level changes were recorded during this month."
@@ -98,7 +103,7 @@ def _metadata_block(
     last_updated_at: str | None,
 ) -> str:
     lines = [
-        "## Metadata",
+        METADATA_TITLE,
         "",
         f"- History Month: {month_title(year, month)}",
         f"- Generated At: {generated_at}",

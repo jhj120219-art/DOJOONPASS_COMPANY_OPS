@@ -39,7 +39,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
@@ -61,6 +61,7 @@ from agent.status import read_status  # noqa: E402
 from app.desktop_activity import read_company_activity  # noqa: E402
 from app.runner import DEFAULT_RUN_SUMMARY_PATH, PIPELINE_COMPONENTS  # noqa: E402
 from backup.state import BackupStateError  # noqa: E402
+from daily.markdown import summary_line_indices  # noqa: E402
 from backup.state import load_state as load_backup_state  # noqa: E402
 from backup.working_copy import scan_for_secrets  # noqa: E402
 
@@ -96,7 +97,45 @@ from scheduler.lock import (  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
-AGENT_DIR = RUNTIME_DIR / "agent"
+
+
+def _agent_dir() -> Path:
+    """`runtime/agent`, derived when asked rather than frozen at import.
+
+    It used to be a module-level constant. That made `RUNTIME_DIR` a knob
+    that only half worked: redirecting it — which is how every test and probe
+    isolates this view — left `AGENT_DIR` pointing at the developer's real
+    `runtime/agent`, so the AGENT block silently reported the live machine
+    while every other block reported the fixture.
+
+    Measured, and not hypothetically: a probe written during C31 set
+    `RUNTIME_DIR` to a temp tree holding a future-dated `agent_state.json`,
+    read back "agent has not run for 3 day(s)" from this repository's own
+    runtime, and nearly recorded a working check as missing.
+
+    This is C13's 결함 2 in a second place, and its wording applies verbatim:
+    *"Reaching for the default inside here made this function depend on a
+    path its caller never named: measured, a test calling it directly picked
+    up the repository's own live manifest — which said SUCCESS — and got
+    exit 0 for a Backup failure."* Deriving on call makes `RUNTIME_DIR` the
+    single knob for everything this module owns, so isolating the view can no
+    longer be half-done.
+
+    The rule was already written down **in this file**, on
+    `_runner_lock_path()`: *"Resolved per call, not at import: `RUNTIME_DIR`
+    is rebound by tests … and a path frozen at import would keep pointing at
+    the old one."* This applies that rule to the one place that missed it
+    rather than inventing one — the same shape as C20 §3 (the spec named two
+    files and only one was in the list) and C27 §4 (the Runner lock was
+    watched and the Agent lock was not).
+
+    `DEFAULT_RUN_SUMMARY_PATH` is deliberately NOT folded in. It belongs to
+    `app.runner`, which decides where the manifest lives; re-deriving it from
+    `RUNTIME_DIR` would be a second opinion about another module's layout. It
+    stays its own knob, and the tests that exercise LAST RUN set it.
+    """
+    return RUNTIME_DIR / "agent"
+
 
 # A Desktop that is simply switched off for a weekend is normal in this
 # deployment (docs/07 section 58), so silence is only worth flagging after
@@ -111,6 +150,13 @@ SILENT_AFTER_DAYS = 3
 # purpose — the cost of firing early is telling an operator to interrupt a
 # healthy long run.
 LOCK_STUCK_AFTER_HOURS = 2
+
+# How far ahead of the real clock `backup_state.last_successful_backup` has
+# to be before it is clock skew rather than a race with a Runner that is
+# still finishing. See the check itself for the reasoning; the short version
+# is that the harm scales with the distance — an hour ahead heals itself,
+# months ahead does not.
+CLOCK_AHEAD_TOLERANCE_HOURS = 1
 
 # The line `daily/markdown.py` writes for each rendered Candidate.
 # Kept as one constant because `_kept_but_not_rendered()` has to ask
@@ -174,6 +220,160 @@ def _would_reach_the_commit(working_copy: Path, candidates: tuple[str, ...]) -> 
     return tuple(
         name for name in candidates if name.replace("\\", "/") in listed
     )
+
+
+def _daily_dates(daily_dir: Path) -> list[date]:
+    """Every date `daily_dir` actually holds a Daily History file for.
+
+    `os.scandir` rather than `glob` + `is_file()`: the directory entry
+    already carries the file-or-directory answer, so asking `is_file()` on a
+    `Path` costs a second stat per file. Measured, and the reason this is
+    not the tidier `glob`:
+
+        730 files    glob+is_file 10.90 ms    scandir 0.69 ms   (16x)
+        3650 files   glob+is_file 58.75 ms    scandir 3.48 ms   (17x)
+
+    Ten years of Daily History is the second row, against a whole-view
+    baseline of ~44 ms on this machine. The two forms were asserted to
+    return identical lists before the swap.
+
+    A directory named `2026-08-05.md` is excluded, for the reason C31 wrote
+    across six other call sites: it exists, and it is not a day of Company
+    History.
+    """
+    found: list[date] = []
+    try:
+        entries = list(os.scandir(daily_dir))
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.endswith(".md") or is_incomplete_write(entry.name):
+            continue
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        try:
+            found.append(date.fromisoformat(entry.name[:-3]))
+        except ValueError:
+            continue  # a hand-added note, not a day of History
+    return sorted(found)
+
+
+def _holes_in_the_daily_sequence(daily_dir: Path) -> tuple[str, ...]:
+    """Dates inside the closed range that have no Daily History file.
+
+    The Daily filenames must form an unbroken run of dates. docs/07 §30's
+    "close in order, leave no gap" is one half of that, and the other is
+    that `generate_daily_history()` writes a file for a day with no work
+    too — an empty day is recorded, not skipped, which is exactly what
+    docs/09 §72 says the empty *month* file is for. So a date sitting
+    between two days that do have files was closed, had a file, and no
+    longer does.
+
+    Nothing was looking. Measured on ten closed days with 08-04..08-06
+    removed — the shape a partial restore, a half-synced OneDrive folder, or
+    a hand deletion (docs/06 §57 permits editing, and deleting is an edit)
+    leaves behind:
+
+        check_state_consistency()   CONSISTENT
+        ATTENTION                   nothing about the three days
+        Scheduler next run          starts at last_close + 1, never returns
+
+    Three days of Company History gone, permanently, with every indicator
+    healthy. `check_state_consistency()` is not wrong — §47 asks it whether
+    the *last* closed day has a file, and it does — it simply never had the
+    interior in view.
+
+    Bounded by the files themselves rather than by
+    `COMPANY_OPS_HISTORY_START_DATE`, which is often unset (see
+    `_history_start_date()`) and would make this check disappear when it is.
+    The earliest file present is a lower bound that needs no configuration
+    and cannot be wrong: whatever came before it is outside this machine's
+    History, and a gap strictly between two present days is not.
+
+    A missing *suffix* is deliberately not reported here — a run that failed
+    part-way leaves one, it is the normal retry shape, and the next run
+    fills it. Only the interior.
+
+    Verified against this machine's own runtime before being written:
+    `local_master/daily` and `backup_working_copy/daily` both hold
+    2026-08-05..2026-08-10 with no hole, so the premise this check rests on
+    is true of the real tree and not only of a fixture.
+    """
+    days = _daily_dates(daily_dir)
+    if len(days) < 2:
+        return ()
+    present = set(days)
+    span = (days[-1] - days[0]).days + 1
+    return tuple(
+        (days[0] + timedelta(days=offset)).isoformat()
+        for offset in range(span)
+        if (days[0] + timedelta(days=offset)) not in present
+    )
+
+
+def _holes_in_the_monthly_sequence(monthly_dir: Path) -> tuple[str, ...]:
+    """Months inside the consolidated range that have no Monthly file.
+
+    The exact sibling of `_holes_in_the_daily_sequence()`, and it rests on
+    the same two facts: `pending_months()` consolidates oldest-first without
+    skipping, and docs/09 §72 writes a file for a month with no material
+    history too — precisely so that "nothing happened" and "we forgot" stay
+    distinguishable. So the Monthly filenames are a contiguous run of months
+    and an interior gap is a file that was there.
+
+    Nothing was looking here either. Measured with 2026-01..2026-08
+    consolidated and 04/05 deleted: no ATTENTION line mentions them,
+    `pending_months()` starts *after* `last_successful_monthly_close` so no
+    run revisits them, and the state-vs-history check asks only about the
+    last closed month.
+
+    The remedy is better than Daily's and is worth stating, because it is
+    exact: Monthly is derived wholly from the Daily files (docs/09 §12-13),
+    so marking the month dirty rebuilds it. Measured end to end —
+
+        delete 2026-07.md      plain re-run: statuses [] , still missing
+        mark_month_dirty()     MONTHLY_GENERATED, file back, EVT-1 in it
+
+    — which is the whole point of Monthly being a derived artifact. Daily
+    cannot promise that, and this function's message does not pretend it
+    can.
+    """
+    if not monthly_dir.is_dir():
+        return ()
+    keys: list[tuple[int, int]] = []
+    try:
+        entries = list(os.scandir(monthly_dir))
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.name.endswith(".md") or is_incomplete_write(entry.name):
+            continue
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        try:
+            year, month = entry.name[:-3].split("-")
+            keys.append((int(year), int(month)))
+        except ValueError:
+            continue
+    if len(keys) < 2:
+        return ()
+    keys.sort()
+    present = set(keys)
+    (first_year, first_month), (last_year, last_month) = keys[0], keys[-1]
+    span = (last_year - first_year) * 12 + (last_month - first_month) + 1
+    missing = []
+    for offset in range(span):
+        index = (first_year * 12 + first_month - 1) + offset
+        candidate = (index // 12, index % 12 + 1)
+        if candidate not in present:
+            missing.append(f"{candidate[0]:04d}-{candidate[1]:02d}")
+    return tuple(missing)
 
 
 def _history_newer_than_the_last_backup(local_master: Path, last_backup: datetime | None):
@@ -285,6 +485,21 @@ def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
     re-created from scratch (docs/08 §30 permits it) has no old commits even
     though the remote still does. Nothing here can see that without network
     access to the remote, which this read-only view does not take.
+
+    Case-folded as well as exact (E-24). The gate's comparison is
+    case-sensitive and Windows is not, so `daily/ID_RSA` is precisely the
+    path that reaches the remote — measured, BACKUP_SUCCESS with the key
+    readable via `git show`. Matching only the exact spelling would leave
+    this report blind at the one place the leak actually happens.
+
+    Widening the *report* is not widening the *gate*. `scan_for_secrets()` is
+    untouched: nothing here can make a backup fail, which is the property
+    that puts E-24's real fix behind a decision. And over-reporting is the
+    direction this project already chose for every secret-shaped signal —
+    `_would_reach_the_commit()` falls back to over-reporting when git cannot
+    answer, and `oplog.SECRET_PATTERNS` deliberately over-matches, for the
+    same asymmetry: an unnecessary rotation costs one afternoon, an
+    unreported one costs a live credential.
     """
     if not working_copy.is_dir():
         return ()
@@ -307,9 +522,66 @@ def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
         # `<oid>` for commits, `<oid> <path>` for everything with a name.
         _, _, path = line.partition(" ")
         path = path.strip()
-        if path and _looks_like_secret(PurePosixPath(path).name):
+        if not path:
+            continue
+        name = PurePosixPath(path).name
+        if _looks_like_secret(name) or _looks_like_secret(name.lower()):
             seen.add(path)
     return tuple(sorted(seen))
+
+
+def _secret_names_the_gate_will_not_recognise(root: Path) -> tuple[str, ...]:
+    """Files the Backup gate's own name list would match — except for case.
+
+    `_looks_like_secret()` compares names exactly. Windows compares them
+    case-insensitively, so on the platform docs/11 deploys to, a file named
+    `ID_RSA` **is** a file named `id_rsa` and the gate does not think so.
+
+    Measured, eight files written into a `daily/` directory (in scope,
+    docs/08 §26):
+
+        on disk   .env  CREDENTIALS.JSON  ID_RSA  server.PEM
+        flagged   daily\\.env
+
+    `.env`, `.ENV` and `.Env` collapsed into one file, which is the point —
+    the filesystem already treats the name as case-insensitive. The other
+    three are ordinary distinct files carrying the exact names docs/08 §29
+    asks this gate to catch, and all three passed it: `run_once()` returns
+    BACKUP_SUCCESS and `git add -A` commits them.
+
+    This is BUG-55's root (a case-sensitive comparison against a
+    case-insensitive filesystem) at a second location. BUG-55 is about which
+    directories get *backed up*; this is about which files get *blocked*.
+
+    **Detection only, deliberately.** Case-folding the comparison would give
+    the gate a new way to return BACKUP_FAILED, which is precisely E-15's
+    documented harm — a false positive there stops Company History reaching
+    the remote at all, and every candidate fix for that pair is recorded as
+    needing a decision. So this reports and changes nothing, the same
+    treatment `_misnamed_scope_directories()` gives BUG-55.
+
+    The name list is imported from the gate rather than restated, for the
+    reason the import block gives: a second opinion about what a secret looks
+    like is how the two drift apart.
+
+    `.git/` is skipped, for the reason `_would_reach_the_commit()`'s own
+    caller already gives: git never lists anything inside its own storage, so
+    a secret-shaped name there is not on its way anywhere, and it is 93% of
+    the walk on this machine's Working Copy today (90 of 97 files) — a share
+    that only grows as backup history accumulates.
+    """
+    if not root.is_dir():
+        return ()
+    found: list[str] = []
+    for path in root.rglob("*"):
+        if ".git" in path.parts or not path.is_file():
+            continue
+        name = path.name
+        if _looks_like_secret(name):
+            continue  # the gate already sees this one
+        if _looks_like_secret(name.lower()):
+            found.append(str(path.relative_to(root)))
+    return tuple(sorted(found))
 
 
 def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
@@ -653,20 +925,231 @@ def _kept_but_not_rendered(
         # Whole lines, not a substring search. `E-1` is a substring of the
         # line rendered for `E-10`, so a substring test reported a genuinely
         # stranded `E-1` as fine — measured, with ordinary sequential ids and
-        # no crafted input. The renderer writes exactly
-        # `- Event ID: {event_id}` (daily/markdown.py), so comparing whole
-        # lines asks the same question the renderer answers.
-        rendered_ids = {
-            line.strip()[len(_EVENT_ID_LINE_PREFIX):]
-            for line in text.splitlines()
-            if line.strip().startswith(_EVENT_ID_LINE_PREFIX)
+        # no crafted input (C30).
+        #
+        # The comparison is built the way the renderer builds it — take the
+        # id, make the line — rather than by taking the line apart. C30 did
+        # the latter (`startswith(prefix)`, then slice the prefix off), and
+        # the prefix it had to slice ends in a space, so a rendered
+        # `- Event ID: ` (an `event_id` of `""`, which `validate_event()`
+        # accepts — BACKLOG A-15) did not start with it. The Candidate was in
+        # its Daily file and this reported it as permanently lost, with a
+        # message telling the operator no run will ever fix it. Constructing
+        # the line has no such edge: whatever the renderer wrote for an id,
+        # this writes the same thing.
+        #
+        # Summary lines excluded for the same reason, one layer up. The
+        # renderer writes a summary raw as its block's first bullet, so a
+        # Candidate whose summary reads `Event ID: EVT-B` renders a line
+        # identical to EVT-B's own. Measured — EVT-A rendered with that
+        # summary, EVT-B genuinely absent from the file:
+        #
+        #     summary `Event ID: EVT-B`   ->  ()
+        #     summary `Shipped it.`       ->  ('EVT-B (2026-08-05)',)
+        #
+        # This function exists to catch exactly that loss (E-17's shape),
+        # and one ordinary summary switched it off for the Candidate it
+        # named. Excluding summaries cannot go the other way: a summary is
+        # never the renderer's label line, so nothing genuinely rendered is
+        # removed from the set.
+        #
+        # Measured, whole function, before -> after:
+        #
+        #      14 days x  5 Candidates    0.84 ->  0.99 ms
+        #     365 days x 10 Candidates   24.09 -> 30.05 ms
+        #
+        # The file read still dominates; the second row is a year of stored
+        # Candidates, well past what this repository holds (13 when the
+        # function was written).
+        lines = text.splitlines()
+        summaries = summary_line_indices(lines)
+        rendered_lines = {
+            line.strip()
+            for index, line in enumerate(lines)
+            if index not in summaries
         }
         stranded.extend(
             f"{event_id} ({when})"
             for event_id in event_ids
-            if event_id not in rendered_ids
+            if f"{_EVENT_ID_LINE_PREFIX}{event_id}".strip() not in rendered_lines
         )
     return tuple(stranded)
+
+
+_CONSOLIDATED_ITEMS_LINE_PREFIX = "- Consolidated Items: "
+
+
+def _monthly_counts_more_than_it_shows(monthly_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Monthly files claiming more items than they actually carry.
+
+    `(key, claimed, rendered)` per month, for months where the two disagree.
+
+    A Monthly file states its own total — `monthly/markdown._metadata_block()`
+    writes `- Consolidated Items: {len(items)}` — and renders one
+    `- Event ID:` line per item it files under a section. Both come from the
+    same `render_monthly_markdown()` call on the same list, so **as
+    generated** they cannot disagree — which is what makes this decidable
+    with no window: nothing has to be read twice and nothing outside the one
+    file is consulted.
+
+    "As generated" is the whole of that guarantee, and it used to be written
+    here as "no false-positive case to caveat", which is more than it earns.
+    The file then lives on disk, where docs/06 §57 and docs/11 §71 permit
+    the COO to edit official History by hand. Measured, three items rendered
+    and one item block deleted by hand:
+
+        as generated        ()
+        one block deleted   ('2026-08', 3, 2)
+
+    That is reported, and reporting it is right — the file's own total now
+    contradicts its contents, and an operator who deleted an item without
+    updating the number should be told. But it is a hand edit rather than a
+    loss the pipeline caused, and it stays on screen until the number is
+    corrected. The opposite direction (`claimed < rendered`, an item block
+    *added* by hand) is excluded below for that same reason.
+
+    They can nonetheless disagree, and the way they do is a silent loss.
+    `render_monthly_markdown()` files an item only when
+    `item.category in by_category` (DECISION / MILESTONE / ISSUE / LEARNING);
+    anything else is dropped from every section while `len(items)` still
+    counts it. Measured — two items in, one with `category="Decision"`:
+
+        Consolidated Items: 2
+        sections rendered  : Major Decisions, Source Records, Metadata
+        EVT-2 present      : False
+
+    and `consolidate_month()` returned `MONTHLY_GENERATED, item_count=2`.
+
+    Reachable without corruption. A `## Late Events` item states its own
+    category on a `- Category:` bullet in the Daily file (docs/06 §37,
+    docs/09 §12-13), `monthly/parser.py` takes that bullet's text verbatim,
+    and docs/06 §57 / docs/11 §71 explicitly permit the COO to edit a Daily
+    History by hand. One hand-typed `- Category: Decision` therefore deletes
+    that Event from the month.
+
+    Detection only. Which section an unrecognised category belongs in is a
+    docs/09 §14 rendering decision — the exact sibling of the Daily-side drop
+    `tests/test_daily_history.py::
+    test_a_category_less_keep_candidate_silently_loses_its_detail`
+    characterizes. That one at least leaves the summary in `## Summary`;
+    Monthly has no equivalent, so nothing of the item survives.
+
+    A file whose metadata line is missing or unparseable is skipped rather
+    than guessed at: this reports a discrepancy between two numbers, and one
+    number it could not read is not a discrepancy.
+
+    One direction only. `claimed < rendered` means the file carries more than
+    it was generated with, which is a hand edit (docs/06 §57's Monthly
+    equivalent) rather than a loss, and reporting it would put a standing
+    line in front of an operator who did exactly what the spec allows.
+
+    **What this cannot see, measured rather than assumed.** A summary is
+    rendered unescaped (BUG-11/27, an open docs/06 rendering decision), so a
+    summary containing a newline and `- Event ID: …` adds a line this counts.
+    Measured — two items, one dropped for its category and one whose summary
+    carries a forged line:
+
+        - Consolidated Items: 2
+        `- Event ID: ` lines    2
+        EVT-2 in the file       False
+        this check              () — silent
+
+    That route needs a hand-edited Monthly file, because the pipeline cannot
+    deliver a multi-line summary here: `monthly/parser.py` is line-based, so
+    a Daily summary carrying a newline loses everything after the first line
+    (and the item itself, counted as `unconsolidated`). It can only raise
+    `rendered`, so it **hides** a shortfall rather than inventing one: this
+    check can be silenced but cannot cry wolf, which is the safer of the two
+    directions for an alert. Counting `### ` headings instead would be
+    defeated by the same root. Closing it is BUG-11/27's decision, not this
+    function's.
+
+    What did **not** need a newline, a hand edit, or anything crafted was a
+    summary shaped like one of these two lines — `Event ID: X` silenced a
+    shortfall and `Consolidated Items: 999` produced `('2026-08', 999, 1)`
+    on a perfectly good month, breaking the "cannot cry wolf" half outright.
+    `summary_line_indices()` closes both below.
+
+    Threaded on the same `_READ_WORKERS` idiom as `_read_keep_candidates()`
+    and for the same measured reason — the cost is the file OPEN, so the
+    figures only mean anything cold, each on its own freshly written tree:
+
+        24 months x  30 items   serial 124.7 ms   threaded  5.6 ms
+        120 months x 60 items   serial 667.9 ms   threaded 14.4 ms
+
+    against a whole-view baseline of ~44 ms on this machine. Serial, two
+    years of Monthly History would have tripled the cost of `ops_status.py`;
+    threaded it is inside the noise. On this machine's actual runtime the
+    check is 0.014 ms.
+
+    `summary_line_indices()` adds CPU rather than I/O, so it does not thread
+    away — measured in-process, no file access, against the bare line scan
+    it sits beside:
+
+        24 months x 30 items (225 lines)   scan 0.24 ms   + 1.14 ms
+        120 months x 60 items (435 lines)  scan 2.28 ms   + 11.38 ms
+
+    Two years is the scale this project is at and the whole check stays at
+    ~5.9 ms there. Ten years costs ~17 ms more than it used to. That was
+    taken over a two-tier fast path (cheap scan first, precise pass only for
+    files about to be reported) because the fast path reopens the silencing
+    direction to buy a saving at a scale a decade away.
+    """
+    if not monthly_dir.is_dir():
+        return ()
+    paths = [
+        path
+        for path in sorted(monthly_dir.glob("*.md"))
+        if not is_incomplete_write(path.name)
+    ]
+    if not paths:
+        return ()
+
+    def _read(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+    with ThreadPoolExecutor(max_workers=_READ_WORKERS) as pool:
+        # `map` preserves input order, so the sorted-filename ordering of the
+        # findings is identical to the serial version's.
+        texts = list(pool.map(_read, paths))
+
+    mismatched: list[tuple[str, int, int]] = []
+    for path, text in zip(paths, texts):
+        if text is None:
+            continue
+        claimed = None
+        rendered = 0
+        lines = text.splitlines()
+        # An item's summary is rendered raw as its block's first bullet, so a
+        # summary reading `Event ID: X` or `Consolidated Items: 999` is
+        # byte-identical to the lines this counts. Both directions measured,
+        # one item per file:
+        #
+        #     summary `Consolidated Items: 999`  ->  ('2026-08', 999, 1)
+        #     summary `Event ID: EXTRA`          ->  ()  (shortfall hidden)
+        #
+        # The first is the one that matters: this function's contract below
+        # is that it can be silenced but cannot cry wolf, and that ordinary
+        # summary put "998 items missing" in front of an operator.
+        summaries = summary_line_indices(lines)
+        for index, line in enumerate(lines):
+            if index in summaries:
+                continue
+            stripped = line.strip()
+            if stripped.startswith(_EVENT_ID_LINE_PREFIX):
+                rendered += 1
+            elif claimed is None and stripped.startswith(_CONSOLIDATED_ITEMS_LINE_PREFIX):
+                try:
+                    claimed = int(stripped[len(_CONSOLIDATED_ITEMS_LINE_PREFIX):].strip())
+                except ValueError:
+                    claimed = None
+                    break
+        if claimed is not None and claimed > rendered:
+            mismatched.append((path.stem, claimed, rendered))
+    return tuple(mismatched)
 
 
 def _source_note(*breakdowns) -> str:
@@ -758,6 +1241,16 @@ def _print_company(now: datetime) -> list[str]:
             if backlog.already_collected
             else ""
         )
+        + (
+            f" incoming_incomplete_write={backlog.incoming_incomplete_write}"
+            if backlog.incoming_incomplete_write
+            else ""
+        )
+        + (
+            f" rejected_incomplete_write={backlog.rejected_incomplete_write}"
+            if backlog.rejected_incomplete_write
+            else ""
+        )
     )
     # Who each pile came from (BACKLOG E-10). The counts above are the
     # authority and are unchanged; these lines only answer "which Desktop",
@@ -802,6 +1295,32 @@ def _print_company(now: datetime) -> list[str]:
             f"Collector가 거부한 Event {backlog.rejected}건"
             + _source_note(backlog.rejected_sources)
             + " — 사람이 확인해야 한다"
+        )
+    if backlog.incoming_incomplete_write:
+        # The same file as the sentence below, one directory earlier, in the
+        # window between the reporter dying and the next run moving it. It
+        # used to be counted as "an Event the Collector has not taken yet",
+        # which named a non-Event and held `is_clear` False for it.
+        attention.append(
+            f"incoming/에 중단된 쓰기 잔여물 {backlog.incoming_incomplete_write}건 — "
+            f"수집을 기다리는 Event가 아니다. Desktop 4의 reporter가 쓰기 도중에 "
+            f"죽으면 남는 staging 파일(`.tmp-…json`)이고, 다음 실행에서 Collector가 "
+            f"`rejected/`로 옮긴다. 보낸 Desktop을 확인할 필요는 없고 지워도 안전하다"
+        )
+    if backlog.rejected_incomplete_write:
+        # A different sentence, because it is a different fact and a
+        # different action. C27 §8 measured that a truncated staging file in
+        # `incoming/` is REJECTED and lands in `rejected/` under its staging
+        # name, and that ATTENTION then reported it as a rejected Event —
+        # C27's own words, *"잘못 이름 붙은 경보 하나"*. No Event was
+        # rejected; a write on this machine stopped. Nothing sent it and no
+        # Desktop needs looking at.
+        attention.append(
+            f"rejected/에 중단된 쓰기 잔여물 {backlog.rejected_incomplete_write}건 — "
+            f"거부된 Event가 아니다. Desktop 4의 reporter가 쓰기 도중에 죽으면 "
+            f"`incoming/`에 남는 staging 파일(`.tmp-…json`)이고, Collector가 그것을 "
+            f"읽어 여기로 옮긴 것이다. 보낸 Desktop을 확인할 필요는 없고 지워도 "
+            f"안전하다"
         )
     if backlog.unparseable or backlog.unreadable_incoming:
         # Reported for the right reason. These used to be counted as
@@ -988,9 +1507,14 @@ def _print_history(now: datetime) -> list[str]:
         attention.append(
             f"KEEP Candidate {len(unrendered)}건이 저장돼 있는데 그 날짜의 Daily "
             f"History에 없다: {', '.join(unrendered[:5])}"
-            f"{' 외' if len(unrendered) > 5 else ''} — 그 날짜는 이미 렌더링됐고 "
-            f"Late Event 병합은 재시도되지 않으므로(BACKLOG E-17) 어떤 실행도 "
-            f"이것을 넣지 않는다. 사람이 확인해야 한다{running}"
+            f"{' 외' if len(unrendered) > 5 else ''} — 그 날짜는 이미 렌더링됐고, "
+            f"Late Event 병합(6.5단계)의 대상은 **그 실행이 수집한 날짜뿐**이라 "
+            f"어떤 실행도 이것만 따로 넣지는 않는다(BACKLOG E-17). 다만 같은 "
+            f"날짜의 Event가 나중에 하나라도 더 수집되면 그때 **함께 들어간다** "
+            f"(실측: 방치된 EVT-S가 뒤늦은 EVT-N과 같이 "
+            f"`added_event_ids=('EVT-S','EVT-N')`으로 병합됐다). 지난 날짜라면 "
+            f"그런 Event가 오지 않는 것이 보통이므로 사람이 확인해야 "
+            f"한다{running}"
         )
     if review_waiting:
         attention.append(
@@ -1015,6 +1539,70 @@ def _print_history(now: datetime) -> list[str]:
             f"{last_backup.isoformat(timespec='seconds') if last_backup else '아직 없음'}"
             + (f" ({backup_state.backup_status.value})" if backup_state.backup_status else "")
         )
+        # The same future-dated-pointer family as the two state pointers
+        # below, and the worst member of it: the other two stop *work*, this
+        # one silences a *safety check*.
+        #
+        # `_history_newer_than_the_last_backup()` asks "was this file written
+        # after the last successful push". A `last_successful_backup` ahead of
+        # the calendar makes that true of nothing, so the check that exists to
+        # say "this Company History is only on this machine" returns clean
+        # forever. Measured, one real never-pushed Daily present:
+        #
+        #     last_successful_backup 2026-08-01   -> 1 alert (correct)
+        #     last_successful_backup 2027-05-01   -> 0 alerts
+        #
+        # `backup/state.py` writes this from the run's own clock, so the same
+        # skew that produces a future Daily Close pointer produces this too —
+        # and a restored `backup_state.json` carries it across machines.
+        #
+        # Reported before the check it disables, so the operator reads why the
+        # line below is silent rather than trusting the silence. Detection
+        # only: correcting the timestamp is deciding when the last real backup
+        # happened, which nothing here knows.
+        # Two deliberate differences from the two date pointers below.
+        #
+        # Compared against the **real** clock, not the caller's `now`. This
+        # value and the file mtimes it is weighed against are both real-time
+        # measurements; `now` is the view's date reference. Mixing the two is
+        # the trap `_healthy_backup_state()` in the tests names in as many
+        # words ("Anchoring one of them to the pinned clock and the other to
+        # the wall clock"). In production they are the same value.
+        #
+        # And with a tolerance, because this one has sub-second resolution
+        # and a real race. `ops_status.py` promises it is safe to run while
+        # the Runner is running, and `main()` takes its clock reading once at
+        # the top — so a Backup finishing a few hundred milliseconds later
+        # legitimately writes a timestamp after it. That is not skew.
+        #
+        # The tolerance is not arbitrary: the harm scales with the distance.
+        # A timestamp an hour ahead blinds the unbacked-History check for an
+        # hour and then heals itself; one months ahead blinds it until the
+        # calendar arrives, which is the condition worth a line in ATTENTION.
+        # An hour is far beyond any run's duration (the git subprocess
+        # timeout alone is 300 s) and far below "effectively permanent".
+        if last_backup is not None:
+            wall_clock = datetime.now().astimezone()
+            reference = (
+                wall_clock
+                if last_backup.tzinfo is not None
+                else wall_clock.replace(tzinfo=None)
+            )
+            if last_backup > reference + timedelta(hours=CLOCK_AHEAD_TOLERANCE_HOURS):
+                print(
+                    f"  마지막 성공 백업    : 미래 시각 "
+                    f"({last_backup.isoformat(timespec='seconds')})"
+                )
+                attention.append(
+                    f"backup state가 미래 시각을 마지막 성공 백업으로 기록하고 있다: "
+                    f"{last_backup.isoformat(timespec='seconds')} (지금은 "
+                    f"{reference.isoformat(timespec='seconds')}) — 이 값보다 나중에 "
+                    f"쓰인 History만 '미백업'으로 잡히므로, **그 시각이 올 때까지 "
+                    f"미백업 History 검사가 무엇도 보고하지 못한다.** 즉 아래 줄이 "
+                    f"조용한 것은 안전하다는 뜻이 아니다. 시계가 앞섰다가 교정됐거나 "
+                    f"state 파일을 그런 머신에서 복원한 경우다 — 사람이 확인해야 한다"
+                )
+
         unbacked = _history_newer_than_the_last_backup(local_master, last_backup)
         if unbacked:
             names = ", ".join(str(p.relative_to(local_master)) for p in unbacked[:5])
@@ -1077,6 +1665,83 @@ def _print_history(now: datetime) -> list[str]:
     elif consistency.status is ConsistencyStatus.STATE_UNREADABLE:
         attention.append(f"Daily State를 읽을 수 없다: {consistency.detail}")
 
+    # The interior of the closed range, which the check above never had in
+    # view — see `_holes_in_the_daily_sequence()`.
+    holes = _holes_in_the_daily_sequence(daily_dir)
+    if holes:
+        print(f"  Daily 시퀀스 구멍   : {len(holes)}")
+        # Where the missing days might still be, asked rather than assumed.
+        # The Backup Working Copy is right here and is already listed for
+        # the un-backed check, so naming which ones survive there turns a
+        # diagnosis into an instruction. `git` history may hold others.
+        backup_daily = RUNTIME_DIR / "backup_working_copy" / "daily"
+        recoverable = sorted(
+            {day.isoformat() for day in _daily_dates(backup_daily)} & set(holes)
+        )
+        where = (
+            f"그 중 {len(recoverable)}건은 Backup Working Copy에 아직 있다"
+            f"({', '.join(recoverable[:5])}{' 외' if len(recoverable) > 5 else ''})"
+            if recoverable
+            else "Backup Working Copy에도 없다 — 원격 git history를 확인해야 한다"
+        )
+        attention.append(
+            f"Daily History 시퀀스에 구멍 {len(holes)}일: "
+            f"{', '.join(holes[:5])}{' 외' if len(holes) > 5 else ''} — 그 날짜들은 "
+            f"닫혔고 파일이 있었는데 지금 없다(빈 날에도 파일은 쓰인다). Scheduler는 "
+            f"마지막 Daily Close **다음** 날짜부터 처리하므로 **어떤 실행도 이 날들을 "
+            f"다시 만들지 않는다**, 그리고 정합성 검사는 마지막 날짜만 보므로 계속 "
+            f"CONSISTENT를 보고한다. 부분 복원·동기화 누락·손편집 삭제가 남기는 "
+            f"모양이다. {where}"
+        )
+
+    # A Daily Close pointer dated in the future — a silent, permanent stop
+    # that every other indicator reports as perfect health.
+    #
+    # `agent/status.py` already answers this exact question for the Agent's
+    # own state file, in these words: *"agent state says it has collected
+    # through X, which is in the future … nothing will be collected until
+    # that date arrives"*. The Runner's own state file makes the identical
+    # claim and nobody had asked it. Applying an answer this project has
+    # already given is not a new policy (C28 §6's rule).
+    #
+    # `check_state_consistency()` cannot see it: it asks only whether the
+    # claimed Daily file exists, and in the reachable version of this the
+    # file does exist — the Scheduler wrote it while the clock was skewed.
+    # Measured, pointer `2026-12-25` with that file present, "now"
+    # 2026-08-14, one KEEP Candidate waiting for 2026-08-12:
+    #
+    #     scheduler.run_once()   COMPLETED, generated=()
+    #     state consistency      CONSISTENT
+    #     ATTENTION              (nothing)
+    #
+    # Company History stops for four months and every signal reads green,
+    # because `_generate_pending_dates()` computes `start = pointer + 1 day`
+    # and `end = yesterday`, so `start > end` and the loop runs zero times.
+    # It never walks backwards, which is the right behaviour — and that is
+    # exactly why nothing recovers on its own.
+    #
+    # Reachable through clock skew that was later corrected (a dead CMOS
+    # battery, an NTP jump, a VM resumed with a stale clock) or a state file
+    # restored from a machine that had one — the same two causes C17 records
+    # for the Agent side.
+    #
+    # Detection only, and it cannot false-alarm: `end` is always yesterday,
+    # so no healthy run can ever set this pointer past today. Repairing it
+    # would mean deciding which date Company History should resume from,
+    # which is docs/10 §46's prohibition and §64's operator call.
+    close = consistency.last_successful_daily_close
+    if close is not None and close > now.date():
+        print(f"  daily state 정합성  : 미래 날짜 ({close.isoformat()})")
+        attention.append(
+            f"Daily State가 미래 날짜를 마지막 Daily Close로 기록하고 있다: "
+            f"{close.isoformat()} (오늘은 {now.date().isoformat()}) — Scheduler는 "
+            f"그 다음 날부터 어제까지를 처리하므로 **그 날짜가 올 때까지 어떤 "
+            f"Daily History도 생성되지 않는다.** 그동안 수집된 Event는 전부 "
+            f"Candidate로만 쌓이고, Scheduler는 COMPLETED를, 정합성 검사는 "
+            f"CONSISTENT를 계속 보고한다. 시계가 앞섰다가 교정됐거나 state 파일을 "
+            f"그런 머신에서 복원한 경우다 — 사람이 state 파일을 확인해야 한다"
+        )
+
     # The same §48 check, aimed at the pair nobody aimed it at.
     #
     # `check_state_consistency()` compares Scheduler state against the Daily
@@ -1118,6 +1783,30 @@ def _print_history(now: datetime) -> list[str]:
                 f"시작한다). 사람이 확인해야 한다"
             )
 
+        # The Daily pointer's future-dated twin, for the same reason and with
+        # the same restraint. `pending_months()` starts at the month AFTER
+        # this pointer and stops at the last closed month, so a pointer ahead
+        # of the calendar makes that range empty — `monthly_run_once()`
+        # returns no results at all and this view prints the pointer as if it
+        # were an achievement. Measured, pointer `2027-06` with the file
+        # present and "now" 2026-08: `results=()`, no ATTENTION, and every
+        # month from 2026-08 onward silently never consolidated.
+        #
+        # Strictly *after* the current month, so it cannot false-alarm: §49
+        # forbids consolidating a month still in progress, so a healthy run
+        # can never set this past the previous month.
+        current_month_key = f"{now.year:04d}-{now.month:02d}"
+        if closed > current_month_key:
+            print(f"  monthly state 정합성: 미래 달 ({closed})")
+            attention.append(
+                f"Monthly State가 미래의 달을 통합 완료로 기록하고 있다: {closed} "
+                f"(이번 달은 {current_month_key}) — pending_months()는 이 포인터 "
+                f"**다음** 달부터 시작하므로 그때까지 **어떤 달도 통합되지 않는다.** "
+                f"Daily는 계속 쌓이고 Monthly만 영구히 멈춘 채 모든 지표가 정상을 "
+                f"보고한다. 시계가 앞섰다가 교정됐거나 state 파일을 그런 머신에서 "
+                f"복원한 경우다 — 사람이 state 파일을 확인해야 한다"
+            )
+
     # BACKLOG A-20: an Event consumed by the Collector whose History
     # Candidate was never written is lost from Company History permanently —
     # the event_id is already marked seen, so no later run reconsiders it.
@@ -1139,7 +1828,12 @@ def _print_history(now: datetime) -> list[str]:
     )
     if reconciliation.orphaned:
         for orphan in reconciliation.orphaned[:5]:
-            print(f"                        ! {orphan.event_id} [{orphan.decision.value}]")
+            # `one_line()` for the reason `main()`'s ATTENTION loop gives:
+            # `event_id` arrives from another Desktop and a newline inside one
+            # forges a whole line of this block. The `!` prefix and the fixed
+            # indentation are exactly what a forged line would imitate.
+            print(f"                        ! {one_line(orphan.event_id)} "
+                  f"[{orphan.decision.value}]")
         # `find_orphaned_events()` is a pure function and knows nothing about
         # the lock, but the pipeline it inspects has a window where a
         # perfectly healthy Event looks orphaned: Collector moves the WHOLE
@@ -1164,6 +1858,43 @@ def _print_history(now: datetime) -> list[str]:
             f"processed에 읽을 수 없는 Event {len(reconciliation.unreadable)}건 — "
             f"History 반영 여부를 판단할 수 없다"
         )
+
+    # Secret names the gate's own list holds but its comparison misses.
+    #
+    # Both roots, because they fail for different reasons and the action is
+    # the same: Local Master is what the gate scans (so a case variant there
+    # passes the gate, is synced, and is pushed), and the Working Copy is
+    # what git commits (E-21's ungated route, whose report above uses the
+    # same case-sensitive scan and is therefore blind in the same way).
+    #
+    # Not folded into the E-21 line: that one says "the gate did not look
+    # here", this one says "the gate looked and did not recognise it", and
+    # only the second is still true after E-15/E-21 are decided.
+    #
+    # The Working Copy list goes through `_would_reach_the_commit()` for the
+    # same reason the E-21 line does — what matters there is what git stages,
+    # and C26 measured that reporting without asking git is a standing false
+    # alarm on a correctly configured repo (docs/08 §28's `.gitignore`).
+    # Local Master has no repository to ask; there the fact is that sync will
+    # copy the file and the gate will not stop it.
+    for label, root, ask_git in (
+        ("Local Master", local_master, False),
+        ("Backup Working Copy", RUNTIME_DIR / "backup_working_copy", True),
+    ):
+        unrecognised = _secret_names_the_gate_will_not_recognise(root)
+        if unrecognised and ask_git:
+            unrecognised = _would_reach_the_commit(root, unrecognised)
+        if unrecognised:
+            attention.append(
+                f"{label}에 Backup Secret 게이트가 **이름을 알아보지 못하는** 파일 "
+                f"{len(unrecognised)}건: {', '.join(unrecognised[:5])}"
+                f"{' 외' if len(unrecognised) > 5 else ''} — 게이트의 이름 목록"
+                f"(docs/08 §29)에는 들어 있지만 비교가 대소문자를 구분하고 Windows "
+                f"파일시스템은 구분하지 않는다. 즉 `id_rsa`는 막히고 `ID_RSA`는 "
+                f"BACKUP_SUCCESS로 원격에 올라간다(BUG-55와 같은 뿌리, 다른 위치). "
+                f"게이트를 바꾸면 새로운 BACKUP_FAILED 조건이 생기므로(E-15) 여기서는 "
+                f"보고만 한다 — 파일 이름을 소문자로 바꾸거나 옮겨야 한다"
+            )
 
     # Secret-shaped files sitting in the Backup Working Copy (E-21).
     #
@@ -1267,6 +1998,31 @@ def _print_history(now: datetime) -> list[str]:
                 f"원격에 잘린 내용이 들어간다. 지워도 안전하다"
             )
 
+    # A Monthly that counted an item it did not write down.
+    shortfall = _monthly_counts_more_than_it_shows(monthly_dir)
+    if shortfall:
+        for key, claimed, rendered in shortfall:
+            print(f"  Monthly 항목 누락   : {key} ({claimed}건 중 {rendered}건만 기록)")
+        attention.append(
+            "Monthly History가 스스로 센 항목보다 적게 기록한 달 "
+            f"{len(shortfall)}건: "
+            + ", ".join(
+                f"{key}({claimed}→{rendered})" for key, claimed, rendered in shortfall[:5]
+            )
+            + (" 외" if len(shortfall) > 5 else "")
+            + " — 그 달의 Event가 Monthly에서 통째로 사라졌다(Daily 쪽과 달리 "
+            "요약조차 남지 않는다). 원인은 둘 중 하나이고 조치가 서로 다르다. "
+            "(1) 렌더러가 DECISION/MILESTONE/ISSUE/LEARNING 외의 Category를 어느 "
+            "Section에도 넣지 않고 버리는데 `Consolidated Items`는 그것까지 세는 "
+            "경우 — 해당 달 Daily의 `- Category:` 줄이 네 값 중 하나인지 확인한다. "
+            "이건 **다시 만들어도 같은 결과**다. (2) Monthly 파일이 손으로 편집돼 "
+            "항목 블록이 빠진 경우(docs/06 §57 / docs/11 §71이 허용한다) — 이건 "
+            "그 달을 dirty로 표시하고 다시 실행하면 **복구된다**(실측: 항목 블록 "
+            "하나를 지우면 그냥 재실행은 그대로 두고, 강제 rebuild가 되살린다). "
+            "이 검사는 두 숫자가 어긋난 사실만 알 수 있고 둘 중 어느 쪽인지는 "
+            "말할 수 없다"
+        )
+
     print(f"  마지막 통합한 달    : {state.last_successful_monthly_close}")
     if state.dirty_months:
         print(f"  재생성 대기         : {', '.join(state.dirty_months)}")
@@ -1314,6 +2070,24 @@ def _print_history(now: datetime) -> list[str]:
                 f"확인해야 한다"
             )
 
+    # The interior of the consolidated range — Daily's hole check, one level
+    # up. See `_holes_in_the_monthly_sequence()`.
+    monthly_holes = _holes_in_the_monthly_sequence(monthly_dir)
+    if monthly_holes:
+        print(f"  Monthly 시퀀스 구멍 : {len(monthly_holes)}")
+        attention.append(
+            f"Monthly History 시퀀스에 구멍 {len(monthly_holes)}달: "
+            f"{', '.join(monthly_holes[:5])}"
+            f"{' 외' if len(monthly_holes) > 5 else ''} — 그 달들은 통합됐고 파일이 "
+            f"있었는데 지금 없다(중요한 일이 없던 달에도 파일은 쓰인다, docs/09 §72). "
+            f"`pending_months()`는 마지막 통합한 달 **다음**부터 시작하므로 어떤 "
+            f"실행도 이 달들을 다시 만들지 않는다. **다만 Monthly는 Daily에서만 "
+            f"파생되므로(docs/09 §12-13) 복구된다** — 그 달을 dirty로 표시하고 다시 "
+            f"실행하면 내용까지 그대로 돌아온다(실측: 삭제 후 그냥 재실행은 그대로, "
+            f"dirty 표시 후 MONTHLY_GENERATED). 해당 달 Daily가 남아 있는지 먼저 "
+            f"확인해야 한다"
+        )
+
     # A month that closed but was never consolidated is the one case worth
     # flagging: it means Daily Coverage never became COMPLETE for it.
     last_closed = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
@@ -1340,27 +2114,32 @@ def _agent_lock_path() -> Path:
     `runtime/agent/locks/agent.lock`, deliberately a different file: the two
     protect different critical sections and run on different machines.
     """
-    return AGENT_DIR / "locks" / "agent.lock"
+    return _agent_dir() / "locks" / "agent.lock"
 
 
 def _print_agent(now: datetime) -> list[str]:
-    if not AGENT_DIR.exists():
+    agent_dir = _agent_dir()
+    if not agent_dir.exists():
         print("AGENT — 이 머신에는 Agent가 설정되어 있지 않다 (runtime/agent 없음)")
         return []
 
     snapshot = read_status(
         agent_start_date=_agent_start_date(),
         now=now,
-        state_path=AGENT_DIR / "state" / "agent_state.json",
-        outbox_dir=AGENT_DIR / "outbox",
-        sent_dir=AGENT_DIR / "sent",
-        rejected_signals_dir=AGENT_DIR / "signals_rejected",
+        state_path=agent_dir / "state" / "agent_state.json",
+        outbox_dir=agent_dir / "outbox",
+        sent_dir=agent_dir / "sent",
+        rejected_signals_dir=agent_dir / "signals_rejected",
     )
 
     print("AGENT — 이 머신의 Agent")
     print("-" * 60)
-    print(f"  desktop_id          : {snapshot.desktop_id}")
-    print(f"  last_run            : {snapshot.last_run}")
+    # Both are strings taken out of `agent_state.json` with only a type
+    # check (`agent/state.load_state()`), so a hand-edited or restored state
+    # file can put a line break in either. Same rule as `main()`'s ATTENTION
+    # loop, applied where it costs nothing.
+    print(f"  desktop_id          : {one_line(snapshot.desktop_id)}")
+    print(f"  last_run            : {one_line(snapshot.last_run)}")
     print(f"  마지막 수집 날짜    : {snapshot.last_successful_collection_date}")
     print(f"  미수집 날짜         : {len(snapshot.pending_dates)}")
     if snapshot.pending_dates:
@@ -1391,7 +2170,7 @@ def _print_agent(now: datetime) -> list[str]:
     sync_folder = os.environ.get("COMPANY_OPS_AGENT_SYNC_FOLDER")
     if sync_folder:
         delivery = find_undelivered_events(
-            sent_dir=AGENT_DIR / "sent", sync_folder=Path(sync_folder)
+            sent_dir=agent_dir / "sent", sync_folder=Path(sync_folder)
         )
         print(
             f"  전달 정합성         : "
@@ -1399,7 +2178,9 @@ def _print_agent(now: datetime) -> list[str]:
             f"(확인 {delivery.checked}건, 이미 수거됨 {delivery.absent}건)"
         )
         for item in delivery.undelivered[:5]:
-            print(f"                        ! {item.event_id} [{item.problem}]")
+            # Same rule, same origin: this `event_id` is read back out of a
+            # file in `sent/` and is not constrained to one line.
+            print(f"                        ! {one_line(item.event_id)} [{item.problem}]")
         if delivery.undelivered:
             delivery_attention.append(
                 f"전송 완료로 기록됐지만 sync 폴더에 도착하지 않은 Event "
@@ -1539,7 +2320,11 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
         print("  아직 기록된 실행이 없다.")
         return attention
 
-    print(f"  실행 시각   : {summary.started_at}")
+    # `started_at` and the component fields below are read back out of the
+    # manifest file, which `read_summary()` does not constrain to one line.
+    # Same rule as `main()`'s ATTENTION loop; a hand-edited or restored
+    # manifest is a DR path, not an exotic one.
+    print(f"  실행 시각   : {one_line(summary.started_at)}")
 
     # How long ago that was — the question this line never answered.
     #
@@ -1589,11 +2374,11 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
         if component.status is ComponentStatus.SUCCESS:
             continue
         if component.status is ComponentStatus.SKIPPED:
-            print(f"  - {component.name}: SKIPPED (미설정)")
+            print(f"  - {one_line(component.name)}: SKIPPED (미설정)")
             continue
         failure = component.failure
         print(
-            f"  ! {component.name}: {failure.classification} "
+            f"  ! {one_line(component.name)}: {one_line(failure.classification)} "
             f"[{failure.severity.value}/{failure.retryability.value}]"
         )
         # The failing step's own numbers. `ComponentResult.metrics` is
@@ -1682,7 +2467,44 @@ def main() -> int:
     print("ATTENTION")
     print("-" * 60)
     for item in attention:
-        print(f"  ! {item}")
+        # `one_line()` at the sink, so "one item, one line" holds for every
+        # ATTENTION message — including ones added years from now by someone
+        # who never read this comment. That is the same argument
+        # `oplog.append_line()` makes for logs, and this file already accepts
+        # it for Run Manifest metrics ("nothing read back from disk can forge
+        # a line should not depend on today's metric list staying the way it
+        # is"). The metrics were the smaller half.
+        #
+        # Measured before this existed. `event_id` crosses the OneDrive
+        # transport from another Desktop and docs/02 constrains it only to
+        # "present and non-null" (BACKLOG A-15), so a newline inside one is
+        # accepted, stored, and interpolated into these messages by
+        # `_kept_but_not_rendered()`, `find_orphaned_events()` and
+        # `_candidates_before()`. One KEEP Candidate whose id began
+        # `"X\n  ! 모든 검사 통과 — 사람이 지금 할 일은 없다"` produced exactly
+        # that line, standing on its own inside ATTENTION:
+        #
+        #     ! KEEP Candidate 1건이 저장돼 있는데 … 없다: X
+        #     ! 모든 검사 통과 — 사람이 지금 할 일은 없다 (2026-08-05) — …
+        #
+        # BUG-6's shape, in the one view AGENT.md §6 tells an operator to read
+        # first. `oplog.one_line()` closed it for `collector.log` (C10); the
+        # renderer of this view had no equivalent.
+        #
+        # Escaped rather than stripped, for `one_line()`'s own reason: the
+        # real id stays recoverable, so the message still names the file a
+        # human has to go and find.
+        #
+        # `redact()` is deliberately NOT applied here, unlike in
+        # `append_line()`. Every ATTENTION message is built from filenames,
+        # ids and counts — never from a file's *contents* — and the two that
+        # carry an exception message carry a state-file parse error, whose
+        # text is positional ("Expecting ',' delimiter: line 3 column 5") and
+        # quotes nothing. Over-redacting a path an operator has to act on
+        # would cost more than it protects. If a message ever starts carrying
+        # a response body, it needs `redact()` too — see
+        # `run_company_ops.py::_print_result()`, where one already does.
+        print(f"  ! {one_line(item)}")
     return 3
 
 

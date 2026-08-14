@@ -7,7 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -128,15 +128,356 @@ class MissingOrDamagedStateTests(StateConsistencyTestCase):
 
 
 class SchedulerBehaviourUnchangedTests(StateConsistencyTestCase):
-    def test_consistency_module_does_not_import_scheduler_run_once(self):
-        # The check must stay a report, not a gate: wiring it into
-        # Scheduler's control flow would be a policy change (docs/10 §64
-        # makes an inconsistency an operator decision).
+    """The check must stay a report, not a gate: wiring it into Scheduler's
+    control flow would be a policy change (docs/10 §64 makes an inconsistency
+    an operator decision).
+
+    Asked of the parsed module, not of its text. This was two `assertNotIn`
+    calls against the raw source, and C31 tripped the second one by writing
+    the words `scheduler.run_once()` **in a comment** explaining why a
+    predicate had changed — the module still imported and called nothing.
+
+    That is this repository's recurring defect in a test rather than in
+    production: a substring standing in for a structural question (C30 §5's
+    shape, and the reason C29 §3 moved an equivalent check to AST). A test
+    that a comment can break teaches people not to write comments, and it can
+    fail while the invariant holds — or hold while a `getattr(scheduler,
+    "run_" + "once")` slips past it.
+    """
+
+    def _tree(self):
+        import ast
+
+        return ast.parse(
+            (
+                Path(__file__).resolve().parents[1]
+                / "src"
+                / "scheduler"
+                / "consistency.py"
+            ).read_text(encoding="utf-8")
+        )
+
+    def test_the_consistency_module_imports_nothing_from_scheduler(self):
+        import ast
+
+        imported = set()
+        for node in ast.walk(self._tree()):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    imported.add(f"{node.module}.{alias.name}")
+            elif isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+
+        self.assertNotIn("scheduler.run_once", imported)
+        self.assertEqual(
+            {name for name in imported if "scheduler" in name.split(".")[-1]},
+            set(),
+            imported,
+        )
+
+    def test_the_consistency_module_calls_nothing_named_run_once(self):
+        import ast
+
+        called = set()
+        for node in ast.walk(self._tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+
+        self.assertNotIn("run_once", called)
+
+    def test_a_comment_mentioning_run_once_does_not_break_the_invariant(self):
+        """The regression itself: the module says the words today."""
         source = (
             Path(__file__).resolve().parents[1] / "src" / "scheduler" / "consistency.py"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("from .scheduler import", source)
-        self.assertNotIn("run_once", source)
+
+        self.assertIn("run_once", source, "this test is pointless if it does not")
+
+
+class NonFileInTheWayTests(unittest.TestCase):
+    """NEW, **P0**. A directory named like a Daily History file made every
+    check that guards a missing day agree it was there.
+
+    `exists()` answers "is this name taken". "Is this day of Company History
+    written" is a different question, and a directory named `2026-08-12.md`
+    answers the first yes and the second no. Four predicates were asking the
+    first while meaning the second.
+
+    Measured end to end, one KEEP Candidate waiting for 2026-08-12 and a
+    directory of that name in the output directory:
+
+        scheduler.run_once()           COMPLETED
+        result.generated_dates         ('2026-08-12', '2026-08-13')
+        check_state_consistency()      CONSISTENT
+        (daily/'2026-08-12.md').is_file()   False
+
+    The run **claimed to have generated a day it never wrote**, advanced
+    `last_successful_daily_close` past it, and left the Candidate
+    unreachable — docs/07 §30's "close in order, leave no gap" defeated by a
+    gap the loop could not see. The Monthly sibling did the same one
+    granularity up: a directory named `2026-08.md` produced
+    `MONTHLY_UNCHANGED`, and UNCHANGED advances the catch-up pointer.
+
+    Fixed by asking the question the code means. Nothing changes when the
+    artifact is a real file; when it is not, the run stops and says what is
+    in the way.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.daily = self.root / "daily"
+        self.daily.mkdir()
+
+    def _repository(self):
+        from history import HistoryCandidate, HistoryDecision
+        from history.file_repository import FileHistoryRepository
+
+        repository = FileHistoryRepository(
+            keep_dir=self.root / "keep", review_dir=self.root / "review"
+        )
+        repository.save(
+            HistoryCandidate(
+                history_id="HIST-A", event_id="EVT-A",
+                timestamp="2026-08-12T10:00:00+09:00", category="MILESTONE",
+                project_id="P", role="COO", summary="real work",
+                evidence=(), filter_result=HistoryDecision.KEEP,
+            )
+        )
+        return repository
+
+    def test_the_scheduler_does_not_report_a_day_it_did_not_write(self):
+        from scheduler import run_once as scheduler_run_once
+
+        (self.daily / "2026-08-12.md").mkdir()
+
+        result = scheduler_run_once(
+            self._repository(),
+            history_start_date=date(2026, 8, 12),
+            now=datetime(2026, 8, 14, 11, 0).astimezone(),
+            state_path=self.root / "s.json",
+            daily_output_dir=self.daily,
+            already_locked=True,
+        )
+
+        self.assertEqual(result.generated_dates, ())
+        self.assertEqual(result.failed_date, date(2026, 8, 12))
+        self.assertIn("non-file is in the way", result.error)
+
+    def test_the_pointer_does_not_advance_past_it(self):
+        """The half that made it permanent: once the pointer passes a date,
+        no later run reconsiders it."""
+        from scheduler import run_once as scheduler_run_once
+        from scheduler.state import load_state
+
+        (self.daily / "2026-08-12.md").mkdir()
+        state_path = self.root / "s.json"
+
+        scheduler_run_once(
+            self._repository(),
+            history_start_date=date(2026, 8, 12),
+            now=datetime(2026, 8, 14, 11, 0).astimezone(),
+            state_path=state_path,
+            daily_output_dir=self.daily,
+            already_locked=True,
+        )
+
+        self.assertIsNone(load_state(state_path).last_successful_daily_close)
+
+    def test_consistency_no_longer_calls_a_directory_a_written_day(self):
+        (self.daily / "2026-08-10.md").mkdir()
+        state_path = self.root / "s.json"
+        state_path.write_text(
+            json.dumps({"last_successful_daily_close": "2026-08-10"}), encoding="utf-8"
+        )
+
+        result = check_state_consistency(state_path, self.daily)
+
+        self.assertEqual(result.status, ConsistencyStatus.STATE_INCONSISTENCY)
+
+    def test_a_real_file_is_still_a_written_day(self):
+        """The guard on the guard — the healthy path is untouched."""
+        (self.daily / "2026-08-10.md").write_text("# real", encoding="utf-8")
+        state_path = self.root / "s.json"
+        state_path.write_text(
+            json.dumps({"last_successful_daily_close": "2026-08-10"}), encoding="utf-8"
+        )
+
+        self.assertEqual(
+            check_state_consistency(state_path, self.daily).status,
+            ConsistencyStatus.CONSISTENT,
+        )
+
+    def test_the_monthly_sibling_fails_loudly_instead_of_unchanged(self):
+        import calendar
+
+        from monthly import MonthlyStatus, consolidate_month
+
+        monthly = self.root / "monthly"
+        monthly.mkdir()
+        _, last = calendar.monthrange(2026, 8)
+        for day in range(1, last + 1):
+            (self.daily / f"2026-08-{day:02d}.md").write_text("# H\n", encoding="utf-8")
+        (monthly / "2026-08.md").mkdir()
+
+        result = consolidate_month(
+            year=2026, month=8, daily_dir=self.daily, monthly_dir=monthly,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 9, 2, 11, 0).astimezone(),
+        )
+
+        self.assertIs(result.status, MonthlyStatus.MONTHLY_FAILED)
+        self.assertIn("non-file is in the way", result.error)
+        # And no staging residue is left behind for C27's checks to find.
+        self.assertEqual([p.name for p in monthly.iterdir() if p.name.startswith(".tmp-")], [])
+
+    def test_the_late_update_path_reports_the_right_thing(self):
+        """It used to answer `FAILED: [Errno 13] Permission denied` naming a
+        temp path — a report about the wrong file entirely."""
+        from daily import LateUpdateOutcome, update_daily_history
+        from history.file_repository import FileHistoryRepository
+
+        (self.daily / "2026-08-20.md").mkdir()
+
+        result = update_daily_history(
+            FileHistoryRepository(
+                keep_dir=self.root / "keep", review_dir=self.root / "review"
+            ),
+            date(2026, 8, 20),
+            output_dir=self.daily,
+            now=datetime(2026, 9, 2, 11, 0).astimezone(),
+        )
+
+        self.assertIs(result.outcome, LateUpdateOutcome.NO_EXISTING_FILE)
+        self.assertIsNone(result.error)
+
+    def test_the_orphan_detector_is_not_silenced_by_a_directory(self):
+        """A-20's detector, same defect. It asks "was a Candidate written for
+        this Event"; a directory carrying the Candidate's name answered "is
+        this name taken" instead. Measured: the same genuinely orphaned Event
+        reported correctly with nothing there, and reported by nothing once
+        the directory existed."""
+        from events import create_event
+        from history.file_repository import safe_candidate_filename
+        from history.reconciliation import find_orphaned_events
+
+        processed, keep, review = (self.root / n for n in ("p", "k", "r"))
+        for directory in (processed, keep, review):
+            directory.mkdir()
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="P",
+            event_type="MILESTONE_COMPLETED", status="IN_PROGRESS", summary="s",
+            history_candidate=True, event_id="EVT-ORPHAN",
+        )
+        (processed / "EVT-ORPHAN.json").write_text(event.to_json(), encoding="utf-8")
+        (keep / safe_candidate_filename("HIST-EVT-ORPHAN")).mkdir()
+
+        result = find_orphaned_events(
+            processed_dir=processed, keep_dir=keep, review_dir=review
+        )
+
+        self.assertEqual([o.event_id for o in result.orphaned], ["EVT-ORPHAN"])
+
+    def test_a_real_candidate_file_still_clears_the_orphan_check(self):
+        from events import create_event
+        from history.file_repository import safe_candidate_filename
+        from history.reconciliation import find_orphaned_events
+
+        processed, keep, review = (self.root / n for n in ("p2", "k2", "r2"))
+        for directory in (processed, keep, review):
+            directory.mkdir()
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="P",
+            event_type="MILESTONE_COMPLETED", status="IN_PROGRESS", summary="s",
+            history_candidate=True, event_id="EVT-OK",
+        )
+        (processed / "EVT-OK.json").write_text(event.to_json(), encoding="utf-8")
+        (keep / safe_candidate_filename("HIST-EVT-OK")).write_text("{}", encoding="utf-8")
+
+        self.assertEqual(
+            find_orphaned_events(
+                processed_dir=processed, keep_dir=keep, review_dir=review
+            ).orphaned,
+            (),
+        )
+
+    def test_is_sent_does_not_treat_a_directory_as_a_delivered_event(self):
+        """`is_sent()` asks "was this Event delivered". A directory of that
+        name made it answer yes, which is the Agent deciding not to send an
+        Event it never sent — and `sent/` is exactly where the outbox's
+        "never lose an Event" guarantee is cashed."""
+        from agent.outbox import is_sent
+        from reporter.local_output import safe_event_filename
+
+        sent = self.root / "sent"
+        sent.mkdir()
+        (sent / safe_event_filename("EVT-DIR")).mkdir()
+        (sent / safe_event_filename("EVT-FILE")).write_text("{}", encoding="utf-8")
+
+        self.assertFalse(is_sent("EVT-DIR", sent))
+        self.assertTrue(is_sent("EVT-FILE", sent))
+
+    def test_name_taken_questions_still_use_exists(self):
+        """The other half of the rule, so the sweep is not over-applied.
+
+        `collector/runtime.run_once()`'s destination guard and `intake`'s
+        duplicate check ask "is this name taken", and a directory takes a
+        name just as firmly as a file does. Narrowing those to `is_file()`
+        would let a run try to write over a directory instead of refusing.
+
+        **`outbox.stage()` used to be listed here and was mis-filed.** Its
+        early return is not a refusal, it is an "already done, skip" fast
+        path, and "already done" has to mean a real Event file — measured,
+        a directory named `EVT-1.json` made `stage()` return success having
+        written nothing. The fear this test recorded ("would let a run try
+        to write over a directory") does not apply: the refusal lives one
+        call down in `_write_atomic()`, which still asks `exists()` and
+        still refuses. Both are asserted below so the two halves stay
+        distinguishable.
+        """
+        import inspect
+
+        from collector import runtime as collector_runtime
+        from reporter import local_output
+
+        self.assertIn(
+            "destination.exists()", inspect.getsource(collector_runtime.run_once)
+        )
+        self.assertIn(
+            "final_path.exists()", inspect.getsource(local_output.write_event_json)
+        )
+
+    def test_stage_asks_whether_the_event_is_persisted_not_whether_a_name_is_taken(self):
+        """The corrected half. Behaviour, not source text: a directory in
+        the way must reach the caller as an error rather than a Path, and an
+        ordinary re-stage must still be the no-op the docstring promises."""
+        from agent.outbox import stage
+        from events import create_event
+        from reporter.local_output import safe_event_filename
+
+        event = create_event(
+            source="DESKTOP_1", role="COO", project_id="P",
+            event_type="COMPLETED", status="COMPLETED", summary="s",
+            history_candidate=True, event_id="EVT-STAGE",
+        )
+        outbox_dir = self.root / "outbox"
+        outbox_dir.mkdir()
+        (outbox_dir / safe_event_filename("EVT-STAGE")).mkdir()
+
+        with self.assertRaises(OSError):
+            stage(event, outbox_dir)
+
+        clean = self.root / "outbox_clean"
+        clean.mkdir()
+        first = stage(event, clean)
+        self.assertTrue(first.is_file())
+        self.assertEqual(stage(event, clean), first)
 
 
 class NeverExercisedRejectionTests(unittest.TestCase):

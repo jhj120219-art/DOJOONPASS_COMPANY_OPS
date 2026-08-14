@@ -46,7 +46,7 @@ from typing import Sequence
 
 from history import HistoryCandidate
 
-from .markdown import _render_item_block
+from .markdown import _render_item_block, summary_line_indices
 
 LATE_SECTION_TITLE = "## Late Events"
 METADATA_TITLE = "## Metadata"
@@ -61,7 +61,28 @@ METADATA_TITLE = "## Metadata"
 # is a blunt substring scan for absolute Windows drive prefixes, and the tail
 # of "Event ID:" followed by an escape happens to spell one. The guard is
 # right to stay blunt; the pattern is easy to write another way.
-_EVENT_ID_LINE = re.compile(r"^- Event ID:[ \t]*(\S.*)$")
+#
+# `(.*)` rather than `(\S.*)`: the value has to be allowed to be empty,
+# because the renderer is allowed to write an empty one. `validate_event()`
+# rejects only a *missing* `event_id` (`data.get(field) is None`), so `""` is
+# a valid Event today — whether it should be is docs/02's decision (BACKLOG
+# A-15) and is untouched here. What is not a decision is that §38's duplicate
+# guard reads back what §18's renderer wrote.
+#
+# Measured with `(\S.*)`, one KEEP Candidate with `event_id=""` on a date
+# already closed, three ordinary runs:
+#
+#     run 1  UPDATED_LATE_EVENT ('',)      run 3  UPDATED_LATE_EVENT ('',)
+#     run 2  UPDATED_LATE_EVENT ('',)
+#     -> 3 identical `## Late Events` item blocks for ONE Candidate
+#     -> `- Late Events Added: 3` beside `- Event Count: 1`
+#
+# The item was rendered every time and recognised none of the times, so
+# `select_late_candidates()` re-added it on every run that revisited the
+# date, and `total_events` (also computed from this function) could not
+# count it either. Unbounded growth of a Company History file, with the two
+# Metadata numbers contradicting each other inside it.
+_EVENT_ID_LINE = re.compile(r"^- Event ID:[ \t]*(.*)$")
 _GENERATED_AT_LINE = re.compile(r"^- Generated At:[ \t]*")
 _LAST_UPDATED_LINE = re.compile(r"^- Last Updated At:[ \t]*")
 _LATE_ADDED_LINE = re.compile(r"^- Late Events Added:[ \t]*(\d+)[ \t]*$")
@@ -76,13 +97,36 @@ def existing_event_ids(markdown: str) -> set[str]:
     and after a manual edit the Repository is no longer authoritative about
     that.
 
-    Only `- Event ID:` lines count. The Evidence section's `- <id>: <text>`
-    lines deliberately do not match — an Event can contribute evidence lines
-    without its own item block only if the file was hand-edited, and in that
-    case the item block's absence is what matters.
+    Only `- Event ID:` lines count, and only the ones that are the
+    renderer's *label* — `summary_line_indices()` excludes the bullet that is
+    an item's summary, because the renderer writes a summary raw and one
+    reading `Event ID: EVT-999` is byte-identical to a label. Getting that
+    wrong is not a cosmetic miscount: this set is section 38's duplicate
+    guard, so a phantom id here means a real Event dated that day is dropped
+    on arrival, and again on every run that revisits the date. Measured
+    before the fix, an ordinary KEEP Candidate whose summary was
+    `Event ID: EVT-999`:
+
+        existing_event_ids(day) == {'EVT-1', 'EVT-999'}
+        select_late_candidates(day, [EVT-999]) == ()   # never appended
+        `- Event Count: 3` for two real Events
+
+    Nothing about that summary is crafted; it is also how an author would
+    write "Event ID: EVT-999" as a note to themselves. That it doubles as an
+    Event ID spoofing vector — one Event able to suppress a later one by
+    naming it — is the same defect seen from the security side.
+
+    The Evidence section's `- <id>: <text>` lines deliberately do not match —
+    an Event can contribute evidence lines without its own item block only if
+    the file was hand-edited, and in that case the item block's absence is
+    what matters.
     """
+    lines = markdown.splitlines()
+    summaries = summary_line_indices(lines)
     found: set[str] = set()
-    for line in markdown.splitlines():
+    for index, line in enumerate(lines):
+        if index in summaries:
+            continue
         match = _EVENT_ID_LINE.match(line.strip())
         if match:
             found.add(match.group(1).strip())

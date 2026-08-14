@@ -484,6 +484,46 @@ class ProcessProbeFailureTests(LockTestCase):
         self.assertTrue(lock_module._is_process_running(os.getpid()))
         self.assertFalse(lock_module._is_process_running(DEAD_PID))
 
+    @unittest.skipUnless(sys.platform == "win32", "tasklist is Windows-only")
+    def test_the_property_that_makes_it_locale_independent(self):
+        """C31: the claim above is right, and narrower than it reads.
+
+        `_is_process_running()` asks `str(pid) in result.stdout`. That is
+        substring matching against a **localized** subprocess output, and it
+        is only safe while the no-match message contains no digits. If a
+        Windows build or a translation ever renders it as, say, "0 tasks
+        found", every dead pid would answer *running* — the recorded holder
+        would never be judged stale, `try_acquire_lock()` would return False
+        forever, and every scheduled run would skip silently. That is BUG-42's
+        outcome reached by a different route, and nothing anywhere states the
+        assumption it rests on.
+
+        Measured on this machine (UI culture ko-KR), the message really does
+        carry no digits:
+
+            정보: 실행 중인 작업 중 지정된 조건에 일치하는 작업이 없습니다.
+
+        Asserted rather than argued, against whatever locale the suite
+        actually runs under, so the day it stops being true this fails
+        instead of the Runner jamming.
+        """
+        import subprocess
+
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {DEAD_PID}", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(
+            any(character.isdigit() for character in result.stdout),
+            "tasklist's no-match message now contains digits; "
+            "`_is_process_running()`'s substring test can no longer tell a "
+            f"dead pid from a live one: {result.stdout!r}",
+        )
+
 
 class StaleTakeoverTests(LockTestCase):
     """`_take_over_stale()` exists to stop two runs that both judged the same

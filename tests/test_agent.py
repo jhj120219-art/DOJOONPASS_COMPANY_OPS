@@ -1174,6 +1174,63 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
             with self.subTest(repair=repair):
                 self.assertNotIn(repair, after_catch)
 
+    def test_a_per_date_error_cannot_forge_a_result_row(self):
+        """The third entrypoint, held to the rule the other two now are.
+
+        `date_result.errors` holds a Signal filename, a parse error, or a
+        Transport failure — all read back from disk, none constrained to one
+        line. `agent.py` already `redact()`s them where it builds them; what
+        it does not do is stop one ending a line, and this report's rows
+        (`  <date>: <outcome> events=…`) are exactly what a forged line would
+        imitate.
+
+        Same guard, same reason, as `ops_status.py`'s ATTENTION block
+        (`test_observability.py::AttentionLineForgeryTests`) and
+        `run_company_ops.py::_print_result()`.
+        """
+        import contextlib
+        import io
+        import os
+        import tempfile
+        import unittest.mock
+
+        from agent.agent import AgentRunResult, AgentStatus, DateOutcome, DateResult
+
+        module = self._entrypoint()
+        forged = "  2026-01-01: COMPLETED events=99 already_sent=0 rejected=0"
+        result = AgentRunResult(
+            status=AgentStatus.COMPLETED,
+            desktop_id="DESKTOP_1",
+            role="CTO_BACKEND",
+            dates=(
+                DateResult(
+                    date=date(2026, 8, 10),
+                    outcome=DateOutcome.FAILED,
+                    errors=("s.json: could not read\n" + forged,),
+                ),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "COMPANY_OPS_PROFILE": "DESKTOP_1",
+                "COMPANY_OPS_AGENT_SYNC_FOLDER": tmp,
+                "COMPANY_OPS_AGENT_START_DATE": "2026-08-10",
+            }
+            out = io.StringIO()
+            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(
+                module, "run_once", return_value=result
+            ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                module.main()
+        printed = out.getvalue()
+
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [], printed)
+        self.assertIn("\\n", printed)
+        # Exactly one row per DateResult, whatever the error text contained.
+        self.assertEqual(
+            sum(1 for ln in printed.splitlines() if "2026-08-10" in ln), 1, printed
+        )
+
 
 class CorruptStateGuidanceTests(unittest.TestCase):
     """A damaged state file and a state file belonging to another Desktop
@@ -1396,3 +1453,131 @@ class EventIdCannotCaseCollideFromTheAgentTests(unittest.TestCase):
                     target_date=date(2026, 8, 10),
                     path=path,
                 )
+
+
+from agent.outbox import stage  # noqa: E402
+from events import create_event  # noqa: E402
+from reporter.local_output import safe_event_filename  # noqa: E402
+
+
+class OutboxNameOccupiedByADirectoryTests(AgentTestCase):
+    """`stage()` promises on its first line to persist the Event. With a
+    directory wearing the Event's filename it returned that path and wrote
+    nothing.
+
+    The outbox write is the Agent's durability boundary -- `_collect_one_date()`
+    says so where it catches `OSError`: *"If it fails the Event does not
+    exist yet, so the date has NOT been collected and must not be marked as
+    such."* A `stage()` that reports success skips that whole branch.
+
+    Measured before the fix, with a directory named `EVT-1.json` in the
+    outbox:
+
+        stage() returned              EVT-1.json    <- success
+        (outbox/EVT-1.json).is_file() False         <- nothing written
+
+    It was **contained**, which is why it had not been noticed: `drain()`
+    files the entry as `unreadable`, `DrainSummary.is_clear` goes False, and
+    the date does not advance. But the operator was told "an unreadable file
+    in the outbox (Permission denied)" instead of which date failed to
+    collect, and the containment was luck rather than the design -- the
+    branch written for exactly this, one function below, was already
+    hardened for the race case while the fast path above it was not.
+
+    `is_file()` on both checks routes it back through the durability
+    boundary: `_write_atomic()` refuses the occupied name, `FileExistsError`
+    (an `OSError`) reaches the caller, and the date is FAILED.
+    """
+
+    def _occupy(self, event_id):
+        self.outbox_dir.mkdir(parents=True, exist_ok=True)
+        blocker = self.outbox_dir / safe_event_filename(event_id)
+        blocker.mkdir()
+        return blocker
+
+    def test_stage_does_not_report_success_without_writing(self):
+        event = create_event(
+            source="DESKTOP_1", role="COO", project_id="P",
+            event_type="COMPLETED", status="COMPLETED", summary="s",
+            history_candidate=True, event_id="EVT-1",
+        )
+        self._occupy("EVT-1")
+
+        with self.assertRaises(OSError):
+            stage(event, self.outbox_dir)
+
+    def test_the_race_window_is_still_absorbed(self):
+        """The `except FileExistsError` branch exists for a real Event file
+        appearing between the check and the write. Narrowing to `is_file()`
+        must not close that."""
+        event = create_event(
+            source="DESKTOP_1", role="COO", project_id="P",
+            event_type="COMPLETED", status="COMPLETED", summary="s",
+            history_candidate=True, event_id="EVT-2",
+        )
+        self.outbox_dir.mkdir(parents=True, exist_ok=True)
+
+        first = stage(event, self.outbox_dir)
+        before = first.read_bytes()
+        second = stage(event, self.outbox_dir)
+
+        self.assertEqual(first, second)
+        self.assertEqual(second.read_bytes(), before)
+
+    def test_a_pre_existing_blocker_stops_the_run_before_any_date(self):
+        """End to end, and the answer is one step earlier than expected:
+        `run_once()` drains the outbox *before* processing any date, so a
+        blocker already sitting there stops the run outright rather than
+        failing one date.
+
+        Measured: `AgentStatus.FAILED`, `dates == ()`, and
+        `last_successful_collection_date` still None. That containment is
+        pre-existing and is not what the `stage()` fix changes -- it is
+        recorded here so the next reader does not mistake it for the fix.
+        """
+        day = date(2026, 8, 8)
+        self.write_signal(day, "s1")
+        self._occupy(
+            derive_event_id(source=self.PROFILE, target_date=day, signal_id="s1")
+        )
+
+        result = self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 9, 0).astimezone()
+        )
+
+        self.assertIs(result.status, AgentStatus.FAILED)
+        self.assertEqual(result.dates, ())
+        self.assertIsNone(self.state().last_successful_collection_date)
+
+    def test_a_blocker_appearing_after_the_drain_fails_its_date(self):
+        """The window `stage()` actually owns, and the one the fix is for.
+
+        The outbox was clear when the run started and the name is taken by
+        the time the Event is staged -- what a concurrent process or a
+        half-finished manual cleanup leaves. Before the fix `stage()`
+        returned that path as a success, so this date was COLLECTED with the
+        Event nowhere on disk and the collection pointer moved past it.
+        """
+        day = date(2026, 8, 8)
+        self.write_signal(day, "s1")
+        occupy = self._occupy
+
+        import agent.agent as agent_module
+
+        real_stage = agent_module.stage
+
+        def blocking_stage(event, outbox_dir):
+            occupy(event.event_id)
+            return real_stage(event, outbox_dir)
+
+        agent_module.stage = blocking_stage
+        self.addCleanup(setattr, agent_module, "stage", real_stage)
+
+        result = self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 9, 0).astimezone()
+        )
+
+        self.assertEqual([d.outcome for d in result.dates], [DateOutcome.FAILED])
+        self.assertIsNone(self.state().last_successful_collection_date)
+        errors = [error for d in result.dates for error in d.errors]
+        self.assertTrue(any("could not stage event" in e for e in errors), errors)

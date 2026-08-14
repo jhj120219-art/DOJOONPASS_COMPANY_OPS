@@ -47,9 +47,51 @@ EMPTY_DAY_MARKER = "No material company history recorded."
 
 _HEADING2 = re.compile(r"^##[ \t]+(.+?)[ \t]*$")
 _HEADING3 = re.compile(r"^###[ \t]+(.+?)[ \t]*$")
+# The literal `daily/markdown._render_item_block()` writes, used to count how
+# many items a document claims independently of how many this module can
+# parse. Kept beside the regex it complements: the regex reads a *value*, this
+# only asks whether the line is there at all.
+_EVENT_ID_LINE_PREFIX = "- Event ID:"
+# The same literal without the bullet, for comparing a bullet's text.
+_EVENT_ID_LABEL = "Event ID:"
+
 _EVENT_ID_LINE = re.compile(r"^-[ \t]+Event ID:[ \t]*(\S.*?)[ \t]*$")
 _OWNER_LINE = re.compile(r"^-[ \t]+Owner:[ \t]*(\S.*?)[ \t]*$")
 _CATEGORY_LINE = re.compile(r"^-[ \t]+Category:[ \t]*(\S.*?)[ \t]*$")
+
+# Every labelled bullet `daily/markdown._render_item_block()` can write inside
+# one `###` item block — the summary is the bullet that is none of these.
+#
+# This used to be the shape test `^[A-Z][A-Za-z ]+:[ \t]`, which asks "does
+# this look like a label" rather than "is this one of our labels". Measured:
+# an ordinary summary of `Fixed: login token refresh loop.` matches it, so
+# every bullet in the block was skipped, `_first_bullet()` returned None, and
+# the item was dropped from Monthly History entirely — no warning, and
+# `Consolidated Items` simply counted one fewer. `Decision: `, `Resolved: `,
+# `Note: `, `TODO: ` and anything else of that extremely common English shape
+# do the same. Nothing about the input has to be crafted or hand-edited.
+#
+# The label set is fixed by the renderer, so asking for it exactly is both
+# narrower and closer to what this module's own docstring already claimed.
+#
+# **Order matters, and is the renderer's own.** `_render_item_block()` writes
+# the summary first and then these labels in exactly this sequence, which is
+# what lets `_first_bullet()` tell a real label bullet from a summary that
+# merely opens with one of these words — see there. A test extracts the
+# sequence from the renderer's source and compares it to this tuple, so the
+# two cannot drift.
+_ITEM_LABELS = (
+    "Owner",
+    "Event ID",
+    "Category",
+    "Decision Context",
+    "Expected Outcome",
+    "Actual Outcome",
+    "Lessons Learned",
+)
+_LABEL_BULLET = re.compile(
+    r"^(?:%s):(?:[ \t]|$)" % "|".join(re.escape(label) for label in _ITEM_LABELS)
+)
 
 
 class DailyParseError(ValueError):
@@ -78,28 +120,143 @@ class DailyDocument:
     path: Path
     items: tuple[DailyItem, ...] = field(default_factory=tuple)
     is_empty_day: bool = False
+    # `- Event ID:` lines this document carries that did NOT become an item.
+    #
+    # The renderer writes exactly one such line per item it files
+    # (`daily/markdown._render_item_block()`), so on a document this module
+    # fully understands the two numbers are equal and this is 0. Anything
+    # above 0 is Company History that is in the Daily file and will not be
+    # in the Monthly — the loss this module can otherwise only cause
+    # silently, since a dropped item simply never appears in `items`.
+    #
+    # Free: the lines are already split and walked. No extra file read, and
+    # `consolidate_month()` gets it for nothing on a parse it already does.
+    #
+    # Counted rather than diagnosed on purpose. The parser has three
+    # documented reasons to skip an item (no `- Event ID:`, a late item with
+    # no `- Category:`, no summary bullet) and at least one undocumented way
+    # to lose a whole section — see `unconsolidated_event_ids` below for what
+    # this cannot distinguish. The number is the fact; the cause is for a
+    # human with the file open.
+    unconsolidated: int = 0
 
     @property
     def has_material_history(self) -> bool:
         return bool(self.items)
 
 
-def _first_bullet(lines: list[str], start: int, end: int) -> str | None:
+def _label_position(text: str) -> int | None:
+    """Where `text`'s label sits in the renderer's sequence, or None.
+
+    None means "this bullet is not one of the renderer's labels", which is
+    the only question `_LABEL_BULLET` used to answer. The position is what
+    `_first_bullet()` needs on top of it.
+    """
+    if not _LABEL_BULLET.match(text):
+        return None
+    for position, label in enumerate(_ITEM_LABELS):
+        if text.startswith(label + ":"):
+            return position
+    return None  # pragma: no cover - _LABEL_BULLET is built from the same tuple
+
+
+def _is_sole_identifier(indexed: list[tuple[int, str]]) -> bool:
+    """Whether the block's first bullet carries its only `Event ID:`.
+
+    The one thing that overrides the order rule in `_first_bullet()` — see
+    there. Mirrors `daily/markdown._is_sole_identifier()`.
+    """
+    if not indexed[0][1].startswith(_EVENT_ID_LABEL):
+        return False
+    return not any(text.startswith(_EVENT_ID_LABEL) for _index, text in indexed[1:])
+
+
+def _first_bullet(lines: list[str], start: int, end: int) -> tuple[int | None, str | None]:
     """The item block's summary: its first plain `- ` bullet.
 
-    Deliberately positional rather than keyword-matched, because that is how
-    `daily/markdown._render_item_block()` writes it — the summary is the only
-    bullet with no `Label:` prefix, and it always comes first.
+    `daily/markdown._render_item_block()` writes the summary first and then
+    the labels in `_ITEM_LABELS`' order. Scanning rather than taking
+    `block_start + 2` keeps the hand-edited case working (docs/06 §57 permits
+    it), where a label bullet may have been moved above the summary.
+
+    What it must NOT do is guess from the *shape* of the text — see
+    `_LABEL_BULLET`. A summary is prose written by a human and prose says
+    `Fixed: …` all the time.
+
+    **And a summary may legitimately open with one of the label words.**
+    Narrowing the shape test to the exact label set fixed `Fixed: `, but left
+    all seven real labels lost — measured, every one of
+
+        Owner: …   Event ID: …   Category: …   Decision Context: …
+        Expected Outcome: …   Actual Outcome: …   Lessons Learned: …
+
+    dropped its item. Four of those are domain-natural openers here:
+    `Lessons Learned: …` is how a LEARNING item's summary reads, and
+    `Decision Context: …` is how a DECISION's does.
+
+    The order settles it without guessing. The renderer emits its labels in a
+    strictly increasing sequence, so a first bullet whose label sits *later*
+    in that sequence than a label below it cannot be a label bullet — the
+    renderer would never have written it there. Three cases, all measured:
+
+        - Lessons Learned: …   - Owner: …          6 before 0  -> prose
+        - Owner: …             - real summary      hand edit   -> skip to prose
+        - Owner: …             - Event ID: …       0 before 1  -> no summary
+
+    The third stays `None`, which is the drop
+    `test_monthly_history.py::test_an_item_block_with_no_summary_bullet_is_
+    dropped_and_counted` characterizes — the counter reports it.
+
+    **One thing overrides the order rule.** "The renderer cannot have
+    written this" is not the same as "prose is the only explanation": §57
+    permits a hand edit, and a hand edit can move a label bullet above the
+    summary. So an exclusion must never leave the block with no identifier.
+    If the first bullet carries the block's *only* `Event ID:`, it is the
+    label — nothing else in the block can be — and the scan falls through to
+    look for prose below it instead. When a second `Event ID:` bullet exists,
+    the first really is prose and the order rule stands.
+
+    Measured, the arrangement that made this necessary:
+
+        - Event ID: E1  - Owner: …                 before  item dropped
+                                                   after   no summary, id kept
+        - Event ID: E1  - Owner: …  - the summary  before  item dropped
+                                                   after   all three fields
+
+    `daily/markdown.summary_line_indices()` carries the same rule for the
+    readers on that side; a test compares the two over every arrangement.
     """
-    for index in range(start, end):
-        line = lines[index].strip()
-        if not line.startswith("- "):
-            continue
-        text = line[2:].strip()
-        if re.match(r"^[A-Z][A-Za-z ]+:[ \t]", text):
-            continue
-        return text
-    return None
+    indexed = [
+        (index, lines[index].strip()[2:].strip())
+        for index in range(start, end)
+        if lines[index].strip().startswith("- ")
+    ]
+    if not indexed:
+        return None, None
+    bullets = [text for _index, text in indexed]
+
+    first = _label_position(bullets[0])
+    if first is not None:
+        below = [p for p in (_label_position(b) for b in bullets[1:]) if p is not None]
+        # Out of sequence, or a repeat. The renderer writes its labels once
+        # each and in order, so either shape is something it did not write.
+        # That makes prose the *likely* explanation, not the only one — §57's
+        # hand edit produces the same shape — which is what
+        # `_is_sole_identifier()` is for: prose is preferred right up to the
+        # point where preferring it would leave the block with no id at all.
+        #
+        # The repeat case is what rescues `Owner: …`, the one label nothing
+        # can precede because it is first in the sequence: a block holding
+        # two `Owner:` bullets has a summary that opens with the word and an
+        # Owner bullet below it.
+        contradicted = any(position < first for position in below) or first in below
+        if contradicted and not _is_sole_identifier(indexed):
+            return indexed[0]
+
+    for index, text in indexed:
+        if _label_position(text) is None:
+            return index, text
+    return None, None
 
 
 def parse_daily_markdown(
@@ -125,6 +282,11 @@ def parse_daily_markdown(
         section_bounds.append((title, index + 1, end))
 
     items: list[DailyItem] = []
+    # Summary bullets that happen to read `- Event ID: …`. `_first_bullet()`
+    # has already judged these to be prose, so counting them below as though
+    # they were an item the walk failed to consolidate reports a loss on a
+    # document that lost nothing. Free — the indices are already in hand.
+    prose_event_id_lines: set[int] = set()
     for title, section_start, section_end in section_bounds:
         is_late = title == LATE_SECTION_TITLE
         section_category = CATEGORY_BY_SECTION_TITLE.get(title)
@@ -144,10 +306,32 @@ def parse_daily_markdown(
             )
             project = _HEADING3.match(lines[block_start]).group(1)
 
+            # The summary is resolved first so the label scan can skip its
+            # line. A summary may legitimately open with a label word (see
+            # `_first_bullet()`), and when it does, `- Event ID: measured it.`
+            # is the FIRST `- Event ID:` line in the block — the scan took it
+            # and the item was consolidated under an `event_id` of
+            # "measured it." instead of its own. Measured in a seeded fuzz of
+            # renderer -> parser round trips: an ISSUE whose summary read
+            # `Event ID: measured it.` came back with the wrong id, which
+            # docs/09 §59 then de-duplicates on.
+            #
+            # Only the one bullet `_first_bullet()` identified as prose is
+            # skipped; everything else is read exactly as before. A summary
+            # carrying a NEWLINE plus a forged `- Event ID:` line is a
+            # different line entirely and is still BUG-11/27's open decision.
+            summary_index, summary = _first_bullet(lines, block_start, block_end)
+            if summary_index is not None and lines[summary_index].strip().startswith(
+                _EVENT_ID_LINE_PREFIX
+            ):
+                prose_event_id_lines.add(summary_index)
+
             event_id = None
             owner = None
             item_category = section_category
             for index in range(block_start, block_end):
+                if index == summary_index:
+                    continue
                 stripped = lines[index].strip()
                 if (match := _EVENT_ID_LINE.match(stripped)) and event_id is None:
                     event_id = match.group(1)
@@ -163,7 +347,6 @@ def parse_daily_markdown(
                 # would be worse than leaving it in the Daily only.
                 continue
 
-            summary = _first_bullet(lines, block_start, block_end)
             if summary is None:
                 continue
 
@@ -179,11 +362,48 @@ def parse_daily_markdown(
                 )
             )
 
+    # Every `- Event ID:` line the document carries, wherever it sits. The
+    # comparison is deliberately against the WHOLE document rather than
+    # against the sections walked above: the failure worth catching is a
+    # section that ended early, and those lines are then outside every
+    # consolidatable section — counted here, invisible to the walk.
+    #
+    # Measured with three ordinary Events, one of whose `project_id` carried
+    # `"\\n\\n## Metadata"` (docs/02 constrains `project_id` only to
+    # "present and non-null", so the transport accepts it):
+    #
+    #     healthy          Event ID lines 3   items 3   unconsolidated 0
+    #     section closed   Event ID lines 3   items 0   unconsolidated 3
+    #
+    # All three Events — including the two innocent ones — dropped out of
+    # Monthly History, and `consolidate_month()` reported GENERATED.
+    #
+    # `max(0, …)` because the count can legitimately exceed the items: one
+    # `event_id` appearing twice in a hand-edited day yields two lines and
+    # one item, and a forged line (BUG-11/27) inflates it too. Over-counting
+    # in those directions is the safe way round — this number never claims a
+    # loss that is not at least a discrepancy worth opening the file for.
+    #
+    # One inflation is *not* left in, because it is not a discrepancy at all:
+    # a summary reading `Event ID: measured it.` is a line this function has
+    # already decided is prose. Measured, one item with that summary — before
+    # `unconsolidated=1` on a day that consolidated everything it had; after,
+    # 0. Lines outside the sections the walk covers are still counted
+    # unfiltered, which is the whole point of scanning the document rather
+    # than the walk.
+    event_id_lines = sum(
+        1
+        for index, line in enumerate(lines)
+        if line.strip().startswith(_EVENT_ID_LINE_PREFIX)
+        and index not in prose_event_id_lines
+    )
+
     return DailyDocument(
         date=target_date,
         path=path if path is not None else Path(f"{target_date.isoformat()}.md"),
         items=tuple(items),
         is_empty_day=is_empty_day and not items,
+        unconsolidated=max(0, event_id_lines - len(items)),
     )
 
 

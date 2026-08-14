@@ -171,12 +171,32 @@ class WhatIfExecutionTests(unittest.TestCase):
 
     def test_both_effects_are_announced_as_would_be_done(self):
         """Each guarded effect reports itself, so the operator sees both the
-        environment write and the registration before agreeing to either."""
+        environment write and the registration before agreeing to either.
+
+        Asserted on the operation/target strings **the script supplies** to
+        `ShouldProcess`, never on PowerShell's own preview prefix. That prefix
+        is localized: measured on one machine, one script, one PowerShell
+        5.1.26100.8875, only the parent process's UI culture differing --
+
+            ko-KR   WhatIf: 대상 "user environment"에서 ... 수행합니다.
+            en-US   What if: Performing the operation ... on target ...
+
+        The old assertion was `assertIn("WhatIf", combined)`, which is the
+        ko-KR spelling; it passes only where Windows displays in a language
+        that leaves the prefix untranslated and fails on every English
+        machine -- including the ones docs/11 deploys to. A test that pins
+        the console language instead of the script's behaviour reports the
+        wrong thing in both directions.
+
+        The four strings below are written in `install_agent_task.ps1` and
+        are echoed verbatim by every locale.
+        """
         result = self._run_whatif()
         combined = result.stdout + result.stderr
 
-        self.assertIn("WhatIf", combined)
+        self.assertIn("Set COMPANY_OPS_* variables", combined)
         self.assertIn("user environment", combined)
+        self.assertIn("Register scheduled task", combined)
         self.assertIn(self.TASK, combined)
 
     def test_the_optional_daily_trigger_also_builds(self):

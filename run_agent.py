@@ -66,6 +66,13 @@ from agent.state import AgentStateError, AgentStateMismatchError  # noqa: E402
 from reporter.profiles import ReporterConfigError, resolve_profile  # noqa: E402
 from transport import OneDriveTransport  # noqa: E402
 
+# "One item, one line" for anything this script prints that was read back
+# out of a file, the same rule `oplog.append_line()` applies to every logged
+# line and `ops_status.py` applies to its ATTENTION block. `agent.py` already
+# `redact()`s these strings at the point it builds them; what it does not do
+# is stop one of them ending a line.
+from oplog import one_line  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 
@@ -207,7 +214,11 @@ def main() -> int:
         marker = "  " if date_result.outcome is not DateOutcome.FAILED else "! "
         print(f"{marker}{date_result.date.isoformat()}: {date_result.outcome.value} {detail}")
         for error in date_result.errors:
-            print(f"    - {error}")
+            # A Signal filename, a parse error, or a Transport failure — all
+            # read back from disk, none constrained to one line. A forged
+            # line here imitates a `  <date>: <outcome>` result row in the
+            # report an operator reads to decide whether a date was collected.
+            print(f"    - {one_line(error)}")
 
     print(f"last_successful_collection_date = {result.last_successful_collection_date}")
 

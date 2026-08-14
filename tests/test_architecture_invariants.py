@@ -1384,6 +1384,170 @@ class ExitCodeContractTests(unittest.TestCase):
         # One stream, so redirection and ordering stay predictable.
         self.assertEqual(err.getvalue(), "")
 
+    def test_a_notion_response_body_reaches_stdout_redacted_and_on_one_line(self):
+        """NEW, **security**. The one sink for this string that was unguarded.
+
+        `notion/transport._error_detail()` appends Notion's own response body
+        to `NotionAPIError` so an operator can see which property was
+        rejected (BUG-58), and `SyncResult.error` carries it verbatim.
+        `oplog.append_line()` redacts and flattens exactly this class of
+        string on its way to `notion_sync.log`, and its docstring says why in
+        measured terms: *"a 502 page containing `Authorization: Bearer ntn_…`
+        put the token straight into notion_sync.log"*.
+
+        `_print_result()` printed the same string raw. Measured, one proxy
+        502 echoing the request headers back:
+
+            notion_sync.log   token redacted, 1 line
+            this stdout       `Authorization: Bearer ntn_…` in full, 4 lines
+
+        Both halves are asserted. The second is not cosmetic — a multi-line
+        body forges further `  - <event_id> …` result lines in the report an
+        operator reads to decide what happened, which is BUG-6's shape in a
+        sink nobody had aimed it at.
+
+        Fixed at the sink rather than at `notion/transport.py`, where the
+        string is built: `notion` may import only `events`
+        (`LayeringInvariantTests`), and widening that table is an
+        architecture decision. This script sits above everything already.
+        """
+        import contextlib
+        import importlib
+        import io
+
+        from backup.log import BackupLogEntry
+        from backup.result import BackupStatus
+        from collector.runtime import RuntimeSummary
+        from notion.sync import SyncResult, SyncStatus
+        from scheduler.result import SchedulerRunResult, SchedulerStatus
+
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            run_company_ops = importlib.import_module("run_company_ops")
+        finally:
+            sys.path.remove(str(REPO_ROOT))
+
+        token = "ntn_" + "A" * 46
+        body = (
+            "Notion API returned 502: Bad Gateway | <html><pre>\n"
+            "GET /v1/databases/db HTTP/1.1\n"
+            f"Authorization: Bearer {token}\n"
+            "</pre></html>"
+        )
+        now = datetime(2026, 8, 11, 11, 0).astimezone()
+        result = (
+            type("Intake", (), {"moved": ()})(),
+            RuntimeSummary(accepted=1, duplicate=0, rejected=0, failed=0, files=()),
+            SchedulerRunResult(status=SchedulerStatus.COMPLETED, generated_dates=()),
+            BackupLogEntry(
+                run_id="RUN-1",
+                backup_start=now,
+                source="local_master",
+                changed_files=(),
+                deleted_files=(),
+                commit_hash=None,
+                push_result=None,
+                backup_end=now,
+                final_status=BackupStatus.NOT_REQUIRED,
+            ),
+            [
+                SyncResult(
+                    status=SyncStatus.NOTION_RETRY_REQUIRED,
+                    event_id="EVT-1",
+                    project_id="PRJ",
+                    error=body,
+                )
+            ],
+        )
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            run_company_ops._print_result(result)
+        printed = out.getvalue()
+
+        self.assertNotIn(token, printed)
+        self.assertIn("[REDACTED]", printed)
+        # Still diagnosable — the point of carrying the body at all.
+        self.assertIn("502", printed)
+        # One result line per SyncResult, whatever the body contained.
+        self.assertEqual(
+            [line for line in printed.splitlines() if line.startswith("  - ")],
+            [line for line in printed.splitlines() if "EVT-1" in line],
+        )
+        self.assertEqual(sum(1 for line in printed.splitlines() if "EVT-1" in line), 1)
+
+    def test_the_event_id_and_project_id_on_that_line_are_guarded_too(self):
+        """The blind spot the fix above shipped with, found by asking the
+        adjacent-boundary question of my own change.
+
+        `r.error` was guarded because it obviously came from a remote
+        response. `r.event_id` and `r.project_id` sit on the *same printed
+        line*, cross the *same* transport from another Desktop, and docs/02
+        constrains both to "present and non-null" only (BACKLOG A-15) — they
+        were left raw. Measured, an `event_id` of
+        `"EVT-1\\n  - EVT-GHOST (PRJ): SYNCED"`:
+
+            printed rows starting `  - `   2
+            the second one                 fully attacker-authored
+
+        Guarding the obvious half of a line is half a fix. Both shapes are
+        asserted here so the next person cannot fix one and miss the other.
+        """
+        import contextlib
+        import importlib
+        import io
+
+        from backup.log import BackupLogEntry
+        from backup.result import BackupStatus
+        from collector.runtime import RuntimeSummary
+        from notion.sync import SyncResult, SyncStatus
+        from scheduler.result import SchedulerRunResult, SchedulerStatus
+
+        sys.path.insert(0, str(REPO_ROOT))
+        try:
+            run_company_ops = importlib.import_module("run_company_ops")
+        finally:
+            sys.path.remove(str(REPO_ROOT))
+
+        now = datetime(2026, 8, 11, 11, 0).astimezone()
+        for label, event_id, project_id in (
+            ("event_id", "EVT-1\n  - EVT-GHOST (PRJ): SYNCED", "PRJ"),
+            ("project_id", "EVT-1", "PRJ\n  - EVT-GHOST (X): SYNCED"),
+        ):
+            with self.subTest(field=label):
+                result = (
+                    type("Intake", (), {"moved": ()})(),
+                    RuntimeSummary(accepted=1, duplicate=0, rejected=0, failed=0, files=()),
+                    SchedulerRunResult(
+                        status=SchedulerStatus.COMPLETED, generated_dates=()
+                    ),
+                    BackupLogEntry(
+                        run_id="RUN-1", backup_start=now, source="local_master",
+                        changed_files=(), deleted_files=(), commit_hash=None,
+                        push_result=None, backup_end=now,
+                        final_status=BackupStatus.NOT_REQUIRED,
+                    ),
+                    [
+                        SyncResult(
+                            status=SyncStatus.NOTION_RETRY_REQUIRED,
+                            event_id=event_id, project_id=project_id, error=None,
+                        )
+                    ],
+                )
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(
+                    io.StringIO()
+                ):
+                    run_company_ops._print_result(result)
+                printed = out.getvalue()
+
+                rows = [
+                    line for line in printed.splitlines() if line.startswith("  - ")
+                ]
+                self.assertEqual(len(rows), 1, printed)
+                self.assertNotIn("EVT-GHOST (PRJ): SYNCED\n", printed)
+                self.assertIn("\\n", rows[0])
+
     def test_a_raised_backup_failure_exits_nonzero_with_an_explanation(self):
         """NOT a change to the exit-code policy this class characterizes.
 
@@ -1593,6 +1757,36 @@ class ResultFieldConsumptionTests(unittest.TestCase):
         from scheduler.result import SchedulerRunResult
 
         self.assertEqual(self._unread_fields(SchedulerRunResult, "scheduler_result"), [])
+
+    def test_the_monthly_diagnostics_reach_a_sink(self):
+        """BUG-39's question, asked of the one result object it never covered.
+
+        This class sweeps `RuntimeSummary`, `BackupLogEntry` and
+        `SchedulerRunResult` for fields that are computed and then discarded
+        at process exit. `MonthlyResult` was not in the sweep, and C31 found
+        exactly the shape BUG-39 describes sitting in it: a Daily item that
+        did not reach Monthly left no trace anywhere, because `item_count`
+        counts what arrived rather than what was sent.
+
+        The five unread fields are unread *by the Runner* on purpose, and
+        each is consumed elsewhere — `year`/`month` are carried by `key`,
+        which the log lines use; `coverage` and `source_dates` are rendered
+        into the Monthly document itself by `render_monthly_markdown()`; and
+        `path` is where that document was written. Copying them into the log
+        would make two records of the same run disagree the first time they
+        drifted, which is the reasoning `BackupLogEntry` above already gives
+        for its four.
+        """
+        from monthly.generator import MonthlyResult
+
+        unread = self._unread_fields(MonthlyResult, "month_result")
+
+        for diagnostic in ("status", "item_count", "error", "unconsolidated_days"):
+            with self.subTest(field=diagnostic):
+                self.assertNotIn(diagnostic, unread)
+        self.assertEqual(
+            sorted(unread), ["coverage", "month", "path", "source_dates", "year"]
+        )
 
     def test_the_scheduler_still_sets_the_fields_its_consumers_read(self):
         """The producing half of the same contract: if scheduler.py stopped
@@ -3026,19 +3220,26 @@ class IncompleteWriteInvariantTests(unittest.TestCase):
 
             complete    ACCEPTED. The Event is real and reaches Company
                         History; only its filename is the staging name
-            truncated   REJECTED -> `rejected/`, and ATTENTION says
-                        "Collector가 거부한 Event 1건" — a false statement
-                        (nothing was rejected; a write was abandoned) that
-                        clears only when a human deletes the file
+            truncated   REJECTED -> `rejected/`
 
         Neither loses data and neither parks anything in `incoming/` — the
         file moves on in one run, which is exactly what the other six did
-        not do. What is left is one mislabelled alert, and correcting it
-        means changing what the Collector consumes from `incoming/`, which
-        is docs/03's processing pipeline rather than a reader's filter.
+        not do.
 
-        Pinned rather than argued: if `run_once()` ever starts skipping these,
-        this test fails and the boundary gets revisited on purpose.
+        C31 update: what C27 left behind was the *name* of the alert, not
+        this boundary. ATTENTION used to say "Collector가 거부한 Event 1건"
+        for the truncated shape, which is a false statement — nothing was
+        rejected, a write was abandoned. C27 read that as needing the same
+        pipeline decision as the boundary itself; it does not. The Collector
+        still consumes exactly what it consumed before (this test), and the
+        report now counts a staging file in `rejected/` separately and says
+        it is safe to delete
+        (`IntakeBacklog.rejected_incomplete_write`,
+        `test_observability.py::RejectedStagingResidueTests`).
+
+        So this test pins one thing and one thing only: `run_once()` does not
+        skip staging files in `incoming/`. If it ever starts, this fails and
+        the boundary gets revisited on purpose.
         """
         from collector.collector import Collector
         from collector.runtime import run_once as collector_run_once

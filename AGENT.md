@@ -268,11 +268,18 @@ python run_agent.py      # 수동 1회 실행
 침묵 일수, 아직 수집되지 않은 backlog. backlog 줄에는 왜 그 숫자가 줄지 않는지도
 같이 나온다(`unparseable`, `future_dated`, `name_collision`, `incomplete`,
 `already_collected`, `unreadable_incoming`) — 숫자만 있고 이유가 없으면 지워지지
-않는 경보가 되기 때문이다.
+않는 경보가 되기 때문이다. `incoming_incomplete_write`와
+`rejected_incomplete_write`는 그것들과 다른 것을 센다: **Event가 아니라 중단된
+쓰기의 잔여물**(`.tmp-…json`)이고, 보낸 Desktop을 확인할 필요가 없으며 지워도
+안전하다. 같은 파일이 `incoming/`에 있으면 앞의 것, 다음 실행에서 Collector가
+`rejected/`로 옮기면 뒤의 것으로 세어진다.
 
 **HISTORY** — Company Repository의 daily/monthly 파일 수, 사람 검토를 기다리는
 Candidate, **daily/monthly State와 실제 파일의 정합성**, 수집됐지만 History에
-들어가지 못한 Event, 그리고 Backup Working Copy에 있으면 안 되는 파일.
+들어가지 못한 Event, **Monthly가 스스로 센 것보다 적게 기록한 달**
+(`Consolidated Items`와 실제 항목 수가 다르면 그 Event는 그 달에서 사라진 것이다),
+그리고 Backup Working Copy에 있으면 안 되는 파일 — 게이트가 이름을 아는 것과
+**대소문자 때문에 못 알아보는 것**(`ID_RSA` 대 `id_rsa`)을 따로 보여준다.
 
 **LAST RUN** — 마지막 Runner 실행의 Run Manifest: 실행 시각, 종합 상태,
 실패한 단계와 **그 단계의 수치**(예: `queued=47`), 시작조차 못 한 단계,

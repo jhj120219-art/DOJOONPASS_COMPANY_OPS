@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .coverage import DailyCoverage, check_coverage
-from .markdown import MonthlyItem, render_monthly_markdown
+from .markdown import METADATA_TITLE, MonthlyItem, render_monthly_markdown
 from .parser import DailyParseError, read_daily_document
 from .state import (
     DEFAULT_STATE_PATH,
@@ -81,6 +81,18 @@ class MonthlyResult:
     coverage: DailyCoverage | None = None
     path: Path | None = None
     error: str | None = None
+    # Per-day `"YYYY-MM-DD: N"` for days whose Daily file carries more
+    # `- Event ID:` lines than this consolidation could turn into items.
+    #
+    # Not an error and not a status change: the month was still built from
+    # everything the parser understood, which is what docs/09 §12-13 asks
+    # for. It is the one fact the result could not otherwise carry — a Daily
+    # item that did not reach Monthly leaves no trace in `item_count`,
+    # because `item_count` counts what arrived, not what was sent.
+    #
+    # Free. `read_daily_document()` already parses every day of the month;
+    # this is a number that parse computes on the way past.
+    unconsolidated_days: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def key(self) -> str:
@@ -184,7 +196,15 @@ def consolidate_month(
             ),
         )
 
-    already_exists = final_path.exists()
+    # `is_file()`, not `exists()`. "Is this month already consolidated" is a
+    # question about a Monthly History document; a directory named
+    # `2026-08.md` is not one. Measured with a complete month of Daily files
+    # and such a directory present: `MONTHLY_UNCHANGED` — the month was
+    # silently never written, and the catch-up pointer advanced past it
+    # because UNCHANGED counts as success (see `run_once()`). With
+    # `is_file()` the month is built, `os.replace()` onto the directory
+    # fails, and the run reports MONTHLY_FAILED with the reason.
+    already_exists = final_path.is_file()
     if already_exists and not allow_update:
         return MonthlyResult(
             year=year,
@@ -198,9 +218,17 @@ def consolidate_month(
         items: list[MonthlyItem] = []
         seen_event_ids: set[str] = set()
         source_dates: list[date_type] = []
+        unconsolidated: list[str] = []
 
         for day in coverage.present_dates:
             document = read_daily_document(daily_dir / f"{day.isoformat()}.md", day)
+            if document.unconsolidated:
+                # Carried out, never raised. §44/§74 want a failed month to
+                # leave the previous file alone and retry later; this is not
+                # a failure — the month is built from everything the parser
+                # understood. What it must not do is stay silent, which is
+                # what it did before this line existed.
+                unconsolidated.append(f"{day.isoformat()}: {document.unconsolidated}")
             contributed = False
             for entry in document.items:
                 # §59: one event_id, one entry — however many Daily files
@@ -244,6 +272,16 @@ def consolidate_month(
         )
 
         monthly_dir.mkdir(parents=True, exist_ok=True)
+        # Named before it is hit. `os.replace()` onto a directory fails with
+        # a bare `[WinError 5] 액세스가 거부되었습니다: '…\\.tmp-xxxx.md'`,
+        # which names the temp file this function is about to delete and says
+        # nothing about the month or what is blocking it. Same reasoning, same
+        # wording, as `daily/generator.generate_daily_history()`.
+        if final_path.exists() and not final_path.is_file():
+            raise OSError(
+                f"a non-file is in the way of monthly history: {final_path} — this "
+                "month cannot be written there until it is moved"
+            )
         fd, tmp_path = tempfile.mkstemp(dir=monthly_dir, prefix=".tmp-", suffix=".md")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -274,6 +312,7 @@ def consolidate_month(
         source_dates=tuple(source_dates),
         coverage=coverage,
         path=final_path,
+        unconsolidated_days=tuple(unconsolidated),
     )
 
 
@@ -292,16 +331,48 @@ def _existing_generated_at(path: Path) -> str | None:
     rebuild — the one operation that would have repaired the corrupted file.
     Losing one metadata line is a far smaller harm than a month that can
     never be regenerated.
+
+    Read from inside `## Metadata` only, not from the first matching line in
+    the file. `render_monthly_markdown()` writes an item's summary raw as its
+    block's first bullet, so a Daily summary of
+    `Generated At: 1999-01-01T00:00:00+09:00` is rendered as a line
+    indistinguishable from this field — and it sits *above* the Metadata
+    block. Measured, one item carrying that summary:
+
+        - Generated At: 1999-01-01T00:00:00+09:00   <- the item's summary
+        - Generated At: 2026-09-01T02:00:00+09:00   <- the real field
+        _existing_generated_at() -> '1999-01-01T00:00:00+09:00'
+
+    The next rebuild of that month — an ordinary §58 dirty rebuild after a
+    Late Event — then writes the forged value in as the month's real
+    `Generated At`, and it stays: once it is in the Metadata block, removing
+    the offending Event does not bring the original back. §58's whole point
+    is that `Generated At` records when the month was first closed, so this
+    is History integrity rather than cosmetics, and it needs no corruption
+    or hand edit to reach — any Event author can write that summary.
+
+    The **last** Metadata block wins rather than the first, which closes the
+    same forgery via BUG-11/27's route. A summary is rendered unescaped, so
+    one containing a newline and a literal `## Metadata` heading creates a
+    real second block — but only ever above this one, because
+    `render_monthly_markdown()` appends the Metadata block last on both of
+    its paths (empty month and populated month alike). Preferring the last
+    block therefore needs no escaping decision, which is BUG-11/27's to make.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, ValueError):
         return None
+    found: str | None = None
+    inside = False
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped.startswith("- Generated At:"):
-            return stripped.split(":", 1)[1].strip()
-    return None
+        if stripped.startswith("#"):
+            inside = stripped == METADATA_TITLE
+            continue
+        if inside and stripped.startswith("- Generated At:"):
+            found = stripped.split(":", 1)[1].strip()
+    return found
 
 
 def run_once(
@@ -464,7 +535,10 @@ def mark_month_dirty(
         and key <= state.last_successful_monthly_close
     )
     if not consolidated and monthly_dir is not None:
-        consolidated = monthly_history_path(monthly_dir, key).exists()
+        # `is_file()` for the same reason `consolidate_month()` uses it: the
+        # fact this is reaching for is "a Monthly History document is on
+        # disk", and only a file is one.
+        consolidated = monthly_history_path(monthly_dir, key).is_file()
 
     if not consolidated:
         return False

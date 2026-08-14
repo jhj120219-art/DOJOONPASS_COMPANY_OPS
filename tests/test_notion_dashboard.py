@@ -206,6 +206,97 @@ class BootstrapDiagnosisTests(unittest.TestCase):
         self.assertEqual(d.readiness, BootstrapReadiness.READY)
         self.assertEqual(d.resolved_parent_page_id, "company-ops-page")
 
+    def test_the_ready_verdict_does_not_say_there_is_nothing_to_do(self):
+        """NEW. The success message pointed at a step nothing performs.
+
+        It used to read:
+
+            None — the reference database already lives in a Page;
+            bootstrap_dashboard_databases(client) will use it.
+
+        Both halves mislead. `init_notion.py` — the one command whose job is
+        Notion setup — calls `diagnose_dashboard_bootstrap()` and stops; it
+        never calls `bootstrap_dashboard_databases()`. Verified by AST across
+        `src/**` and every root script with import aliases resolved: that
+        function has **zero** call sites in production, and no document
+        mentions it. So an operator on the happy path reads
+        `다음 할 일: None`, concludes the Dashboard is configured, and gets
+        `NOTION_OPS_RUNS_DATABASE_ID` unset — under which `record_run()` is
+        skipped on every run, permanently and by design (.env.example says
+        so).
+
+        A clear signal for work nobody did is the inverse of this project's
+        recurring alert-that-cannot-clear, and worse: nothing ever
+        contradicts it.
+
+        Automating the creation is out of scope — it writes to a real Notion
+        Workspace. Telling the truth about it is not.
+        """
+        transport = InMemoryNotionTransport(
+            parent={"type": "page_id", "page_id": "company-ops-page"}
+        )
+        client = NotionClient(transport=transport, database_id="projects-db")
+
+        action = diagnose_dashboard_bootstrap(client).required_action
+
+        self.assertNotIn("None —", action)
+        self.assertIn("NOTION_OPS_RUNS_DATABASE_ID", action)
+        self.assertIn("no entrypoint", action)
+
+    def test_every_verdict_names_the_variable_that_actually_switches_it_on(self):
+        """The one fact an operator needs in all three reachable states."""
+        cases = {}
+
+        cases["READY"] = InMemoryNotionTransport(
+            parent={"type": "page_id", "page_id": "p"}
+        )
+
+        needs_choice = InMemoryNotionTransport()
+        needs_choice.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+        cases["NEEDS_PARENT_CHOICE"] = needs_choice
+
+        cases["NEEDS_SHARED_PAGE"] = InMemoryNotionTransport()
+
+        for label, transport in cases.items():
+            with self.subTest(readiness=label):
+                action = diagnose_dashboard_bootstrap(
+                    NotionClient(transport=transport, database_id="projects-db")
+                ).required_action
+
+                self.assertIn("NOTION_OPS_RUNS_DATABASE_ID", action)
+
+    def test_nothing_in_production_creates_the_dashboard_databases(self):
+        """The fact the messages above now state. Pinned so that wiring it up
+        (which needs approval — it writes to a real Workspace) forces those
+        messages to be rewritten in the same change."""
+        import ast
+
+        repo_root = Path(__file__).resolve().parents[1]
+        files = [
+            p
+            for p in list((repo_root / "src").glob("**/*.py")) + list(repo_root.glob("*.py"))
+            if "__pycache__" not in str(p)
+        ]
+        sites = []
+        for path in files:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            aliases = {
+                a.asname: a.name
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                for a in node.names
+                if a.asname
+            }
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if aliases.get(name, name) == "bootstrap_dashboard_databases":
+                    sites.append(f"{path.name}:{node.lineno}")
+
+        self.assertEqual(sites, [])
+
     def test_workspace_root_with_no_shared_page_needs_sharing(self):
         # This is the real workspace's current state.
         transport = InMemoryNotionTransport()

@@ -66,7 +66,7 @@ from collector import (  # noqa: E402
     run_once as collector_run_once,
 )
 from daily import LateUpdateOutcome, update_daily_history  # noqa: E402
-from events import Event  # noqa: E402
+from events import Event, EventValidationError  # noqa: E402
 from history import FileHistoryRepository, HistoryDecision, HistoryFilter  # noqa: E402
 from monthly import (  # noqa: E402
     DEFAULT_STATE_PATH as DEFAULT_MONTHLY_STATE_PATH,
@@ -502,6 +502,11 @@ def run_once(
             # dequeued. No Event is lost, and none is applied twice.
             queue_entries = load_retry_queue(resolved_retry_queue_path)
             queue_dirty = False
+            # Collected Event files this step could not read back. Kept
+            # separate from `notion_sync_results`, which holds real sync
+            # outcomes — see the read guard in 4b for why nothing is
+            # fabricated for them.
+            notion_unreadable: list[str] = []
             # in-memory lookup index for this run's upserts/removes below —
             # a Notion outage held open across n queued Events previously cost
             # O(n^2) list scans draining the queue (measured: 0.45 ms at 100
@@ -545,15 +550,72 @@ def run_once(
                 # 4a. Retry Queue를 가장 먼저 처리한다 (CEO Policy Decision).
                 #     Iterate a snapshot: _sync_and_record() mutates queue_entries.
                 for queued_entry in list(queue_entries):
-                    notion_sync_results.append(_sync_and_record(queued_entry.to_event()))
+                    # `to_event()` is `Event.from_json(self.event_data)`, and
+                    # the queue is a JSON file on disk that `load_queue()`
+                    # shape-checks but never re-validates as an Event. A
+                    # hand-edited or truncated entry therefore raises here —
+                    # the same unguarded-read hole 4b had, one loop up.
+                    try:
+                        queued_event = queued_entry.to_event()
+                    except (ValueError, TypeError, KeyError, EventValidationError) as exc:
+                        notion_unreadable.append(queued_entry.event_id)
+                        _append_log_line(
+                            resolved_notion_sync_log_path,
+                            f"NOTION_UNREADABLE queued:{queued_entry.event_id} "
+                            f"{_bounded_error(exc)}",
+                        )
+                        continue
+                    notion_sync_results.append(_sync_and_record(queued_event))
 
                 # 4b. 이번 실행에서 새로 수집된 ACCEPTED Event.
                 for processed_file in collector_summary.files:
                     if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
                         continue
-                    event = Event.from_json(
-                        processed_file.destination_path.read_text(encoding="utf-8")
-                    )
+                    try:
+                        event = Event.from_json(
+                            processed_file.destination_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, ValueError, EventValidationError) as read_exc:
+                        # This read had no guard, and `_sync_and_record()`'s
+                        # try only covers `notion_sync.sync()` — so a file
+                        # that became unreadable between step 4 and here took
+                        # the whole run down from a step docs/14 §5 grades
+                        # DEGRADED.
+                        #
+                        # Measured, one simulated undecodable file:
+                        #
+                        #     run ABORTED: ValueError
+                        #     Daily files : NONE
+                        #     backup state: MISSING
+                        #
+                        # Notion Sync aborting Daily History and Backup is
+                        # the inversion `daily/generator.update_daily_history`
+                        # already names in as many words: "A component
+                        # docs/14 §5 classifies as DEGRADED was aborting one
+                        # it classifies as CRITICAL, which inverts the entire
+                        # point of having the two severities." Same shape,
+                        # other step — and this step's own comment three
+                        # lines up already says "Notion 실패가 Runtime을 막지
+                        # 않는다".
+                        #
+                        # Reachable without corruption: `runtime/` sits under
+                        # OneDrive in this deployment (docs/11), and a sync
+                        # client or scanner holding a handle produces exactly
+                        # this on Windows. The Collector read the same file
+                        # minutes earlier, which is why nothing here expected
+                        # it to fail.
+                        #
+                        # Counted, not fabricated into a SyncResult: the
+                        # event_id is precisely what could not be read, and
+                        # inventing one would put a made-up id in the log and
+                        # the manifest.
+                        notion_unreadable.append(processed_file.destination_path.name)
+                        _append_log_line(
+                            resolved_notion_sync_log_path,
+                            f"NOTION_UNREADABLE {processed_file.destination_path.name} "
+                            f"{_bounded_error(read_exc)}",
+                        )
+                        continue
                     notion_sync_results.append(_sync_and_record(event))
             finally:
                 # 4c. 이 단계에서 발생한 모든 큐 변경을 1회만 기록한다 (B안).
@@ -586,17 +648,37 @@ def run_once(
             # unexpected-exception path (unknown — it may never clear), while
             # NOTION_RETRY_REQUIRED is what the queue exists for.
             queued = [r for r in notion_sync_results if r.status in _FAILED_SYNC_STATUSES]
-            if queued:
-                unknown = any(r.status is SyncStatus.NOTION_FAILED for r in queued)
+            if queued or notion_unreadable:
+                # An unreadable file is an Event that did not reach Notion,
+                # which is what `NOTION_SYNC_INCOMPLETE` means — so it fails
+                # the component exactly as a queued Event does. UNKNOWN
+                # retryability: whether the next run can read the file is not
+                # something this step can tell, and BUG-13 is about not
+                # pretending otherwise.
+                unknown = (
+                    bool(notion_unreadable)
+                    or any(r.status is SyncStatus.NOTION_FAILED for r in queued)
+                )
+                reason = (
+                    queued[0].error
+                    if queued and queued[0].error
+                    else (
+                        f"{len(notion_unreadable)} collected Event file(s) could not be "
+                        f"read: {', '.join(notion_unreadable[:5])}"
+                        if notion_unreadable
+                        else ""
+                    )
+                )
                 recorder.failed(
                     C_NOTION_SYNC,
                     classification="NOTION_SYNC_INCOMPLETE",
-                    reason=queued[0].error or "",
+                    reason=reason,
                     retryability=(
                         Retryability.UNKNOWN if unknown else Retryability.RETRYABLE
                     ),
                     processed=len(notion_sync_results),
                     queued=len(queued),
+                    unreadable=len(notion_unreadable),
                 )
             else:
                 recorder.ok(C_NOTION_SYNC, processed=len(notion_sync_results))
@@ -761,13 +843,39 @@ def run_once(
             shared_keep = None
 
         for kept_date in sorted(kept_dates):
-            late_result = update_daily_history(
-                repository,
-                kept_date,
-                output_dir=local_master_dir / "daily",
-                now=now,
-                keep_candidates=shared_keep,
-            )
+            # `update_daily_history()`'s docstring promises it never raises
+            # for an I/O or rendering failure, and this loop believed it —
+            # with no belt of its own. Measured by injecting a raise into
+            # that call: the run ABORTED and `backup_state.json` was never
+            # written. Late Event Update is `Severity.DEGRADED`; Backup is
+            # CRITICAL, so a DEGRADED step was taking a CRITICAL one down,
+            # which is the inversion this file's Notion step was just fixed
+            # for and which `update_daily_history()` itself already names.
+            #
+            # The promise is now actually true (its `select_late_candidates()`
+            # call had been sitting between two guards rather than inside
+            # one), but the same reasoning `run_once()` applies to Monthly
+            # applies here: *"삼키되, 흔적 없이 삼키지는 않는다"*. An
+            # unexpected escape is recorded against this date and the loop
+            # moves on, so one bad date cannot cost the run its Backup.
+            try:
+                late_result = update_daily_history(
+                    repository,
+                    kept_date,
+                    output_dir=local_master_dir / "daily",
+                    now=now,
+                    keep_candidates=shared_keep,
+                )
+            except Exception as late_exc:  # noqa: BLE001  (§41 / docs/14 §5)
+                late_update_failures.append(
+                    f"{kept_date.isoformat()}: {_bounded_error(late_exc)}"
+                )
+                _log_late_update(
+                    resolved_late_update_log_path,
+                    f"LATE_UPDATE_UNEXPECTED {kept_date.isoformat()} "
+                    f"{_bounded_error(late_exc)}",
+                )
+                continue
             if late_result.outcome is LateUpdateOutcome.UPDATED_LATE_EVENT:
                 late_updated_dates.append(kept_date)
                 _log_late_update(
@@ -875,6 +983,28 @@ def run_once(
                         f"{month_result.status.value} {month_result.key} "
                         f"items={month_result.item_count}",
                     )
+                    # Company History that is in the Daily file and did not
+                    # reach the Monthly. A separate line, because the one
+                    # above is a success and this is not — `item_count`
+                    # counts what arrived, so a dropped item leaves no trace
+                    # in it. AGENT.md §6a already sends an operator to this
+                    # log for "돌긴 돌았는데 뭔가 안 됐다", which is exactly
+                    # this shape.
+                    #
+                    # Measured cause: `monthly/parser.py` loses a whole
+                    # section when one Event's `project_id` carries a `##`
+                    # heading — three Events, two of them innocent, all
+                    # dropped, MONTHLY_GENERATED reported. Escaping that is
+                    # docs/06's rendering contract (BUG-11/27), so the loss
+                    # stays; being unable to see it does not.
+                    if month_result.unconsolidated_days:
+                        _log_late_update(
+                            resolved_late_update_log_path,
+                            f"MONTHLY_UNCONSOLIDATED {month_result.key} "
+                            f"{_bounded(', '.join(month_result.unconsolidated_days))} "
+                            f"— Daily에 있는 `- Event ID:` 줄이 Monthly 항목이 "
+                            f"되지 못했다. 해당 Daily 파일을 확인해야 한다",
+                        )
                 elif month_result.status in (
                     MonthlyStatus.MONTHLY_PENDING,
                     MonthlyStatus.MONTHLY_FAILED,
@@ -982,13 +1112,45 @@ def run_once(
                 changed_files=len(backup_entry.changed_files),
             )
         elif backup_entry.final_status is BackupStatus.FAILED:
+            # `BACKUP_FAILED`는 두 가지 서로 다른 일에서 나온다. docs/08 §21의
+            # 인증/권한 실패와, docs/08 §31/§44-47의 **Local Master 파일 삭제
+            # 감지**다. 후자는 `sync_to_working_copy()`가 add/commit/push를
+            # 통째로 막고 돌아오는 경우로, Company History 파일이 사라졌다는
+            # 뜻이다 — 이 실행에서 일어날 수 있는 일 중 가장 무거운 축이다.
+            #
+            # Manifest에는 그 구분이 없었다. 실측, Daily 하루치를 지우고 실행:
+            #
+            #     classification  BACKUP_FAILED
+            #     reason          ""            <- 비어 있다
+            #     metrics         changed_files=1
+            #
+            # `deleted_files`는 성공 분기에만 실려 있었고, 삭제 분기에는
+            # `push_result`가 None이라 `reason`도 비었다. 즉 Run Manifest만
+            # 읽어서는 **Company History가 지워졌다는 사실 자체를 알 수 없고**
+            # 자격증명 실패와 구별되지도 않는다. docs/14 §3이 Manifest에게
+            # 요구하는 것이 정확히 그 한 줄이다.
+            #
+            # 새 classification 값을 만들지는 않았다 — 그 어휘는 docs/14 §5의
+            # 것이고 §5의 예시는 `BACKUP_FAILED`를 인증 실패에 묶고 있다
+            # (BACKLOG 참조, 승인 대상). `reason`은 `Failure`의 docstring이
+            # 자유 텍스트라고 명시한 필드이므로 여기에 사실을 적는다.
+            deleted = backup_entry.deleted_files
+            reason = backup_entry.push_result or ""
+            if deleted:
+                reason = _bounded(
+                    "Local Master에서 파일 %d건이 사라져 Backup이 add/commit/push를 "
+                    "중단했다 (docs/08 §31): %s"
+                    % (len(deleted), ", ".join(_one_line(name) for name in deleted[:5]))
+                    + (" 외" if len(deleted) > 5 else "")
+                )
             recorder.failed(
                 C_BACKUP,
                 classification="BACKUP_FAILED",
-                reason=backup_entry.push_result or "",
+                reason=reason,
                 retryability=Retryability.PERMANENT,
                 commit_hash=backup_entry.commit_hash,
                 changed_files=len(backup_entry.changed_files),
+                deleted_files=len(deleted),
             )
         else:
             recorder.ok(

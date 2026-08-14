@@ -159,7 +159,13 @@ def find_orphaned_events(
             continue
 
         expected = target_dir / safe_candidate_filename(f"HIST-{event.event_id}")
-        if not expected.exists():
+        # `is_file()`, not `exists()`. The question is "was a Candidate
+        # written for this Event", and a directory carrying the Candidate's
+        # name answers "is this name taken" instead. Measured: one genuinely
+        # orphaned Event, reported correctly with nothing there, and reported
+        # by nothing once a directory of that name existed — A-20's detector
+        # silenced by the presence of something that is not a Candidate.
+        if not expected.is_file():
             orphaned.append(
                 OrphanedEvent(
                     event_id=event.event_id,

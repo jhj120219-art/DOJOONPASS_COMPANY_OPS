@@ -139,6 +139,27 @@ def _git_environment() -> dict[str, str]:
     which does not consult `GIT_TERMINAL_PROMPT` and would otherwise open a
     dialog no scheduled task can answer.
 
+    `LC_ALL=C` / `LANG=C` are the same kind of fix one step further out.
+    `_AUTH_FAILURE_MARKERS` is a list of English phrases, and git translates
+    its messages when a message catalog for the caller's locale is installed.
+    Where one is, every marker stops matching, `is_authentication_failure()`
+    answers False for a real credential failure, and the run is classified
+    BACKUP_PENDING — which is the unbounded retry loop docs/08 §62 forbids,
+    reached by the one route the classification cannot see.
+
+    Measured before writing this, rather than assumed: Git for Windows
+    2.55.0.windows.3 on this machine ships **no** catalogs at all
+    (`C:\\Program Files\\Git\\mingw64\\share\\locale` does not exist), and
+    git answers in English under `LC_ALL=ko_KR.UTF-8` exactly as under
+    `LC_ALL=C`. So this changes no classification here. It is removing a
+    dependency on that packaging default, the same stance `_run_git()` takes
+    with `encoding="utf-8"` for a stream that happens to be ASCII today —
+    and the same one this function already takes for `GIT_TERMINAL_PROMPT`,
+    where a marker was listed for a condition nothing could produce.
+
+    Widening the marker list would be a classification decision (BACKLOG
+    BUG-52). Making the decided list apply is not.
+
     Passed as environment rather than `-c` flags on purpose: the command
     line stays exactly the approved set
     (tests/test_spec_conformance.py::test_git_ops_runs_only_the_approved_command_set).
@@ -146,6 +167,8 @@ def _git_environment() -> dict[str, str]:
     environment = dict(os.environ)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GCM_INTERACTIVE"] = "never"
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
     return environment
 
 

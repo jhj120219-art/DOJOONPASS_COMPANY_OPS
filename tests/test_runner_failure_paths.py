@@ -939,21 +939,39 @@ class RetryQueueBatchSaveDurabilityTests(RunnerFailurePathTestCase):
         return sorted(entry["event_id"] for entry in queue["entries"])
 
     def _run_with_failure_at(self, nth):
-        """Raise on the nth Event parsed inside the Notion step."""
+        """Raise on the nth Event handled inside the Notion step.
+
+        The stimulus is `retry_queue_upsert`, not `Event.from_json`. It was
+        the latter until C31 gave the two `processed/` reads in this step
+        their own handlers — a DEGRADED step was aborting Backup, so an
+        unreadable file is now counted and skipped instead of escaping.
+
+        That fix did not touch what this class protects. BUG-24 is about the
+        queue delta surviving *an exception anywhere inside the step*, and
+        the `finally` that guarantees it is untouched; only this test's way
+        of producing such an exception stopped producing one. `upsert_entry`
+        is inside the same `try`, is not guarded (nothing claims it cannot
+        raise), and standing in for "something in this step blew up" is
+        exactly what it is being used for.
+        """
+        import app.runner as runner_module
+
         for i in range(4):
             self._write_event(event_id=f"BATCHSAVE-{i:03d}")
 
-        original = Event.from_json
+        original = runner_module.retry_queue_upsert
         calls = {"n": 0}
 
-        def counting_from_json(raw):
+        def counting_upsert(entries, event, **kwargs):
             calls["n"] += 1
             if calls["n"] == nth:
                 raise ValueError("injected failure inside the Notion step")
-            return original(raw)
+            return original(entries, event, **kwargs)
 
-        Event.from_json = staticmethod(counting_from_json)
-        self.addCleanup(lambda: setattr(Event, "from_json", original))
+        runner_module.retry_queue_upsert = counting_upsert
+        self.addCleanup(
+            lambda: setattr(runner_module, "retry_queue_upsert", original)
+        )
         with self.assertRaises(ValueError):
             self._run(notion_sync=self._failing_sync())
 
@@ -1022,17 +1040,21 @@ class RetryQueueBatchSaveDurabilityTests(RunnerFailurePathTestCase):
         for i in range(4):
             self._write_event(event_id=f"BATCHSAVEFAIL2-{i:03d}")
 
-        original = Event.from_json
+        # `retry_queue_upsert`, not `Event.from_json` — see
+        # `_run_with_failure_at()` for why the stimulus moved.
+        original = runner_module.retry_queue_upsert
         calls = {"n": 0}
 
-        def counting_from_json(raw):
+        def counting_upsert(entries, event, **kwargs):
             calls["n"] += 1
             if calls["n"] == nth:
                 raise ValueError("ORIGINAL injected failure inside the Notion step")
-            return original(raw)
+            return original(entries, event, **kwargs)
 
-        Event.from_json = staticmethod(counting_from_json)
-        self.addCleanup(lambda: setattr(Event, "from_json", original))
+        runner_module.retry_queue_upsert = counting_upsert
+        self.addCleanup(
+            lambda: setattr(runner_module, "retry_queue_upsert", original)
+        )
 
         def failing_save(path, entries):
             raise OSError("save ALSO fails while the ORIGINAL exception is propagating")
@@ -5336,3 +5358,556 @@ class RecursionErrorIsUnparseableTests(unittest.TestCase):
             )
 
         self.assertIn("nested too deeply", str(caught.exception))
+
+
+class DegradedStepMustNotAbortCriticalStepsTests(RunnerFailurePathTestCase):
+    """NEW, **P0**. Notion Sync could take Daily History and Backup down.
+
+    `_sync_and_record()` guards `notion_sync.sync()`, so a Notion outage is
+    contained — that was never the gap. The gap was one line above it: step
+    4b re-reads each collected Event from `processed/` with
+
+        Event.from_json(processed_file.destination_path.read_text(...))
+
+    and that read had no handler at all. Verified by AST: the only `try`
+    blocks enclosing it are two `try/finally` with no `except`, so the
+    exception leaves `run_once()` entirely.
+
+    Measured before the fix, one simulated undecodable file:
+
+        run ABORTED: ValueError
+        Daily files : NONE
+        backup state: MISSING
+
+    Notion Sync is `Severity.DEGRADED`; History and Backup are CRITICAL. This
+    is the inversion `daily/generator.update_daily_history` already names —
+    *"A component docs/14 §5 classifies as DEGRADED was aborting one it
+    classifies as CRITICAL, which inverts the entire point of having the two
+    severities."* — reached through a different step, and contradicted by
+    this step's own comment: "Notion 실패가 Runtime을 막지 않는다".
+
+    Reachable without corruption. The Collector read the same file minutes
+    earlier, which is why nothing expected it to fail; but `runtime/` sits
+    under OneDrive in this deployment (docs/11), and a sync client or scanner
+    holding a handle produces exactly this on Windows.
+
+    Nothing is fabricated for the unreadable file — the event_id is precisely
+    what could not be read, so a made-up one would land in the log and the
+    manifest. It is counted, logged by filename, and fails the component.
+    """
+
+    def _failing_read(self):
+        """`Event.from_json` that dies on its first call only."""
+        import app.runner as runner_module
+
+        real = runner_module.Event.from_json
+        state = {"n": 0}
+
+        def flaky(raw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise ValueError("simulated undecodable processed file")
+            return real(raw)
+
+        return runner_module, staticmethod(flaky)
+
+    def _run_with_one_unreadable(self):
+        import unittest.mock
+
+        self._write_event(event_id="EVT-A")
+        self._write_event(event_id="EVT-B")
+        runner_module, flaky = self._failing_read()
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=InMemoryNotionTransport(), database_id="db")
+        )
+        with unittest.mock.patch.object(runner_module.Event, "from_json", flaky):
+            return self._run(notion_sync=sync)
+
+    def test_the_run_reaches_daily_history(self):
+        self._run_with_one_unreadable()
+
+        written = sorted(p.name for p in (self.local_master_dir / "daily").glob("*.md"))
+        self.assertTrue(written, "Daily History was not written at all")
+
+    def test_the_run_reaches_backup(self):
+        """The CRITICAL step furthest downstream of the DEGRADED one."""
+        self._run_with_one_unreadable()
+
+        self.assertTrue(self.backup_state_path.exists())
+
+    def test_the_unreadable_file_is_counted_on_the_component(self):
+        import json
+
+        self._run_with_one_unreadable()
+
+        manifest = json.loads(self.run_summary_path.read_text(encoding="utf-8"))
+        notion = next(c for c in manifest["components"] if c["name"] == "notion_sync")
+
+        self.assertEqual(notion["status"], "FAILED")
+        self.assertEqual(notion["metrics"]["unreadable"], 1)
+        self.assertEqual(notion["failure"]["retryability"], "UNKNOWN")
+        self.assertIn("could not be read", notion["failure"]["reason"])
+
+    def test_it_is_named_in_the_notion_log(self):
+        self._run_with_one_unreadable()
+
+        written = self.notion_sync_log_path.read_text(encoding="utf-8")
+
+        self.assertIn("NOTION_UNREADABLE", written)
+
+    def test_a_clean_run_reports_no_unreadable_and_stays_ok(self):
+        """The guard: the count must not appear out of nowhere."""
+        import json
+
+        self._write_event(event_id="EVT-OK")
+        self._run(
+            notion_sync=ExecutionPlanSync(
+                client=NotionClient(
+                    transport=InMemoryNotionTransport(), database_id="db"
+                )
+            )
+        )
+
+        manifest = json.loads(self.run_summary_path.read_text(encoding="utf-8"))
+        notion = next(c for c in manifest["components"] if c["name"] == "notion_sync")
+
+        self.assertEqual(notion["status"], "SUCCESS")
+        self.assertNotIn("unreadable", notion["metrics"])
+
+    def test_the_read_is_actually_guarded_in_source(self):
+        """AST, not text: the read in step 4b must sit inside an `except`."""
+        import ast
+        import inspect
+
+        import app.runner as runner_module
+
+        tree = ast.parse(inspect.getsource(runner_module.run_once))
+        guarded = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try) or not node.handlers:
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and getattr(inner.func, "attr", None) == "from_json"
+                ):
+                    guarded.append(inner.lineno)
+
+        self.assertTrue(guarded, "no Event.from_json call sits inside an except-handling try")
+
+
+class EveryDegradedStepIsContainedTests(RunnerFailurePathTestCase):
+    """No DEGRADED step may take a CRITICAL one down. Enforced by injection.
+
+    docs/14 §5 grades four steps DEGRADED — Notion Sync, Late Update,
+    Monthly, Dashboard — precisely so that Company History and Backup keep
+    running when they fail. Two of the four did not honour it:
+
+        notion_sync   the `processed/` re-read in step 4b had no handler
+        late_update   the loop trusted `update_daily_history()`'s "never
+                      raises" docstring, and that promise had a gap of its
+                      own (`select_late_candidates()` sat between two guards)
+
+    Measured, injecting a raise into each in turn — before the fix both
+    aborted `run_once()` with `backup_state.json` never written.
+
+    Asserted by fault injection rather than by reading the source. Five
+    static analyses were tried while finding these and every one of them was
+    wrong: "exported but unused outside its package" (114 false hits of 180),
+    entrypoint call-graph reachability (64 of 231, including `run_intake`
+    with 15 real call sites), grep for a call (counted comments), AST without
+    import-alias resolution (11 of 15 false), and "is the step's line range
+    inside a try" (the guards are *inside* each range, not around it). The
+    question "can an exception escape this step" is answered by making one
+    escape.
+    """
+
+    def _guarded_run(self, target, replacement):
+        import unittest.mock
+
+        import app.runner as runner_module
+
+        self._write_event(event_id="EVT-A")
+        with unittest.mock.patch.object(runner_module, target, replacement):
+            return self._run()
+
+    @staticmethod
+    def _boom(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    def test_a_raise_from_late_update_does_not_cost_the_backup(self):
+        self._guarded_run("update_daily_history", self._boom)
+
+        self.assertTrue(
+            self.backup_state_path.exists(),
+            "Late Update (DEGRADED) prevented Backup (CRITICAL) from running",
+        )
+
+    def test_that_failure_is_recorded_against_its_own_component(self):
+        import json
+
+        self._guarded_run("update_daily_history", self._boom)
+
+        manifest = json.loads(self.run_summary_path.read_text(encoding="utf-8"))
+        late = next(c for c in manifest["components"] if c["name"] == "late_update")
+
+        self.assertEqual(late["status"], "FAILED")
+        self.assertEqual(late["metrics"]["failed"], 1)
+        # A DEGRADED component failing while the CRITICAL ones succeed is
+        # exactly what DEGRADED/exit 3 is for.
+        self.assertEqual(manifest["overall_status"], "DEGRADED")
+        self.assertEqual(manifest["exit_code"], 3)
+
+    def test_the_unexpected_escape_is_named_in_the_log(self):
+        self._guarded_run("update_daily_history", self._boom)
+
+        log = self.notion_sync_log_path.parent / "daily_late_update.log"
+
+        self.assertIn("LATE_UPDATE_UNEXPECTED", log.read_text(encoding="utf-8"))
+
+    def test_a_raise_from_monthly_does_not_cost_the_backup(self):
+        """Already guarded before this sprint — asserted so it stays that
+        way, and so the four are enforced as one rule rather than three."""
+        self._guarded_run("monthly_run_once", self._boom)
+
+        self.assertTrue(self.backup_state_path.exists())
+
+    def test_the_late_update_contract_is_actually_true_now(self):
+        """The other half: the function promises never to raise. Its
+        `select_late_candidates()` call used to sit between two guards, so
+        the promise was not true of the whole body."""
+        import unittest.mock
+
+        import daily.generator as generator_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            daily_dir = Path(tmp)
+            (daily_dir / "2026-08-01.md").write_text("# day\n", encoding="utf-8")
+            with unittest.mock.patch.object(
+                generator_module, "select_late_candidates", self._boom
+            ):
+                result = generator_module.update_daily_history(
+                    FileHistoryRepository(
+                        keep_dir=daily_dir / "k", review_dir=daily_dir / "r"
+                    ),
+                    date(2026, 8, 1),
+                    output_dir=daily_dir,
+                    now=datetime(2026, 8, 2, 12, 0).astimezone(),
+                )
+
+        self.assertIs(result.outcome, LateUpdateOutcome.FAILED)
+        self.assertIn("injected failure", result.error)
+
+
+class CorruptRetryQueueEntryTests(RunnerFailurePathTestCase):
+    """The 4a twin of the unguarded read, found because fixing 4b broke a
+    durability test and made me look at what could still escape.
+
+    Step 4a drains the retry queue with `queued_entry.to_event()`, which is
+    `Event.from_json(self.event_data)`. `load_queue()` checks the queue file's
+    *shape* — the keys each entry must have — and never re-validates
+    `event_data` as an Event. So a hand-edited or truncated
+    `notion_retry_queue.json` raises there, out of a `Severity.DEGRADED` step,
+    taking Daily History and Backup with it.
+
+    Same treatment as 4b: the entry is counted, named in `notion_sync.log`,
+    and skipped. It stays in the queue — nothing here deletes an entry it
+    could not read, which is the same restraint every other damaged-file path
+    in this repository takes.
+    """
+
+    def _queue_with_a_corrupt_entry(self):
+        self.notion_retry_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.notion_retry_queue_path.write_text(
+            json.dumps(
+                {
+                    "entries": [
+                        {
+                            "event_id": "EVT-CORRUPT",
+                            "project_id": "PRJ",
+                            "event_data": {"not": "an event"},
+                            "added_at": "2026-08-01T10:00:00+09:00",
+                            "attempt_count": 1,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _run_it(self):
+        self._queue_with_a_corrupt_entry()
+        return self._run(
+            notion_sync=ExecutionPlanSync(
+                client=NotionClient(
+                    transport=InMemoryNotionTransport(), database_id="db"
+                )
+            )
+        )
+
+    def test_the_run_survives_and_reaches_backup(self):
+        self._run_it()
+
+        self.assertTrue(self.backup_state_path.exists())
+
+    def test_it_is_counted_and_named(self):
+        self._run_it()
+
+        manifest = json.loads(self.run_summary_path.read_text(encoding="utf-8"))
+        notion = next(c for c in manifest["components"] if c["name"] == "notion_sync")
+
+        self.assertEqual(notion["status"], "FAILED")
+        self.assertEqual(notion["metrics"]["unreadable"], 1)
+        self.assertIn(
+            "NOTION_UNREADABLE queued:EVT-CORRUPT",
+            self.notion_sync_log_path.read_text(encoding="utf-8"),
+        )
+
+    def test_the_unreadable_entry_is_not_deleted(self):
+        """Nothing here removes an entry it could not read — the operator
+        still has the file, and the same restraint applies as everywhere
+        else damaged input is met."""
+        self._run_it()
+
+        queue = json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))
+
+        self.assertIn(
+            "EVT-CORRUPT", [entry["event_id"] for entry in queue["entries"]]
+        )
+
+
+class RepeatedRunnerIsANoOpTests(RunnerFailurePathTestCase):
+    """Running the Runner again with no new input must change nothing.
+
+    Every duplicate defect this project has had reduces to a violation of
+    this one property -- a Late Event re-appended each run, an Event
+    re-queued for Notion, a month re-consolidated, a commit made with
+    nothing to commit. Each was found and fixed separately, and **nothing
+    asserted the property itself**, so the next component to break it would
+    be found the same way: by someone noticing a file growing.
+
+    Two shapes, and the second is the one that bites. Repeating a run with
+    *no* new input exercises very little -- step 6.5 takes only the dates
+    that run collected, so with nothing collected it does not execute at
+    all. Blinding §38's duplicate guard failed none of the assertions here
+    until `test_successive_late_events_do_not_re_add_the_earlier_ones` was
+    added below.
+
+    Asserted over the whole tree rather than per component, because the
+    interesting failures are the ones nobody thought to look for. Log files
+    and the Run Manifest are excluded by name and for one reason each:
+    `collector.log` is an append-only record of runs happening (growing is
+    its job), and `last_run.json` describes *this* run, so a byte-identical
+    one across runs would mean it was not rewritten.
+
+    Measured across three consecutive runs: no file added, removed, or
+    changed outside those; two commits total (the fixture's `init` plus one
+    real backup); `backup_status` settling SUCCESS -> NOT_REQUIRED ->
+    NOT_REQUIRED; one id in the seen store.
+    """
+
+    VOLATILE = (
+        "last_run.json",
+        "collector.log",
+        "notion_sync.log",
+        "daily_late_update.log",
+        "collector_state.json",
+        "backup_state.json",
+    )
+
+    def _snapshot(self):
+        import hashlib
+
+        snapshot = {}
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.root).as_posix()
+            if relative.startswith(".git/") or "/.git/" in relative:
+                continue
+            if any(name in relative for name in self.VOLATILE):
+                continue
+            snapshot[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return snapshot
+
+    def _three_runs(self):
+        self._write_event(summary="event one")
+        self._write_event(
+            summary="event two", timestamp="2026-08-01T11:00:00+09:00"
+        )
+        snapshots = []
+        for index in range(3):
+            self._run(
+                now=datetime(2026, 8, 2, 12 + index, 0).astimezone(),
+                run_id=f"idempotence-{index}",
+            )
+            snapshots.append(self._snapshot())
+        return snapshots
+
+    def test_no_durable_artifact_changes_after_the_first_run(self):
+        first, second, third = self._three_runs()
+
+        self.assertNotEqual(first, {}, "the first run produced nothing to compare")
+        self.assertEqual(sorted(second), sorted(first))
+        self.assertEqual(second, first)
+        self.assertEqual(third, second)
+
+    def test_no_empty_commit_is_made(self):
+        """docs/08's `git status` gate. A commit per run with nothing in it
+        would push a growing history of nothing and hide the real ones."""
+        self._three_runs()
+
+        count = self._run_git(
+            ["rev-list", "--count", "HEAD"], cwd=self.backup_working_copy_dir
+        ).stdout.strip()
+
+        self.assertEqual(count, "2", "one init commit plus one real backup")
+        self.assertEqual(self._unpushed_commit_count(), 0)
+
+    def test_the_backup_settles_on_not_required(self):
+        self._three_runs()
+
+        state = json.loads(self.backup_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(state["backup_status"], "BACKUP_NOT_REQUIRED")
+
+    def test_the_seen_store_does_not_regrow(self):
+        """The Collector's duplicate guard is what makes runs 2 and 3
+        no-ops at all; if it re-marked, everything downstream would too."""
+        self._three_runs()
+
+        state = json.loads(self.collector_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(state["processed_event_ids"]), 2)
+
+    def test_successive_late_events_do_not_re_add_the_earlier_ones(self):
+        """The case with teeth, and the one the first draft of this class
+        missed.
+
+        Runs 2 and 3 above collect nothing, so step 6.5 has no dates and
+        never runs -- blinding §38's duplicate guard did not fail a single
+        assertion. The duplicate risk needs *successive* runs that each
+        collect an Event for the same already-closed date, so the guard is
+        actually asked.
+
+        Measured, three runs each adding one Event dated 2026-08-01 (closed
+        after the first run), with `existing_event_ids()` returning an empty
+        set:
+
+            fixed     3 `- Event ID:` lines, Late Events Added 2, Event Count 3
+            blinded   7 `- Event ID:` lines, Late Events Added 6, Event Count 0
+
+        Unbounded growth of a Company History file, with the two Metadata
+        numbers contradicting each other inside it.
+        """
+        self._write_event(summary="A", timestamp="2026-08-01T10:00:00+09:00")
+        self._run(now=datetime(2026, 8, 2, 12, 0).astimezone(), run_id="late-a")
+        self._write_event(summary="B", timestamp="2026-08-01T11:00:00+09:00")
+        self._run(now=datetime(2026, 8, 3, 12, 0).astimezone(), run_id="late-b")
+        self._write_event(summary="C", timestamp="2026-08-01T12:00:00+09:00")
+        self._run(now=datetime(2026, 8, 4, 12, 0).astimezone(), run_id="late-c")
+
+        daily = (self.local_master_dir / "daily" / "2026-08-01.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(daily.count("- Event ID:"), 3)
+        self.assertIn("- Late Events Added: 2", daily)
+        self.assertIn("- Event Count: 3", daily)
+
+    def test_a_new_event_still_moves_the_tree(self):
+        """The property must not be satisfiable by doing nothing at all."""
+        self._three_runs()
+        settled = self._snapshot()
+
+        self._write_event(
+            summary="a late one", timestamp="2026-08-01T15:00:00+09:00"
+        )
+        self._run(now=datetime(2026, 8, 3, 12, 0).astimezone(), run_id="late-1")
+
+        self.assertNotEqual(self._snapshot(), settled)
+
+
+class DeletedHistoryReachesTheManifestTests(RunnerFailurePathTestCase):
+    """`BACKUP_FAILED` comes from two different things and the manifest could
+    not tell them apart.
+
+    docs/08 §21 is credential/permission failure. docs/08 §31/§44-47 is
+    `sync_to_working_copy()` detecting that a Local Master file is **gone**
+    and refusing to add/commit/push at all — Company History was deleted,
+    which is about the heaviest thing a run can discover.
+
+    Measured before the fix, one Daily file deleted between two runs:
+
+        classification  BACKUP_FAILED
+        reason          ""                <- empty
+        metrics         changed_files=1
+
+    `deleted_files` was only on the success branch, and the deletion branch
+    leaves `push_result` None so `reason` was empty too. Reading
+    `last_run.json` — which docs/14 §3 says is the thing that states what
+    happened and where the detail is — an operator could not learn that
+    Company History had been deleted, nor tell this from a bad credential.
+
+    No new classification value: that vocabulary is docs/14 §5's and its
+    example binds `BACKUP_FAILED` to authentication (recorded in BACKLOG as
+    needing a decision). `reason` is free-form by `Failure`'s own docstring,
+    so the fact goes there, bounded like every other external string.
+    """
+
+    def _delete_a_day(self):
+        import contextlib
+
+        self._write_event(summary="one")
+        self._run(now=datetime(2026, 8, 2, 12, 0).astimezone(), run_id="deleted-1")
+        victim = self.local_master_dir / "daily" / "2026-08-01.md"
+        self.assertTrue(victim.is_file(), "fixture did not produce the Daily file")
+        victim.unlink()
+        with contextlib.suppress(Exception):
+            self._run(now=datetime(2026, 8, 3, 12, 0).astimezone(), run_id="deleted-2")
+        summary = json.loads(self.run_summary_path.read_text(encoding="utf-8"))
+        return next(c for c in summary["components"] if c["name"] == "backup")
+
+    def test_the_manifest_says_a_file_was_deleted(self):
+        backup = self._delete_a_day()
+
+        self.assertEqual(backup["status"], "FAILED")
+        self.assertEqual(backup["metrics"]["deleted_files"], 1)
+
+    def test_the_reason_names_the_file_and_the_cause(self):
+        backup = self._delete_a_day()
+
+        reason = backup["failure"]["reason"]
+        self.assertIn("2026-08-01.md", reason)
+        self.assertIn("사라져", reason)
+        self.assertNotEqual(reason, "")
+
+    def test_the_severity_contract_is_unchanged(self):
+        """Backup is CRITICAL and a deletion block is PERMANENT. The fix
+        adds information; it must not move the run's verdict."""
+        backup = self._delete_a_day()
+
+        self.assertEqual(backup["failure"]["classification"], "BACKUP_FAILED")
+        self.assertEqual(backup["failure"]["severity"], "CRITICAL")
+        self.assertEqual(backup["failure"]["retryability"], "PERMANENT")
+
+    def test_the_deletion_is_not_propagated_to_the_remote(self):
+        """The property the whole branch exists for (docs/08 §31): the
+        Working Copy still holds the file and nothing was pushed."""
+        self._delete_a_day()
+
+        self.assertTrue(
+            (self.backup_working_copy_dir / "daily" / "2026-08-01.md").is_file()
+        )
+        self.assertEqual(self._unpushed_commit_count(), 0)
+
+    def test_an_ordinary_backup_reports_no_deletions(self):
+        """The other direction, so `deleted_files` cannot become a constant."""
+        self._write_event(summary="one")
+        self._run(now=datetime(2026, 8, 2, 12, 0).astimezone(), run_id="ok-1")
+
+        summary = json.loads(self.run_summary_path.read_text(encoding="utf-8"))
+        backup = next(c for c in summary["components"] if c["name"] == "backup")
+
+        self.assertEqual(backup["status"], "SUCCESS")
+        self.assertEqual(backup["metrics"].get("deleted_files", 0), 0)

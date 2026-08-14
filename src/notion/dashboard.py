@@ -305,8 +305,14 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
             hostable_pages=hostable,
             search_available=search_available,
             required_action=(
-                "None — the reference database already lives in a Page; "
-                "bootstrap_dashboard_databases(client) will use it."
+                "The workspace is ready, but nothing creates the OPS_* "
+                "databases on its own: no entrypoint in this repository calls "
+                "bootstrap_dashboard_databases(), so this command diagnoses "
+                "and stops. To finish, either run that function yourself "
+                "against this client, or create the OPS_RUNS database by hand "
+                "in the Page above. Either way, set "
+                "NOTION_OPS_RUNS_DATABASE_ID to its id — until that variable "
+                "is set, Dashboard recording is skipped on every run."
             ),
         )
 
@@ -319,8 +325,11 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
             search_available=search_available,
             required_action=(
                 "The reference database sits at workspace root, but shared Page(s) exist. "
-                "Pass one of hostable_pages' page_id as parent_page_id "
-                "(choosing the Page is an operator decision, not this code's)."
+                "Choose one and pass its page_id as parent_page_id to "
+                "bootstrap_dashboard_databases() (choosing the Page is an "
+                "operator decision, not this code's) — and note that no "
+                "entrypoint here runs that function, so the creation step is "
+                "yours to perform. Then set NOTION_OPS_RUNS_DATABASE_ID."
             ),
         )
 
@@ -333,7 +342,9 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
         required_action=(
             "Share an existing Page (the Company Ops page) with this integration in "
             "Notion (Share -> Connections). Notion's API cannot create a database at "
-            "workspace root, and creating a Page is out of scope."
+            "workspace root, and creating a Page is out of scope. That only clears "
+            "the prerequisite — creating the OPS_* databases and setting "
+            "NOTION_OPS_RUNS_DATABASE_ID is still a step no command here performs."
         ),
     )
 

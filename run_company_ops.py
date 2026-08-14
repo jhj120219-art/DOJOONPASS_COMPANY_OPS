@@ -75,6 +75,12 @@ from app.runner import DEFAULT_RUN_SUMMARY_PATH  # noqa: E402
 from runsummary import RunSummaryError, read_summary  # noqa: E402
 from scheduler import SchedulerStatus  # noqa: E402
 
+# The same two rules `oplog.append_line()` applies to every logged line, for
+# strings of the same origin. `ops_status.py` already imports `one_line` for
+# this reason; the pair is needed here because this script prints text that
+# came out of a remote HTTP response.
+from oplog import one_line, redact  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
 
@@ -254,8 +260,47 @@ def _print_result(result) -> int:
     )
     print(f"Notion Sync: {len(notion_sync_results)}건 처리")
     for r in notion_sync_results:
-        suffix = f" [{r.error}]" if r.error else ""
-        print(f"  - {r.event_id} ({r.project_id}): {r.status.value}{suffix}")
+        # `SyncResult.error` is a remote HTTP response body carried verbatim
+        # (`notion/transport._error_detail()` appends it so an operator can
+        # see *which* property Notion rejected — BUG-58). That makes it the
+        # same class of string `oplog.append_line()` guards, and it reached
+        # here guarded by nothing.
+        #
+        # Measured, a proxy answering 502 in Notion's place and echoing the
+        # request headers back — the exact scenario `append_line()`'s own
+        # docstring names as the reason redaction exists:
+        #
+        #     notion_sync.log   token redacted, 1 line
+        #     this stdout       `Authorization: Bearer ntn_…` in full, 4 lines
+        #
+        # Both halves matter. `redact()` is docs/04 §56; `one_line()` stops a
+        # multi-line body from forging further `  - <event_id> …` result
+        # lines in a report an operator reads to decide what happened.
+        #
+        # Applied here rather than in `notion/transport.py`, which is where
+        # the string is built: `notion` may import only `events`
+        # (LayeringInvariantTests), and widening that table is an
+        # architecture decision. This script is the composition root's
+        # entrypoint and already sits above everything, so the guard goes at
+        # the sink — which is also where the exposure is.
+        suffix = f" [{redact(one_line(r.error))}]" if r.error else ""
+        # `event_id` and `project_id` need `one_line()` too, and this line
+        # shipped without it — a blind spot in the fix directly above.
+        # Guarding the interpolation that obviously came from a remote
+        # response, while leaving two Event fields that cross the same
+        # transport unguarded, is half a fix. Measured: an `event_id` of
+        # `"EVT-1\n  - EVT-GHOST (PRJ): SYNCED"` put a fully attacker-authored
+        # result row in this report, indistinguishable from a real one.
+        #
+        # `redact()` is not applied to these two: they are identifiers the
+        # operator needs verbatim to find the Event, and unlike `r.error`
+        # neither carries a remote response body. docs/02 constrains both to
+        # "present and non-null" only (BACKLOG A-15), which is why they need
+        # the line guard at all.
+        print(
+            f"  - {one_line(r.event_id)} ({one_line(r.project_id)}): "
+            f"{r.status.value}{suffix}"
+        )
     print(
         f"Daily History (Scheduler): {scheduler_result.status.value}, "
         f"generated={scheduler_result.generated_dates}"

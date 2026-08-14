@@ -77,7 +77,13 @@ def check_state_consistency(state_path: Path, daily_dir: Path) -> ConsistencyRes
         )
 
     expected = Path(daily_dir) / f"{last_close.isoformat()}.md"
-    if expected.exists():
+    # `is_file()`, not `exists()`. §47's failure is "State claims a Daily
+    # Close that has no Local History file", and a directory named
+    # `2026-08-10.md` is not a Local History file — but it does exist, so
+    # this reported CONSISTENT for a day that was never written. Measured
+    # alongside `scheduler.run_once()` reporting COMPLETED for the same date:
+    # both of the checks meant to catch a missing day agreed it was there.
+    if expected.is_file():
         return ConsistencyResult(
             status=ConsistencyStatus.CONSISTENT,
             last_successful_daily_close=last_close,

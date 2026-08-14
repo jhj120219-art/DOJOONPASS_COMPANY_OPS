@@ -128,6 +128,20 @@ def generate_daily_history(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     final_path = output_dir / f"{target_date.isoformat()}.md"
+    # The non-file case is tested FIRST, and deliberately so. Both branches
+    # raise `FileExistsError`, but they are different facts and only one of
+    # them needs a person: "that day is already written" is the normal
+    # catch-up outcome, while "something that is not a file is sitting where
+    # that day belongs" is an anomaly no run can clear. Checked second, the
+    # generic message won and the operator was told the day already existed —
+    # about a directory. Under `overwrite=True` the alternative was worse
+    # still: `os.replace()` failed with a bare `Errno 13 Permission denied`
+    # naming a temp path.
+    if final_path.exists() and not final_path.is_file():
+        raise FileExistsError(
+            f"a non-file is in the way of daily history: {final_path} — a day of "
+            "Company History cannot be written there until it is moved"
+        )
     if final_path.exists() and not overwrite:
         raise FileExistsError(f"daily history already exists: {final_path}")
 
@@ -202,7 +216,14 @@ def update_daily_history(
     now = now or datetime.now().astimezone()
     final_path = output_dir / f"{target_date.isoformat()}.md"
 
-    if not final_path.exists():
+    # `is_file()`, not `exists()`: this function's whole precondition is
+    # "there is an already-written day here to add to". A directory named
+    # `2026-08-20.md` is not one, and treating it as one produced
+    # `FAILED: [Errno 13] Permission denied` naming a temp path — a report
+    # about the wrong thing. `NO_EXISTING_FILE` is the honest answer, and it
+    # routes the problem to `generate_daily_history()`, which now says
+    # exactly what is in the way.
+    if not final_path.is_file():
         return LateUpdateResult(date=target_date, outcome=LateUpdateOutcome.NO_EXISTING_FILE)
 
     try:
@@ -244,7 +265,24 @@ def update_daily_history(
             date=target_date, outcome=LateUpdateOutcome.FAILED, error=str(exc)
         )
 
-    late = select_late_candidates(existing, for_this_date)
+    # Inside the guard, not between two of them. This line sat in the gap
+    # between the "read the Repository" try above and the "render and write"
+    # try below, so the docstring's promise three paragraphs up — "Never
+    # raises for an I/O or rendering failure" — was not actually true of the
+    # whole function. `select_late_candidates()` parses the existing document
+    # (`existing_event_ids()`) and sorts by `chronological_key`, both over
+    # content this function did not produce and docs/06 §57 lets a human
+    # edit.
+    #
+    # The caller has a belt for this now too (`app/runner.py`'s step 6.5),
+    # but a function whose contract says it does not raise should not need
+    # one — and until both existed, an escape here took Backup down with it.
+    try:
+        late = select_late_candidates(existing, for_this_date)
+    except Exception as exc:  # noqa: BLE001  (§41: report, never crash the run)
+        return LateUpdateResult(
+            date=target_date, outcome=LateUpdateOutcome.FAILED, error=str(exc)
+        )
     if not late:
         return LateUpdateResult(
             date=target_date, outcome=LateUpdateOutcome.NO_LATE_EVENTS, path=final_path
