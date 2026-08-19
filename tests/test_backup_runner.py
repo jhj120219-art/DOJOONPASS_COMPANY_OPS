@@ -230,5 +230,108 @@ class AuthVsTransientFailureStateTests(BackupRunnerTestCase):
         self.assertTrue((self.master_dir / "daily" / "2026-08-06.md").exists())
 
 
+class PendingRetryClassifiesTheSameWayTests(BackupRunnerTestCase):
+    """The **second** place docs/08 §19 vs §21/§62 is decided, and the one
+    nothing asked about.
+
+    `run_once()` writes that classification twice. The one above
+    (`AuthVsTransientFailureStateTests`) is step 7's — a run with changes
+    whose add/commit/push failed. The other is step 6's PENDING retry: a
+    working copy with NOTHING to commit, whose previous run left the state
+    PENDING because only the push failed. That path re-pushes first (BUG-1),
+    and when THAT push fails it makes the same auth-vs-transient decision in
+    its own `except`.
+
+    A branch-coverage pass (C43) found only one side of it had ever run:
+    `test_pending_retry_that_still_fails_stays_pending` covers the transient
+    side, and nothing covered the credential side. The cost of the two
+    drifting apart is exactly what §62 forbids — a push that can never
+    succeed, retried on every scheduled run forever, with the state saying
+    "the next run will fix it".
+
+    Both cases here start from a state file that already says PENDING and a
+    clean working copy, which is the only way to reach that branch.
+    """
+
+    def _pending_state_and_clean_copy(self):
+        """A Working Copy with nothing to commit, and a state that says the
+        previous run's push failed."""
+        from backup.state import BackupState, save_state
+
+        self.working_copy_dir.mkdir(parents=True)
+        _run_git(["init", "-b", "main"], cwd=self.working_copy_dir)
+        _run_git(["config", "user.email", "test@example.invalid"], cwd=self.working_copy_dir)
+        _run_git(["config", "user.name", "Backup Runner Test"], cwd=self.working_copy_dir)
+        (self.working_copy_dir / ".gitkeep").write_text("", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.working_copy_dir)
+        _run_git(["commit", "-m", "init"], cwd=self.working_copy_dir)
+        save_state(self.state_path, BackupState(backup_status=BackupStatus.PENDING))
+
+    def _run_with_push(self, message):
+        from backup import git_ops
+
+        import backup.runner as backup_runner
+
+        original_push = backup_runner.git_push
+
+        def fake_push(repo_dir):
+            raise git_ops.GitOperationError(message)
+
+        backup_runner.git_push = fake_push
+        try:
+            with self.assertRaises(git_ops.GitOperationError):
+                run_once(
+                    self.master_dir, self.working_copy_dir, state_path=self.state_path
+                )
+        finally:
+            backup_runner.git_push = original_push
+        return load_state(self.state_path)
+
+    def test_the_premise_this_branch_needs_is_real(self):
+        """Stated first, because the test below is meaningless if the run
+        took step 7 instead: nothing to commit, state already PENDING."""
+        from backup.git_ops import git_status
+
+        self._pending_state_and_clean_copy()
+
+        self.assertFalse(git_status(self.working_copy_dir).has_changes)
+        self.assertIs(load_state(self.state_path).backup_status, BackupStatus.PENDING)
+
+    def test_a_credential_failure_on_the_retry_stops_being_pending(self):
+        self._pending_state_and_clean_copy()
+
+        state = self._run_with_push(
+            "git push failed (exit 128): fatal: Authentication failed for "
+            "'https://github.com/example/backup.git'"
+        )
+
+        self.assertIs(state.backup_status, BackupStatus.FAILED)
+
+    def test_a_transient_failure_on_the_retry_stays_pending(self):
+        """The side that already had a test, kept here so the pair is
+        readable in one place — a classification is only right relative to
+        the other answer."""
+        self._pending_state_and_clean_copy()
+
+        state = self._run_with_push(
+            "git push failed (exit 128): fatal: unable to access "
+            "'https://github.com/example/backup.git': Could not resolve host"
+        )
+
+        self.assertIs(state.backup_status, BackupStatus.PENDING)
+
+    def test_the_two_places_use_the_same_rule(self):
+        """Written twice in one function, so they can drift. Compared from
+        the source rather than trusted: `DuplicatedRulesStayInStepTests` makes
+        the same argument for the two `safe_event_filename()` copies."""
+        import inspect
+
+        import backup.runner as backup_runner
+
+        source = inspect.getsource(backup_runner.run_once)
+
+        self.assertEqual(source.count("is_authentication_failure(str(exc))"), 2)
+        self.assertEqual(source.count("else BackupStatus.PENDING"), 2)
+
 if __name__ == "__main__":
     unittest.main()

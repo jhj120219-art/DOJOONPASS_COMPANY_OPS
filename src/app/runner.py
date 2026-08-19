@@ -65,6 +65,11 @@ from collector import (  # noqa: E402
     RuntimeOutcome,
     run_once as collector_run_once,
 )
+
+# docs/02 §8's Desktop->role table, one hop from `reporter/profiles.py`
+# where it lives. Used for exactly one number in the Dashboard row — see
+# `desktops_reporting` at step 9b — and never to decide anything.
+from controltower import ROLE_FOR_SOURCE, event_instant_key  # noqa: E402
 from daily import LateUpdateOutcome, update_daily_history  # noqa: E402
 from events import Event, EventValidationError  # noqa: E402
 from history import FileHistoryRepository, HistoryDecision, HistoryFilter  # noqa: E402
@@ -99,6 +104,7 @@ from oplog import (  # noqa: E402
     bounded as _bounded,
     bounded_error as _bounded_error,
     one_line as _one_line,
+    redact as _redact,
 )
 from runsummary import (  # noqa: E402
     ComponentResult,
@@ -288,11 +294,17 @@ def _log_notion_sync(log_path: Path, sync_result: SyncResult) -> None:
     사라졌다. Retry Queue가 같은 Event를 매 실행 재전송하는 것을 보면서도
     이유를 알 수 없던 것이 이 누락이다.
 
-    실패에만 붙인다: 성공한 Sync의 `error`는 None이고, 매 줄에 빈 필드를
-    더하면 §55의 형식만 흐려진다.
+    조건은 "status가 실패인가"가 아니라 "`error`가 채워져 있는가"다. 원래
+    의도("빈 필드를 매 줄에 더하지 않는다")는 그대로이고 — 성공한 Sync의
+    `error`는 여전히 대부분 None이다 — 성공한 Sync가 *할 말이 있는* 경우를
+    잃지 않는다. 그런 경우가 실제로 생겼다: Notion에 저장된 `Last Updated`가
+    비교할 수 없는 값이면(사람이 날짜 선택기로 시간 없이 고른 경우, docs/04
+    §43) `ExecutionPlanSync`는 Late Event 보호를 건너뛰고 Update를 진행하며
+    그 사실을 `error`에 적는다. status로 거르면 그 줄이 사라지고, 보호가
+    꺼진 채 돌아간 실행이 로그에 아무 흔적도 남기지 않는다.
     """
     suffix = ""
-    if sync_result.status in _FAILED_SYNC_STATUSES and sync_result.error:
+    if sync_result.error:
         # 줄바꿈은 `_append_log_line()`이 escape하고, 길이는 `_bounded()`가
         # 막는다. 보통은 `_error_detail()`이 이미 400자로 자른 뒤라 이 상한에
         # 닿지 않는다 — 닿는 것은 아무 층도 자르지 않은 문자열뿐이다.
@@ -479,6 +491,45 @@ def run_once(
             if notion_sync_log_path is not None
             else DEFAULT_NOTION_SYNC_LOG_PATH
         )
+        # Two facts about this step that step 9b puts on the Dashboard, and
+        # that therefore have to exist whether or not this step runs.
+        #
+        # `notion_unreadable` is declared inside the `if` below as well —
+        # this is its zero value for the unconfigured case, so the Dashboard
+        # reports "no Event files were unreadable" rather than crashing on a
+        # name that was never bound. `notion_queue_depth` is the queue's size
+        # *after* this step, which is the number an operator needs: how many
+        # Events are still waiting for Notion right now.
+        #
+        # Both were computed and reached only the Run Manifest. The manifest
+        # shows `queued=` only when the component is non-SUCCESS, and it
+        # cannot see a queued entry whose `to_event()` fails at all — so the
+        # Dashboard, which is the view meant to answer "is Notion keeping
+        # up", had no column that could ever say no.
+        notion_unreadable: list[str] = []
+        notion_queue_depth = 0
+        # `begin()` before anything this step can die in — C34 §1.
+        #
+        # `_Recorder.begin()` is what lets the `finally` attribute an escaping
+        # exception to the step that raised it ("knows which step is currently
+        # in flight so that an exception escaping any step can still be
+        # attributed to it"). Two of the nine steps never called it: this one
+        # and step 6. Both are steps whose FIRST action reads a state file
+        # that docs/10 §46 explicitly expects to find damaged.
+        #
+        # Measured with a corrupt `notion_retry_queue.json` — `load_retry_queue()`
+        # below raises `RetryQueueError` with nothing between it and the
+        # `finally`:
+        #
+        #     STEP_ABORTED   NONE
+        #     manifest       SUCCESS / exit 0     <- for a run that aborted
+        #     ops_status     "시작되지 못한 단계: notion_sync …" blaming collector
+        #
+        # `overall_status()` folds recorded FAILED components, so recording
+        # none makes an aborted run indistinguishable from a clean one, and
+        # `ops_status.py`'s LAST RUN block — the first thing AGENT.md §6 tells
+        # an operator to read — prints `종합 상태 : SUCCESS (exit 0)`.
+        recorder.begin(C_NOTION_SYNC)
         if notion_sync is not None:
             resolved_retry_queue_path = (
                 Path(notion_retry_queue_path)
@@ -505,8 +556,9 @@ def run_once(
             # Collected Event files this step could not read back. Kept
             # separate from `notion_sync_results`, which holds real sync
             # outcomes — see the read guard in 4b for why nothing is
-            # fabricated for them.
-            notion_unreadable: list[str] = []
+            # fabricated for them. (Bound above too, for the unconfigured
+            # case; this rebinding keeps the declaration next to its use.)
+            notion_unreadable = []
             # in-memory lookup index for this run's upserts/removes below —
             # a Notion outage held open across n queued Events previously cost
             # O(n^2) list scans draining the queue (measured: 0.45 ms at 100
@@ -568,6 +620,40 @@ def run_once(
                     notion_sync_results.append(_sync_and_record(queued_event))
 
                 # 4b. 이번 실행에서 새로 수집된 ACCEPTED Event.
+                #
+                # **Read first, then apply oldest-first.** The loop used to
+                # sync in `collector_summary.files` order, which is the
+                # Collector's `sorted(glob("*.json"))` — filename order. An
+                # `event_id` is `uuid5(namespace, "<Desktop>|<date>|<Signal
+                # filename>")`, so that order has no relation to when the work
+                # happened, and docs/04 §29-30's Late Event guard refuses any
+                # Event not newer than the row's `Last Updated`.
+                #
+                # Measured (C47), two Events of one project in ONE batch:
+                #
+                #     file order == time order   BLOCKED then DECISION
+                #                                -> row shows the blocker
+                #     file order reversed        DECISION then BLOCKED
+                #                                -> NOTION_SKIPPED_OLD_EVENT,
+                #                                   row shows NO blocker
+                #
+                # Neither Event is late in any operational sense — they are
+                # an hour apart in the same run — and which of the two
+                # outcomes an operator gets was a coin flip on a uuid. The
+                # guard is right; the order it was fed was arbitrary.
+                #
+                # Sorting changes the final row state only when the older
+                # Event carries state the newer one does not touch (a
+                # `RESUMED` clears a blocker, a `DECISION_APPROVED` touches
+                # none), and in exactly those cases the sorted answer is the
+                # one the fold over the same Events gives — the invariant
+                # `TheRowIsExactlyTheFoldOverWhatReachedItTests` pins. It is
+                # the same key that fold uses, imported rather than restated.
+                #
+                # Unreadable files are handled in the read pass, so they are
+                # still counted and logged; only the order of the log lines
+                # relative to the sync lines changes.
+                collected: list[Event] = []
                 for processed_file in collector_summary.files:
                     if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
                         continue
@@ -582,12 +668,6 @@ def run_once(
                         # the whole run down from a step docs/14 §5 grades
                         # DEGRADED.
                         #
-                        # Measured, one simulated undecodable file:
-                        #
-                        #     run ABORTED: ValueError
-                        #     Daily files : NONE
-                        #     backup state: MISSING
-                        #
                         # Notion Sync aborting Daily History and Backup is
                         # the inversion `daily/generator.update_daily_history`
                         # already names in as many words: "A component
@@ -597,6 +677,46 @@ def run_once(
                         # other step — and this step's own comment three
                         # lines up already says "Notion 실패가 Runtime을 막지
                         # 않는다".
+                        #
+                        # **What this guard does and does not buy — C34 §4.**
+                        # The measurement that used to sit here read:
+                        #
+                        #     run ABORTED: ValueError
+                        #     Daily files : NONE
+                        #     backup state: MISSING
+                        #
+                        # and it is still, today, exactly what happens. Step 5
+                        # reads the same file with no guard at all, so the run
+                        # dies eleven lines later on the identical exception.
+                        # Re-measured on the same scenario, one collected file
+                        # corrupted after the Collector moved it:
+                        #
+                        #     notion_sync    FAILED   unreadable=1   (logged)
+                        #     STEP_ABORTED   history_filter
+                        #     overall/exit   FAILED / 2
+                        #     Daily files    NONE
+                        #     backup state   MISSING
+                        #     dashboard      never reached
+                        #
+                        # So the claim to keep is narrower than the one that
+                        # was here. What the guard buys is real but is about
+                        # *attribution and evidence*, not survival:
+                        #
+                        #   - the run is charged to `history_filter`, which
+                        #     docs/14 §5 grades CRITICAL, instead of to a
+                        #     DEGRADED step — the inversion above is gone;
+                        #   - `NOTION_UNREADABLE <file>` reaches the log, so
+                        #     the operator is told *which* file, which the
+                        #     bare traceback from step 5 never says.
+                        #
+                        # Step 5 aborting is not a defect to fix here. It is
+                        # BUG-20's deliberate design: History is the CRITICAL
+                        # record, and a file that cannot be read must not be
+                        # silently dropped from it. The consequence worth
+                        # knowing is that `Notion Unreadable` on the Dashboard
+                        # (C33 §1) can only ever be non-zero from the 4a
+                        # retry-queue path above — a 4b unreadable file kills
+                        # the run before step 9b writes the row.
                         #
                         # Reachable without corruption: `runtime/` sits under
                         # OneDrive in this deployment (docs/11), and a sync
@@ -616,6 +736,10 @@ def run_once(
                             f"{_bounded_error(read_exc)}",
                         )
                         continue
+                    collected.append(event)
+
+                collected.sort(key=lambda item: (event_instant_key(item), item.event_id))
+                for event in collected:
                     notion_sync_results.append(_sync_and_record(event))
             finally:
                 # 4c. 이 단계에서 발생한 모든 큐 변경을 1회만 기록한다 (B안).
@@ -634,8 +758,36 @@ def run_once(
                         # 않고 유실됨). `save_exc.__context__`는 이 예외가
                         # *발생한 시점*에 이미 전파 중이던 예외를 가리키므로
                         # (원래 예외 없음 -> None) 의도한 판단을 실제로 한다.
+                        #
+                        # 그런데 삼키는 쪽 가지는 **아무 흔적도 남기지 않았다**
+                        # (C40). 원래 예외를 가리지 않는 것은 옳지만, 그 결정의
+                        # 대가는 실제로 있다: 이 실행이 큐에 새로 넣으려던
+                        # 재시도 대상이 디스크에 없으므로 **다음 실행이 그것을
+                        # 다시 시도하지 않는다.** 중단 자체는 STEP_ABORTED로
+                        # 보고되지만, 큐 쓰기까지 함께 실패했다는 사실은
+                        # 어디에도 없었다 — 그 둘은 사람이 해야 할 일이 다르다.
+                        #
+                        # raise 하지 않고 **기록만** 더한다. 제어 흐름은 한 줄도
+                        # 바뀌지 않는다.
+                        try:
+                            _append_log_line(
+                                resolved_notion_sync_log_path,
+                                f"RETRY_QUEUE_SAVE_FAILED entries={len(queue_entries)} "
+                                f"{_bounded_error(save_exc)}",
+                            )
+                        except Exception:  # noqa: BLE001
+                            # 로그도 못 쓰는 상황이라면 원래 예외를 가리는 것이
+                            # 훨씬 나쁘다. 기록은 최선 노력이다.
+                            pass
                         if save_exc.__context__ is None:
                             raise
+
+            # The queue's size after this step — every entry that failed
+            # again plus every one this step could not even parse. Read from
+            # the in-memory list rather than by re-reading the file: 4c has
+            # just written exactly this list, and re-reading would be a
+            # second opinion about what was written.
+            notion_queue_depth = len(queue_entries)
 
             # Notion Sync's component verdict. Per-Event, not per-call: a run
             # that synced nine Events and queued one is not a failed sync
@@ -648,6 +800,17 @@ def run_once(
             # unexpected-exception path (unknown — it may never clear), while
             # NOTION_RETRY_REQUIRED is what the queue exists for.
             queued = [r for r in notion_sync_results if r.status in _FAILED_SYNC_STATUSES]
+            # Recognised by the note `notion.sync` attaches, not by
+            # re-deriving the comparison here: the module that made the
+            # decision is the only one that still has both timestamps, and a
+            # second derivation is how the two answers drift.
+            same_instant_skips = sum(
+                1
+                for r in notion_sync_results
+                if r.status is SyncStatus.NOTION_SKIPPED_OLD_EVENT
+                and r.error
+                and r.error.startswith("same-instant skip:")
+            )
             if queued or notion_unreadable:
                 # An unreadable file is an Event that did not reach Notion,
                 # which is what `NOTION_SYNC_INCOMPLETE` means — so it fails
@@ -659,9 +822,40 @@ def run_once(
                     bool(notion_unreadable)
                     or any(r.status is SyncStatus.NOTION_FAILED for r in queued)
                 )
+                # Notion answered, and the answer will not change by waiting
+                # (400/401/403/404 — see `notion.sync`'s list and why it is
+                # short). docs/14 §5 defines PERMANENT as "지금 개입해야 한다
+                # (ops_status.py ATTENTION에 뜬다)", and that is exactly what
+                # these are: a wrong token, a database that is not shared, a
+                # property value Notion refuses.
+                #
+                # Until now every Notion failure was RETRYABLE, and
+                # `ops_status.py` lists only PERMANENT ones — deliberately, so
+                # that what the next run fixes does not become a standing
+                # alert. The cost was the other half: a request Notion will
+                # refuse forever could not reach ATTENTION *through the
+                # manifest* at all. It surfaced only once C32 §14's NOTION
+                # block noticed the queue entry had aged past three days.
+                #
+                # This changes no exit code. `runsummary.overall_status()`
+                # folds **severity**, not retryability, and Notion Sync's
+                # severity is unchanged (docs/14 §5: Notion is DEGRADED, off
+                # the History critical path per README RULE 5). It changes
+                # only whether an operator is told today or on Thursday.
+                #
+                # UNKNOWN still wins. An unreadable file, or an unexpected
+                # exception, means this step cannot tell — and BUG-13 is about
+                # not pretending otherwise. Claiming PERMANENT there would be
+                # the same overreach in the opposite direction.
+                permanently_refused = [r for r in queued if r.is_permanently_refused]
+                # The reason names an unrecoverable failure in preference to a
+                # transient one. With a 503 and a 400 in the same batch, the
+                # 400 is the one a person can act on, and `reason` is the only
+                # sentence that reaches them.
+                first_actionable = (permanently_refused or queued or [None])[0]
                 reason = (
-                    queued[0].error
-                    if queued and queued[0].error
+                    first_actionable.error
+                    if first_actionable is not None and first_actionable.error
                     else (
                         f"{len(notion_unreadable)} collected Event file(s) could not be "
                         f"read: {', '.join(notion_unreadable[:5])}"
@@ -669,19 +863,47 @@ def run_once(
                         else ""
                     )
                 )
+                if unknown:
+                    retryability = Retryability.UNKNOWN
+                elif permanently_refused:
+                    retryability = Retryability.PERMANENT
+                else:
+                    retryability = Retryability.RETRYABLE
                 recorder.failed(
                     C_NOTION_SYNC,
                     classification="NOTION_SYNC_INCOMPLETE",
                     reason=reason,
-                    retryability=(
-                        Retryability.UNKNOWN if unknown else Retryability.RETRYABLE
-                    ),
+                    retryability=retryability,
                     processed=len(notion_sync_results),
                     queued=len(queued),
                     unreadable=len(notion_unreadable),
+                    # The status codes Notion actually answered with, so the
+                    # manifest carries the machine-readable form of `reason`
+                    # rather than only its prose.
+                    refused=len(permanently_refused),
+                    same_instant_skips=same_instant_skips or None,
                 )
             else:
-                recorder.ok(C_NOTION_SYNC, processed=len(notion_sync_results))
+                recorder.ok(
+                    C_NOTION_SYNC,
+                    processed=len(notion_sync_results),
+                    # BACKLOG E-23, made countable in C40. A Signal written
+                    # without its own timestamp gets that date's midnight
+                    # (docs/06 §12), the same value for every Signal of that
+                    # day, so for one project only the day's first Event
+                    # reaches Notion — the rest are skipped by the Late Event
+                    # guard as "not newer" (docs/04 §29-30). Both specs are
+                    # right; the divergence lives between them and the
+                    # decision that resolves it is not this module's.
+                    #
+                    # What was wrong meanwhile is that the run reported
+                    # nothing: the skip is a SUCCESS component, and a
+                    # same-instant skip was byte-identical to a genuine Late
+                    # Event in the result object. `or None` so an ordinary
+                    # run carries no metric at all — `_Recorder._add()` drops
+                    # None — and the number appears only when it happened.
+                    same_instant_skips=same_instant_skips or None,
+                )
         else:
             # Not a fault. docs/04's own contract makes `notion_sync=None` a
             # supported deployment, and README RULE 9 keeps Company History
@@ -702,10 +924,24 @@ def run_once(
         # Invariant("아무것도 pending이 아니면 repository.list()를 호출하지 않는다",
         # tests/test_architecture_invariants.py)를 그대로 지킨다.
         kept_dates: set[date] = set()
+        # Where this run's Events came from, counted in the one loop that
+        # already reads every accepted Event of this run. Two facts the
+        # Dashboard row could not answer (C47): which Desktops contributed,
+        # and whether any Event claimed a `role` its Desktop does not own.
+        #
+        # Counted here rather than by re-reading `processed/`, which holds
+        # every Event this project ever collected — a per-run row must not be
+        # built from an all-time directory.
+        events_by_source: dict[str, int] = {}
+        role_mismatches = 0
         for processed_file in collector_summary.files:
             if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
                 continue
             event = Event.from_json(processed_file.destination_path.read_text(encoding="utf-8"))
+            events_by_source[event.source] = events_by_source.get(event.source, 0) + 1
+            expected_role = ROLE_FOR_SOURCE.get(event.source)
+            if expected_role is not None and event.role != expected_role:
+                role_mismatches += 1
             filter_result = history_filter.evaluate(event)
             repository.save(filter_result.candidate)
             if filter_result.decision is HistoryDecision.KEEP:
@@ -724,6 +960,25 @@ def run_once(
         #    (scheduler.run_once가 내부에서 daily.generate_daily_history를 반복 호출)
         #    already_locked=True: 1번에서 이미 시스템 전체 Lock을 쥐고 있으므로
         #    Scheduler 자신의 Lock을 별도로 잡지 않는다(위 1번 주석 참고).
+        #
+        # `begin()` before the call, for step 4's reason and with a worse
+        # consequence — C34 §1. This step is CRITICAL (`_SEVERITY`): it is the
+        # one that writes Company History.
+        #
+        # Measured with a corrupt `daily_history_state.json`, which is the
+        # first thing `scheduler.run_once()` reads:
+        #
+        #     raised         SchedulerStateError
+        #     STEP_ABORTED   NONE
+        #     manifest       SUCCESS / exit 0
+        #
+        # A run that never wrote Company History and never reached Backup,
+        # recorded as a success. The same corrupt file aborts every following
+        # run identically, so Company History stops advancing for good while
+        # the manifest keeps saying SUCCESS. BUG-3 already records that a
+        # corrupt state file aborts the Runner; what this adds is that the
+        # abort was *unattributed*, which is why it read as success.
+        recorder.begin(C_DAILY)
         scheduler_result = scheduler_run_once(
             repository,
             history_start_date=history_start_date,
@@ -780,12 +1035,19 @@ def run_once(
                     else None
                 ),
                 generated_days=len(scheduler_result.generated_dates),
+                reused_days=len(scheduler_result.reused_dates) or None,
             )
         else:
             recorder.ok(
                 C_DAILY,
                 status=scheduler_result.status.value,
                 generated_days=len(scheduler_result.generated_dates),
+                # Days this run closed without writing, because the file was
+                # already there — a crashed predecessor's (docs/07 §28) or,
+                # after a disaster restore, git's (C39). `or None` so the
+                # metric is absent on the ordinary run rather than a standing
+                # `reused_days=0`; `_Recorder._add()` drops None values.
+                reused_days=len(scheduler_result.reused_dates) or None,
             )
 
         # 6.5. Late Event Update — docs/06 §36-40.
@@ -1101,6 +1363,23 @@ def run_once(
         # ordinary case, and collapsing both into success would hide the one
         # that never clears. BUG-39: `push_result` and `commit_hash` reach an
         # artifact here for the first time.
+        #
+        # **This first arm is unreachable today** (C41, found by a line
+        # coverage pass and then read out of `backup/runner.py`). Every
+        # `BackupLogEntry` that module *returns* carries SUCCESS,
+        # NOT_REQUIRED or FAILED; `BackupStatus.PENDING` is only ever written
+        # to `state.backup_status` immediately before a `raise`. So a pending
+        # push arrives here as the `except GitOperationError` above, which
+        # produces the same classification without these two metrics —
+        # measured, the manifest for a real rejected push carries `{}`.
+        #
+        # Kept rather than deleted: it is the path this branch takes the day
+        # BUG-4 / A-18 is decided the other way and `run_once()` absorbs the
+        # Backup exception. Named as unreachable so nobody reads it as the
+        # explanation for a BACKUP_PENDING they are looking at.
+        # `BackupPendingReachesTheManifestTests` pins both halves — what the
+        # reachable path actually records, and the premise that makes this
+        # one unreachable.
         if backup_entry.final_status is BackupStatus.PENDING:
             recorder.failed(
                 C_BACKUP,
@@ -1244,6 +1523,48 @@ def run_once(
                     scheduler_result=scheduler_result,
                     backup_entry=backup_entry,
                     notion_sync_results=notion_sync_results,
+                    # The two Notion facts a per-run result set cannot carry:
+                    # an Event file that could not be parsed never becomes a
+                    # SyncResult, and the queue's depth is a property of the
+                    # queue rather than of this run's results. Passed rather
+                    # than defaulted — `record_run()`'s defaults exist for
+                    # callers that do not have these numbers, and this one
+                    # does.
+                    notion_unreadable=len(notion_unreadable),
+                    notion_queued=notion_queue_depth,
+                    # Step 5 counted these while it was reading this run's
+                    # Events; sorted so the same run always renders the same
+                    # string and a diff between two rows means a difference
+                    # in the work, not in dict order.
+                    desktops_reporting=" ".join(
+                        f"{source}:{count}"
+                        for source, count in sorted(events_by_source.items())
+                    ),
+                    role_mismatches=role_mismatches,
+                    # The manifest's own verdict inputs, so the Dashboard
+                    # row cannot contradict the exit code of the run that
+                    # produced it (C37). Every step except this one has
+                    # already recorded by now — `dashboard` is last, and a
+                    # Dashboard failure is reported in the row it failed to
+                    # write only in the sense that the row is not written.
+                    #
+                    # Measured before this existed: `late_update` or
+                    # `monthly` FAILED gave manifest DEGRADED / exit 3 and a
+                    # Dashboard row saying `Overall OK`. Those two are
+                    # exactly the steps that record FAILED without raising,
+                    # so they were the two the row could not see.
+                    failed_steps=[
+                        component.name
+                        for component in recorder.components
+                        if component.status is ComponentStatus.FAILED
+                    ],
+                    critical_failed_steps=[
+                        component.name
+                        for component in recorder.components
+                        if component.status is ComponentStatus.FAILED
+                        and component.failure is not None
+                        and component.failure.severity is Severity.CRITICAL
+                    ],
                 )
                 if dashboard_result.outcome is DashboardOutcome.FAILED:
                     _log_dashboard(
@@ -1328,10 +1649,55 @@ def run_once(
         if run_summary is None:
             in_flight = recorder.current
             if in_flight is not None:
+                # …and *what* aborted it. The attribution above was added
+                # because an unattributed abort read as success; the reason
+                # stayed the constant string, so the manifest could say which
+                # step died and never why.
+                #
+                # That gap is widest exactly where it costs most — the aborts
+                # that repeat. Measured with a corrupted
+                # `collector_state.json` (a truncated write, a partial
+                # restore, a hand edit):
+                #
+                #     collector  FAILED  STEP_ABORTED
+                #     reason     "the run aborted inside this step"
+                #
+                # `PersistentSeenEventStore._load()` raises a
+                # `CollectorStateError` that names the file *and* the parse
+                # position, and that sentence existed only in the scheduled
+                # task's console output. Every following run dies the same
+                # way, so Company History stops advancing while the one
+                # artifact docs/14 §3 tells an operator to read says nothing
+                # they can act on.
+                #
+                # `sys.exc_info()` rather than a new `except` clause: this
+                # `finally` must not change what propagates, and Python
+                # restores the in-flight exception after the inner handlers
+                # here (`release_lock()`) return. `redact()` because an
+                # aborting exception can carry a remote response body — the
+                # same reason `oplog.append_line()` redacts, applied at the
+                # one write point into the manifest that can reach one.
+                # `one_line()` beside it for the sibling reason: the backup
+                # gate a hundred lines up already guards the filenames it
+                # puts in `reason`, and `run_company_ops.py` prints this
+                # field as one indented row per component. Guarding at the
+                # write point keeps that true for a reader that forgets to.
+                #
+                # The `is not None` arm is the only one that runs today and
+                # is the only one tested: reaching here at all means
+                # `run_summary` was never assigned, and the sole way out of
+                # the `try` without assigning it is an exception, which is
+                # exactly what `sys.exc_info()` then holds. The guard stays
+                # because this is a `finally` — code here must not be the
+                # thing that raises, and `_bounded_error(None)` would.
+                aborted_by = sys.exc_info()[1]
+                reason = "the run aborted inside this step"
+                if aborted_by is not None:
+                    reason = f"{reason}: {_one_line(_redact(_bounded_error(aborted_by)))}"
                 recorder.failed(
                     in_flight,
                     classification="STEP_ABORTED",
-                    reason="the run aborted inside this step",
+                    reason=reason,
                     retryability=Retryability.UNKNOWN,
                     severity=_SEVERITY.get(in_flight, Severity.CRITICAL),
                 )

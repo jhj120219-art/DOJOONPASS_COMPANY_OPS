@@ -119,12 +119,42 @@ def build_update_properties(event: Event) -> dict[str, Any]:
 
 
 def _extract_rich_text(prop: dict | None) -> str | None:
+    """The whole text of a `rich_text` property value.
+
+    Notion does not store a rich_text value as one item. It stores one item
+    per *run of identical formatting*, and items that are not literal text
+    (a mention, an equation) carry no `"text"` key at all. Reading
+    `items[0]["text"]["content"]` therefore returned a prefix, or None,
+    for values a person had touched — and docs/04 §43 says people do touch
+    this database.
+
+    Measured against `ExecutionPlanSync._update()`: with `Last Event ID`
+    holding the same id in two formatting runs (`EVT-` + `1`), §62's
+    duplicate guard compared `"EVT-"` to `"EVT-1"`, missed, and re-applied
+    an Event it had already applied. Same with the id stored as a mention.
+    (§29-30's timestamp guard usually catches the re-application a step
+    later, which is why this stayed invisible — but "usually" is not what
+    §62 promises, and the two guards exist because neither covers the
+    other's case.)
+
+    `plain_text` first because that is the field Notion always fills and the
+    one `dashboard._page_title()` already reads for the title property —
+    same Notion shape, same answer, and now the same way of asking.
+    `text.content` remains as a fallback so a hand-built payload without
+    `plain_text` still reads.
+    """
     if not prop:
         return None
     items = prop.get("rich_text") or []
     if not items:
         return None
-    return items[0].get("text", {}).get("content")
+    parts = []
+    for item in items:
+        text = item.get("plain_text")
+        if text is None:
+            text = (item.get("text") or {}).get("content") or ""
+        parts.append(text)
+    return "".join(parts)
 
 
 def extract_last_updated(project_row: Mapping[str, Any]) -> str | None:

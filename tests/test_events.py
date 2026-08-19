@@ -233,5 +233,118 @@ class EventSerializationTests(unittest.TestCase):
         self.assertEqual(restored.milestone, "검색 UI")
 
 
+class DeclaredStringFieldsAreEnforcedTests(unittest.TestCase):
+    """REGRESSION. docs/02 §4's table says `string`; the validator did not.
+
+    Every other typed field was enforced — `timestamp` through
+    `_timestamp_error()`, `milestone`/`blocker` and `evidence` and
+    `history_candidate` directly, and `source`/`role`/`event_type`/`status`
+    implicitly, because a non-string cannot be a member of a frozenset of
+    strings. `event_id`, `project_id` and `summary` were checked for presence
+    only, so any JSON type passed.
+
+    That is a trust boundary. An Event is JSON written on another Desktop
+    that crosses OneDrive, and the Signal layer does not close the gap
+    either: `agent.signals.parse_signal()` validates the field *set*, not the
+    field types.
+
+    What it cost, measured through the real Runner with one crafted Event
+    beside one ordinary one (`test_runner_notion_integration.py::
+    ANonStringFieldIsRejectedNotCrashedIntoTests` runs it):
+
+        summary=12345    ACCEPTED -> KEEP Candidate stored -> daily FAILED
+                         -> 0 Daily files, exit 2, and again on every run
+        project_id=7     ACCEPTED -> notion_sync and daily both FAILED
+        event_id=99      TypeError escapes run_once() from a sorted() over
+                         mixed int and str ids
+
+    Empty strings are deliberately untouched: `""` is still valid, which is
+    BACKLOG A-15's separate and still-open question.
+    """
+
+    def _valid(self, **overrides):
+        data = {
+            "schema_version": "1.0",
+            "event_id": "EVT-1",
+            "timestamp": "2026-08-05T10:00:00+09:00",
+            "source": "DESKTOP_1",
+            "role": "CTO_BACKEND",
+            "project_id": "SEARCH_FRONTEND",
+            "event_type": "STARTED",
+            "status": "IN_PROGRESS",
+            "summary": "did work",
+            "evidence": [],
+            "history_candidate": True,
+        }
+        data.update(overrides)
+        return data
+
+    FIELDS = ("event_id", "project_id", "summary")
+    NON_STRINGS = (12345, 1.5, {"t": "x"}, ["a"], True)
+
+    def test_a_baseline_event_is_valid(self):
+        self.assertEqual(validate_event(self._valid()), [])
+
+    def test_every_declared_string_field_refuses_every_non_string(self):
+        for field_name in self.FIELDS:
+            for value in self.NON_STRINGS:
+                with self.subTest(field=field_name, value=type(value).__name__):
+                    errors = validate_event(self._valid(**{field_name: value}))
+
+                    self.assertTrue(errors, f"{field_name}={value!r} was accepted")
+                    self.assertTrue(
+                        any(field_name in error for error in errors),
+                        f"the error does not name the field: {errors}",
+                    )
+
+    def test_the_docs_table_is_what_this_enforces(self):
+        """The three names are not a guess — they are the rows docs/02 §4
+        marks `string` that nothing else in this function covers."""
+        docs = Path(__file__).resolve().parents[1] / "docs"
+        table = (docs / "02_EVENT_SCHEMA.md").read_text(encoding="utf-8")
+
+        for field_name in self.FIELDS:
+            with self.subTest(field=field_name):
+                self.assertIn(f"| {field_name} | string |", table)
+
+    def test_an_empty_string_is_still_accepted(self):
+        """A-15 is about emptiness and is untouched. If this starts failing,
+        that decision was taken and BACKLOG must record it."""
+        for field_name in self.FIELDS:
+            with self.subTest(field=field_name):
+                self.assertEqual(validate_event(self._valid(**{field_name: ""})), [])
+
+    def test_a_missing_field_still_reads_as_missing_not_as_a_type_error(self):
+        """One error per problem: `None` is the absence the required-field
+        loop already reports, so the type check must not double up on it."""
+        for field_name in self.FIELDS:
+            with self.subTest(field=field_name):
+                errors = validate_event(self._valid(**{field_name: None}))
+
+                self.assertEqual(errors, [f"missing required field: {field_name}"])
+
+    def test_the_other_typed_fields_were_already_covered(self):
+        """The half that says why only three names were added — a sweep, not
+        a guess."""
+        cases = {
+            "milestone": 1,
+            "blocker": 1,
+            "evidence": [1],
+            "history_candidate": "yes",
+            "timestamp": 5,
+            "source": 5,
+            "role": 5,
+            "event_type": 5,
+            "status": 5,
+            "schema_version": 5,
+        }
+        for field_name, value in cases.items():
+            with self.subTest(field=field_name):
+                data = self._valid(**{field_name: value})
+                if field_name == "blocker":
+                    data["event_type"] = "BLOCKED"
+
+                self.assertTrue(validate_event(data), f"{field_name} was accepted")
+
 if __name__ == "__main__":
     unittest.main()

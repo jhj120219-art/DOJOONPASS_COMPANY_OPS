@@ -25,11 +25,22 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# The repository root as well, for the same reason `test_notion_dashboard.py`
+# does it: ten tests in this file import `ops_status`, which lives beside
+# `src/` rather than in it. Under pytest the rootdir is on `sys.path` and the
+# omission never showed; run directly, those ten raised ModuleNotFoundError.
+# They were invisible either way until the stray `unittest.main()` above them
+# was moved to the end of the file — it had been cutting the direct run off
+# at 44 of 411 tests and printing OK (C38).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent import AgentState, save_state  # noqa: E402
 from agent.status import read_status  # noqa: E402
 from app.desktop_activity import read_company_activity  # noqa: E402
 from app.runner import PIPELINE_COMPONENTS  # noqa: E402
+from agent import find_secret_material  # noqa: E402
+from oplog import one_line  # noqa: E402
+from events import create_event  # noqa: E402
 from events import SOURCES, create_event  # noqa: E402
 from runsummary import (  # noqa: E402
     ComponentResult,
@@ -38,6 +49,7 @@ from runsummary import (  # noqa: E402
     Retryability,
     RunSummary,
     Severity,
+    read_summary,
     write_summary,
 )
 
@@ -894,10 +906,6 @@ class StatusEntrypointTests(unittest.TestCase):
         self.assertEqual(module._print_history(NOW), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class UnparseableTransportFileTests(CompanyActivityTestCase):
     """A file `transport.run_intake()` cannot parse must not be reported as
     "awaiting collection" — it is never going to be collected.
@@ -1294,6 +1302,93 @@ class BacklogAttributionInStatusViewTests(unittest.TestCase):
         printed, _attention = self._run(module)
 
         self.assertIn("backlog: transport=0 incoming=0 rejected=1", printed)
+
+
+class UnreadableLastRunTests(AgentStatusTestCase):
+    """A `last_run` that is not a timestamp was reported as "never ran".
+
+    `agent/state.load_state()` checks that `last_run` is a string and stops
+    there. Its sibling `last_successful_collection_date` is additionally
+    parsed and rejected if it will not — so of the two date fields in that
+    file, one is validated and one is not, and a state file that a human
+    edited (docs/11 §71), that a restore brought back from another version,
+    or that any writer other than this Agent produced can load cleanly with
+    `last_run` set to `2026-08-0`, `yesterday`, or `""`.
+
+    `days_since_last_run()` answers None for all of those, and None was also
+    the answer for "there is no last_run at all", so one branch reported
+    both. Two costs, both measured:
+
+        the sentence is false     `ops_status.py` prints the `last_run` line
+                                  three lines above the ATTENTION block, so
+                                  the view contradicted itself
+        staleness goes unchecked  an Agent down for weeks got the newcomer's
+                                  line instead of "has not run for N day(s)"
+
+    Deliberately NOT fixed by validating the field on load: `last_run` is
+    informational, `last_successful_collection_date` is what decides what
+    gets collected, and refusing to start over a cosmetic corruption would
+    turn a reporting problem into a stopped Agent.
+    """
+
+    UNREADABLE = ("2026-08-0", "yesterday", "2026-08-18 09:00 KST", "")
+
+    def _state(self, last_run):
+        save_state(
+            self.state_path,
+            AgentState(
+                desktop_id="DESKTOP_1",
+                last_successful_collection_date=date(2026, 8, 9),
+                last_run=last_run,
+            ),
+        )
+
+    def test_an_unreadable_last_run_is_not_reported_as_never_having_run(self):
+        for value in self.UNREADABLE:
+            with self.subTest(last_run=value):
+                self._state(value)
+
+                reasons = self.status().needs_attention(NOW)
+
+                self.assertNotIn("agent has never completed a run", reasons)
+                self.assertTrue(
+                    any("last_run is not a timestamp" in reason for reason in reasons),
+                    reasons,
+                )
+
+    def test_the_value_itself_is_not_quoted_into_the_attention_line(self):
+        """`ops_status.main()`'s ATTENTION block states its messages are built
+        from filenames, ids and counts rather than from file *contents*, and
+        `last_run` is contents — it crosses no validation beyond `isinstance`
+        and can carry anything, including a newline."""
+        self._state(chr(10).join(["not-a-time", "! forged ATTENTION line"]))
+
+        for reason in self.status().needs_attention(NOW):
+            with self.subTest(reason=reason):
+                self.assertNotIn("forged", reason)
+                self.assertNotIn(chr(10), reason)
+
+    def test_a_missing_last_run_still_reports_never_having_run(self):
+        """The other half: the branch that was always right stays right."""
+        self._state(None)
+
+        reasons = self.status().needs_attention(NOW)
+
+        self.assertIn("agent has never completed a run", reasons)
+        self.assertFalse(any("not a timestamp" in reason for reason in reasons))
+
+    def test_a_readable_last_run_is_unaffected(self):
+        self._state(NOW.isoformat(timespec="seconds"))
+
+        self.assertEqual(self.status().needs_attention(NOW), ())
+
+    def test_the_snapshot_still_carries_the_raw_value_for_the_printed_line(self):
+        """The operator's way to the actual value: `ops_status.py` prints
+        `snapshot.last_run` verbatim (through `one_line()`), and that is what
+        the new message points at."""
+        self._state("yesterday")
+
+        self.assertEqual(self.status().last_run, "yesterday")
 
 
 class FutureCollectionDateTests(AgentStatusTestCase):
@@ -3152,6 +3247,1156 @@ class SuppressedDeliveryTests(CompanyActivityTestCase):
             [item for item in attention if "같은 이름의 다른 파일에 막혀" in item],
             attention,
         )
+
+
+class DeliveryConsistencyIsRenderedTests(unittest.TestCase):
+    """The AGENT section's delivery block — never executed.
+
+    `agent/delivery.find_undelivered_events()` is thoroughly tested
+    (`test_agent_delivery.py`), and its three-way result is the whole point:
+    an Event recorded as sent that never reached the sync folder is silent
+    data loss on the machine that PRODUCES Company History. What nothing ran
+    was the block in `ops_status._print_agent()` that turns that result into
+    a line and an ATTENTION entry — it is guarded by
+    `COMPANY_OPS_AGENT_SYNC_FOLDER`, and no test had ever set it while
+    calling `_print_agent()` (found by a line-coverage pass, C42).
+
+    That matters here more than coverage usually does, because the claim
+    about this renderer lives in a docstring in a *different file*:
+    `test_agent_delivery.py::UnreadableSentRecordTests` says the defect it
+    fixed was "`ops_status.py` prints `전달 정합성 : OK` — the same line it
+    prints when every Event was checked and every one arrived". Whether it
+    still prints something else was asserted nowhere.
+
+    Three verdicts, both ATTENTION lines, and the unconfigured case.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.agent_dir = self.runtime / "agent"
+        for relative in ("locks", "state", "outbox", "sent", "signals_rejected"):
+            (self.agent_dir / relative).mkdir(parents=True, exist_ok=True)
+        self.sync_folder = self.root / "cloud"
+        self.sync_folder.mkdir()
+
+    def _sent(self, event_id, *, payload=None):
+        """A record in `sent/`, in the shape the Agent writes it.
+
+        `reporter.local_output.safe_event_filename()` names it, reused rather
+        than re-derived — the whole delivery check is a comparison between
+        two filenames and a fixture with its own naming rule would compare
+        nothing.
+        """
+        from reporter.local_output import safe_event_filename
+
+        body = payload if payload is not None else json.dumps({"event_id": event_id})
+        path = self.agent_dir / "sent" / safe_event_filename(event_id)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def _deliver(self, event_id):
+        from reporter.local_output import safe_event_filename
+
+        (self.sync_folder / safe_event_filename(event_id)).write_text(
+            json.dumps({"event_id": event_id}), encoding="utf-8"
+        )
+
+    def _run(self, *, sync_folder=True):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_delivery", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+
+        key = "COMPANY_OPS_AGENT_SYNC_FOLDER"
+        original = os.environ.get(key)
+
+        def restore():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
+
+        self.addCleanup(restore)
+        if sync_folder:
+            os.environ[key] = str(self.sync_folder)
+        else:
+            os.environ.pop(key, None)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_agent(NOW)
+        return buffer.getvalue(), attention
+
+    def _line(self, output):
+        return next(
+            item for item in output.splitlines() if "전달 정합성" in item
+        )
+
+    def test_everything_arrived_reads_ok(self):
+        self._sent("EVT-1")
+        self._deliver("EVT-1")
+
+        output, attention = self._run()
+
+        self.assertIn("OK", self._line(output))
+        self.assertEqual([a for a in attention if "sync" in a or "전송" in a], [])
+
+    def test_a_record_whose_event_never_arrived_reads_undelivered(self):
+        """The loss this block exists for. The Agent moved the Event to
+        `sent/` — its own durability boundary — and the file is not in the
+        folder Desktop 4 reads."""
+        self._sent("EVT-1")
+        self._deliver("EVT-1")
+        # A second Event recorded as sent, whose delivered copy is a
+        # different Event: present by name, wrong by content.
+        self._sent("EVT-2")
+        from reporter.local_output import safe_event_filename
+
+        (self.sync_folder / safe_event_filename("EVT-2")).write_text(
+            json.dumps({"event_id": "SOMETHING-ELSE"}), encoding="utf-8"
+        )
+
+        output, attention = self._run()
+
+        self.assertIn("UNDELIVERED", self._line(output))
+        self.assertIn("! EVT-2", output)
+        self.assertTrue(
+            any("EVT-2" in item for item in attention),
+            f"the loss did not reach ATTENTION: {attention}",
+        )
+
+    def test_an_unreadable_record_reads_unknown_not_ok(self):
+        """C32 §13's fix, asserted where it is actually visible. "I could not
+        check this one" must not print the line that means "I checked
+        everything and it all arrived"."""
+        self._sent("EVT-1")
+        self._deliver("EVT-1")
+        (self.agent_dir / "sent" / "damaged.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        output, attention = self._run()
+
+        self.assertIn("UNKNOWN", self._line(output))
+        self.assertNotIn("OK", self._line(output))
+        self.assertIn("읽을 수 없음 1건", self._line(output))
+        self.assertTrue(
+            any("damaged.json" in item for item in attention),
+            f"the unreadable record did not reach ATTENTION: {attention}",
+        )
+
+    def test_undelivered_wins_over_unknown(self):
+        """Both conditions at once. A verdict that reported UNKNOWN while an
+        Event was known to be missing would bury the harder fact."""
+        from reporter.local_output import safe_event_filename
+
+        self._sent("EVT-2")
+        (self.sync_folder / safe_event_filename("EVT-2")).write_text(
+            json.dumps({"event_id": "SOMETHING-ELSE"}), encoding="utf-8"
+        )
+        (self.agent_dir / "sent" / "damaged.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        output, attention = self._run()
+
+        self.assertIn("UNDELIVERED", self._line(output))
+        self.assertEqual(len([a for a in attention if "읽을 수 없는 전송 기록" in a]), 1)
+
+    def test_an_absent_event_is_not_a_loss(self):
+        """docs: a file already collected by Desktop 4 is *gone* from the
+        sync folder, which is the pipeline working. Counting it as
+        undelivered would make every healthy Desktop permanently red."""
+        self._sent("EVT-1")
+
+        output, attention = self._run()
+
+        line = self._line(output)
+        self.assertIn("OK", line)
+        self.assertIn("이미 수거됨 1건", line)
+        self.assertEqual([a for a in attention if "전송 완료로" in a], [])
+
+    def test_an_unset_sync_folder_says_it_cannot_check(self):
+        """The `else` arm. "확인 불가" and "OK" must not be the same line —
+        a Desktop whose folder is unconfigured has had nothing verified."""
+        self._sent("EVT-1")
+
+        output, attention = self._run(sync_folder=False)
+
+        self.assertIn("확인 불가", self._line(output))
+        self.assertNotIn("OK", self._line(output))
+        self.assertEqual([a for a in attention if "전송 완료로" in a], [])
+
+    def test_the_undelivered_list_is_bounded_and_the_count_is_not(self):
+        """Six losses, five names. The printed list is capped; the number in
+        the ATTENTION line is the real total, because a cap that also capped
+        the count would understate the loss."""
+        from reporter.local_output import safe_event_filename
+
+        for index in range(6):
+            event_id = f"EVT-{index}"
+            self._sent(event_id)
+            (self.sync_folder / safe_event_filename(event_id)).write_text(
+                json.dumps({"event_id": "OTHER"}), encoding="utf-8"
+            )
+
+        output, attention = self._run()
+
+        printed = [item for item in output.splitlines() if item.strip().startswith("! EVT-")]
+        self.assertEqual(len(printed), 5)
+        self.assertTrue(
+            any("6건" in item for item in attention),
+            f"the ATTENTION line lost the real count: {attention}",
+        )
+
+
+class PendingDatesAreListedTests(unittest.TestCase):
+    """The three lines under `미수집 날짜`, which nothing ran.
+
+    A count on its own does not tell an operator whether a Desktop is one
+    day behind or has been off since last month — and the dates are already
+    in hand. The listing is capped at seven with a trailing `...`, and the
+    cap is what makes it worth a test: a truncation that did not show it had
+    truncated would read as the whole backlog.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.runtime = Path(tmp.name) / "runtime"
+        self.agent_dir = self.runtime / "agent"
+        for relative in ("locks", "state", "outbox", "sent", "signals_rejected"):
+            (self.agent_dir / relative).mkdir(parents=True, exist_ok=True)
+
+    def _run(self, *, last_collected, start_date):
+        import contextlib
+        import importlib.util
+
+        (self.agent_dir / "state" / "agent_state.json").write_text(
+            json.dumps(
+                {
+                    "desktop_id": "DESKTOP_1",
+                    "last_successful_collection_date": last_collected,
+                    "last_run": "2026-08-13T09:00:00+09:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_pending", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+
+        key = "COMPANY_OPS_AGENT_START_DATE"
+        original = os.environ.get(key)
+
+        def restore():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
+
+        self.addCleanup(restore)
+        if start_date is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = start_date
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_agent(NOW)
+        return buffer.getvalue()
+
+    def test_a_short_backlog_lists_every_date(self):
+        """`NOW` here is 2026-08-10 and today is never collected, so a
+        watermark at 08-05 leaves 08-06 … 08-09 pending."""
+        output = self._run(last_collected="2026-08-05", start_date="2026-08-01")
+
+        self.assertIn("미수집 날짜         : 4", output)
+        self.assertIn("2026-08-06, 2026-08-07, 2026-08-08, 2026-08-09", output)
+        self.assertNotIn("...", output)
+
+    def test_a_long_backlog_shows_that_it_was_truncated(self):
+        output = self._run(last_collected="2026-07-01", start_date="2026-06-01")
+
+        self.assertIn("2026-07-02, 2026-07-03", output)
+        self.assertIn("...", output)
+
+    def test_without_a_start_date_the_operator_is_told_why_it_is_zero(self):
+        """REGRESSION. The note was unreachable, and it is the only thing
+        separating "nothing is pending" from "nothing was computed".
+
+        `read_status()` fills `pending_dates` only when it is given a start
+        date, and `_print_agent()` gives it `_agent_start_date()`. So the old
+        condition — `if snapshot.pending_dates and _agent_start_date() is
+        None` — required a non-empty list *and* an unset variable, which
+        cannot both hold. Measured with the variable unset and a watermark
+        five days back:
+
+            미수집 날짜         : 0
+
+        and nothing else: byte-identical to a Desktop that is fully caught
+        up, on a machine that produces Company History.
+        """
+        output = self._run(last_collected="2026-08-05", start_date=None)
+
+        self.assertIn("미수집 날짜         : 0", output)
+        self.assertIn("COMPANY_OPS_AGENT_START_DATE", output)
+
+    def test_the_note_is_absent_when_the_variable_is_set(self):
+        """The other direction: a configured Desktop must not carry a
+        standing line telling it to configure something."""
+        output = self._run(last_collected="2026-08-05", start_date="2026-08-01")
+
+        self.assertNotIn("COMPANY_OPS_AGENT_START_DATE", output)
+
+    def test_the_history_sibling_was_always_written_the_right_way_round(self):
+        """Where the corrected shape comes from. Both notes answer the same
+        question for two different variables, and only one of them could
+        ever print."""
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("if history_start is None:", source)
+        self.assertIn("if _agent_start_date() is None:", source)
+        self.assertNotIn(
+            "if snapshot.pending_dates and _agent_start_date() is None:", source
+        )
+
+
+class MetricsOnASuccessfulStepReachNoViewTests(unittest.TestCase):
+    """CHARACTERIZATION — asserts today's behaviour, deliberately.
+
+    Every `recorder.ok()` call records metrics, and **no view prints them.**
+    `_print_last_run()` skips SUCCESS components outright (`continue`), and
+    `run_company_ops._report_run_summary()` prints only failures. So a metric
+    a step records on its healthy path lives in `runtime/runs/last_run.json`
+    and nowhere else.
+
+    Mostly that is right and this test says so: `daily`'s counts, `backup`'s
+    status and hash, `collector`'s four numbers and `transport`'s six are all
+    on the Dashboard row, in the entrypoint's stdout, or both — printing them
+    again would make the LAST RUN block long enough that nobody reads the
+    part that matters ("only the failing components are printed so the block
+    stays short").
+
+    **One is not covered anywhere else, and it is the one that reports a
+    divergence rather than activity:** `notion_sync.same_instant_skips`
+    (BACKLOG E-23, made countable in C40). It counts Events that Company
+    History kept and the Notion row did not — Source and View disagreeing —
+    and it is recorded on the SUCCESS branch, because the skip IS a success
+    by docs/04 §29-30. Measured: manifest `same_instant_skips=2`,
+    `ops_status.py` LAST RUN block silent, Dashboard `Notion Skipped: 2` with
+    no way to tell a genuine Late Event skip from a same-instant one.
+
+    Not fixed here. Which of a healthy step's numbers deserve a line is a
+    judgement, and E-23's own resolution — whether a same-instant skip should
+    be a distinct outcome at all — is a spec decision that is still open. What
+    is not a judgement is that the sweep which would have caught this could
+    not see it: `WrittenAndNeverReadFieldTests` walked every **dataclass
+    field** in `src/`, and metrics are dict keys.
+
+    If this starts failing, a view for success metrics was added and BACKLOG
+    must say which one and why.
+    """
+
+    def _module(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_metrics", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        # `DEFAULT_RUN_SUMMARY_PATH` is a second knob on purpose — see this
+        # module's own note at the import ("deliberately NOT folded in").
+        module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+        return module
+
+    def _manifest(self, components):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "runs").mkdir(parents=True)
+        (runtime / "runs" / "last_run.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "R-1",
+                    "started_at": "2026-08-10T08:00:00+09:00",
+                    "finished_at": "2026-08-10T08:00:30+09:00",
+                    "components": components,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return runtime
+
+    def _last_run(self, components):
+        import contextlib
+
+        runtime = self._manifest(components)
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_last_run(NOW)
+        return buffer.getvalue()
+
+    def test_a_successful_steps_metrics_are_not_printed(self):
+        output = self._last_run(
+            [
+                {
+                    "name": "notion_sync",
+                    "status": "SUCCESS",
+                    "metrics": {"processed": 4, "same_instant_skips": 2},
+                }
+            ]
+        )
+
+        self.assertIn("SUCCESS", output)
+        self.assertNotIn("same_instant_skips", output)
+        self.assertNotIn("processed", output)
+
+    def test_the_same_step_failing_does_print_them(self):
+        """The contrast that makes the line above a choice rather than an
+        oversight — the renderer works, it is only ever asked about
+        failures."""
+        output = self._last_run(
+            [
+                {
+                    "name": "notion_sync",
+                    "status": "FAILED",
+                    "failure": {
+                        "classification": "NOTION_SYNC_INCOMPLETE",
+                        "reason": "503",
+                        "retryability": "RETRYABLE",
+                        "severity": "DEGRADED",
+                    },
+                    "metrics": {"processed": 4, "same_instant_skips": 2},
+                }
+            ]
+        )
+
+        self.assertIn("same_instant_skips=2", output)
+
+    def test_the_runner_really_records_it_on_the_success_branch(self):
+        """The premise, from `app/runner.py` rather than assumed: the metric
+        this is about is attached to `recorder.ok()`, which is why no view
+        asks for it."""
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "app" / "runner.py"
+        ).read_text(encoding="utf-8")
+        ok_call = source[source.index("recorder.ok(\n                    C_NOTION_SYNC"):]
+
+        self.assertIn("same_instant_skips=same_instant_skips or None", ok_call[:4000])
+
+    def test_the_dashboard_cannot_separate_the_two_kinds_of_skip(self):
+        """The other view, so the gap is stated once and completely."""
+        from notion.dashboard import DASHBOARD_DATABASES, OPS_RUNS
+
+        self.assertIn("Notion Skipped", DASHBOARD_DATABASES[OPS_RUNS])
+        self.assertNotIn("Notion Same Instant Skips", DASHBOARD_DATABASES[OPS_RUNS])
+
+
+class AHealthyRuntimeCanActuallyBeQuietTests(unittest.TestCase):
+    """`main()`'s clean exit — the one path nothing ran.
+
+    Every other test here plants a fault and checks that ATTENTION names it.
+    That leaves the opposite property unasserted, and it is the one the whole
+    section depends on: **a healthy system must be able to produce an empty
+    ATTENTION list.** This file's own guidance says why — "지워지지 않는
+    경보는 그 절을 대충 넘기도록 훈련시킨다" — and a view that can never be
+    quiet is one an operator stops reading, at which point every real alarm
+    in it is lost too.
+
+    It is also the only exit-0 path in `ops_status.main()`, and a line
+    coverage pass over the root scripts (C42) found neither it nor the
+    sentence it prints had ever executed.
+
+    Built against the real clock rather than a pinned `now`, because `main()`
+    takes no `now` — it reads the clock itself. Everything in the fixture is
+    therefore placed RELATIVE to that clock, and the one absolute fact
+    (`daily/<yesterday>.md` was written before the last backup) is set with
+    `os.utime` rather than left to the order the test happens to run in.
+    """
+
+    # docs/02 §8's own table, not an arbitrary pairing. It was arbitrary
+    # until C47: this fixture called itself a *healthy* runtime while giving
+    # DESKTOP_2 the CTO_FRONTEND role and DESKTOP_3 the CMO role, which §8
+    # assigns the other way round. Nothing checked the pair — `validate_event()`
+    # checks each field against its own allowed set and never the two together
+    # — so the fixture passed for many Sprints while the COMPANY block printed
+    # `DESKTOP_2 role=CTO_FRONTEND` in plain sight.
+    #
+    # `controltower`'s Desktop layer compares the pair against
+    # `reporter/profiles.PROFILES` (which is §8 verbatim) and this fixture is
+    # what it caught first. Corrected here rather than exempted: a fixture
+    # that means "this is what healthy looks like" must not contain the one
+    # shape that makes Team and Desktop aggregation disagree.
+    ROLES = (
+        ("DESKTOP_1", "CTO_BACKEND"),
+        ("DESKTOP_2", "CMO"),
+        ("DESKTOP_3", "CTO_FRONTEND"),
+        ("DESKTOP_4", "COO"),
+    )
+
+    def _healthy_runtime(self, now):
+        from app.runner import PIPELINE_COMPONENTS
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for relative in (
+            "events/processed", "events/transport", "events/incoming",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "runs", "locks",
+        ):
+            (runtime / relative).mkdir(parents=True, exist_ok=True)
+
+        # Every Desktop heard from today: silence is itself an ATTENTION
+        # condition, so a runtime with no Events at all is not a quiet one.
+        for index, (source, role) in enumerate(self.ROLES):
+            (runtime / "events" / "processed" / f"EVT-{index}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0", "event_id": f"EVT-{index}",
+                        "source": source, "role": role, "project_id": "P",
+                        "event_type": "STARTED", "status": "IN_PROGRESS",
+                        "summary": "s", "evidence": [], "history_candidate": False,
+                        "timestamp": now.isoformat(timespec="seconds"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        yesterday = now.date() - timedelta(days=1)
+        daily = runtime / "local_master" / "daily" / f"{yesterday.isoformat()}.md"
+        daily.write_text("# ok\n", encoding="utf-8")
+        # Written BEFORE the last backup — otherwise it is Company History
+        # that exists only on this machine, which is an ATTENTION condition
+        # and rightly so.
+        stamp = (now - timedelta(hours=1)).timestamp()
+        os.utime(daily, (stamp, stamp))
+
+        (runtime / "state" / "daily_history_state.json").write_text(
+            json.dumps({"last_successful_daily_close": yesterday.isoformat()}),
+            encoding="utf-8",
+        )
+        (runtime / "state" / "backup_state.json").write_text(
+            json.dumps(
+                {
+                    "last_successful_backup": now.isoformat(timespec="seconds"),
+                    "last_backup_commit": "abc123",
+                    "backup_status": "BACKUP_SUCCESS",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (runtime / "runs" / "last_run.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1, "run_id": "R-1",
+                    "started_at": now.isoformat(timespec="seconds"),
+                    "finished_at": now.isoformat(timespec="seconds"),
+                    # All nine, because a step missing from the manifest is
+                    # reported as "시작되지 못한 단계" — correctly.
+                    "components": [
+                        {"name": name, "status": "SUCCESS", "metrics": {}}
+                        for name in PIPELINE_COMPONENTS
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return runtime
+
+    def _run(self):
+        import contextlib
+        import importlib.util
+
+        now = datetime.now().astimezone()
+        runtime = self._healthy_runtime(now)
+
+        for key in (
+            "COMPANY_OPS_AGENT_START_DATE",
+            "COMPANY_OPS_HISTORY_START_DATE",
+            "COMPANY_OPS_AGENT_SYNC_FOLDER",
+        ):
+            original = os.environ.get(key)
+            if original is not None:
+                os.environ.pop(key)
+                self.addCleanup(os.environ.__setitem__, key, original)
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_quiet", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = module.main()
+        return buffer.getvalue(), code
+
+    def test_a_healthy_runtime_needs_nobody_and_exits_zero(self):
+        output, code = self._run()
+
+        self.assertEqual(code, 0, output)
+        self.assertIn("ATTENTION — 없음", output)
+
+    def test_the_attention_block_itself_is_not_printed(self):
+        """The two outputs must not both appear — an operator scanning for
+        the word would find it either way."""
+        output, _code = self._run()
+
+        self.assertNotIn("  ! ", output)
+
+    def test_every_section_still_ran(self):
+        """A quiet report and a report that skipped its checks look the same
+        from the exit code alone."""
+        output, _code = self._run()
+
+        for heading in ("COMPANY", "HISTORY", "LAST RUN", "NOTION", "AGENT"):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, output)
+
+
+class DailyCountsMoreThanItShowsTests(unittest.TestCase):
+    """The Daily counterpart of `MonthlyCountsMoreThanItShowsTests`, which
+    existed while this one did not.
+
+    A Daily file states its own total (`- Event Count:`) and carries the
+    Event IDs themselves. As generated the two agree, so a disagreement is
+    decidable inside one file — no window, nothing else consulted, and the
+    comparison reuses `existing_event_ids()`, the same function §38's
+    duplicate guard reads the file with, rather than counting the lines a
+    second way.
+
+    Three real losses reach an operator through it, and none had a reporter:
+
+        fewer ids than counted   a `category=None` KEEP Candidate is dropped
+                                 from every category section, so its Event ID
+                                 never reaches the file
+                                 (`test_daily_history.py::test_a_category_
+                                 less_keep_candidate_silently_loses_its_
+                                 detail` characterizes the loss)
+        more ids than counted    BUG-11/27: a newline in `summary` /
+                                 `project_id` / `event_id` forges a
+                                 `- Event ID:` line
+        fewer ids than counted   an item block deleted by hand (docs/06 §57)
+
+    The middle one is why this reports BOTH directions where the Monthly
+    sibling reports only a shortfall — see the function's docstring.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.runtime = self.root / "runtime"
+        for relative in (
+            "history_candidates/keep", "history_candidates/review",
+            "local_master/daily", "local_master/monthly", "state",
+            "events/processed", "locks",
+        ):
+            (self.runtime / relative).mkdir(parents=True)
+        self.daily = self.runtime / "local_master" / "daily"
+
+    def _candidate(self, event_id, summary="did work", category="MILESTONE"):
+        from history import HistoryCandidate, HistoryDecision
+
+        return HistoryCandidate(
+            history_id=f"HIST-{event_id}", event_id=event_id,
+            timestamp="2026-08-05T10:00:00+09:00", category=category,
+            project_id="PRJ_A", role="COO", summary=summary, evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _write_day(self, day, candidates):
+        from daily.markdown import render_daily_markdown
+
+        (self.daily / f"{day}.md").write_text(
+            render_daily_markdown(
+                date(*(int(part) for part in day.split("-"))), candidates, "gen"
+            ),
+            encoding="utf-8",
+        )
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_daily_count", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        return module
+
+    def _report(self):
+        return self._module()._daily_counts_more_than_it_shows(self.daily)
+
+    def _alerts(self):
+        import contextlib
+
+        module = self._module()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [
+            item for item in attention if "Daily History의 자기 숫자" in item
+        ]
+
+    # ---- the defect ------------------------------------------------------
+
+    def test_a_forged_event_id_line_is_reported(self):
+        """BUG-11/27's silent half. Measured alongside this: the forged id
+        makes §38 refuse a genuinely late Event of that id forever, and
+        `_kept_but_not_rendered()` reports clean because the id IS in the
+        file. This line is the only thing that sees it."""
+        self._write_day(
+            "2026-08-05", [self._candidate("EVT-1", "did work\n- Event ID: VICTIM")]
+        )
+
+        self.assertEqual(self._report(), (("2026-08-05", 1, 2),))
+
+    def test_the_two_existing_detectors_really_are_defeated_by_it(self):
+        """The premise, so this class's reason for existing is asserted and
+        not merely described."""
+        from daily.late_events import existing_event_ids, select_late_candidates
+        from daily.markdown import render_daily_markdown
+
+        text = render_daily_markdown(
+            date(2026, 8, 5),
+            [self._candidate("EVT-1", "did work\n- Event ID: VICTIM")],
+            "gen",
+        )
+        (self.daily / "2026-08-05.md").write_text(text, encoding="utf-8")
+        module = self._module()
+        stored = (
+            module.StoredCandidate(stem="a", event_id="EVT-1", when=date(2026, 8, 5), reviewed=()),
+            module.StoredCandidate(stem="b", event_id="VICTIM", when=date(2026, 8, 5), reviewed=()),
+        )
+
+        self.assertIn("VICTIM", existing_event_ids(text))
+        self.assertEqual(
+            select_late_candidates(text, [self._candidate("VICTIM", "genuinely late")]), ()
+        )
+        self.assertEqual(module._kept_but_not_rendered(stored, self.daily), ())
+
+    def test_a_category_less_candidate_is_reported(self):
+        """The other direction, and the loss `test_daily_history.py` already
+        characterizes without anything reporting it."""
+        self._write_day("2026-08-06", [self._candidate("EVT-2", category=None)])
+
+        self.assertEqual(self._report(), (("2026-08-06", 1, 0),))
+
+    def test_a_hand_deleted_item_block_is_reported(self):
+        """docs/06 §57 permits the edit; the count then contradicts the file
+        and an operator who removed an item without correcting it should be
+        told, exactly as the Monthly sibling tells them."""
+        self._write_day("2026-08-07", [self._candidate("A"), self._candidate("B")])
+        text = (self.daily / "2026-08-07.md").read_text(encoding="utf-8")
+        text = text.replace("- Event ID: B\n", "")
+        (self.daily / "2026-08-07.md").write_text(text, encoding="utf-8")
+
+        self.assertEqual(self._report(), (("2026-08-07", 2, 1),))
+
+    # ---- the false-alarm guard ------------------------------------------
+
+    def test_every_healthy_shape_is_clean(self):
+        """The half that decides whether this is usable at all. A detector
+        that fires on ordinary days is one an operator learns to skip."""
+        from daily.late_events import append_late_events, select_late_candidates
+        from daily.markdown import render_daily_markdown
+
+        shapes = {}
+        shapes["2026-09-01"] = render_daily_markdown(date(2026, 9, 1), [], "gen")
+        shapes["2026-09-02"] = render_daily_markdown(
+            date(2026, 9, 2),
+            [self._candidate("A"), self._candidate("B"), self._candidate("C")],
+            "gen",
+        )
+        base = render_daily_markdown(date(2026, 9, 3), [self._candidate("A")], "gen")
+        once = append_late_events(
+            base, select_late_candidates(base, [self._candidate("L1")]), now_iso="T1"
+        )
+        shapes["2026-09-03"] = once
+        shapes["2026-09-04"] = append_late_events(
+            once, select_late_candidates(once, [self._candidate("L2")]), now_iso="T2"
+        )
+        shapes["2026-09-05"] = render_daily_markdown(
+            date(2026, 9, 5),
+            [
+                self._candidate("A", category="DECISION"),
+                self._candidate("B", category="ISSUE"),
+                self._candidate("C", category="LEARNING"),
+                self._candidate("D"),
+            ],
+            "gen",
+        )
+        # An empty `event_id` is a valid Event today (BACKLOG A-15) and the
+        # renderer writes `- Event ID: ` for it — the id set still has one
+        # member, so this must not read as a loss.
+        shapes["2026-09-06"] = render_daily_markdown(
+            date(2026, 9, 6), [self._candidate("")], "gen"
+        )
+        for day, text in shapes.items():
+            (self.daily / f"{day}.md").write_text(text, encoding="utf-8")
+
+        self.assertEqual(self._report(), ())
+
+    def test_a_file_with_no_event_count_line_is_skipped(self):
+        """One number it could not read is not a disagreement — the same
+        rule the Monthly sibling states."""
+        (self.daily / "2026-08-08.md").write_text(
+            "# hand-written note\n\n- Event ID: X\n", encoding="utf-8"
+        )
+
+        self.assertEqual(self._report(), ())
+
+    def test_an_unparseable_count_is_skipped_too(self):
+        """`- Event Count: many` — a hand edit that replaced the number with
+        a word. One number it cannot read is not a disagreement, the same
+        rule as a missing line, and the two arrive by different routes."""
+        (self.daily / "2026-08-12.md").write_text(
+            "# T\n\n## Milestones\n\n### P\n\n- s\n- Event ID: A\n\n"
+            "## Metadata\n\n- Event Count: many\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self._report(), ())
+
+    def test_a_negative_or_padded_count_is_still_read(self):
+        """The other side of the same parse: whitespace and a sign are still
+        numbers, so they must be compared rather than skipped."""
+        (self.daily / "2026-08-13.md").write_text(
+            "# T\n\n## Milestones\n\n### P\n\n- s\n- Event ID: A\n\n"
+            "## Metadata\n\n- Event Count:   2  \n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self._report(), (("2026-08-13", 2, 1),))
+
+    def test_an_unreadable_file_is_skipped_not_raised(self):
+        """This is a read-only diagnostic; damaged evidence must not take the
+        view down."""
+        self._write_day("2026-08-09", [self._candidate("A")])
+        (self.daily / "2026-08-10.md").write_bytes(b"\xff\xfe not utf-8")
+
+        self.assertEqual(self._report(), ())
+
+    def test_a_staging_file_is_not_a_daily(self):
+        """`.tmp-…md` is an unfinished write, not Company History — the same
+        exclusion every other scanner in this file applies."""
+        self._write_day("2026-08-11", [self._candidate("A")])
+        (self.daily / ".tmp-half.md").write_text(
+            "# T\n\n## Metadata\n\n- Event Count: 9\n", encoding="utf-8"
+        )
+
+        self.assertEqual(self._report(), ())
+
+    # ---- it reaches the operator ----------------------------------------
+
+    def test_it_is_printed_and_reaches_attention(self):
+        self._write_day(
+            "2026-08-05", [self._candidate("EVT-1", "did work\n- Event ID: VICTIM")]
+        )
+
+        output, attention = self._alerts()
+
+        self.assertIn("Daily 항목 불일치", output)
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("2026-08-05(1→2)", attention[0])
+        self.assertIn("BUG-11/27", attention[0])
+
+    def test_a_healthy_history_says_nothing(self):
+        self._write_day("2026-08-05", [self._candidate("A")])
+
+        output, attention = self._alerts()
+
+        self.assertNotIn("Daily 항목 불일치", output)
+        self.assertEqual(attention, [])
+
+
+class ATypeBrokenCandidateReachesAttentionTests(unittest.TestCase):
+    """C44. The status view called a pipeline-stopping Candidate readable.
+
+    `_read_keep_candidates()` checked `timestamp` and `event_id` and nothing
+    else, so a Candidate whose `summary` or `project_id` had the wrong type
+    counted as a perfectly good record. Measured, one such file beside one
+    ordinary Candidate:
+
+        Runner      daily FAILED, 0 Daily files, exit 2 — and again next run
+        this view   "Candidate 정합성 : OK", and no unreadable count
+
+    The ATTENTION line for unreadable Candidates already existed and already
+    said the right thing ("이 파일 하나 때문에 모든 날짜의 Daily History 생성이
+    멈춘다"). It simply never fired for this shape. The reader now asks
+    `history.result.candidate_errors()` — the same predicate
+    `FileHistoryRepository` refuses on — so the two cannot disagree.
+    """
+
+    GOOD = {
+        "history_id": "HIST-OK",
+        "event_id": "EV-OK",
+        "timestamp": "2026-08-01T10:00:00+09:00",
+        "category": "MILESTONE",
+        "project_id": "PRJ_OK",
+        "role": "COO",
+        "summary": "ordinary work",
+        "evidence": [],
+        "filter_result": "KEEP",
+    }
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.runtime = self.root / "runtime"
+        for relative in (
+            "history_candidates/keep", "history_candidates/review",
+            "local_master/daily", "local_master/monthly", "state",
+            "events/processed", "locks",
+        ):
+            (self.runtime / relative).mkdir(parents=True)
+        self.keep = self.runtime / "history_candidates" / "keep"
+
+    def _write(self, name, **overrides):
+        data = dict(self.GOOD)
+        data["history_id"] = f"HIST-{name}"
+        data["event_id"] = name
+        data.update(overrides)
+        (self.keep / f"HIST-{name}.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def _alerts(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c44", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [
+            item for item in attention if "읽을 수 없는 KEEP Candidate" in item
+        ]
+
+    def test_a_wrong_typed_field_is_reported_as_unreadable(self):
+        self._write("EV-OK")
+        self._write("EV-BAD", summary=12345)
+
+        output, attention = self._alerts()
+
+        self.assertIn("읽을 수 없는 Candidate: 1", output)
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("HIST-EV-BAD.json", attention[0])
+
+    def test_an_unparseable_timestamp_is_still_reported_here(self):
+        """A-7's case, which `candidate_errors()` deliberately leaves out —
+        the index build raises on it with `isoformat`, and moving that raise
+        into `list()` would change a contract. This reader keeps its own
+        check for it, so the status view names the file either way.
+        """
+        self._write("EV-OK")
+        self._write("EV-A7", timestamp="not-a-timestamp")
+
+        output, attention = self._alerts()
+
+        self.assertIn("읽을 수 없는 Candidate: 1", output)
+        self.assertIn("HIST-EV-A7.json", attention[0])
+
+    def test_the_message_says_it_stops_every_date(self):
+        """The blast radius is the actionable part — it is why this is
+        ATTENTION and not a line on a screen."""
+        self._write("EV-BAD", project_id=7)
+
+        _output, attention = self._alerts()
+
+        self.assertIn("모든 날짜의", attention[0])
+
+    def test_a_healthy_repository_says_nothing(self):
+        self._write("EV-OK")
+
+        output, attention = self._alerts()
+
+        self.assertNotIn("읽을 수 없는 Candidate", output)
+        self.assertEqual(attention, [])
+
+    def test_the_shapes_the_pipeline_survives_are_not_reported_here_either(self):
+        """The two sides agree in both directions, which is the point of
+        sharing the predicate rather than copying it."""
+        for label, override in (
+            ("role=int", {"role": 5}),
+            ("category=int", {"category": 9}),
+        ):
+            with self.subTest(case=label):
+                self.setUp()
+                self._write("EV-SOFT", **override)
+
+                _output, attention = self._alerts()
+
+                self.assertEqual(attention, [])
+
+
+class ADamagedManifestDoesNotKillTheStatusViewTests(unittest.TestCase):
+    """C44. `metrics` that is not a mapping took the whole view down.
+
+    `read_summary()` states plainly that it "validates only the three enums";
+    `metrics` comes back as `c.get("metrics", {})`, whatever the JSON holds.
+    The renderer had already been hardened once for that — `one_line()` on
+    every key and every value, so a forged newline cannot fake a metric row
+    (C38) — and the hardening assumed the container was a mapping.
+
+    Measured, a manifest whose `metrics` was a string:
+
+        AttributeError: 'str' object has no attribute 'items'
+        raised out of `_print_last_run()`, out of `main()`
+        the operator gets a traceback instead of ANY status
+
+    Two of this file's own promises broken at once: the view "must still
+    produce an answer when part of the evidence is damaged", and docs/10 §46
+    makes a damaged state file something to REPORT. It is a disaster-recovery
+    path — a restored or hand-edited manifest — which is precisely when
+    someone runs this command.
+    """
+
+    BASE = {
+        "schema_version": 1,
+        "run_id": "R-1",
+        "started_at": "2026-08-05T10:00:00+09:00",
+        "finished_at": "2026-08-05T10:00:01+09:00",
+    }
+
+    def _failing(self, name, metrics):
+        return {
+            "name": name,
+            "status": "FAILED",
+            "failure": {
+                "classification": "NOTION_SYNC_INCOMPLETE",
+                "reason": "r",
+                "retryability": "RETRYABLE",
+                "severity": "DEGRADED",
+            },
+            "metrics": metrics,
+        }
+
+    def _run(self, components):
+        import contextlib
+        import importlib.util
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "runs").mkdir(parents=True)
+        (runtime / "state").mkdir()
+        data = dict(self.BASE)
+        data["components"] = components
+        manifest = runtime / "runs" / "last_run.json"
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_damaged", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = manifest
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_last_run(NOW)
+        return buffer.getvalue(), attention
+
+    DAMAGED = {"str": "oops", "list": [1, 2], "int": 7}
+
+    def test_it_does_not_raise(self):
+        for label, metrics in self.DAMAGED.items():
+            with self.subTest(kind=label):
+                output, _attention = self._run([self._failing("notion_sync", metrics)])
+
+                self.assertIn("notion_sync", output)
+
+    def test_the_damage_is_named_rather_than_skipped(self):
+        output, attention = self._run([self._failing("notion_sync", "oops")])
+
+        self.assertIn("metrics 읽을 수 없음", output)
+        self.assertIn("str", output)
+        self.assertTrue(
+            any("metrics가 손상" in item and "notion_sync" in item for item in attention),
+            attention,
+        )
+
+    def test_the_rest_of_the_manifest_still_renders(self):
+        """The reason this reports instead of failing the read: a partially
+        damaged manifest still says which step failed and how badly, and that
+        is most of what the block is for."""
+        output, _attention = self._run(
+            [
+                self._failing("notion_sync", "oops"),
+                {
+                    "name": "daily",
+                    "status": "FAILED",
+                    "failure": {
+                        "classification": "DAILY_CLOSE_FAILED",
+                        "reason": "r2",
+                        "retryability": "RETRYABLE",
+                        "severity": "CRITICAL",
+                    },
+                    "metrics": {"generated_days": 0},
+                },
+            ]
+        )
+
+        self.assertIn("DAILY_CLOSE_FAILED", output)
+        self.assertIn("generated_days=0", output)
+
+    def test_a_healthy_manifest_is_unchanged(self):
+        output, attention = self._run(
+            [self._failing("notion_sync", {"queued": 3, "processed": 4})]
+        )
+
+        self.assertIn("processed=4 queued=3", output)
+        self.assertNotIn("읽을 수 없음", output)
+        self.assertEqual([a for a in attention if "metrics가 손상" in a], [])
+
+    def test_an_empty_metrics_object_is_not_damage(self):
+        """`{}` is what a step with nothing to report writes, and `None` is
+        what an older manifest has. Neither may raise the alarm."""
+        for metrics in ({}, None):
+            with self.subTest(metrics=metrics):
+                output, attention = self._run([self._failing("notion_sync", metrics)])
+
+                self.assertNotIn("읽을 수 없음", output)
+                self.assertEqual([a for a in attention if "metrics가 손상" in a], [])
+
+    def test_artifact_refs_as_a_string_is_a_known_cosmetic_limit(self):
+        """CHARACTERIZATION, deliberately not fixed here.
+
+        `read_summary()` does `tuple(c.get("artifact_refs", ()))`, so a string
+        becomes a tuple of characters before the renderer ever sees it — the
+        container type is already gone by then and no guard at this end can
+        tell it from a real tuple. It prints `a, b, c` instead of crashing,
+        so the cost is cosmetic; closing it means widening `read_summary()`'s
+        stated contract, which is a bigger change than this defect earns.
+        """
+        component = self._failing("notion_sync", {})
+        component["artifact_refs"] = "abc"
+
+        output, _attention = self._run([component])
+
+        self.assertIn("evidence: a, b, c", output)
 
 
 class AgentLockIsReportedTests(unittest.TestCase):
@@ -5261,7 +6506,73 @@ class UnresolvableDirtyMonthTests(CandidatesBeforeTheHistoryStartTests):
         self.assertIn("predates the history start date", source)
 
 
-class KeptButNotRenderedTests(unittest.TestCase):
+class _KeptButNotRenderedFixture:
+    """Harness only, deliberately not a TestCase.
+
+    Split out for the reason `test_runner_notion_integration.RunnerNotionTestCase`
+    gives: a second suite needs this fixture, and inheriting a TestCase to get
+    it re-runs every test in the first one.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in ("history_candidates/keep", "history_candidates/review",
+                    "local_master/daily", "local_master/monthly", "state",
+                    "events/processed", "locks"):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _candidate(self, runtime, event_id, day):
+        (runtime / "history_candidates" / "keep" / f"HIST-{event_id}.json").write_text(
+            json.dumps(
+                {
+                    "history_id": f"HIST-{event_id}", "event_id": event_id,
+                    "timestamp": f"{day}T10:00:00+09:00", "category": "MILESTONE",
+                    "project_id": "PRJ", "role": "COO", "summary": "s",
+                    "evidence": [], "filter_result": "KEEP",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _daily(self, runtime, day, *event_ids):
+        """Real item blocks, `### ` heading and summary bullet included.
+
+        The fixture used to be a bare list of `- Event ID:` lines under
+        `## Milestones`, which is not a shape `daily/markdown.py` can
+        produce — and once `_label_lines()` confined the match to `### `
+        item blocks (the fix for a summary written as a bullet silencing
+        this very detector), a fixture with no block asserted nothing about
+        a real Daily file.
+        """
+        body = [f"# DOJOONPASS Company History — {day}", "", "## Milestones", ""]
+        for event_id in event_ids:
+            body.extend(["### PRJ", "", "- s", "- Owner: COO", f"- Event ID: {event_id}", ""])
+        (runtime / "local_master" / "daily" / f"{day}.md").write_text(
+            "\n".join(body) + "\n", encoding="utf-8"
+        )
+
+    def _run(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_e17", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "Daily History에 없다" in a]
+
+
+
+
+
+class KeptButNotRenderedTests(_KeptButNotRenderedFixture, unittest.TestCase):
     """E-17's loss, made visible. NOT fixed — reported.
 
     E-17: when `update_daily_history()` fails, that Late Event is never
@@ -5292,51 +6603,6 @@ class KeptButNotRenderedTests(unittest.TestCase):
     13 of 14 stored Candidates were present in their Daily file, and the
     fourteenth was genuinely absent — E-17's shape, sitting there unreported.
     """
-
-    def _runtime(self):
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        runtime = root / "runtime"
-        for rel in ("history_candidates/keep", "history_candidates/review",
-                    "local_master/daily", "local_master/monthly", "state",
-                    "events/processed", "locks"):
-            (runtime / rel).mkdir(parents=True)
-        return runtime
-
-    def _candidate(self, runtime, event_id, day):
-        (runtime / "history_candidates" / "keep" / f"HIST-{event_id}.json").write_text(
-            json.dumps(
-                {
-                    "history_id": f"HIST-{event_id}", "event_id": event_id,
-                    "timestamp": f"{day}T10:00:00+09:00", "category": "MILESTONE",
-                    "project_id": "PRJ", "role": "COO", "summary": "s",
-                    "evidence": [], "filter_result": "KEEP",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    def _daily(self, runtime, day, *event_ids):
-        body = [f"# DOJOONPASS Company History — {day}", "", "## Milestones", ""]
-        for event_id in event_ids:
-            body.append(f"- Event ID: {event_id}")
-        (runtime / "local_master" / "daily" / f"{day}.md").write_text(
-            "\n".join(body) + "\n", encoding="utf-8"
-        )
-
-    def _run(self, runtime):
-        import contextlib
-        import importlib.util
-
-        path = Path(__file__).resolve().parents[1] / "ops_status.py"
-        spec = importlib.util.spec_from_file_location("ops_status_e17", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.RUNTIME_DIR = runtime
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            attention = module._print_history(NOW)
-        return buffer.getvalue(), [a for a in attention if "Daily History에 없다" in a]
 
     # ---- the defect ----------------------------------------------------
 
@@ -5582,6 +6848,269 @@ class KeptButNotRenderedTests(unittest.TestCase):
         _output, alerts = self._run(runtime)
 
         self.assertEqual(alerts, [])
+
+
+class ReviewedButNotRenderedIsRenderedTests(_KeptButNotRenderedFixture, unittest.TestCase):
+    """C33 §3's detector — the block that prints it never ran.
+
+    The loss is the most expensive kind this pipeline handles: Decision
+    Context a HUMAN typed, stored by `history.review`, renderable by
+    `daily/markdown.py`, and unreachable for a Candidate whose day is already
+    closed. `_reviewed_but_not_rendered()` is well covered
+    (`test_history_review.py`), and the two lines in `_print_history()` that
+    turn its result into a screen line and an ATTENTION entry were covered by
+    a **source-string assertion**:
+
+        assertIn("_reviewed_but_not_rendered(keep_candidates, daily_dir)", source)
+
+    which is a claim about how the call is written, not that anything is
+    printed. A detector nothing prints detects nothing, and that is what the
+    string was standing in for (C41 §1's shape, found by a line-coverage pass
+    in C42).
+    """
+
+    def _reviewed_candidate(self, runtime, event_id, day, **fields):
+        payload = {
+            "history_id": f"HIST-{event_id}", "event_id": event_id,
+            "timestamp": f"{day}T10:00:00+09:00", "category": "MILESTONE",
+            "project_id": "PRJ", "role": "COO", "summary": "s",
+            "evidence": [], "filter_result": "KEEP",
+        }
+        payload.update(fields)
+        (runtime / "history_candidates" / "keep" / f"HIST-{event_id}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def test_a_stranded_decision_context_reaches_the_screen_and_attention(self):
+        runtime = self._runtime()
+        self._reviewed_candidate(
+            runtime, "EVT-R", "2026-08-05", decision_context="정식 출시로 간다"
+        )
+        # The day is closed and carries the Candidate's own id — so
+        # `_kept_but_not_rendered()` is clean and only the review check can
+        # see the loss. That separation is the whole point of having two.
+        self._daily(runtime, "2026-08-05", "EVT-R")
+
+        output, _ = self._run(runtime)
+        attention = self._review_alerts(runtime)
+
+        self.assertIn("검토 미반영         : 1", output)
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("EVT-R", attention[0])
+        self.assertIn("Decision Context", attention[0])
+
+    def test_a_rendered_decision_context_is_not_reported(self):
+        """The other direction. A Candidate whose review DID reach the file
+        must not leave a standing line — the renderer writes
+        `- Decision Context: <value>` inside the item block, and that is what
+        the check looks for."""
+        runtime = self._runtime()
+        self._reviewed_candidate(
+            runtime, "EVT-R", "2026-08-05", decision_context="정식 출시로 간다"
+        )
+        (runtime / "local_master" / "daily" / "2026-08-05.md").write_text(
+            "# H\n\n## Milestones\n\n### PRJ\n\n- s\n- Owner: COO\n"
+            "- Event ID: EVT-R\n- Decision Context: 정식 출시로 간다\n",
+            encoding="utf-8",
+        )
+
+        output, _ = self._run(runtime)
+
+        self.assertNotIn("검토 미반영", output)
+        self.assertEqual(self._review_alerts(runtime), [])
+
+    def test_a_candidate_with_no_review_is_not_reported(self):
+        """A KEEP Candidate nobody reviewed has nothing to strand."""
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-P", "2026-08-05")
+        self._daily(runtime, "2026-08-05", "EVT-P")
+
+        output, _ = self._run(runtime)
+
+        self.assertNotIn("검토 미반영", output)
+        self.assertEqual(self._review_alerts(runtime), [])
+
+    def _review_alerts(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_review", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        with contextlib.redirect_stdout(io.StringIO()):
+            attention = module._print_history(NOW)
+        return [item for item in attention if "Decision Context" in item]
+
+
+class MonthlySequenceHoleIsRenderedTests(unittest.TestCase):
+    """The Monthly hole ATTENTION block — covered by nothing that ran it.
+
+    `_holes_in_the_monthly_sequence()` has its own suite. What it feeds — a
+    screen line and an ATTENTION entry inside `_print_history()` — did not,
+    and a hole in the Monthly sequence means a consolidated month whose file
+    is gone: `monthly_history_state.json` has already advanced past it, so no
+    ordinary run rebuilds it. The message is the only place the remedy
+    (`mark_month_dirty()`) is stated.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.runtime = Path(tmp.name) / "runtime"
+        for relative in ("history_candidates/keep", "history_candidates/review",
+                         "local_master/daily", "local_master/monthly", "state",
+                         "events/processed", "locks"):
+            (self.runtime / relative).mkdir(parents=True)
+
+    def _months(self, *keys):
+        for key in keys:
+            (self.runtime / "local_master" / "monthly" / f"{key}.md").write_text(
+                f"# {key}\n", encoding="utf-8"
+            )
+
+    def _run(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_monthly_hole", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "Monthly History 시퀀스" in a]
+
+    def test_a_missing_month_in_the_middle_reaches_attention(self):
+        self._months("2026-03", "2026-05")
+
+        output, attention = self._run()
+
+        self.assertIn("Monthly 시퀀스 구멍 : 1", output)
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("2026-04", attention[0])
+
+    def test_a_complete_sequence_says_nothing(self):
+        """The endpoints are not holes — a month not yet consolidated is
+        simply not consolidated yet, and reporting it would be a standing
+        line every operator would learn to ignore."""
+        self._months("2026-03", "2026-04", "2026-05")
+
+        output, attention = self._run()
+
+        self.assertNotIn("Monthly 시퀀스 구멍", output)
+        self.assertEqual(attention, [])
+
+    def test_the_message_names_what_to_do(self):
+        """An ATTENTION line with no remedy sends an operator to guess. The
+        remedy is measured in `MonthlySequenceHoleTests`; this is the half
+        that gets it in front of a person."""
+        self._months("2026-03", "2026-05")
+
+        _output, attention = self._run()
+
+        self.assertIn("dirty", attention[0])
+        self.assertIn("Daily", attention[0])
+
+
+class ASummaryCanNoLongerSilenceTheLossDetectorTests(
+    _KeptButNotRenderedFixture, unittest.TestCase
+):
+    """REGRESSION. The detector above could be switched off, per Candidate,
+    by an ordinary summary — and it was the *second* time that happened.
+
+    C30 closed the first door: `render_daily_markdown()` writes a summary raw
+    as its block's first bullet, so a summary of `Event ID: EVT-B` renders a
+    line identical to EVT-B's own label. `summary_line_indices()` excludes
+    that bullet, and the detector went back to reporting EVT-B.
+
+    `## Summary` is the same door one section up, and it was open. That
+    section repeats every summary RAW — no `- ` of its own — so a summary
+    that is itself a bullet lands there as a bare line spelling a label, and
+    `summary_line_indices()` cannot reach it: that rule walks `### ` item
+    blocks and the Summary section has none.
+
+    Measured, EVT-A rendered by the real renderer with three summaries, EVT-B
+    genuinely absent from the same day's file:
+
+        'Shipped it.'         ('EVT-B (2026-08-05)',)
+        'Event ID: EVT-B'     ('EVT-B (2026-08-05)',)
+        '- Event ID: EVT-B'   ()                        <- silenced
+
+    E-17's data loss, unreported again, by one Candidate naming another. Seen
+    from the security side it is the same spoofing vector
+    `daily/late_events.existing_event_ids()` carries — which lost a real late
+    Event to the identical line, and is where the shared rule now lives
+    (`daily.markdown.item_block_bounds()`).
+
+    Inherits the harness above so both detectors are exercised on documents
+    the REAL renderer produced, not on the hand-built fixture.
+    """
+
+    def _render_real_daily(self, runtime, day, summary, *, present):
+        from daily.markdown import render_daily_markdown
+        from history import HistoryCandidate, HistoryDecision
+
+        candidates = [
+            HistoryCandidate(
+                history_id=f"HIST-{present}", event_id=present,
+                timestamp=f"{day}T10:00:00+09:00", category="MILESTONE",
+                project_id="PRJ", role="COO", summary=summary, evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+        ]
+        (runtime / "local_master" / "daily" / f"{day}.md").write_text(
+            render_daily_markdown(date(*(int(p) for p in day.split("-"))), candidates, "g"),
+            encoding="utf-8",
+        )
+
+    def _alerts_for(self, summary):
+        runtime = self._runtime()
+        self._candidate(runtime, "EVT-A", "2026-08-05")
+        self._candidate(runtime, "EVT-B", "2026-08-05")
+        self._render_real_daily(runtime, "2026-08-05", summary, present="EVT-A")
+        _output, alerts = self._run(runtime)
+        return alerts
+
+    def test_a_bullet_shaped_summary_does_not_hide_the_stranded_candidate(self):
+        for summary in ("Shipped it.", "Event ID: EVT-B", "- Event ID: EVT-B"):
+            with self.subTest(summary=summary):
+                alerts = self._alerts_for(summary)
+
+                self.assertEqual(len(alerts), 1, alerts)
+                self.assertIn("EVT-B", alerts[0])
+
+    def test_the_rendered_candidate_is_never_reported(self):
+        """The other direction: narrowing the match must not start reporting
+        a Candidate the renderer really did write."""
+        for summary in ("Shipped it.", "Event ID: EVT-B", "- Event ID: EVT-B"):
+            with self.subTest(summary=summary):
+                self.assertNotIn("EVT-A", "".join(self._alerts_for(summary)))
+
+    def test_the_summary_section_is_where_it_came_from(self):
+        """Names the mechanism, so a renderer that stops repeating summaries
+        raw shows up here rather than quietly making this class vacuous."""
+        from daily.markdown import render_daily_markdown
+        from history import HistoryCandidate, HistoryDecision
+
+        text = render_daily_markdown(
+            date(2026, 8, 5),
+            [
+                HistoryCandidate(
+                    history_id="HIST-EVT-A", event_id="EVT-A",
+                    timestamp="2026-08-05T10:00:00+09:00", category="MILESTONE",
+                    project_id="PRJ", role="COO", summary="- Event ID: EVT-B",
+                    evidence=(), filter_result=HistoryDecision.KEEP,
+                )
+            ],
+            "g",
+        )
+        lines = text.splitlines()
+
+        self.assertEqual(lines[lines.index("## Summary") + 2], "- Event ID: EVT-B")
 
 
 class RuntimeDirIsTheOnlyKnobTests(unittest.TestCase):
@@ -6884,8 +8413,13 @@ class StrandedCandidateHiddenByASummaryTests(unittest.TestCase):
             render_daily_markdown(date(2026, 8, 5), rendered, "gen"),
             encoding="utf-8",
         )
+        from ops_status import StoredCandidate
+
         return _kept_but_not_rendered(
-            tuple((f"s{i}", e, date(2026, 8, 5)) for i, e in enumerate(stored)),
+            tuple(
+                StoredCandidate(f"s{i}", e, date(2026, 8, 5))
+                for i, e in enumerate(stored)
+            ),
             directory,
         )
 
@@ -7081,8 +8615,11 @@ class AStrandedCandidateIsRecoveredByACompanionTests(unittest.TestCase):
     def _detector(self, event_id):
         from ops_status import _kept_but_not_rendered
 
+        from ops_status import StoredCandidate
+
         return _kept_but_not_rendered(
-            ((f"HIST-{event_id}", event_id, date(2026, 8, 5)),), self.daily_dir
+            (StoredCandidate(f"HIST-{event_id}", event_id, date(2026, 8, 5)),),
+            self.daily_dir,
         )
 
     def _close_the_day_then_strand(self):
@@ -7162,6 +8699,333 @@ class AStrandedCandidateIsRecoveredByACompanionTests(unittest.TestCase):
         self.assertEqual(
             ast.unparse(loops[0].iter), "sorted(kept_dates)",
             "step 6.5 no longer iterates the dates this run collected",
+        )
+
+
+class SameInstantSkipReachesTheOperatorTests(unittest.TestCase):
+    """E-23's divergence, out of the Run Manifest and onto the screen.
+
+    C40 made the count exist and nothing read it: `_print_last_run()` prints
+    a component's metrics only when the component FAILED, and a same-instant
+    skip is not a failure (docs/04 §35 "적용하지 않았다", `recorder.ok()`,
+    exit 0). So `same_instant_skips` went to `last_run.json` on every
+    affected run and no view has ever shown it.
+
+    Measured through the real Runner and the real `ExecutionPlanSync`, with
+    the two Events two timestamp-less Signals on one date actually produce
+    (docs/06 §12 gives both that date's midnight):
+
+        manifest        notion_sync SUCCESS, {'processed': 2,
+                                              'same_instant_skips': 1}
+        Notion row      Status IN_PROGRESS, Blocker (none), Last Event EVT-A
+        on disk         BLOCKED on "예산 승인 대기"
+
+    E-23 records the loss as "Notion 쪽 Current State의 **최신성**". The row
+    being one Event behind is not the whole of it — it can show the opposite
+    of the risk state, and this repository now has a second view (CONTROL
+    TOWER) that reads the same Events and says BLOCKED, so the two disagree
+    in public.
+
+    Not a standing alarm: the metric is per run and absent on the next one,
+    and the action named is the mitigation AGENT.md §3 already documents.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _module(self, runtime):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_e23", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+        return module
+
+    def _manifest(self, runtime, metrics, *, status=ComponentStatus.SUCCESS):
+        write_summary(
+            runtime / "runs" / "last_run.json",
+            RunSummary(
+                run_id="RUN-E23",
+                started_at="2026-08-03T11:00:00+09:00",
+                finished_at="2026-08-03T11:00:02+09:00",
+                components=(
+                    ComponentResult(name="notion_sync", status=status, metrics=metrics),
+                ),
+            ),
+        )
+
+    def _run(self, runtime):
+        import contextlib
+
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_notion(NOW)
+        return buffer.getvalue(), [a for a in attention if "같은 instant" in a or "instant" in a]
+
+    def test_the_count_reaches_the_screen_and_attention(self):
+        runtime = self._runtime()
+        self._manifest(runtime, {"processed": 2, "same_instant_skips": 1})
+
+        printed, lines = self._run(runtime)
+
+        self.assertIn("같은 instant 미반영 : 1", printed)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("E-23", lines[0])
+        self.assertIn("timestamp", lines[0])
+
+    def test_an_ordinary_run_says_nothing(self):
+        """`app/runner.py` writes the metric as `or None`, so a run where it
+        did not happen carries no key at all — and this must stay silent for
+        it rather than print a standing zero."""
+        runtime = self._runtime()
+        self._manifest(runtime, {"processed": 2})
+
+        printed, lines = self._run(runtime)
+
+        self.assertNotIn("instant", printed)
+        self.assertEqual(lines, [])
+
+    def test_a_zero_is_treated_as_nothing_to_say(self):
+        runtime = self._runtime()
+        self._manifest(runtime, {"processed": 2, "same_instant_skips": 0})
+
+        self.assertEqual(self._run(runtime)[1], [])
+
+    def test_no_manifest_is_not_an_error_here(self):
+        """LAST RUN already reports a missing or unreadable manifest; a
+        second line for the same file would be a second opinion."""
+        runtime = self._runtime()
+
+        self.assertEqual(self._run(runtime)[1], [])
+
+    def test_an_unreadable_manifest_is_not_an_error_here_either(self):
+        runtime = self._runtime()
+        (runtime / "runs" / "last_run.json").write_bytes(b"{not json")
+
+        self.assertEqual(self._run(runtime)[1], [])
+
+    def test_a_damaged_metrics_container_does_not_take_the_block_down(self):
+        """`read_summary()` validates the three enums and nothing else, so
+        `metrics` comes back as whatever the file holds — the DR path C44
+        already had to defend `_print_last_run()` against."""
+        runtime = self._runtime()
+        path = runtime / "runs" / "last_run.json"
+        self._manifest(runtime, {"processed": 2, "same_instant_skips": 1})
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["components"][0]["metrics"] = "not a mapping"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        printed, lines = self._run(runtime)
+
+        self.assertEqual(lines, [])
+        self.assertIn("NOTION", printed)
+
+    def test_a_forged_metric_value_cannot_make_a_number_up(self):
+        runtime = self._runtime()
+        self._manifest(runtime, {"same_instant_skips": "9999"})
+
+        self.assertEqual(self._run(runtime)[1], [])
+
+
+class SameInstantSkipEndToEndTests(unittest.TestCase):
+    """The whole chain, driven by the real Runner: two timestamp-less Signals
+    on one date -> the Late Event guard -> the manifest metric -> the view.
+
+    The fixture is not crafted. `agent/agent.py::_default_timestamp()` gives
+    every Signal of a date that date's midnight *on purpose* (docs/06 §12), so
+    two Signals for one project on one day is exactly this.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.runtime = self.root / "runtime"
+        self.local_master = self.runtime / "local_master"
+        self.local_master.mkdir(parents=True)
+        self.working_copy = self.runtime / "backup_working_copy"
+        self.working_copy.mkdir(parents=True)
+        self._init_git()
+        self.incoming = self.runtime / "events" / "incoming"
+        self.incoming.mkdir(parents=True)
+
+    def _git(self, args, cwd):
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _init_git(self):
+        bare = self.root / "remote.git"
+        self._git(["init", "--bare", "-b", "main", str(bare)], self.root)
+        self._git(["init", "-b", "main"], self.working_copy)
+        self._git(["config", "user.email", "t@example.invalid"], self.working_copy)
+        self._git(["config", "user.name", "E23"], self.working_copy)
+        self._git(["remote", "add", "origin", str(bare)], self.working_copy)
+        (self.working_copy / ".gitkeep").write_text("", encoding="utf-8")
+        self._git(["add", "-A"], self.working_copy)
+        self._git(["commit", "-m", "init"], self.working_copy)
+        self._git(["push", "-u", "origin", "main"], self.working_copy)
+
+    MIDNIGHT = "2026-08-01T00:00:00+09:00"
+
+    def test_the_second_signal_of_a_day_diverges_and_is_now_reported(self):
+        import contextlib
+        import importlib.util
+
+        from app.runner import run_once
+        from notion import ExecutionPlanSync, InMemoryNotionTransport, NotionClient
+        from reporter import Reporter
+
+        for event_id, event_type, status, extra in (
+            ("EVT-A", "STARTED", "IN_PROGRESS", {}),
+            ("EVT-B", "BLOCKED", "BLOCKED", {"blocker": "예산 승인 대기"}),
+        ):
+            Reporter(profile="DESKTOP_2").report_and_write(
+                directory=self.incoming, project_id="BRAND", event_type=event_type,
+                status=status, summary=f"s {event_id}", history_candidate=True,
+                timestamp=self.MIDNIGHT, event_id=event_id, evidence=[], **extra,
+            )
+
+        transport = InMemoryNotionTransport()
+        run_once(
+            local_master_dir=self.local_master,
+            backup_working_copy_dir=self.working_copy,
+            history_start_date=date(2026, 8, 1),
+            runner_lock_path=self.runtime / "locks" / "l.lock",
+            now=datetime(2026, 8, 3, 11, 0).astimezone(),
+            transport_dir=self.runtime / "transport",
+            incoming_dir=self.incoming,
+            processed_dir=self.runtime / "events" / "processed",
+            rejected_dir=self.runtime / "events" / "rejected",
+            collector_log_path=self.runtime / "logs" / "collector.log",
+            collector_state_path=self.runtime / "state" / "collector_state.json",
+            notion_sync=ExecutionPlanSync(
+                client=NotionClient(transport=transport, database_id="DB")
+            ),
+            notion_sync_log_path=self.runtime / "logs" / "notion_sync.log",
+            late_update_log_path=self.runtime / "logs" / "daily_late_update.log",
+            monthly_state_path=self.runtime / "state" / "monthly_history_state.json",
+            run_summary_path=self.runtime / "runs" / "last_run.json",
+            notion_retry_queue_path=self.runtime / "state" / "queue.json",
+            keep_dir=self.runtime / "history_candidates" / "keep",
+            review_dir=self.runtime / "history_candidates" / "review",
+            scheduler_state_path=self.runtime / "state" / "scheduler.json",
+            backup_state_path=self.runtime / "state" / "backup.json",
+        )
+
+        summary = read_summary(self.runtime / "runs" / "last_run.json")
+        component = summary.component("notion_sync")
+
+        # The run is a success — which is precisely why nothing showed this.
+        self.assertEqual(summary.exit_code, 0)
+        self.assertIs(component.status, ComponentStatus.SUCCESS)
+        self.assertEqual(component.metrics.get("same_instant_skips"), 1)
+
+        # The Notion row shows the FIRST Event, not the state on disk.
+        page = [
+            p for p in transport._pages.values()
+            if "Project ID" in p.get("properties", {})
+        ][0]
+        properties = page["properties"]
+        blocker = (properties.get("Blocker") or {}).get("rich_text") or []
+        self.assertEqual(
+            (properties["Status"]["select"] or {}).get("name"), "IN_PROGRESS"
+        )
+        self.assertEqual(blocker, [], "the Notion row shows no blocker")
+
+        # ...while the Control Tower, reading the same Events, says BLOCKED.
+        from controltower import build_company_rollup
+
+        rollup = build_company_rollup(
+            processed_dir=self.runtime / "events" / "processed",
+            now=datetime(2026, 8, 3, 11, 0).astimezone(),
+        )
+        self.assertTrue(rollup.project("BRAND").is_blocked)
+        self.assertEqual(rollup.project("BRAND").open_blocker, "예산 승인 대기")
+
+        # ...and the operator is told, which is the part that was missing.
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_e23_e2e", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = self.runtime / "runs" / "last_run.json"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_notion(datetime(2026, 8, 3, 12, 0).astimezone())
+
+        self.assertIn("같은 instant 미반영 : 1", buffer.getvalue())
+        self.assertTrue(any("E-23" in line for line in attention), attention)
+
+    def test_one_second_apart_takes_no_such_path(self):
+        """The mitigation AGENT.md §3 documents, held to its promise."""
+        from app.runner import run_once
+        from notion import ExecutionPlanSync, InMemoryNotionTransport, NotionClient
+        from reporter import Reporter
+
+        for event_id, event_type, status, stamp, extra in (
+            ("EVT-A", "STARTED", "IN_PROGRESS", "2026-08-01T00:00:00+09:00", {}),
+            ("EVT-B", "BLOCKED", "BLOCKED", "2026-08-01T00:00:01+09:00",
+             {"blocker": "예산 승인 대기"}),
+        ):
+            Reporter(profile="DESKTOP_2").report_and_write(
+                directory=self.incoming, project_id="BRAND", event_type=event_type,
+                status=status, summary=f"s {event_id}", history_candidate=True,
+                timestamp=stamp, event_id=event_id, evidence=[], **extra,
+            )
+
+        transport = InMemoryNotionTransport()
+        run_once(
+            local_master_dir=self.local_master,
+            backup_working_copy_dir=self.working_copy,
+            history_start_date=date(2026, 8, 1),
+            runner_lock_path=self.runtime / "locks" / "l.lock",
+            now=datetime(2026, 8, 3, 11, 0).astimezone(),
+            transport_dir=self.runtime / "transport",
+            incoming_dir=self.incoming,
+            processed_dir=self.runtime / "events" / "processed",
+            rejected_dir=self.runtime / "events" / "rejected",
+            collector_log_path=self.runtime / "logs" / "collector.log",
+            collector_state_path=self.runtime / "state" / "collector_state.json",
+            notion_sync=ExecutionPlanSync(
+                client=NotionClient(transport=transport, database_id="DB")
+            ),
+            notion_sync_log_path=self.runtime / "logs" / "notion_sync.log",
+            late_update_log_path=self.runtime / "logs" / "daily_late_update.log",
+            monthly_state_path=self.runtime / "state" / "monthly_history_state.json",
+            run_summary_path=self.runtime / "runs" / "last_run.json",
+            notion_retry_queue_path=self.runtime / "state" / "queue.json",
+            keep_dir=self.runtime / "history_candidates" / "keep",
+            review_dir=self.runtime / "history_candidates" / "review",
+            scheduler_state_path=self.runtime / "state" / "scheduler.json",
+            backup_state_path=self.runtime / "state" / "backup.json",
+        )
+
+        component = read_summary(
+            self.runtime / "runs" / "last_run.json"
+        ).component("notion_sync")
+
+        self.assertIsNone(component.metrics.get("same_instant_skips"))
+        page = [
+            p for p in transport._pages.values()
+            if "Project ID" in p.get("properties", {})
+        ][0]
+        blocker = (page["properties"].get("Blocker") or {}).get("rich_text") or []
+        self.assertEqual(
+            "".join(i["text"]["content"] for i in blocker), "예산 승인 대기"
         )
 
 
@@ -7340,6 +9204,658 @@ class HoleInTheDailySequenceTests(unittest.TestCase):
         self.assertEqual(len(module._daily_dates(daily)), 10)
 
 
+class HistoryGoneFromLocalMasterTests(unittest.TestCase):
+    """The days the hole check cannot bound: a missing **prefix**.
+
+    `_holes_in_the_daily_sequence()` bounds its range by the files that are
+    present and says so plainly — *"whatever came before it is outside this
+    machine's History"*. When the days that went missing are the earliest
+    ones, the first present file simply moves forward and the range moves
+    with it, so there is no interior gap to find. A partial restore that
+    stopped part-way, a OneDrive folder that synced from the top, and a hand
+    deletion of "the old ones" all leave exactly that shape.
+
+    Measured through the real Runner with `2026-08-01.md` replaced by a
+    **directory of the same name** (C31's shape, and what a half-finished
+    copy leaves), 08-01..08-04 closed:
+
+        _holes_in_the_daily_sequence()      ()
+        _kept_but_not_rendered()            ()
+        check_state_consistency()           CONSISTENT
+        _daily_counts_more_than_it_shows()  ()
+        _misnamed_scope_directories()       ()
+        daily 파일                          5      <- counting the directory
+        ATTENTION                           nothing naming 2026-08-01
+
+    Backup does fail — its deletion gate sees the same thing — but the
+    filename lives only in the manifest's `reason`, which
+    `_print_last_run()` deliberately does not print, so what an operator
+    reads is `backup: BACKUP_FAILED`: the same line a credential failure
+    produces, which is exactly the confusion the Runner's comment beside
+    that gate says it was written to remove.
+
+    The answer needs no configuration. `sync_to_working_copy()` writes one
+    direction and never deletes — a detected deletion makes it apply nothing
+    at all (docs/08 §31/§44-47) — so the Working Copy is a monotonic record
+    of every file that ever reached backup scope, and a name in it that
+    Master does not have is a file that existed and does not now. The
+    comparison reuses the gate's own listing (`_relative_files`) rather than
+    a second `glob()`, so "Company History" means the same thing on both
+    sides.
+    """
+
+    def _module(self, runtime):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_gone", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        return module
+
+    def _runtime(self, *, master=(), backup=(), monthly_master=(), monthly_backup=()):
+        from scheduler.state import SchedulerState
+        from scheduler.state import save_state as save_scheduler_state
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "backup_working_copy/daily",
+            "backup_working_copy/monthly", "state", "locks", "runs", "logs",
+        ):
+            (runtime / rel).mkdir(parents=True)
+        for where, days in (
+            (runtime / "local_master" / "daily", master),
+            (runtime / "backup_working_copy" / "daily", backup),
+        ):
+            for day in days:
+                (where / f"{day}.md").write_text("history", encoding="utf-8")
+        for where, months in (
+            (runtime / "local_master" / "monthly", monthly_master),
+            (runtime / "backup_working_copy" / "monthly", monthly_backup),
+        ):
+            for month in months:
+                (where / f"{month}.md").write_text("history", encoding="utf-8")
+        save_scheduler_state(
+            runtime / "state" / "daily_history_state.json",
+            SchedulerState(last_successful_daily_close=date(2026, 8, 10)),
+        )
+        return runtime
+
+    def _gone(self, runtime):
+        module = self._module(runtime)
+        return module._history_gone_from_local_master(
+            runtime / "local_master", runtime / "backup_working_copy"
+        )
+
+    def _attention(self, runtime):
+        import contextlib
+
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+        return buffer.getvalue(), [a for a in attention if "Local Master에는 없는" in a]
+
+    ALL = tuple(f"2026-08-{d:02d}" for d in range(1, 11))
+
+    def test_a_missing_prefix_is_reported(self):
+        """The case the hole check cannot see at all."""
+        runtime = self._runtime(master=self.ALL[2:], backup=self.ALL)
+
+        module = self._module(runtime)
+        daily = runtime / "local_master" / "daily"
+
+        self.assertEqual(module._holes_in_the_daily_sequence(daily), ())
+        self.assertEqual(
+            self._gone(runtime),
+            (str(Path("daily") / "2026-08-01.md"), str(Path("daily") / "2026-08-02.md")),
+        )
+
+    def test_a_directory_wearing_a_days_name_is_reported_as_gone(self):
+        runtime = self._runtime(master=self.ALL, backup=self.ALL)
+        target = runtime / "local_master" / "daily" / "2026-08-01.md"
+        target.unlink()
+        target.mkdir()
+
+        self.assertEqual(self._gone(runtime), (str(Path("daily") / "2026-08-01.md"),))
+
+    def test_the_attention_line_names_the_file_and_says_backup_is_blocked(self):
+        runtime = self._runtime(master=self.ALL[1:], backup=self.ALL)
+
+        printed, lines = self._attention(runtime)
+
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("2026-08-01.md", lines[0])
+        self.assertIn("docs/08 §31", lines[0])
+        self.assertIn("Master에서 사라짐   : 1", printed)
+
+    def test_a_monthly_file_counts_too(self):
+        """Backup scope is `daily/` **and** `monthly/` (docs/08 §26), and the
+        Monthly hole check has the same blind prefix."""
+        runtime = self._runtime(
+            master=self.ALL, backup=self.ALL,
+            monthly_master=("2026-08",), monthly_backup=("2026-07", "2026-08"),
+        )
+
+        self.assertEqual(self._gone(runtime), (str(Path("monthly") / "2026-07.md"),))
+
+    def test_a_master_that_is_ahead_of_the_backup_is_quiet(self):
+        """The ordinary state between a run and its backup: Master has more,
+        never less. That is `_history_newer_than_the_last_backup()`'s
+        question, not this one."""
+        runtime = self._runtime(master=self.ALL, backup=self.ALL[:5])
+
+        self.assertEqual(self._gone(runtime), ())
+        self.assertEqual(self._attention(runtime)[1], [])
+
+    def test_an_identical_pair_is_quiet(self):
+        runtime = self._runtime(master=self.ALL, backup=self.ALL)
+
+        self.assertEqual(self._gone(runtime), ())
+
+    def test_a_machine_with_no_working_copy_yet_is_quiet(self):
+        """A fresh install, and a deployment that has never configured
+        Backup. Neither is a loss, and a standing alert on either would be
+        the alert-that-cannot-clear this file keeps warning about."""
+        runtime = self._runtime(master=self.ALL)
+        shutil.rmtree(runtime / "backup_working_copy")
+
+        self.assertEqual(self._gone(runtime), ())
+        self.assertEqual(self._attention(runtime)[1], [])
+
+    def test_staging_residue_in_the_working_copy_is_not_company_history(self):
+        """`.tmp-*.md` is a write that never committed. The gate's own
+        listing excludes it on both sides, which is why this reuses it."""
+        runtime = self._runtime(master=self.ALL, backup=self.ALL)
+        (runtime / "backup_working_copy" / "daily" / ".tmp-abandoned.md").write_text(
+            "residue", encoding="utf-8"
+        )
+
+        self.assertEqual(self._gone(runtime), ())
+
+    def test_out_of_scope_files_in_the_working_copy_are_ignored(self):
+        """git puts things in the Working Copy that Company History does not
+        own — `.gitkeep`, a README. Backup scope is `daily/` and `monthly/`
+        only (docs/08 §26), and the shared listing is what enforces it."""
+        runtime = self._runtime(master=self.ALL, backup=self.ALL)
+        (runtime / "backup_working_copy" / ".gitkeep").write_text("", encoding="utf-8")
+        (runtime / "backup_working_copy" / "notes").mkdir()
+        (runtime / "backup_working_copy" / "notes" / "x.md").write_text("n", encoding="utf-8")
+
+        self.assertEqual(self._gone(runtime), ())
+
+    def test_the_detector_agrees_with_the_gate_that_will_block_the_backup(self):
+        """Not a second opinion: `sync_to_working_copy()`'s `deleted` is the
+        same set difference, and a run would refuse on exactly these names."""
+        from backup.working_copy import sync_to_working_copy
+
+        runtime = self._runtime(master=self.ALL[2:], backup=self.ALL)
+
+        result = sync_to_working_copy(
+            runtime / "local_master", runtime / "backup_working_copy"
+        )
+
+        self.assertEqual(tuple(sorted(result.deleted)), self._gone(runtime))
+
+
+class DailyAndMonthlyCountsExcludeDirectoriesTests(unittest.TestCase):
+    """`daily 파일` / `monthly 파일` counted anything named `*.md`.
+
+    Every other reader of these two directories already asks `is_file()` —
+    `_daily_dates()` ("it exists, and it is not a day of Company History"),
+    `_holes_in_the_monthly_sequence()`, and `working_copy._relative_files()`.
+    These two counts were the last without it, which
+    `_misnamed_scope_directories()`'s docstring already noted in passing.
+
+    Measured with `2026-08-01.md` replaced by a directory: `daily 파일 : 5`
+    for four days of Company History, printed one line above
+    `daily state 정합성 : CONSISTENT` — a count that disagreed with the
+    detector beneath it, in the direction that hides a loss.
+    """
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (runtime / rel).mkdir(parents=True)
+        return runtime
+
+    def _printed(self, runtime):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_counts", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_history(NOW)
+        return buffer.getvalue()
+
+    def test_a_directory_named_like_a_day_is_not_counted(self):
+        runtime = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        for day in ("2026-08-02", "2026-08-03"):
+            (daily / f"{day}.md").write_text("history", encoding="utf-8")
+        (daily / "2026-08-01.md").mkdir()
+
+        self.assertIn("daily 파일          : 2", self._printed(runtime))
+
+    def test_a_directory_named_like_a_month_is_not_listed(self):
+        runtime = self._runtime()
+        monthly = runtime / "local_master" / "monthly"
+        (monthly / "2026-08.md").write_text("history", encoding="utf-8")
+        (monthly / "2026-07.md").mkdir()
+
+        printed = self._printed(runtime)
+
+        self.assertIn("monthly 파일        : 1", printed)
+        self.assertNotIn("2026-07", printed)
+
+    def test_ordinary_files_are_still_counted(self):
+        runtime = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        for day in ("2026-08-01", "2026-08-02", "2026-08-03"):
+            (daily / f"{day}.md").write_text("history", encoding="utf-8")
+        (runtime / "local_master" / "monthly" / "2026-08.md").write_text("m", encoding="utf-8")
+
+        printed = self._printed(runtime)
+
+        self.assertIn("daily 파일          : 3", printed)
+        self.assertIn("monthly 파일        : 1", printed)
+
+    def test_the_count_agrees_with_the_detector_printed_beneath_it(self):
+        """The property that was broken: two numbers in one block disagreeing
+        about how many days of Company History exist."""
+        import importlib.util
+
+        runtime = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        for day in ("2026-08-01", "2026-08-02", "2026-08-03"):
+            (daily / f"{day}.md").write_text("history", encoding="utf-8")
+        (daily / "2026-08-04.md").mkdir()
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_agree", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertIn("daily 파일          : 3", self._printed(runtime))
+        self.assertEqual(len(module._daily_dates(daily)), 3)
+
+
+class MonthlyLagsItsDailySourceTests(unittest.TestCase):
+    """The third link in the chain, and the only one that crosses files.
+
+        Daily files (the source)  ->  Consolidated Items  ->  rendered items
+
+    `_monthly_counts_more_than_it_shows()` compares the second against the
+    third, inside one file. Nothing compared the first against anything —
+    and docs/09 §12-13 makes that the comparison that matters, because
+    Monthly is derived *wholly* from the Daily files.
+
+    Measured through the real Runner, with an edit two specs explicitly
+    permit (docs/06 §57, docs/11 §71): July consolidated on 08-03, one item
+    added to `2026-07-30.md` by hand afterwards —
+
+        run 08-04   exit 0   Monthly has it: False
+        run 08-05   exit 0   Monthly has it: False
+        ATTENTION            nothing naming it
+
+    and nothing ever revisits that month. `pending_months()` starts *after*
+    `last_successful_monthly_close`, and the only thing that reopens a closed
+    month is `mark_month_dirty()`, which the Runner calls for the dates a
+    **Late Event** changed — not for a date a person changed. That Late Event
+    path is correct and is pinned below unchanged; what had no route back is
+    the hand edit.
+    """
+
+    def _module(self, runtime=None):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_lag", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if runtime is not None:
+            module.RUNTIME_DIR = runtime
+        return module
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.daily = self.root / "daily"
+        self.monthly = self.root / "monthly"
+        self.daily.mkdir(parents=True)
+        self.monthly.mkdir(parents=True)
+        # mtime is the prefilter, so every test places the two sides in
+        # time on purpose rather than relying on the order they were written.
+        self.base = time.time()
+
+    DAILY = """# DOJOONPASS Company History — {day}
+
+## Summary
+
+{summary}
+
+## Milestones
+
+### OPS
+
+- {summary}
+- Owner: COO
+- Event ID: {event_id}
+
+## Metadata
+
+- History Date: {day}
+- Generated At: 2026-07-31T09:00:00+09:00
+- Source: DOJOONPASS Company Ops
+- Event Count: 1
+"""
+
+    EMPTY_DAILY = """# DOJOONPASS Company History — {day}
+
+No material company history recorded.
+
+## Metadata
+
+- History Date: {day}
+- Generated At: 2026-07-31T09:00:00+09:00
+- Source: DOJOONPASS Company Ops
+- Event Count: 0
+"""
+
+    MONTHLY = """# DOJOONPASS Company History — 2026-07
+
+## Major Decisions
+
+## Milestones
+
+{items}
+
+## Source Records
+
+- 2026-07-01.md
+
+## Metadata
+
+- History Month: 2026-07
+- Generated At: 2026-08-01T09:00:00+09:00
+- Source: DOJOONPASS Company Ops
+- Daily Coverage: COMPLETE (1/1 days, 2026-07-01 ~ 2026-07-01)
+- Consolidated Items: {count}
+"""
+
+    MONTHLY_ITEM = """### OPS
+
+- {summary}
+- Owner: COO
+- Event ID: {event_id}
+- Source: {day}.md
+"""
+
+    # Built from a list rather than one literal: the escapes belong to the
+    # document, not to this file.
+    LATE_SECTION = chr(10).join([
+        "## Late Events",
+        "",
+        "### OPS",
+        "",
+        "- late work",
+        "- Owner: COO",
+        "- Event ID: EVT-LATE",
+        "- Category: MILESTONE",
+        "",
+        "## Metadata",
+    ])
+
+    def _write_day(self, day, event_id=None, summary="work", *, newer=False):
+        """`newer=True` places this Daily file after the Monthly in time —
+        the only shape the prefilter lets through."""
+        body = (
+            self.EMPTY_DAILY.format(day=day)
+            if event_id is None
+            else self.DAILY.format(day=day, event_id=event_id, summary=summary)
+        )
+        path = self.daily / f"{day}.md"
+        path.write_text(body, encoding="utf-8")
+        stamp = self.base + (300 if newer else -300)
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def _write_monthly(self, entries):
+        items = "\n\n".join(
+            self.MONTHLY_ITEM.format(event_id=e, summary=s, day=d) for e, s, d in entries
+        )
+        path = self.monthly / "2026-07.md"
+        path.write_text(
+            self.MONTHLY.format(items=items, count=len(entries)), encoding="utf-8"
+        )
+        os.utime(path, (self.base, self.base))
+        return path
+
+    def _lagging(self, dirty=()):
+        return self._module()._monthly_lags_its_daily_source(
+            self.daily, self.monthly, dirty_months=tuple(dirty)
+        )
+
+    def test_an_item_added_after_consolidation_is_reported(self):
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([("EVT-1", "work", "2026-07-01")])
+        self._write_day("2026-07-02", "EVT-HAND", summary="a hand-written correction", newer=True)
+
+        self.assertEqual(self._lagging(), (("2026-07", ("EVT-HAND",)),))
+
+    def test_a_consistent_month_is_quiet(self):
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([("EVT-1", "work", "2026-07-01")])
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_month_whose_daily_files_are_all_older_is_not_even_read(self):
+        """The prefilter. A Monthly newer than every Daily it was built from
+        cannot have fallen behind, and the healthy tree is the common case."""
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([])  # deliberately inconsistent...
+        # ...but every Daily file predates it, so there is nothing to find.
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_restore_that_rewrites_every_mtime_reports_nothing(self):
+        """mtime is a prefilter and never the verdict — the month it lets
+        through is decided by reading the files."""
+        self._write_monthly([("EVT-1", "work", "2026-07-01")])
+        self._write_day("2026-07-01", "EVT-1", newer=True)
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_dirty_month_is_skipped(self):
+        """The next run rebuilds it; an alert the next run clears is the kind
+        this file keeps warning about."""
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([("EVT-1", "work", "2026-07-01")])
+        self._write_day("2026-07-02", "EVT-2", newer=True)
+
+        self.assertEqual(self._lagging(), (("2026-07", ("EVT-2",)),))
+        self.assertEqual(self._lagging(dirty=["2026-07"]), ())
+
+    def test_a_month_with_no_monthly_file_is_skipped(self):
+        """Not consolidated is not the same as behind."""
+        self._write_day("2026-07-01", "EVT-1")
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_bullet_shaped_summary_is_not_reported_as_missing(self):
+        """`- Event ID: …` written as a *summary* is prose, and the parser
+        this shares says so — otherwise every such day would report a
+        permanent phantom loss."""
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([("EVT-1", "Event ID: measured it.", "2026-07-01")])
+        self._write_day("2026-07-02", "EVT-2", summary="Event ID: measured it.", newer=True)
+        self._write_monthly(
+            [
+                ("EVT-1", "Event ID: measured it.", "2026-07-01"),
+                ("EVT-2", "Event ID: measured it.", "2026-07-02"),
+            ]
+        )
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_monthly_carrying_an_id_no_daily_has_is_not_reported(self):
+        """One direction only, the same one the sibling check takes: a
+        hand-edited Monthly is not a loss of Company History."""
+        self._write_day("2026-07-01", "EVT-1", newer=True)
+        self._write_monthly(
+            [("EVT-1", "work", "2026-07-01"), ("EVT-GHOST", "invented", "2026-07-01")]
+        )
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_the_attention_line_names_the_month_the_event_and_the_remedy(self):
+        import contextlib
+
+        from scheduler.state import SchedulerState
+        from scheduler.state import save_state as save_scheduler_state
+
+        runtime = self.root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (runtime / rel).mkdir(parents=True)
+        self.daily = runtime / "local_master" / "daily"
+        self.monthly = runtime / "local_master" / "monthly"
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([("EVT-1", "work", "2026-07-01")])
+        self._write_day("2026-07-02", "EVT-HAND", newer=True)
+        save_scheduler_state(
+            runtime / "state" / "daily_history_state.json",
+            SchedulerState(last_successful_daily_close=date(2026, 7, 2)),
+        )
+
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(NOW)
+
+        lines = [a for a in attention if "그 달 Monthly에는 없는" in a]
+        self.assertEqual(len(lines), 1, attention)
+        self.assertIn("2026-07", lines[0])
+        self.assertIn("EVT-HAND", lines[0])
+        self.assertIn("dirty", lines[0])
+        self.assertIn("Monthly 원본 미반영 : 2026-07 (1건)", buffer.getvalue())
+
+    def test_a_daily_this_cannot_read_is_skipped_not_raised(self):
+        """A corrupt Daily has its own reporters — `_daily_counts_more_than_
+        it_shows()` skips it, `find_orphaned_events()` names it, and
+        `read_daily_document()` raises a `DailyParseError` that names the
+        file. What this must not do is die on it: the whole point of the
+        status view is answering while part of the evidence is damaged
+        (docs/10 §46).
+
+        Skipping shrinks the source set, so it can hide a finding and never
+        invent one — the same direction everything else here fails towards.
+        """
+        self._write_day("2026-07-01", "EVT-1")
+        self._write_monthly([("EVT-1", "work", "2026-07-01")])
+        broken = self._write_day("2026-07-02", "EVT-2", newer=True)
+        broken.write_bytes(bytes([0xFF, 0xFE]) + b" not utf-8 at all")
+        stamp = self.base + 300
+        os.utime(broken, (stamp, stamp))
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_monthly_this_cannot_read_is_skipped_not_raised(self):
+        self._write_day("2026-07-01", "EVT-1")
+        monthly = self._write_monthly([("EVT-1", "work", "2026-07-01")])
+        self._write_day("2026-07-02", "EVT-2", newer=True)
+        monthly.write_bytes(bytes([0xFF, 0xFE]) + b" not utf-8 at all")
+        os.utime(monthly, (self.base, self.base))
+
+        self.assertEqual(self._lagging(), ())
+
+    def test_a_late_event_merged_into_a_consolidated_month_stays_quiet(self):
+        """The path that is already correct, pinned so this check cannot start
+        crying wolf on it: the Runner marks the month dirty for a Late Event
+        and rebuilds the month in the same run.
+
+        Driven through the real `consolidate_month()` rather than a
+        hand-written Monthly — the point is that what a rebuild produces
+        satisfies this check, not that a fixture does.
+
+        `_examine()` re-stamps the Daily file after every mutation so the
+        month is always read rather than prefiltered. Both writers here land
+        on the wall clock, and which of two same-instant mtimes compares
+        greater is not something a test may rest on; the property under test
+        is about content.
+        """
+        from monthly import consolidate_month, mark_month_dirty
+        from monthly.state import load_state
+
+        state_path = self.root / "monthly_history_state.json"
+
+        def _examine():
+            stamp = time.time() + 600
+            os.utime(self.daily / "2026-07-30.md", (stamp, stamp))
+            return self._lagging()
+
+        # `history_start_date` trims the month to these two days, so Daily
+        # Coverage is COMPLETE and the month is consolidatable (docs/09 §85).
+        self._write_day("2026-07-30", "EVT-1")
+        self._write_day("2026-07-31")
+        consolidate_month(
+            year=2026, month=7, daily_dir=self.daily, monthly_dir=self.monthly,
+            history_start_date=date(2026, 7, 30),
+            now=datetime(2026, 8, 1, 9, 0).astimezone(),
+        )
+        self.assertEqual(_examine(), ())
+
+        # a Late Event lands in a day of the already-consolidated month
+        path = self.daily / "2026-07-30.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("## Metadata", self.LATE_SECTION),
+            encoding="utf-8",
+        )
+        self.assertEqual(_examine(), (("2026-07", ("EVT-LATE",)),))
+
+        # ...and what the Runner does about it
+        mark_month_dirty(state_path, date(2026, 7, 30), monthly_dir=self.monthly)
+        self.assertEqual(
+            self._lagging(dirty=load_state(state_path).dirty_months),
+            (),
+            "a month awaiting rebuild must not be reported",
+        )
+        consolidate_month(
+            year=2026, month=7, daily_dir=self.daily, monthly_dir=self.monthly,
+            history_start_date=date(2026, 7, 30),
+            now=datetime(2026, 8, 5, 9, 0).astimezone(), allow_update=True,
+        )
+
+        self.assertIn(
+            "- Event ID: EVT-LATE",
+            (self.monthly / "2026-07.md").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(_examine(), ())
+
+
 class HoleInTheMonthlySequenceTests(unittest.TestCase):
     """The exact sibling of the Daily hole, one level up, and it was equally
     unwatched.
@@ -7491,3 +10007,1525 @@ class HoleInTheMonthlySequenceTests(unittest.TestCase):
 
         restored = (root / "monthly" / "2026-07.md").read_text(encoding="utf-8")
         self.assertIn("EVT-1", restored)
+
+
+class NotionQueueVisibilityTests(unittest.TestCase):
+    """C32 §14: the two Notion queues wrote `added_at` and `attempt_count`
+    and nothing ever read them.
+
+    Grepping the whole repository for a *consumer* of either field found
+    none — written by `retry_queue.upsert_entry()` and
+    `dashboard_pending.save_pending()`, round-tripped through JSON, and read
+    by no log line, no status view and no test outside the queue modules'
+    own. BUG-39's shape, in the place where it costs most.
+
+    What it cost: BUG-13 established that `NOTION_RETRY_REQUIRED` covers both
+    "Notion was briefly down" and "Notion will refuse this forever", and
+    fixed the *reason string* so `notion_sync.log` could tell them apart. The
+    queue's own two fields answer the other half — how long has this been
+    stuck, how many times has it been tried — and reached nobody.
+
+    The Run Manifest's `queued=` metric is not a substitute three ways over,
+    and the last test here pins the third: an entry whose `to_event()` fails
+    is counted by `app/runner.py` as `notion_unreadable`, is left in the
+    queue, and appears in no `queued` count at all.
+    """
+
+    def _load(self, runtime_dir: Path):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_notion_queue", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime_dir
+        return module
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "state").mkdir(parents=True)
+        return runtime
+
+    def _write_queue(self, runtime, entries):
+        (runtime / "state" / "notion_retry_queue.json").write_text(
+            json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _entry(self, event_id="EVT-1", *, added_at, attempt_count=1):
+        return {
+            "event_id": event_id,
+            "project_id": "PRJ",
+            "event_data": {"event_id": event_id},
+            "added_at": added_at,
+            "attempt_count": attempt_count,
+        }
+
+    def _run(self, runtime):
+        module = self._load(runtime)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            attention = module._print_notion(NOW)
+        return out.getvalue(), attention
+
+    def test_an_empty_queue_says_so_and_needs_nobody(self):
+        printed, attention = self._run(self._runtime())
+
+        self.assertIn("대기 중 Event       : 0", printed)
+        self.assertEqual(attention, [])
+
+    def test_a_fresh_entry_is_reported_without_raising_attention(self):
+        """The queue doing its job. An outage minutes old is what it is for,
+        and an alert that fires on it is one people learn to skim."""
+        runtime = self._runtime()
+        self._write_queue(
+            runtime,
+            [self._entry(added_at=(NOW - timedelta(hours=2)).isoformat())],
+        )
+
+        printed, attention = self._run(runtime)
+
+        self.assertIn("대기 중 Event       : 1", printed)
+        self.assertEqual(attention, [])
+
+    def test_a_long_stuck_entry_reaches_attention(self):
+        """The case BUG-13 named and nothing could see: an entry that has
+        outlived any plausible outage is probably a request Notion will keep
+        refusing."""
+        runtime = self._runtime()
+        self._write_queue(
+            runtime,
+            [
+                self._entry(
+                    "EVT-STUCK",
+                    added_at=(NOW - timedelta(days=9)).isoformat(),
+                    attempt_count=37,
+                )
+            ],
+        )
+
+        printed, attention = self._run(runtime)
+
+        self.assertIn("최대 재시도 횟수    : 37", printed)
+        self.assertEqual(len(attention), 1)
+        self.assertIn("EVT-STUCK", attention[0])
+        self.assertIn("37", attention[0])
+
+    def test_the_threshold_is_the_one_already_in_this_file(self):
+        """`SILENT_AFTER_DAYS` reused rather than a new number invented —
+        the same choice `_print_last_run()` made. Pinned so the two cannot
+        drift into two different ideas of "too long"."""
+        runtime = self._runtime()
+        module = self._load(runtime)
+        just_under = module.SILENT_AFTER_DAYS - 0.5
+        just_over = module.SILENT_AFTER_DAYS + 0.5
+
+        for days, expected in ((just_under, 0), (just_over, 1)):
+            with self.subTest(days=days):
+                self._write_queue(
+                    runtime,
+                    [self._entry(added_at=(NOW - timedelta(days=days)).isoformat())],
+                )
+                _, attention = self._run(runtime)
+                self.assertEqual(len(attention), expected)
+
+    def test_an_unparseable_added_at_is_skipped_and_said_out_loud(self):
+        """A queue file is JSON that `load_queue()` shape-checks and never
+        validates as timestamps. Guessing at one would be worse than saying
+        it could not be read — but it must still be *counted*, or the entry
+        disappears from the block that exists to count it."""
+        runtime = self._runtime()
+        self._write_queue(
+            runtime,
+            [
+                self._entry("EVT-BAD", added_at="yesterday"),
+                self._entry("EVT-ALSO-BAD", added_at=""),
+            ],
+        )
+
+        printed, attention = self._run(runtime)
+
+        self.assertIn("대기 중 Event       : 2", printed)
+        self.assertIn("added_at을 읽을 수 없는 항목 2건", printed)
+        # Nothing datable, so nothing can be called stale — but the two
+        # entries are still on the count above, which is the point.
+        self.assertEqual(attention, [])
+
+    def test_a_naive_added_at_is_compared_rather_than_discarded(self):
+        """The naive/aware guard, and the reason it is a guard rather than a
+        rejection. `_print_last_run()` already treats a naive `started_at`
+        this way — both sides are made naive and compared — so a state file
+        restored from a backup that lost its offsets still ages correctly
+        instead of silently dropping out of the check.
+
+        Comparing the two directly is the TypeError BUG-29 was about, one
+        module over; discarding the value instead would be the silence this
+        whole block was added to remove.
+        """
+        runtime = self._runtime()
+        self._write_queue(
+            runtime,
+            [self._entry("EVT-NAIVE", added_at="2026-08-01T10:00:00")],
+        )
+
+        printed, attention = self._run(runtime)
+
+        self.assertNotIn("읽을 수 없는 항목", printed)
+        self.assertIn("EVT-NAIVE", printed)
+        self.assertEqual(len(attention), 1)
+
+    def test_a_corrupt_queue_file_is_reported_not_raised(self):
+        """This view's contract is that it answers even when the evidence is
+        damaged — and a Retry Queue the Runner cannot read is a run that
+        fails at step 4."""
+        runtime = self._runtime()
+        (runtime / "state" / "notion_retry_queue.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        printed, attention = self._run(runtime)
+
+        self.assertIn("손상된 Retry Queue", printed)
+        self.assertTrue(any("읽을 수 없다" in item for item in attention))
+
+    def test_a_corrupt_dashboard_pending_file_is_reported_not_raised(self):
+        """Worse than the queue's, and quieter: `drain_pending()` absorbs a
+        damaged file as "nothing to drain" (CEO ④ — a Dashboard problem must
+        never interrupt the Runtime), so the backlog is never retried and
+        nothing outside that one return value says so."""
+        runtime = self._runtime()
+        (runtime / "state" / "dashboard_pending.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        printed, attention = self._run(runtime)
+
+        self.assertIn("손상된 Dashboard 대기열", printed)
+        self.assertTrue(any("영원히 재시도되지 않는다" in item for item in attention))
+
+    def test_the_dashboard_backlog_depth_is_reported(self):
+        runtime = self._runtime()
+        (runtime / "state" / "dashboard_pending.json").write_text(
+            json.dumps(
+                {
+                    "entries": [
+                        {
+                            "run_id": "R-1",
+                            "properties": {},
+                            "queued_at": NOW.isoformat(),
+                            "attempt_count": 12,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        printed, _ = self._run(runtime)
+
+        self.assertIn("Dashboard 밀린 기록 : 1", printed)
+        self.assertIn("최대 재시도 횟수    : 12", printed)
+
+    def test_a_queued_entry_the_runner_cannot_parse_is_still_counted(self):
+        """The third reason the manifest's `queued=` is not a substitute.
+
+        `app/runner.py` step 4a calls `queued_entry.to_event()`; when that
+        raises it records the id under `notion_unreadable`, logs
+        `NOTION_UNREADABLE queued:<id>`, and **leaves the entry in the
+        queue** — it never becomes a `SyncResult`, so it is in no `queued`
+        count. Measured here as the shape it takes on disk: an entry whose
+        `event_data` is not a valid Event.
+        """
+        runtime = self._runtime()
+        self._write_queue(
+            runtime,
+            [
+                {
+                    "event_id": "EVT-UNPARSEABLE",
+                    "project_id": "PRJ",
+                    "event_data": {"event_id": "EVT-UNPARSEABLE"},  # not an Event
+                    "added_at": (NOW - timedelta(days=30)).isoformat(),
+                    "attempt_count": 1,
+                }
+            ],
+        )
+
+        from events import EventValidationError
+        from notion.retry_queue import load_queue
+
+        entry = load_queue(runtime / "state" / "notion_retry_queue.json")[0]
+        with self.assertRaises(EventValidationError):
+            entry.to_event()
+
+        printed, attention = self._run(runtime)
+
+        self.assertIn("대기 중 Event       : 1", printed)
+        self.assertTrue(any("EVT-UNPARSEABLE" in item for item in attention))
+
+    def test_the_block_is_wired_into_the_status_view(self):
+        """A detector nothing runs detects nothing — the exact gap
+        `diagnose_dashboard_bootstrap()` sat in until C31."""
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        main_body = source.split("def main(", 1)[1]
+
+        self.assertIn("_print_notion(now)", main_body)
+
+    def test_the_paths_are_derived_per_call_from_runtime_dir(self):
+        """C31 §10's trap: a path frozen at import makes `RUNTIME_DIR` a knob
+        that only half works, and this block would read the developer's live
+        queue while every other block read the fixture."""
+        runtime = self._runtime()
+        module = self._load(runtime)
+
+        self.assertEqual(
+            module._notion_retry_queue_path(),
+            runtime / "state" / "notion_retry_queue.json",
+        )
+        self.assertEqual(
+            module._dashboard_pending_path(),
+            runtime / "state" / "dashboard_pending.json",
+        )
+
+    def test_the_derived_paths_match_the_queue_modules_own_defaults(self):
+        """Deriving from `RUNTIME_DIR` is a second statement of where these
+        files live, so the two must be checked against each other — by
+        basename and parent, which is all the two agree on once `RUNTIME_DIR`
+        is redirected."""
+        from notion.dashboard_pending import DEFAULT_DASHBOARD_PENDING_PATH
+        from notion.retry_queue import DEFAULT_QUEUE_PATH
+
+        runtime = self._runtime()
+        module = self._load(runtime)
+
+        for derived, default in (
+            (module._notion_retry_queue_path(), DEFAULT_QUEUE_PATH),
+            (module._dashboard_pending_path(), DEFAULT_DASHBOARD_PENDING_PATH),
+        ):
+            with self.subTest(default=default.name):
+                self.assertEqual(derived.name, default.name)
+                self.assertEqual(derived.parent.name, default.parent.name)
+
+
+class ManifestRenderedByTwoEntrypointsTests(unittest.TestCase):
+    """C32 §17: the Run Manifest is rendered twice, and only one renderer
+    guarded what it printed.
+
+    `run_summary.json` is read back by `ops_status.py::_print_last_run()` and
+    by `run_company_ops.py::_report_run_summary()`. `read_summary()`
+    validates exactly three fields — `status`, `severity`, `retryability`,
+    all enums. `name`, `classification`, `reason`, `metrics` and
+    `artifact_refs` come back as whatever the JSON holds.
+
+    The two renderers disagreed about every one of them:
+
+        field               ops_status.py        run_company_ops.py
+        component.name      one_line()           raw
+        classification      one_line()           raw
+        reason              not printed at all   raw
+        metrics key         raw                  not printed
+        metrics value       one_line()           not printed
+        artifact_refs       raw                  raw
+
+    `reason` is the one that matters most. `app/runner.py` records
+    `reason=queued[0].error` for NOTION_SYNC_INCOMPLETE, and that is the
+    remote HTTP response body C31 §7 added `redact(one_line(...))` for —
+    twenty lines above, in the same file. The body redacted on one line was
+    printed in full, from disk, three functions later.
+
+    A restored or hand-edited manifest is a DR path, not an exotic one, and
+    the ops_status half's own comment already said so: *"the rule that
+    nothing read back from disk can forge a line should not depend on today's
+    metric list staying the way it is"* — which is about the metric *keys*,
+    and the guard was on the values.
+    """
+
+    FAKE_TOKEN = "ghp_" + "c" * 30
+
+    def _manifest(self, path: Path, *, reason="", name="notion_sync",
+                  classification="NOTION_SYNC_INCOMPLETE", metrics=None,
+                  artifact_refs=()):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "R-1",
+                    "started_at": "2026-08-10T09:00:00+09:00",
+                    "finished_at": "2026-08-10T09:00:05+09:00",
+                    "components": [
+                        {
+                            "name": name,
+                            "status": "FAILED",
+                            "failure": {
+                                "classification": classification,
+                                "severity": "DEGRADED",
+                                "retryability": "RETRYABLE",
+                                "reason": reason,
+                            },
+                            "metrics": metrics or {},
+                            "artifact_refs": list(artifact_refs),
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    # ---------------------------------------------------- run_company_ops.py
+
+    def _report(self, manifest_path):
+        import importlib.util
+
+        from runsummary import read_summary
+
+        path = Path(__file__).resolve().parents[1] / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_sink", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        summary = read_summary(manifest_path)
+
+        class _Result(tuple):
+            summary = None
+
+        result = _Result(())
+        result.summary = summary
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            module._report_run_summary(result)
+        return out.getvalue()
+
+    def test_a_remote_response_body_in_reason_is_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "run_summary.json",
+                reason=(
+                    "Notion API returned 502: Bad Gateway | "
+                    f"Authorization: Bearer {self.FAKE_TOKEN}"
+                ),
+            )
+            printed = self._report(manifest)
+
+        self.assertNotIn(self.FAKE_TOKEN, printed)
+        self.assertIn("[REDACTED]", printed)
+
+    def test_a_reason_cannot_forge_a_component_row(self):
+        forged = "  [backup] BACKUP_SUCCESS (severity=NONE, retry=NONE)"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "run_summary.json", reason="502 Bad Gateway\n" + forged
+            )
+            printed = self._report(manifest)
+
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [])
+        self.assertIn("\\n", printed)
+
+    def test_a_component_name_cannot_forge_the_overall_status_line(self):
+        forged = "실행 상태: SUCCESS"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "run_summary.json", name="notion_sync\n" + forged
+            )
+            printed = self._report(manifest)
+
+        self.assertEqual(
+            sum(1 for ln in printed.splitlines() if ln.startswith("실행 상태:")),
+            1,
+            printed,
+        )
+
+    def test_an_artifact_ref_cannot_forge_a_line(self):
+        forged = "      evidence: nothing to see"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "run_summary.json",
+                reason="r",
+                artifact_refs=("runtime/logs/x.log\n" + forged,),
+            )
+            printed = self._report(manifest)
+
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [])
+
+    # ---------------------------------------------------------- ops_status.py
+
+    def _last_run(self, manifest_path):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_manifest_sink", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.DEFAULT_RUN_SUMMARY_PATH = manifest_path
+        module.RUNTIME_DIR = manifest_path.parent.parent
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            module._print_last_run(NOW)
+        return out.getvalue()
+
+    def test_a_metric_key_cannot_forge_a_line(self):
+        """The half the guard missed, under a comment about exactly it."""
+        forged = "      queued=0 unreadable=0"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                reason="r",
+                metrics={"queued\n" + forged: 47},
+            )
+            printed = self._last_run(manifest)
+
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [])
+        self.assertIn("\\n", printed)
+
+    def test_a_metric_value_is_still_guarded(self):
+        """The half that was already right — pinned so widening the guard
+        did not narrow it."""
+        forged = "      queued=0"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                reason="r",
+                metrics={"queued": "47\n" + forged},
+            )
+            printed = self._last_run(manifest)
+
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [])
+
+    def test_an_artifact_ref_cannot_forge_a_line_in_the_status_view_either(self):
+        forged = "  종합 상태   : SUCCESS (exit 0)"
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                reason="r",
+                artifact_refs=("runtime/logs/x.log\n" + forged,),
+            )
+            printed = self._last_run(manifest)
+
+        self.assertEqual(
+            sum(1 for ln in printed.splitlines() if ln == forged), 0, printed
+        )
+
+    def test_ops_status_still_does_not_print_reason(self):
+        """The deliberate difference between the two renderers, pinned. This
+        one avoids the problem rather than guarding it, and that choice is
+        recorded in its own comment."""
+        secret = "Bearer " + "d" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json", reason=secret
+            )
+            printed = self._last_run(manifest)
+
+        self.assertNotIn(secret, printed)
+        self.assertNotIn("[REDACTED]", printed)
+
+    def test_read_summary_validates_only_the_three_enums(self):
+        """Why every other field needs a guard at the sink: nothing upstream
+        constrains them. Checked against the loader rather than assumed."""
+        import inspect
+
+        from runsummary import read_summary
+
+        source = inspect.getsource(read_summary)
+
+        for validated in ("ComponentStatus(", "Severity(", "Retryability("):
+            with self.subTest(field=validated):
+                self.assertIn(validated, source)
+        for raw in ('c["name"]', 'c["failure"]["classification"]',
+                    'c["failure"].get("reason", "")', 'c.get("metrics", {})'):
+            with self.subTest(field=raw):
+                self.assertIn(raw, source)
+
+
+class BackupFailureReportSinkTests(unittest.TestCase):
+    """C32 §18: `[FAILED] Backup: {exc}` printed another program's stderr raw.
+
+    `backup/git_ops._run_git()` builds every `GitOperationError` as
+    `f"git ... failed (exit {code}): {result.stderr.strip()}"` — multi-line
+    output from a subprocess. On a push failure git echoes the remote URL,
+    and a `https://<token>@github.com/...` remote carries the credential in
+    it. `oplog.SECRET_PATTERNS` already knows the GitHub token shapes;
+    nothing was applying them here, in the one message an operator reads when
+    a Backup fails.
+
+    The classification is deliberately still computed from the RAW message:
+    `is_authentication_failure()` matches git's own wording, and running it
+    on a redacted string would let a substitution eat the phrase the
+    BACKUP_FAILED-vs-BACKUP_PENDING decision depends on.
+    """
+
+    FAKE_PAT = "ghp_" + "e" * 30
+
+    def _report(self, message):
+        import importlib.util
+
+        from backup.git_ops import GitOperationError
+
+        path = Path(__file__).resolve().parents[1] / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_backup", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = module._report_backup_failure(GitOperationError(message), None)
+        return err.getvalue(), code
+
+    def test_a_token_in_the_remote_url_is_redacted(self):
+        printed, _ = self._report(
+            "git push origin main failed (exit 128): "
+            f"fatal: Authentication failed for 'https://{self.FAKE_PAT}@github.com/x/y.git'"
+        )
+
+        self.assertNotIn(self.FAKE_PAT, printed)
+        self.assertIn("[REDACTED]", printed)
+
+    def test_git_stderr_cannot_forge_a_line_of_the_report(self):
+        """The forged line is one this report never writes — a reassurance
+        that would tell an operator to stop looking. Deliberately not one of
+        the report's own sentences: those appear legitimately, and a test
+        that could not tell the two apart would prove nothing."""
+        forged = "이 실패는 무시해도 됩니다 — 확인할 것 없음"
+        printed, _ = self._report(
+            "git push origin main failed (exit 128): remote rejected\n" + forged
+        )
+
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [])
+        self.assertIn("\\n", printed)
+
+    def test_the_classification_still_reads_the_raw_message(self):
+        """Redacting before classifying would change the verdict, not just
+        the wording. An auth failure must still be called permanent."""
+        printed, _ = self._report(
+            "git push origin main failed (exit 128): "
+            f"fatal: Authentication failed for 'https://{self.FAKE_PAT}@github.com/x/y.git'"
+        )
+
+        self.assertIn("인증/권한 문제로 분류되어 BACKUP_FAILED", printed)
+
+    def test_a_transient_failure_is_still_classified_transient(self):
+        printed, _ = self._report(
+            "git push origin main timed out after 300s (no output; the remote "
+            "may be unreachable or waiting for credentials)"
+        )
+
+        self.assertIn("BACKUP_PENDING", printed)
+
+
+class WrittenAndNeverReadFieldTests(unittest.TestCase):
+    """C32 §20: a sweep of every dataclass field with no production reader.
+
+    §14 found two such fields by hand (`RetryQueueEntry.added_at` and
+    `attempt_count`). Rather than stop at two, every `@dataclass` field in
+    `src/` and the root entrypoints was walked with AST and cross-checked
+    against every attribute *load* in the same set — 255 fields, 36 modules.
+    Thirty had no reader outside their own defining module.
+
+    Most are legitimate: a field the defining module itself renders into a
+    log line, a value carried for a caller that has not needed it yet, a
+    known dead capability already recorded (`RoleActivity.by_category`,
+    C31 §16). Three were not, and all three were the same shape — the file
+    or the timestamp a person needs in order to act, recorded and never
+    shown:
+
+        RunSummary.finished_at              no reader at all, not even a test
+        UnreadableEvent.event_path          ATTENTION said "N건", named none
+        PendingDashboardRecord.queued_at    age reported for the sibling
+                                            queue and not for this one
+
+    The remaining twenty-seven are pinned in BACKLOG rather than here: this
+    class exists for the three that were closed, so that closing them cannot
+    quietly come undone.
+    """
+
+    def _load_status(self, runtime_dir=None):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_unread", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if runtime_dir is not None:
+            module.RUNTIME_DIR = runtime_dir
+        return module
+
+    def _runtime(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "state").mkdir(parents=True)
+        return runtime
+
+    # ------------------------------------------------ RunSummary.finished_at
+
+    def _manifest(self, path, *, started, finished):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "R-1",
+                    "started_at": started,
+                    "finished_at": finished,
+                    "components": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _last_run(self, manifest_path):
+        module = self._load_status(manifest_path.parent.parent)
+        module.DEFAULT_RUN_SUMMARY_PATH = manifest_path
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            module._print_last_run(NOW)
+        return out.getvalue()
+
+    def test_the_run_duration_is_shown(self):
+        """Two timestamps were on disk and neither was ever subtracted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                started="2026-08-10T09:00:00+09:00",
+                finished="2026-08-10T09:02:03+09:00",
+            )
+            printed = self._last_run(manifest)
+
+        self.assertIn("소요 시간   : 123.0s", printed)
+
+    def test_an_unparseable_finished_at_is_skipped_not_guessed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                started="2026-08-10T09:00:00+09:00",
+                finished="who knows",
+            )
+            printed = self._last_run(manifest)
+
+        self.assertNotIn("소요 시간", printed)
+        self.assertIn("실행 시각", printed)
+
+    def test_a_mixed_naive_and_aware_pair_is_skipped(self):
+        """Comparing them directly is the TypeError BUG-29 was about; a
+        restored manifest can carry either shape."""
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                started="2026-08-10T09:00:00+09:00",
+                finished="2026-08-10T09:02:03",
+            )
+            printed = self._last_run(manifest)
+
+        self.assertNotIn("소요 시간", printed)
+
+    def test_a_finished_at_before_started_at_is_not_reported_as_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._manifest(
+                Path(tmp) / "state" / "run_summary.json",
+                started="2026-08-10T09:02:03+09:00",
+                finished="2026-08-10T09:00:00+09:00",
+            )
+            printed = self._last_run(manifest)
+
+        self.assertNotIn("소요 시간", printed)
+
+    # --------------------------------------------- UnreadableEvent.event_path
+
+    def test_an_unreadable_processed_event_is_named(self):
+        """`UnreadableEvent` carries `event_path` so a person can open the
+        file; the ATTENTION line said "N건" and named none. Every sibling
+        line in this view names up to five."""
+        runtime = self._runtime()
+        processed = runtime / "events" / "processed"
+        processed.mkdir(parents=True)
+        (processed / "broken-event.json").write_text("{not json", encoding="utf-8")
+        (runtime / "local_master" / "daily").mkdir(parents=True)
+        _healthy_backup_state(runtime / "state")
+
+        module = self._load_status(runtime)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            attention = module._print_history(NOW)
+
+        named = [item for item in attention if "읽을 수 없는 Event" in item]
+        self.assertEqual(len(named), 1, attention)
+        self.assertIn("broken-event.json", named[0])
+
+    # --------------------------------------- PendingDashboardRecord.queued_at
+
+    def _pending(self, runtime, queued_at, *, attempt_count=1, run_id="R-OLD"):
+        (runtime / "state" / "dashboard_pending.json").write_text(
+            json.dumps(
+                {
+                    "entries": [
+                        {
+                            "run_id": run_id,
+                            "properties": {},
+                            "queued_at": queued_at,
+                            "attempt_count": attempt_count,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _notion(self, runtime):
+        module = self._load_status(runtime)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            attention = module._print_notion(NOW)
+        return out.getvalue(), attention
+
+    def test_the_oldest_pending_dashboard_record_is_dated(self):
+        runtime = self._runtime()
+        self._pending(runtime, (NOW - timedelta(hours=3)).isoformat())
+
+        printed, attention = self._notion(runtime)
+
+        self.assertIn("가장 오래된 기록", printed)
+        self.assertEqual(attention, [])
+
+    def test_a_long_stuck_dashboard_record_reaches_attention(self):
+        """A record Notion permanently refuses comes back every run with
+        nothing but `attempt_count` climbing — the diagnostic blank
+        `DrainPendingResult.last_reason` was added for, and this is the line
+        that points at it."""
+        runtime = self._runtime()
+        self._pending(
+            runtime,
+            (NOW - timedelta(days=11)).isoformat(),
+            attempt_count=53,
+            run_id="R-STUCK",
+        )
+
+        printed, attention = self._notion(runtime)
+
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("R-STUCK", attention[0])
+        self.assertIn("53", attention[0])
+        self.assertIn("DRAIN_PENDING", attention[0])
+
+    def test_the_stuck_record_line_names_the_command_that_fixes_it(self):
+        """C36: the reason was already legible and the way out was not.
+
+        `OPS_RUNS` grew 13 -> 17 columns across C32/C33, so a database made
+        before a widening 400s on every run, forever. That is the most likely
+        REASON behind a record stuck for days, and the line an operator reads
+        should not stop at "go read the log". The pointer is only worth
+        printing if it lands somewhere, so this checks the section exists.
+        """
+        runtime = self._runtime()
+        self._pending(runtime, (NOW - timedelta(days=11)).isoformat())
+
+        _, attention = self._notion(runtime)
+
+        self.assertIn("docs/13 §3-⑧-4", attention[0])
+        setup_doc = (
+            Path(__file__).resolve().parents[1]
+            / "docs"
+            / "13_NOTION_ENVIRONMENT_SETUP.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("⑧-4", setup_doc)
+        self.assertIn("bootstrap_dashboard_properties", setup_doc)
+
+    def test_an_unparseable_queued_at_does_not_break_the_block(self):
+        runtime = self._runtime()
+        self._pending(runtime, "not a timestamp")
+
+        printed, attention = self._notion(runtime)
+
+        self.assertIn("Dashboard 밀린 기록 : 1", printed)
+        self.assertNotIn("가장 오래된 기록", printed)
+        self.assertEqual(attention, [])
+
+    def test_the_two_queues_are_aged_by_the_same_helper(self):
+        """The asymmetry this closed: reporting one queue's age and not the
+        other's, inside the block added to remove exactly that."""
+        import inspect
+
+        module = self._load_status()
+        source = inspect.getsource(module._print_notion)
+
+        self.assertEqual(source.count("_queue_age_days("), 2)
+
+
+class ReconciliationLockAwarenessTests(unittest.TestCase):
+    """The orphan report's "Runner 실행 중" caveat, and the promise beside it.
+
+    `find_orphaned_events()` compares consumed Events against stored
+    Candidates, and a Runner part-way between step 4 and step 5 makes a
+    perfectly healthy Event look orphaned: the Collector moves the whole
+    batch into `processed/` before the History Filter writes Candidates one
+    at a time. So `ops_status.py` appends a sentence when the Runner lock is
+    held — and, deliberately, removes nothing:
+
+        The list is NOT filtered or suppressed: a real loss hidden behind
+        "probably just running" is far worse than a false alarm, and this
+        cannot tell the two apart. A sentence is added, nothing is removed.
+
+    **This class is written because BACKLOG cited it and it did not exist.**
+    The A-20 entry lists `tests/test_observability.py::ReconciliationLockAwarenessTests`
+    (4건) as the evidence for the ops_status half of `is_locked()`; sweeping
+    every test name the BACKLOG cites found this one class missing, while
+    `IsLockedTests` (the lock half, in `test_lock_atomicity.py`) was there.
+    The behaviour was live and untested — including the "nothing is removed"
+    half, which is the one that decides whether a data-loss report can be
+    silenced by a lock file.
+
+    The stale-lock case is the reason that matters most: a lock whose
+    process is dead must not attach the caveat, or a crashed Runner would
+    permanently excuse every orphan report on the machine.
+    """
+
+    def _load(self, runtime_dir: Path):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_orphan_lock", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime_dir
+        return module
+
+    def _runtime(self, *, orphans=1):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for rel in (
+            "state",
+            "locks",
+            "local_master/daily",
+            "events/processed",
+            "history_candidates/keep",
+            "history_candidates/review",
+        ):
+            (runtime / rel).mkdir(parents=True)
+        # Consumed Events with no Candidate: A-20's shape, which is what the
+        # orphan detector reports. `create_event` so the files are real
+        # Events rather than a shape this test invented.
+        for index in range(orphans):
+            event = create_event(
+                source="DESKTOP_1",
+                role="COO",
+                project_id="PRJ_ORPHAN",
+                event_type="MILESTONE_COMPLETED",
+                status="IN_PROGRESS",
+                summary=f"orphan {index}",
+                history_candidate=True,
+                event_id=f"EVT-ORPHAN-{index}",
+                timestamp="2026-08-05T10:00:00+09:00",
+                milestone=f"M{index}",
+            )
+            (runtime / "events" / "processed" / f"{event.event_id}.json").write_text(
+                json.dumps(event.to_dict()), encoding="utf-8"
+            )
+        _healthy_backup_state(runtime / "state")
+        return runtime
+
+    def _lock(self, runtime, *, pid):
+        (runtime / "locks" / "company_ops.lock").write_text(
+            json.dumps(
+                {"process_id": pid, "created_at": NOW.isoformat(timespec="seconds")}
+            ),
+            encoding="utf-8",
+        )
+
+    def _orphan_alert(self, runtime):
+        module = self._load(runtime)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            attention = module._print_history(NOW)
+        matching = [item for item in attention if "History에 들어가지 못한" in item]
+        self.assertEqual(len(matching), 1, attention)
+        return matching[0]
+
+    def test_no_lock_means_no_caveat(self):
+        alert = self._orphan_alert(self._runtime())
+
+        self.assertIn("EVT-ORPHAN-0", alert)
+        self.assertNotIn("Runner 실행 중", alert)
+
+    def test_a_live_lock_adds_the_caveat(self):
+        runtime = self._runtime()
+        self._lock(runtime, pid=os.getpid())
+
+        alert = self._orphan_alert(runtime)
+
+        self.assertIn("Runner 실행 중", alert)
+
+    def test_the_caveat_never_shortens_the_list(self):
+        """The half the comment insists on. Same runtime, same orphans, lock
+        on and off — the only difference allowed is the appended sentence."""
+        without = self._runtime(orphans=3)
+        with_lock = self._runtime(orphans=3)
+        self._lock(with_lock, pid=os.getpid())
+
+        quiet = self._orphan_alert(without)
+        running = self._orphan_alert(with_lock)
+
+        self.assertTrue(running.startswith(quiet))
+        self.assertEqual(running[len(quiet) :], " (Runner 실행 중 — 완료 후 재확인 권장)")
+        for index in range(3):
+            with self.subTest(orphan=index):
+                self.assertIn(f"EVT-ORPHAN-{index}", running)
+
+    def test_a_stale_lock_does_not_excuse_the_orphans(self):
+        """A lock file whose process is gone is not a running Runner. If it
+        attached the caveat anyway, one crashed run would put "probably just
+        running" on every orphan report from then on — BUG-42's silence in a
+        different costume."""
+        runtime = self._runtime()
+        # A pid that cannot be alive: 0 is never a user process, and
+        # `is_locked()` is the function under test for exactly this.
+        self._lock(runtime, pid=0)
+
+        alert = self._orphan_alert(runtime)
+
+        self.assertIn("EVT-ORPHAN-0", alert)
+        self.assertNotIn("Runner 실행 중", alert)
+
+
+class TheTwoSecretProbesFailInOppositeDirectionsTests(unittest.TestCase):
+    """When git cannot answer, one probe over-reports and the other goes
+    silent — on purpose, and in the direction that keeps a real exposure
+    visible in both cases.
+
+        `_would_reach_the_commit(candidates)`  a FILTER over a set it was
+                                               handed. Failing open returns
+                                               the candidates unchanged, so
+                                               a real secret stays named.
+        `_secrets_ever_committed(working_copy)` a PRODUCER of a claim about
+                                               git history. Failing open
+                                               would invent a leak, so it
+                                               returns nothing.
+
+    `_secrets_ever_committed()`'s own docstring states the asymmetry and why
+    ("That probe filters a set it was handed, so failing open keeps a real
+    exposure visible. This one *adds* a claim about history; if git cannot
+    answer, asserting a leak would be inventing one"). **Nothing tested it.**
+    A line-coverage pass including the root scripts (C41) showed both
+    fail-safe returns unexecuted, and the existing check at least
+    (`_would_reach_the_commit(Path("/nonexistent"), ())`) passes an empty
+    candidate set, which cannot tell failing open from failing closed.
+
+    That matters because the two are one refactor apart from swapping. A
+    filter that failed closed would delete a live-credential warning; a
+    producer that failed open would cry leak on every machine without git,
+    and the alert nobody believes is the one nobody reads.
+
+    The stimulus is a directory that is not a git repository — `git rev-list`
+    and `git ls-files` both exit non-zero. That is a real state: docs/08 §30
+    permits re-creating the Working Copy, and `WorkingCopyDestroyedTests`
+    already covers losing it.
+    """
+
+    SECRET = "daily/id_rsa"
+
+    def _load(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_failsafe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _not_a_repository(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "daily").mkdir(parents=True)
+        (root / "daily" / "id_rsa").write_text("not a real key", encoding="utf-8")
+        return root
+
+    def test_the_filter_fails_open_and_keeps_naming_the_file(self):
+        module = self._load()
+        working_copy = self._not_a_repository()
+
+        self.assertEqual(
+            module._would_reach_the_commit(working_copy, (self.SECRET,)),
+            (self.SECRET,),
+        )
+
+    def test_the_producer_falls_silent_rather_than_inventing_a_leak(self):
+        module = self._load()
+
+        self.assertEqual(module._secrets_ever_committed(self._not_a_repository()), ())
+
+    def test_a_missing_directory_is_handled_the_same_way_by_both(self):
+        """The other unexercised guard, and the ordinary case on a machine
+        where Backup was never configured."""
+        module = self._load()
+        missing = Path(tempfile.mkdtemp()) / "never_created"
+
+        self.assertEqual(
+            module._would_reach_the_commit(missing, (self.SECRET,)), (self.SECRET,)
+        )
+        self.assertEqual(module._secrets_ever_committed(missing), ())
+
+    def test_the_directions_really_are_opposite(self):
+        """Stated as one assertion, so the pair cannot drift into agreeing.
+        Two probes that both failed the same way would be a posture change,
+        not a refactor, and this is where it would show."""
+        module = self._load()
+        working_copy = self._not_a_repository()
+
+        filtered = module._would_reach_the_commit(working_copy, (self.SECRET,))
+        produced = module._secrets_ever_committed(working_copy)
+
+        self.assertTrue(filtered, "the filter must fail open")
+        self.assertFalse(produced, "the producer must fail closed")
+
+    def test_the_working_copy_really_is_unreadable_by_git(self):
+        """Guards the guard: if the directory were a valid repository the
+        assertions above would be measuring the ordinary path and would pass
+        for the wrong reason."""
+        import subprocess
+
+        working_copy = self._not_a_repository()
+
+        result = subprocess.run(
+            ["git", "rev-list", "--all", "--objects"],
+            cwd=working_copy,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+
+
+class SecretShapedEventContentTests(unittest.TestCase):
+    """C47: the strongest secret guard in this project only covers one door.
+
+    `parse_signal()` runs `find_secret_material()` over the whole payload and
+    REFUSES a Signal carrying secret-shaped text. An Event arriving from
+    another Desktop over OneDrive, or written by hand (docs/11 allows this on
+    Desktop 4), never meets that function -- it meets `validate_event()`,
+    which type-checks fields and cross-checks `event_type` against `status`
+    and reads no content whatsoever.
+
+    Measured end to end through the real Runner, one Event whose `summary`
+    carries a secret-shaped string and which did not come from this machine's
+    Agent:
+
+        validate_event()          []          <- no errors
+        Daily History written     yes, string intact
+        git show origin/main:...  string intact
+        scan_for_secrets()        ()          <- names only, never content
+        oplog.redact() on a log   [REDACTED]
+
+    The one place the string is scrubbed is the log; the one place it is kept
+    forever is Company History and the backup remote.
+
+    These tests fix the report, not a refusal. Refusing would route the Event
+    to `rejected/` and delete that work from Company History -- the same trade
+    the source/role mismatch records, a decision, SKIPped in BACKLOG.
+    """
+
+    SECRET = "ntn_" + "A1b2C3d4E5f6G7h8"
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_secret", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _processed(self, module):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        processed = module.RUNTIME_DIR / "events" / "processed"
+        processed.mkdir(parents=True)
+        return processed
+
+    def _write(self, processed, name, **overrides):
+        payload = {
+            "schema_version": "1.0",
+            "event_id": "E1",
+            "timestamp": "2026-08-09T10:00:00+09:00",
+            "source": "DESKTOP_2",
+            "role": "CMO",
+            "project_id": "PRJ",
+            "event_type": "MILESTONE_COMPLETED",
+            "status": "IN_PROGRESS",
+            "milestone": "M1",
+            "summary": "ordinary work",
+            "blocker": None,
+            "evidence": [],
+            "history_candidate": True,
+        }
+        payload.update(overrides)
+        (processed / name).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        return payload
+
+    def test_a_clean_processed_directory_says_nothing(self):
+        """The property that decides whether this line is usable at all: on a
+        healthy runtime it must be silent, or it joins the alerts operators
+        learn to skim past."""
+        module = self._load_entrypoint()
+        processed = self._processed(module)
+        for index in range(5):
+            self._write(processed, f"e{index}.json", event_id=f"E{index}")
+
+        self.assertEqual(module._secret_shaped_event_content(processed), ())
+
+    def test_a_secret_in_the_summary_is_found_and_attributed(self):
+        module = self._load_entrypoint()
+        processed = self._processed(module)
+        self._write(processed, "clean.json", event_id="CLEAN")
+        self._write(
+            processed,
+            "leak.json",
+            event_id="LEAK",
+            summary=f"rotated the workspace token to {self.SECRET}",
+        )
+
+        found = module._secret_shaped_event_content(processed)
+
+        self.assertEqual(len(found), 1)
+        event_id, source, filename, fields = found[0]
+        self.assertEqual((event_id, source, filename), ("LEAK", "DESKTOP_2", "leak.json"))
+        self.assertEqual(fields, "summary")
+
+    def test_the_matched_text_is_never_returned(self):
+        """`find_secret_material()`'s own rule, applied here: a report of a
+        leaked credential must not become the second copy of it."""
+        module = self._load_entrypoint()
+        processed = self._processed(module)
+        self._write(processed, "leak.json", event_id="LEAK", summary=f"key {self.SECRET}")
+
+        found = module._secret_shaped_event_content(processed)
+
+        for value in found[0]:
+            self.assertNotIn(self.SECRET, value)
+
+    def test_every_text_carrying_field_is_scanned(self):
+        """Each field separately, because a list that silently covers four of
+        five is worse than no list -- it reads as complete."""
+        module = self._load_entrypoint()
+        cases = {
+            "event_id": {"event_id": self.SECRET},
+            "project_id": {"project_id": self.SECRET},
+            "milestone": {"milestone": self.SECRET},
+            "summary": {"summary": self.SECRET},
+            "blocker": {"blocker": self.SECRET, "event_type": "BLOCKED",
+                        "status": "BLOCKED"},
+            "evidence": {"evidence": ["notes.md", self.SECRET]},
+        }
+        for field, overrides in cases.items():
+            with self.subTest(field=field):
+                processed = self._processed(module)
+                self._write(processed, "e.json", **overrides)
+
+                found = module._secret_shaped_event_content(processed)
+
+                self.assertEqual(len(found), 1)
+                self.assertIn(field, found[0][3])
+
+    def test_the_field_list_covers_every_string_field_the_schema_has(self):
+        """The guard that turns an explicit list into a maintained one.
+
+        Scanning per field is 7.8x cheaper than handing the whole payload to
+        `find_secret_material()` (25 ms vs 193 ms over 2,000 Events, measured),
+        and the price of that is a list this file must keep true. So the list
+        is compared against `Event.to_dict()` itself: a string field added to
+        the schema is either scanned or fails here.
+
+        The excluded names are the ones a person never writes -- schema
+        constants, an ISO instant, and the two identity fields the Agent owns
+        and a Signal is forbidden to set (`FORBIDDEN_SIGNAL_FIELDS`).
+        """
+        module = self._load_entrypoint()
+        sample = create_event(
+            source="DESKTOP_2", role="CMO", project_id="P",
+            event_type="MILESTONE_COMPLETED", status="IN_PROGRESS",
+            summary="s", milestone="M", timestamp="2026-08-09T10:00:00+09:00",
+            history_candidate=True,
+        ).to_dict()
+        machine_owned = {"schema_version", "timestamp", "source", "role",
+                         "event_type", "status", "history_candidate"}
+        text_fields = {
+            name for name, value in sample.items()
+            if name not in machine_owned
+        }
+
+        self.assertEqual(
+            text_fields, set(module._EVENT_TEXT_FIELDS) | {"evidence"}
+        )
+
+    def test_the_rule_is_the_agents_rule(self):
+        """One opinion about what a secret looks like. Every pattern the Agent
+        refuses a Signal for is a pattern this finds in an Event -- otherwise
+        the door that refuses and the door that reports drift apart, and the
+        gap is exactly the credentials nobody hears about."""
+        module = self._load_entrypoint()
+        for pattern, sample in (
+            ("ntn_", "ntn_" + "0123456789abcd"),
+            ("secret_", "secret_" + "0123456789abcd"),
+            ("Bearer", "Bearer " + "a" * 25),
+            ("private key", "-----BEGIN RSA PRIVATE KEY-----"),
+            ("gh PAT", "ghp_" + "b" * 25),
+            ("API_KEY=", "NOTION_API_TOKEN=abc123"),
+            ("PASSWORD:", "PASSWORD: hunter2"),
+        ):
+            with self.subTest(pattern=pattern):
+                processed = self._processed(module)
+                self._write(processed, "e.json", summary=f"note {sample}")
+
+                self.assertEqual(
+                    len(module._secret_shaped_event_content(processed)), 1
+                )
+                self.assertEqual(
+                    find_secret_material({"summary": f"note {sample}"}) != (), True
+                )
+
+    def test_it_reaches_the_operators_screen_redacted(self):
+        """The half that matters: found is not seen. And the ATTENTION line
+        must not carry the string either -- `event_id` is a scanned field, so
+        an Event named after the very token would otherwise print it."""
+        module = self._load_entrypoint()
+        processed = self._processed(module)
+        (module.RUNTIME_DIR / "local_master" / "daily").mkdir(parents=True)
+        (module.RUNTIME_DIR / "local_master" / "monthly").mkdir(parents=True)
+        self._write(
+            processed, "leak.json", event_id=self.SECRET, summary=f"tok {self.SECRET}"
+        )
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(
+                datetime(2026, 8, 12, 9, 0).astimezone()
+            )
+
+        line = [item for item in attention if "Secret 형태의 문자열" in item]
+        self.assertEqual(len(line), 1)
+        self.assertNotIn(self.SECRET, line[0])
+        self.assertIn("[REDACTED]", line[0])
+        self.assertNotIn(self.SECRET, buffer.getvalue())
+
+    def test_an_unreadable_file_does_not_hide_the_rest(self):
+        """`read_events()` drops what it cannot parse and the HISTORY block
+        already names those separately. What must not happen is one bad file
+        suppressing the scan of the good ones."""
+        module = self._load_entrypoint()
+        processed = self._processed(module)
+        (processed / "broken.json").write_text("{ not json", encoding="utf-8")
+        self._write(processed, "leak.json", event_id="LEAK", summary=f"t {self.SECRET}")
+
+        found = module._secret_shaped_event_content(processed)
+
+        self.assertEqual([item[0] for item in found], ["LEAK"])
+
+    def test_a_missing_directory_is_not_an_error(self):
+        module = self._load_entrypoint()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+
+        self.assertEqual(module._secret_shaped_event_content(root / "nope"), ())
+
+
+class AnIdIsAlsoAuthoredTextTests(unittest.TestCase):
+    """C47: the ATTENTION sink's stated reason for not redacting was wrong.
+
+    `main()` applies `one_line()` to every ATTENTION message and deliberately
+    not `redact()`, because "almost every message is built from filenames, ids
+    and counts -- never from a file's contents". That rests on an id being
+    machine-made. It is not: `event_id` and `project_id` are plain strings a
+    Desktop sets for itself, `validate_event()` only type-checks them, and the
+    Agent's own scan never sees an Event that came from somewhere else.
+
+    Found by a test written for something else -- the new secret report
+    asserted it does not print the string it found, and the orphan line two
+    blocks above printed the same Event's id raw, into the console and into
+    the file a scheduled run redirects its output to.
+
+    Stated here as one property over the blocks that print an id, rather than
+    as one case each: a secret-shaped identifier must appear nowhere an
+    operator or a log file can see it.
+    """
+
+    SECRET = "ghp_" + "Q7wE9rT2yU4iO6pA8sD0fG"
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_authored", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _runtime(self, module):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+        return module.RUNTIME_DIR
+
+    def _event(self, **overrides):
+        payload = {
+            "schema_version": "1.0",
+            "event_id": "E1",
+            "timestamp": "2026-08-09T10:00:00+09:00",
+            "source": "DESKTOP_2",
+            "role": "CMO",
+            "project_id": "PRJ",
+            "event_type": "MILESTONE_COMPLETED",
+            "status": "IN_PROGRESS",
+            "milestone": "M1",
+            "summary": "work",
+            "blocker": None,
+            "evidence": [],
+            "history_candidate": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    def _capture(self, block, now):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = block(now)
+        return buffer.getvalue(), list(attention or ())
+
+    def test_the_helper_is_one_line_and_redact(self):
+        """One rule, one place. Restating either half at a call site is how
+        thirteen sites drift into twelve."""
+        module = self._load_entrypoint()
+
+        self.assertEqual(module._authored("a\nb"), one_line("a\nb"))
+        self.assertEqual(module._authored(f"tok {self.SECRET}"), "tok [REDACTED]")
+
+    def test_an_orphaned_event_named_after_a_token_is_redacted(self):
+        """The exact case that was leaking: an Event in `processed/` with no
+        Candidate, whose id is the credential."""
+        module = self._load_entrypoint()
+        runtime = self._runtime(module)
+        (runtime / "events" / "processed" / "e.json").write_text(
+            json.dumps(self._event(event_id=self.SECRET)), encoding="utf-8"
+        )
+
+        printed, attention = self._capture(
+            module._print_history, datetime(2026, 8, 12, 9, 0).astimezone()
+        )
+
+        self.assertIn("ORPHANED_EVENT", printed)
+        self.assertTrue(any("History에 들어가지 못한" in item for item in attention))
+        self.assertNotIn(self.SECRET, printed)
+        self.assertNotIn(self.SECRET, "\n".join(attention))
+
+    def test_a_control_tower_project_named_after_a_token_is_redacted(self):
+        module = self._load_entrypoint()
+        runtime = self._runtime(module)
+        (runtime / "events" / "processed" / "e.json").write_text(
+            json.dumps(
+                self._event(
+                    project_id=self.SECRET, event_type="BLOCKED", status="BLOCKED",
+                    blocker="waiting", milestone=None,
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        printed, attention = self._capture(
+            module._print_control_tower, datetime(2026, 8, 12, 9, 0).astimezone()
+        )
+
+        self.assertIn("BLOCKED", printed)
+        self.assertTrue(any("막혀 있는 Project" in item for item in attention))
+        self.assertNotIn(self.SECRET, printed)
+        self.assertNotIn(self.SECRET, "\n".join(attention))
+
+    def test_a_role_mismatch_on_a_token_named_event_is_redacted(self):
+        module = self._load_entrypoint()
+        runtime = self._runtime(module)
+        (runtime / "events" / "processed" / "e.json").write_text(
+            json.dumps(self._event(event_id=self.SECRET, source="DESKTOP_1", role="CMO")),
+            encoding="utf-8",
+        )
+
+        printed, attention = self._capture(
+            module._print_control_tower, datetime(2026, 8, 12, 9, 0).astimezone()
+        )
+
+        self.assertTrue(any("role이 어긋난" in item for item in attention))
+        self.assertNotIn(self.SECRET, printed)
+        self.assertNotIn(self.SECRET, "\n".join(attention))
+
+    def test_the_retry_queue_entry_is_redacted(self):
+        module = self._load_entrypoint()
+        runtime = self._runtime(module)
+        (runtime / "state" / "notion_retry_queue.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "event_id": self.SECRET,
+                            "added_at": "2026-07-01T09:00:00+09:00",
+                            "attempt_count": 9,
+                            "last_error": "boom",
+                            "payload": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        printed, attention = self._capture(
+            module._print_notion, datetime(2026, 8, 12, 9, 0).astimezone()
+        )
+
+        self.assertNotIn(self.SECRET, printed)
+        self.assertNotIn(self.SECRET, "\n".join(attention))
+
+    def test_no_block_prints_a_secret_shaped_id_anywhere(self):
+        """The property, over every block that takes `now` and prints. One
+        Event carrying the same string in each authored field at once: if any
+        block grows a new line quoting one of them, this fails without anyone
+        remembering to add a case."""
+        module = self._load_entrypoint()
+        runtime = self._runtime(module)
+        (runtime / "events" / "processed" / "e.json").write_text(
+            json.dumps(
+                self._event(
+                    event_id=self.SECRET, project_id=self.SECRET,
+                    milestone=self.SECRET, summary=f"see {self.SECRET}",
+                    event_type="BLOCKED", status="BLOCKED", blocker=self.SECRET,
+                    evidence=[self.SECRET],
+                )
+            ),
+            encoding="utf-8",
+        )
+        now = datetime(2026, 8, 12, 9, 0).astimezone()
+
+        for name in (
+            "_print_company", "_print_history", "_print_notion",
+            "_print_control_tower",
+        ):
+            with self.subTest(block=name):
+                printed, attention = self._capture(getattr(module, name), now)
+
+                self.assertNotIn(self.SECRET, printed)
+                self.assertNotIn(self.SECRET, "\n".join(attention))
+
+if __name__ == "__main__":
+    unittest.main()

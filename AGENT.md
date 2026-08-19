@@ -195,7 +195,7 @@ Event 자신의 timestamp로 날짜를 나누므로(docs/06 §12), 어긋나면 
   →  08-08, 08-09, 08-10   (오래된 날짜부터, 오늘은 제외)
 ```
 
-시각 기반 스케줄이 아니라 **날짜 산술**이다. `scheduler/scheduler.py`가 Daily
+시각 기반 스케줄이 아니라 **날짜 산술**이다. `src/scheduler/scheduler.py`가 Daily
 History에 쓰는 규칙과 정확히 같다(docs/07 §18, §21).
 
 ### 마지막 성공 지점
@@ -225,7 +225,7 @@ Event는 전송 **전에** `outbox/`에 원자적으로 기록되고, 전송이 
 
 ### 동시 실행
 
-로그온 트리거와 수동 실행이 겹치면 `scheduler/lock.py`의 lock으로 한쪽이
+로그온 트리거와 수동 실행이 겹치면 `src/scheduler/lock.py`의 lock으로 한쪽이
 `SKIPPED_ALREADY_RUNNING`이 된다. Agent lock은 Desktop 4 Runner lock과
 **다른 파일**이다 — 둘은 서로 다른 구간을 보호하며 Desktop 4에서 동시에
 실행되어도 정상이다.
@@ -262,7 +262,7 @@ python run_agent.py      # 수동 1회 실행
 ```
 
 `ops_status.py`는 아무것도 쓰지 않고 lock도 잡지 않는다. Runner나 Agent가
-도는 중에 실행해도 안전하다. **네 블록**을 보여준다.
+도는 중에 실행해도 안전하다. **여섯 블록**을 보여준다.
 
 **COMPANY** — Desktop 4가 수집한 Event 기준으로 각 Desktop의 마지막 소식,
 침묵 일수, 아직 수집되지 않은 backlog. backlog 줄에는 왜 그 숫자가 줄지 않는지도
@@ -276,17 +276,96 @@ python run_agent.py      # 수동 1회 실행
 
 **HISTORY** — Company Repository의 daily/monthly 파일 수, 사람 검토를 기다리는
 Candidate, **daily/monthly State와 실제 파일의 정합성**, 수집됐지만 History에
-들어가지 못한 Event, **Monthly가 스스로 센 것보다 적게 기록한 달**
+들어가지 못한 Event, **사람이 `review_cli.py`로 입력했는데 Company History에
+반영되지 않은 Decision Context**(`검토 미반영` — 그 날짜의 Daily는 이미
+렌더링됐고 Late Event 병합은 *새* Event만 대상이라 어떤 실행도 이 내용을 넣지
+않는다. 내용은 `runtime/history_candidates/keep/`에 남아 있으니 유실은 아니지만
+Company History에는 없다. `BACKLOG.md` C33 §3), **Monthly가 스스로 센 것보다 적게 기록한 달**
 (`Consolidated Items`와 실제 항목 수가 다르면 그 Event는 그 달에서 사라진 것이다),
 그리고 Backup Working Copy에 있으면 안 되는 파일 — 게이트가 이름을 아는 것과
 **대소문자 때문에 못 알아보는 것**(`ID_RSA` 대 `id_rsa`)을 따로 보여준다.
+
+> **`Event 내용에 Secret 형태의 문자열` 경보가 뜨면** 그 자격증명을 **교체**해야
+> 한다. 이 머신의 Agent는 Signal에 그런 문자열이 있으면 그 자리에서 거부하지만, 다른
+> Desktop에서 온 Event는 `validate_event()`만 거치고 그것은 내용을 읽지 않는다 —
+> 실측으로 Daily History에 그대로 쓰이고 backup 원격까지 push된다. 파일을 고쳐도
+> 원격 history에서는 사라지지 않는다. 화면에 찍히는 id는 전부 `[REDACTED]` 처리되므로
+> **어느 Event인지는 파일명으로 찾는다.**
+
+여기에 **Daily에는 있는데 그 달 Monthly에는 없는 Event**(`Monthly 원본 미반영`)도
+나온다. Monthly는 Daily에서 **전부** 파생되므로(`docs/09` §12-13) 그 달이 통합된 뒤에
+Daily가 바뀌면 — `docs/06` §57과 `docs/11` §71이 허용하는 손편집이 그렇다 — **어떤
+실행도 그 달을 다시 만들지 않는다.** 닫힌 달을 다시 여는 것은 Late Event가 바꾼
+날짜에 대한 자동 dirty 표시뿐이고, 그건 이미 정상 동작한다. 복구는 정확하다: 그 달을
+dirty로 표시하고 한 번 실행하면 Monthly가 자기 원본과 다시 같아진다.
+
+여기에 **Backup Working Copy에는 있고 Local Master에는 없는 Company History**
+(`Master에서 사라짐`)가 함께 나온다. Working Copy는 한 방향으로만 쓰이고 삭제를
+반영하지 않으므로, 거기 있는 이름이 Master에 없다는 것은 **그 파일이 있었고 지금
+없다**는 뜻이다. `Daily 시퀀스 구멍`은 파일이 남아 있는 범위 안쪽만 보므로
+사라진 것이 **가장 이른 날짜들**이면 아무것도 보고하지 않고, 날짜 이름의
+**디렉터리**가 대신 서 있는 경우도 같다. 이 상태에서는 Backup이 add/commit/push를
+전부 중단하므로(`docs/08` §31) 복구하기 전까지 **이후 History도 원격에 가지
+않는다**.
+
+**CONTROL TOWER** — 나머지 블록이 전부 *운영*을 본다면 이것은 *일*을 본다.
+움직인 Project, 팀별 Event 수와 막힌 Project 수, 완료된 Milestone / 승인된
+Decision / 해결된 Issue, 그리고 **열려 있는 Blocker**. Project 줄은 막힌 것을
+맨 위에 올리고 그 다음은 조용한 순서다.
+
+숫자는 전부 `runtime/events/processed/`의 Event에서 나오며 **추적 가능하다** —
+Blocker 경보는 막힌 Project·팀·사람이 쓴 blocker 문구·그것을 말한 Event 파일
+이름을 함께 댄다. 열린 Blocker는 파이프라인이 스스로 지우지 않는다: 그 팀이
+`RESUMED` / `ISSUE_RESOLVED` / `COMPLETED`를 보고할 때 사라진다. 그래서
+임계값 없이 **열려 있으면 곧 ATTENTION**이다.
+
+`Desktop` 줄은 Team 아래 계층이다. **둘 다 있는 이유**는 `source`→`role`이 1:1인
+동안에는 같은 분할이기 때문이 아니라, **어긋나는 순간 하나만으로는 그것이 보이지
+않기** 때문이다. `validate_event()`는 `source`와 `role`을 **각각의 허용 집합에
+대해서만** 검사하고 **짝은 검사하지 않으므로**, 손으로 쓴 Event나 복원된 파일이
+"DESKTOP_1에서 왔는데 CMO 일을 했다"고 말해도 전부 통과한다. 그 경우 Team 집계와
+Desktop 집계가 서로 다른 곳으로 가고 Notion PROJECTS 행은 `Owner`와 `Source`가
+서로 다른 Desktop을 가리킨다 — 그 Event를 **ATTENTION이 이름으로 댄다**
+(`role 어긋남`). 거부하지는 않는다: 거부하면 그 Event가 `rejected/`로 가서 Company
+History에서 아예 사라지고, "기록을 잃는 것"과 "잘못된 주인으로 기록하는 것" 중
+무엇이 나쁜지는 결정 사항이다(`BACKLOG.md`).
+
+조용한 팀과 조용한 Desktop은 여기서 세지만 경보로 올리지 않는다 — `source`가
+COMPANY 블록의 키이기도 해서, 그것은 그 블록이 이미 말하는 사실이다.
+
+> **`증거 범위 밖` 줄이 보이면** 이 블록의 숫자는 회사 전체가 아니라 **남아 있는
+> Event가 덮는 기간**만 말한다. `runtime/events/processed/`는 Backup 범위가 아니므로
+> (`docs/08` §26) **복원한 머신은 Company History를 전부 되찾고 Event는 하나도 되찾지
+> 못한다.** 그 상태에서 이 블록은 "아무 일도 없었다"처럼 보이는데 사실이 아니고, 그
+> 줄이 그것을 말한다. 경보로 올리지 않는 이유는 그 Event를 되돌리는 조치가 없기
+> 때문이다 — Company History는 그대로 있다.
+
+> **Goal / Team Goal / Sprint / Task 계층은 비어 있지 않고 아예 없다.** Event
+> Schema에도 Company Repository에도 그 계층의 원천이 없어서, 블록 마지막 줄이
+> 그렇게 말한다. Notion에 적어 넣는 것은 답이 아니다 — `docs/14` §1이 Notion을
+> "**View이며 절대 Source가 아니다**"로 고정한다. 어디에 두어야 하는지는
+> `BACKLOG.md`에 있는 결정 사항이다.
 
 **LAST RUN** — 마지막 Runner 실행의 Run Manifest: 실행 시각, 종합 상태,
 실패한 단계와 **그 단계의 수치**(예: `queued=47`), 시작조차 못 한 단계,
 Runner Lock 상태. 마지막 실행이 너무 오래됐으면 그것도 여기서 걸린다.
 
+**NOTION** — Notion에 아직 닿지 못한 것: Retry Queue에 남은 Event 수, 최대
+재시도 횟수, **가장 오래된 항목이 며칠째 남아 있는지**, 그리고 Operations
+Dashboard의 밀린 기록 수. 마지막 두 가지가 이 블록의 이유다 —
+`NOTION_RETRY_REQUIRED`는 "Notion이 잠깐 죽었다"와 "Notion이 이 요청을 영원히
+거부한다"를 같은 한 단어로 보고하고(`BACKLOG.md` BUG-13), 그 둘을 가르는 것은
+**얼마나 오래 막혀 있었는가**다. 사흘을 넘긴 항목은 ATTENTION에 뜬다 —
+일시적 장애라면 이미 빠져나갔을 시간이다. 그때는 `notion_sync.log`의
+`REASON`을 본다. 큐 파일 자체가 손상된 경우도 여기서 보고한다(특히
+`dashboard_pending.json`은 손상돼도 Runtime을 멈추지 않으므로 — CEO 결정 ④ —
+이 줄이 아니면 밀린 기록이 영원히 재시도되지 않는 것을 알 방법이 없다).
+
 **AGENT** — 이 머신 Agent의 마지막 실행, 마지막 수집 날짜, 미수집 날짜,
-outbox/sent 개수, 거부된 Signal 수, 전달 정합성, Agent Lock 상태.
+outbox/sent 개수, 거부된 Signal 수, 전달 정합성, Agent Lock 상태. 전달 정합성은
+세 값이다: `OK`, `UNDELIVERED`(sync 폴더에 도착하지 않은 Event가 있다),
+`UNKNOWN`(`sent/`에 읽을 수 없는 기록이 있어 그 Event의 도착 여부를 판단할 수
+없다).
 
 마지막에 **ATTENTION** 절이 나온다. 비어 있으면 지금 사람이 할 일은 없다.
 
@@ -295,6 +374,12 @@ outbox/sent 개수, 거부된 Signal 수, 전달 정합성, Agent Lock 상태.
 > 일부러 뺀다 — 지워지지 않는 경보는 그 절을 대충 넘기도록 훈련시킨다.
 
 종료 코드: `0` 정상, `1` 설정 오류, `3` 확인이 필요한 항목 있음.
+
+**이 저장소의 도구는 명령줄 인자를 받지 않는다.** 설정은 전부 환경변수다.
+`--dry-run`이나 `--help` 같은 것을 붙이면 `1 설정 오류`로 거부하면서 그 도구가
+읽는 변수 이름을 알려준다. C47 이전에는 인자를 **조용히 무시**했고, 그래서
+`python run_company_ops.py --dry-run`이 진짜 push와 진짜 Notion 쓰기를 하는
+운영 실행이었다.
 
 COMPANY 줄은 두 가지를 따로 보여준다.
 
@@ -366,6 +451,88 @@ Select-String "DASHBOARD|REASON" runtime\logs\notion_sync.log
 
 Company History 자체가 위험한 경우는 이 표에 없다. Notion·Dashboard·Monthly는
 전부 History가 이미 디스크에 저장된 **뒤에** 일어나는 단계다.
+
+---
+
+### 6a-2. 지난 실행이 **중단**됐다면
+
+`ops_status.py`의 LAST RUN에 `STEP_ABORTED`가 있거나 `시작되지 못한 단계`가
+보이면, 그 실행은 도중에 죽은 것이다. **대부분은 다음 실행이 알아서 이어받는다.**
+어느 단계에서 죽었느냐에 따라 남는 것이 다르고, 아래는 전부 실측한 결과다.
+
+| 중단된 단계 | 남는 것 | 다음 실행이 |
+|---|---|---|
+| `transport` / `collector` | 아직 `incoming/`·`transport/`에 있는 파일 | **이어받는다** — 파일이 그대로 있으므로 |
+| `notion_sync` | Retry Queue에 남은 Event | **이어받는다** — 4a가 큐부터 처리한다 |
+| `history_filter` | **소비됐지만 Candidate가 없는 Event** | **이어받지 못한다** ↓ |
+| `daily` | Candidate는 있고 Daily 파일이 없음 | **이어받는다** — Candidate가 durable하다 |
+| `late_update` / `monthly` | (실행을 중단시키지 않는 단계다 — 실패해도 다음 단계로 간다) | 해당 없음 |
+| `backup` | Company History는 있고 push가 안 됨 | **이어받는다** — 다음 실행이 같은 commit을 다시 push한다 |
+| `dashboard` | (중단시키지 않는다) Notion에 못 쓴 기록이 `dashboard_pending.json`에 | **이어받는다** — 다음 실행이 큐부터 비운다 |
+| Lock을 쥔 채 crash | pid가 죽은 lock 파일 | **이어받는다** — 다음 실행이 인수한다 |
+
+**하나만 자동 복구되지 않는다.** `history_filter`에서 죽으면 Collector가 이미
+그 Event를 소비했고(파일이 `processed/`로 옮겨졌고 id가 seen store에 저장됐다)
+어떤 실행도 다시 보지 않는다 — `BACKLOG.md` A-20. 그래서 그 경우에만 **사람이
+필요하고**, `ops_status.py`가 이름을 대 준다:
+
+    ! 수집됐지만 History에 들어가지 못한 Event 1건: EVT-XXX — 재실행으로
+      복구되지 않는다(BACKLOG A-20). 사람이 확인해야 한다
+
+파일 자체가 읽히지 않게 된 경우에는 다른 줄이 뜬다 — 그때는 "잃었다"가 아니라
+"판단할 수 없다"이고, 그 구분은 일부러 유지한다:
+
+    ! processed에 읽을 수 없는 Event 1건: EVT-XXX.json
+      — History 반영 여부를 판단할 수 없다
+
+> **다음 실행이 성공하면 중단 기록은 사라진다.** Run Manifest는
+> `runtime/runs/last_run.json` **한 파일**이고 이름 그대로 마지막 실행만
+> 담는다. 그래서 `종합 상태: SUCCESS`인데 위 ATTENTION 줄이 떠 있는 조합이
+> 나올 수 있다 — 모순이 아니라, **지난 실행에서 잃은 것이 아직 그대로**라는
+> 뜻이다. ATTENTION 쪽이 더 오래 사는 신호다.
+
+---
+
+### 6a-3. Backup에서 **복구한 직후** 첫 실행
+
+`docs/10` §45대로 Desktop 4를 새로 세우고 GitHub Backup에서 Company History를
+되돌린 상태다. 되돌아오는 것과 되돌아오지 않는 것이 정해져 있다(`docs/08` §26):
+
+| | Backup에 있나 | 복구 후 |
+|---|---|---|
+| `daily/`, `monthly/` | ✅ | 그대로 돌아온다 (byte 단위로 동일) |
+| Raw Event, History Candidate | ❌ | 없다 — 이 Desktop에서 다시 만들 수 없다 |
+| `runtime/state/` 전부 | ❌ | 없다 — **watermark가 사라졌다** |
+
+즉 첫 실행은 **완성된 Company History를 손에 들고, 그것을 쓴 기억이 전혀 없는**
+상태에서 시작한다. 위험은 명백하다 — 그 날짜들을 "아직 안 썼다"고 판단하고
+(이제는 없는) Candidate로 다시 만들면, 실제 History가 빈 날로 덮이고 그것이
+**유일한 사본인 원격으로 push된다.**
+
+**그렇게 되지 않는다. 실측이다.** 3일치 History를 만들고 → 디스크 전체를 잃고
+→ 원격에서 clone하고 → 한 번 실행했다:
+
+    복구된 파일        2026-08-01 … 08-04   그대로, 한 바이트도 안 바뀜
+    실제로 쓴 파일     2026-08-05           (복구 이후의 새 날짜 하나)
+    watermark          2026-08-05 로 정상 전진
+    원격               복구된 내용 그대로 유지
+    manifest           SUCCESS / exit 0
+
+Scheduler가 날짜마다 **파일이 이미 있는지 먼저 보고**(`is_file()`), 있으면 쓰지
+않고 "닫힘"으로만 표시하기 때문이다(`docs/07` §28과 같은 장치).
+
+**읽을 때 주의할 것 하나.** 그 실행의 보고는 이렇게 나뉜다:
+
+    Daily History (Scheduler): COMPLETED, generated=1 (2026-08-05) reused=4 (2026-08-01, 2026-08-02, 2026-08-03, 2026-08-04)
+
+각 항목은 `개수 (날짜들)` 꼴이다. 날짜가 10일을 넘으면 뒤에 `외 N일`이 붙는다 —
+잘렸다는 사실을 숨기지 않기 위해서다. 비교해야 하는 것은 **앞의 숫자**다.
+
+`generated`는 **이번 실행이 쓴 날**, `reused`는 **이미 있어서 그대로 둔 날**이다.
+복구 직후에는 `reused`가 크고 `generated`가 작은 것이 정상이며, 그 반대라면
+— 복구한 날짜를 다시 만들고 있다는 뜻이므로 — **즉시 멈추고 원격을 확인해야
+한다.** (C39 전에는 둘이 한 숫자였고, 복구 직후 실행이 "5일 생성"이라고 보고했다.
+없는 Candidate로 만들었을 리 없는 5일이다.)
 
 ---
 

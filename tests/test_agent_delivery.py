@@ -192,13 +192,117 @@ class AccuracyTests(DeliveryTestCase):
     def test_a_damaged_sent_record_yields_no_verdict(self):
         """The local record is the source of the event_id. If it cannot be
         read, "delivered" and "not delivered" are both unfounded — inventing
-        either would be worse than saying nothing."""
+        either would be worse than saying nothing.
+
+        Unchanged, and still the point: it is not in `undelivered`, and it
+        is not in `checked`. What changed is that it is no longer in
+        *nothing* — see the class below.
+        """
         (self.sent / "damaged.json").write_text("{not json", encoding="utf-8")
 
         result = self._run()
 
-        self.assertTrue(result.is_clean)
+        self.assertEqual(result.undelivered, ())
         self.assertEqual(result.checked, 0)
+
+
+class UnreadableSentRecordTests(DeliveryTestCase):
+    """C32 §13: a record this scan could not read was reported by nothing.
+
+    `_verdict()` returned `(None, None, None)` for a damaged file in `sent/`
+    and the loop `continue`d — no field, no count, not even `checked`. The
+    comment beside it cited `history/reconciliation.py` as the precedent for
+    "reports unreadable inputs separately", and that module really does:
+    `ReconciliationResult.unreadable`, its own dataclass, its own docstring,
+    its own ATTENTION line. So did `outbox.DrainSummary.unreadable` and
+    `CompanyActivitySnapshot.unreadable_events`. This was the one sibling
+    that cited the rule and did not follow it.
+
+    The consequence is the shape this repository keeps finding: one corrupt
+    file in `sent/` means one Event's delivery is never verified, and
+    `ops_status.py` prints `전달 정합성 : OK` — the same line it prints when
+    every Event was checked and every one arrived.
+    """
+
+    def test_a_damaged_record_is_reported_rather_than_dropped(self):
+        (self.sent / "damaged.json").write_text("{not json", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(len(result.unreadable_records), 1)
+        self.assertEqual(result.unreadable_records[0].sent_record.name, "damaged.json")
+        self.assertTrue(result.unreadable_records[0].reason)
+
+    def test_an_unreadable_record_is_not_a_clean_result(self):
+        """Mirrors `ReconciliationResult.is_clean`, which counts its own
+        unreadable inputs. "I could not check this one" must not read as
+        "I checked everything"."""
+        (self.sent / "damaged.json").write_text("{not json", encoding="utf-8")
+
+        self.assertFalse(self._run().is_clean)
+
+    def test_it_does_not_become_an_undelivered_event(self):
+        """The original restraint, kept. Reporting it as undelivered would
+        claim a delivery verdict from a file whose `event_id` could not even
+        be read."""
+        (self.sent / "damaged.json").write_text("{not json", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.undelivered, ())
+        self.assertEqual(result.checked, 0)
+        self.assertEqual(result.absent, 0)
+
+    def test_a_readable_neighbour_is_still_checked(self):
+        """Per-record isolation: one damaged file must not cost the verdict
+        on every other Event in `sent/`."""
+        delivered = self._event("E-OK")
+        self._file_as_sent(delivered)
+        self._destination(delivered).write_text(delivered.to_json(), encoding="utf-8")
+        (self.sent / "damaged.json").write_text("{not json", encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.checked, 1)
+        self.assertEqual(result.undelivered, ())
+        self.assertEqual(len(result.unreadable_records), 1)
+
+    def test_a_record_without_an_event_id_counts_too(self):
+        """Valid JSON, wrong shape — the `KeyError` branch."""
+        (self.sent / "shapeless.json").write_text('{"nope": 1}', encoding="utf-8")
+
+        self.assertEqual(len(self._run().unreadable_records), 1)
+
+    def test_a_clean_run_reports_none(self):
+        """The rule that keeps the new field meaningful."""
+        delivered = self._event("E-OK")
+        self._file_as_sent(delivered)
+        self._destination(delivered).write_text(delivered.to_json(), encoding="utf-8")
+
+        result = self._run()
+
+        self.assertEqual(result.unreadable_records, ())
+        self.assertTrue(result.is_clean)
+
+    def test_every_sibling_scanner_reports_its_unreadable_inputs(self):
+        """The rule this module was the exception to, checked across all of
+        them so a future scanner cannot quietly become the next exception."""
+        import dataclasses
+
+        from agent.delivery import DeliveryResult
+        from agent.outbox import DrainSummary
+        from app.desktop_activity import CompanyActivitySnapshot
+        from history.reconciliation import ReconciliationResult
+
+        for result_type, field_name in (
+            (DeliveryResult, "unreadable_records"),
+            (DrainSummary, "unreadable"),
+            (CompanyActivitySnapshot, "unreadable_events"),
+            (ReconciliationResult, "unreadable"),
+        ):
+            with self.subTest(result=result_type.__name__):
+                names = {f.name for f in dataclasses.fields(result_type)}
+                self.assertIn(field_name, names)
 
     def test_an_unset_sync_folder_is_not_an_error(self):
         """Desktop 4 runs `ops_status` without an Agent sync folder."""

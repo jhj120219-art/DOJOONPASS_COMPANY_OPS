@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tempfile
@@ -504,11 +505,44 @@ class PorcelainRenameBoundaryTests(unittest.TestCase):
                 self.assertNotIn(destructive, source)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class _RealBackupFixture(GitOpsTestCase):
+    """Harness only: a real Working Copy, a real bare remote, real git.
+
+    Declared separately for the reason
+    `test_runner_notion_integration.RunnerNotionTestCase` gives — a second
+    suite needs these three helpers, and inheriting the suite that had them
+    would re-run every one of its tests. It subclasses `GitOpsTestCase`
+    rather than mixing in, because the repo fixture is `setUp`'s job.
+    """
+
+    def _setup_master_and_remote(self):
+        master = self.repo_dir.parent / "local_master"
+        (master / "daily").mkdir(parents=True)
+        bare = self.repo_dir.parent / "remote.git"
+        _run_git(["init", "--bare", "-b", "main", str(bare)], cwd=self.repo_dir.parent)
+        _run_git(["remote", "add", "origin", str(bare)], cwd=self.repo_dir)
+        # docs/08 §30 operator setup: an initialised, tracking Working Copy.
+        (self.repo_dir / ".gitkeep").write_text("", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.repo_dir)
+        _run_git(["commit", "-m", "init"], cwd=self.repo_dir)
+        _run_git(["push", "-u", "origin", "main"], cwd=self.repo_dir)
+        return master, bare
+
+    def _remote_files(self, bare):
+        return sorted(_run_git(["ls-tree", "-r", "--name-only", "HEAD"], cwd=bare).split())
+
+    def _backup(self, master, run_id):
+        import backup.runner as backup_runner
+
+        return backup_runner.run_once(
+            master_dir=master,
+            working_copy_dir=self.repo_dir,
+            state_path=self.repo_dir.parent / "backup_state.json",
+            run_id=run_id,
+        )
 
 
-class StagingResidueThroughTheRealBackupTests(GitOpsTestCase):
+class StagingResidueThroughTheRealBackupTests(_RealBackupFixture):
     """C27's highest-severity fix, verified end to end instead of at the seam.
 
     The unit coverage stops at `sync_to_working_copy()`. What that cannot
@@ -543,31 +577,6 @@ class StagingResidueThroughTheRealBackupTests(GitOpsTestCase):
     protection §43-47 exists for.
     """
 
-    def _setup_master_and_remote(self):
-        master = self.repo_dir.parent / "local_master"
-        (master / "daily").mkdir(parents=True)
-        bare = self.repo_dir.parent / "remote.git"
-        _run_git(["init", "--bare", "-b", "main", str(bare)], cwd=self.repo_dir.parent)
-        _run_git(["remote", "add", "origin", str(bare)], cwd=self.repo_dir)
-        # docs/08 §30 operator setup: an initialised, tracking Working Copy.
-        (self.repo_dir / ".gitkeep").write_text("", encoding="utf-8")
-        _run_git(["add", "-A"], cwd=self.repo_dir)
-        _run_git(["commit", "-m", "init"], cwd=self.repo_dir)
-        _run_git(["push", "-u", "origin", "main"], cwd=self.repo_dir)
-        return master, bare
-
-    def _remote_files(self, bare):
-        return sorted(_run_git(["ls-tree", "-r", "--name-only", "HEAD"], cwd=bare).split())
-
-    def _backup(self, master, run_id):
-        import backup.runner as backup_runner
-
-        return backup_runner.run_once(
-            master_dir=master,
-            working_copy_dir=self.repo_dir,
-            state_path=self.repo_dir.parent / "backup_state.json",
-            run_id=run_id,
-        )
 
     def test_the_remote_commit_matches_what_backup_success_claims(self):
         from backup.result import BackupStatus
@@ -688,3 +697,244 @@ class StagingResidueThroughTheRealBackupTests(GitOpsTestCase):
         self.assertIs(entry.final_status, BackupStatus.FAILED)
         self.assertIn("secret", (entry.push_result or "").lower())
         self.assertEqual(self._remote_files(bare), [".gitkeep"])
+
+
+class ChangedFilesIsWhatTheCommitCarriesTests(_RealBackupFixture):
+    """REGRESSION. `BACKUP_SUCCESS` counted directories, not files.
+
+    `git status --porcelain` collapses an untracked DIRECTORY into a single
+    entry, and step 5's status — taken BEFORE `git add -A` — was the list
+    that reached `BackupLogEntry.changed_files`, the Run Manifest's
+    `changed_files` metric, and OPS_BACKUP's `Changed Files` column.
+
+    Measured, three brand-new Daily files in a Working Copy that has never
+    had a `daily/` committed:
+
+        before add   ?? daily/                    -> changed_files ('daily/',)
+        after  add   A  daily/2026-08-01.md          changed_files 3 names
+                     A  daily/2026-08-02.md
+                     A  daily/2026-08-03.md
+
+    So the manifest read `changed_files=1` for a backup that pushed three
+    days, and named a directory rather than any of them. BUG-39 added that
+    metric to answer "what did this backup carry"; on the runs where the
+    answer matters most it did not — the FIRST backup after the operator's
+    `git init` (docs/08 §30), a disaster restore that re-inits one
+    (docs/10 §45), and the run that first writes `monthly/`, which happens
+    once in ordinary operation.
+
+    Not a data loss: every file was committed and pushed correctly. It is
+    the report that was wrong, in the direction that understates.
+
+    The fix takes a second `status --porcelain` between the add and the
+    commit — no new git command, so the approved-command-set gate is
+    untouched — and deliberately keeps reading GIT rather than
+    `sync_result`, because `git add -A` stages the whole Working Copy and
+    only git's own list includes what arrived there by another route
+    (BACKLOG E-21's stray files).
+    """
+
+    def _days(self, master, *names):
+        for name in names:
+            (master / "daily" / name).write_text("# " + name + "\n", encoding="utf-8")
+
+    def test_a_first_backup_names_every_file_not_the_directory(self):
+        master, bare = self._setup_master_and_remote()
+        self._days(master, "2026-08-01.md", "2026-08-02.md", "2026-08-03.md")
+
+        entry = self._backup(master, "RUN-1")
+
+        self.assertEqual(
+            sorted(entry.changed_files),
+            ["daily/2026-08-01.md", "daily/2026-08-02.md", "daily/2026-08-03.md"],
+        )
+
+    def test_the_count_matches_the_remote_commit(self):
+        """The property worth having, stated against the remote itself
+        rather than against another local list."""
+        master, bare = self._setup_master_and_remote()
+        self._days(master, "2026-08-01.md", "2026-08-02.md", "2026-08-03.md")
+
+        entry = self._backup(master, "RUN-1")
+
+        pushed = [f for f in self._remote_files(bare) if f != ".gitkeep"]
+        self.assertEqual(len(entry.changed_files), len(pushed))
+        self.assertEqual(sorted(entry.changed_files), pushed)
+
+    def test_the_premise_git_really_does_collapse_an_untracked_directory(self):
+        """Stated from git, not assumed. If git stops collapsing, the second
+        status call becomes redundant rather than wrong — and this test says
+        which world we are in."""
+        master, _bare = self._setup_master_and_remote()
+        self._days(master, "2026-08-01.md", "2026-08-02.md", "2026-08-03.md")
+        from backup.working_copy import sync_to_working_copy
+
+        sync_to_working_copy(master, self.repo_dir)
+        before = _run_git(["status", "--porcelain"], cwd=self.repo_dir).split()
+        _run_git(["add", "-A"], cwd=self.repo_dir)
+        after = [
+            line[3:]
+            for line in _run_git(["status", "--porcelain"], cwd=self.repo_dir).splitlines()
+        ]
+
+        self.assertEqual(before, ["??", "daily/"])
+        self.assertEqual(sorted(after), sorted(["daily/2026-08-0%d.md" % n for n in (1, 2, 3)]))
+
+    def test_a_later_backup_into_a_tracked_directory_was_never_wrong(self):
+        """The half that explains why this hid for so long: once `daily/`
+        holds one tracked file, git lists new files inside it individually
+        and the old code's count was already right."""
+        master, _bare = self._setup_master_and_remote()
+        self._days(master, "2026-08-01.md")
+        self._backup(master, "RUN-1")
+        self._days(master, "2026-08-02.md", "2026-08-03.md")
+
+        entry = self._backup(master, "RUN-2")
+
+        self.assertEqual(
+            sorted(entry.changed_files), ["daily/2026-08-02.md", "daily/2026-08-03.md"]
+        )
+
+    def test_a_stray_working_copy_file_is_still_reported(self):
+        """E-21's file reaches the commit through `git add -A` and through no
+        sync result. Reading git rather than `sync_result` is what keeps it
+        in this list."""
+        master, bare = self._setup_master_and_remote()
+        self._days(master, "2026-08-01.md")
+        (self.repo_dir / "scratch.log").write_text("stray\n", encoding="utf-8")
+
+        entry = self._backup(master, "RUN-1")
+
+        self.assertIn("scratch.log", entry.changed_files)
+        self.assertIn("scratch.log", self._remote_files(bare))
+
+    def test_a_deletion_made_in_the_working_copy_is_still_reported(self):
+        """The other column of the same status.
+
+        A file deleted from the Working Copy but still present in Master is
+        simply re-copied by `sync_to_working_copy()` before git ever looks,
+        so it is NOT a deletion (asserted below, because the premise matters).
+        A stray file that only ever existed in the Working Copy is different:
+        nothing re-creates it, `git add -A` stages its removal, and it must
+        stay visible in this list.
+        """
+        master, _bare = self._setup_master_and_remote()
+        self._days(master, "2026-08-01.md")
+        (self.repo_dir / "scratch.log").write_text("stray\n", encoding="utf-8")
+        self._backup(master, "RUN-1")
+
+        # Re-copied from Master: not a deletion.
+        (self.repo_dir / "daily" / "2026-08-01.md").unlink()
+        # Only ever in the Working Copy: a real deletion.
+        (self.repo_dir / "scratch.log").unlink()
+        self._days(master, "2026-08-02.md")
+
+        entry = self._backup(master, "RUN-2")
+
+        self.assertEqual(entry.deleted_files, ("scratch.log",))
+        self.assertIn("daily/2026-08-01.md", self._remote_files(_bare))
+
+
+class ChangedFilesMeansTheSameThingAsTheStatusTests(_RealBackupFixture):
+    """CHARACTERIZATION — one field name, two meanings, keyed by status.
+
+    `ChangedFilesIsWhatTheCommitCarriesTests` fixed the SUCCESS path to report
+    git's own staged list. The two paths that stop BEFORE any git command —
+    the deletion gate (docs/08 §31, §44-47) and the mass-modification guard
+    (§46-47) — still report `sync_result.added + modified`, and that asymmetry
+    was noted in C42 and pinned by nothing.
+
+    Both are right for their own path, which is why this characterises rather
+    than unifies:
+
+        SUCCESS         a commit exists. Only git's list cannot understate
+                        what was pushed — it includes whatever reached the
+                        Working Copy by routes the sync never saw (E-21).
+        blocked before  no commit exists, and `git add -A` never ran. git's
+        any git command  list would describe a staging area that was never
+                        built; the sync's list describes what was prepared
+                        and did not get backed up, which is the question.
+
+    Measured through the real Runner (C43), a Daily file deleted from Local
+    Master after a successful backup:
+
+        final_status   BACKUP_FAILED
+        deleted_files  ('daily/2026-08-01.md',)
+        manifest       classification BACKUP_FAILED, CRITICAL/PERMANENT,
+                       reason naming the file, metrics
+                       {'changed_files': 1, 'deleted_files': 1}
+        Dashboard      Backup Status BACKUP_FAILED, Deleted Files 1, FAIL
+    """
+
+    def test_the_deletion_gate_reports_what_the_sync_prepared(self):
+        master, _bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-01.md").write_text("# a\n", encoding="utf-8")
+        self._backup(master, "RUN-1")
+
+        (master / "daily" / "2026-08-02.md").write_text("# b\n", encoding="utf-8")
+        (master / "daily" / "2026-08-01.md").unlink()
+        entry = self._backup(master, "RUN-2")
+
+        self.assertEqual(entry.final_status.value, "BACKUP_FAILED")
+        # Native separators, because these names come from `pathlib` walking
+        # the Working Copy — not from git, which always answers in POSIX
+        # form. That is the third face of the same split (source, meaning,
+        # separator) and it is asserted rather than normalised: nothing
+        # compares the two lists, and a test that hid the difference would
+        # be the reason nobody noticed if something started to.
+        self.assertEqual(entry.deleted_files, (os.path.join("daily", "2026-08-01.md"),))
+        # The day the sync had prepared, from the sync — no commit exists.
+        self.assertEqual(entry.changed_files, (os.path.join("daily", "2026-08-02.md"),))
+        self.assertIsNone(entry.commit_hash)
+
+    def test_the_two_paths_do_not_even_spell_paths_the_same_way(self):
+        """Stated on its own so the split cannot be read as cosmetic.
+
+        git answers `daily/2026-08-01.md` on every platform;
+        `sync_to_working_copy()` builds its lists from `pathlib`, which on
+        Windows spells the same file `daily\2026-08-01.md`. Both reach an
+        operator — the manifest's `reason` names deleted files, and
+        `ChangedFilesIsWhatTheCommitCarriesTests` names committed ones.
+        """
+        master, _bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-01.md").write_text("# a\n", encoding="utf-8")
+        committed = self._backup(master, "RUN-1")
+
+        (master / "daily" / "2026-08-01.md").unlink()
+        blocked = self._backup(master, "RUN-2")
+
+        self.assertIn("daily/2026-08-01.md", committed.changed_files)
+        self.assertEqual(
+            blocked.deleted_files, (os.path.join("daily", "2026-08-01.md"),)
+        )
+
+    def test_the_remote_is_untouched_on_that_path(self):
+        """The property the field is describing: nothing was pushed, so
+        `changed_files` names what did NOT get backed up."""
+        master, bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-01.md").write_text("# a\n", encoding="utf-8")
+        self._backup(master, "RUN-1")
+        before = self._remote_files(bare)
+
+        (master / "daily" / "2026-08-02.md").write_text("# b\n", encoding="utf-8")
+        (master / "daily" / "2026-08-01.md").unlink()
+        self._backup(master, "RUN-2")
+
+        self.assertEqual(self._remote_files(bare), before)
+
+    def test_the_success_path_reports_git_instead(self):
+        """The contrast in one place, so the two meanings are readable
+        together rather than inferred from two classes."""
+        master, _bare = self._setup_master_and_remote()
+        (master / "daily" / "2026-08-01.md").write_text("# a\n", encoding="utf-8")
+        (self.repo_dir / "stray.txt").write_text("only in the working copy\n", encoding="utf-8")
+
+        entry = self._backup(master, "RUN-1")
+
+        self.assertEqual(entry.final_status.value, "BACKUP_SUCCESS")
+        # `stray.txt` is in no sync result and IS in the commit.
+        self.assertIn("stray.txt", entry.changed_files)
+        self.assertIn("daily/2026-08-01.md", entry.changed_files)
+
+if __name__ == "__main__":
+    unittest.main()

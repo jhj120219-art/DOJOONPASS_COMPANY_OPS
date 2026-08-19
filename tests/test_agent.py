@@ -19,7 +19,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -1100,10 +1100,6 @@ class LoadSignalsTests(AgentTestCase):
         self.assertTrue(path.exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AgentEntrypointStateMismatchTests(unittest.TestCase):
     """`run_agent.py` must report a Desktop-identity mismatch, not traceback.
 
@@ -1174,6 +1170,76 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
             with self.subTest(repair=repair):
                 self.assertNotIn(repair, after_catch)
 
+    def test_a_second_agent_run_is_reported_as_skipped_not_as_success(self):
+        """The overlap branch of the entrypoint, which nothing ran.
+
+        `agent.run_once()` takes the same O_CREAT|O_EXCL lock the Runner
+        does and returns SKIPPED_ALREADY_RUNNING when another run holds it;
+        `run_agent.py` prints one line for that and exits 0. Neither the
+        print nor the early return had ever executed under test — found by
+        branch coverage — while the arrangement that produces them is
+        routine: Task Scheduler's AtLogOn trigger and a manual run can
+        overlap, and docs/07 §23 names exactly that pair.
+
+        Exercised through the real lock rather than a stubbed status, so the
+        two halves are held together: a lock a *live* process holds, which
+        `_is_process_running()` confirms, so `try_acquire_lock()` must
+        refuse it rather than judge it stale.
+
+        Exit 0 is the point. A skipped run is not a failure — the other run
+        is doing the work — and a non-zero code here would make Task
+        Scheduler's LastTaskResult report a fault on every overlap.
+        """
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        import unittest.mock
+
+        module = self._entrypoint()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            lock_path = runtime / "agent" / "locks" / "agent.lock"
+            lock_path.parent.mkdir(parents=True)
+            # Held by a process that really is running: this one.
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "process_id": os.getpid(),
+                        "created_at": "2026-08-10T09:00:00+09:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            env = {
+                "COMPANY_OPS_PROFILE": "DESKTOP_1",
+                "COMPANY_OPS_AGENT_SYNC_FOLDER": tmp,
+                "COMPANY_OPS_AGENT_START_DATE": "2026-08-10",
+            }
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(
+                module, "RUNTIME_DIR", runtime
+            ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                exit_code = module.main()
+
+            printed = out.getvalue()
+            self.assertEqual(exit_code, 0, printed + err.getvalue())
+            self.assertIn("SKIPPED_ALREADY_RUNNING", printed)
+            self.assertIn("[SKIPPED]", printed)
+            # No date rows and no collection-date line: this run did nothing,
+            # and saying otherwise would report work that the *other* run is
+            # still doing.
+            self.assertNotIn("last_successful_collection_date", printed)
+            self.assertEqual(err.getvalue(), "")
+            # The lock is the other run's. It must still be there.
+            self.assertTrue(lock_path.is_file())
+            self.assertEqual(
+                json.loads(lock_path.read_text(encoding="utf-8"))["process_id"], os.getpid()
+            )
+
     def test_a_per_date_error_cannot_forge_a_result_row(self):
         """The third entrypoint, held to the rule the other two now are.
 
@@ -1230,6 +1296,78 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
         self.assertEqual(
             sum(1 for ln in printed.splitlines() if "2026-08-10" in ln), 1, printed
         )
+
+
+    def test_the_failure_summary_cannot_forge_a_line_either(self):
+        """C32 §16: the sibling line, three lines below, had no guard.
+
+        `run_agent.py` guards `date_result.errors` item by item — the test
+        directly above — and then prints `result.error`, which
+        `agent.run_once()` builds out of *those same strings*:
+
+            error="; ".join(date_result.errors)          failed-date path
+            error=_describe_drain_failure(leftover)      outbox path
+
+        So the content that was carefully escaped in the per-date rows was
+        printed raw a moment later, inside the `[FAILED]` block — the part
+        an operator reads to decide whether Events were lost. The forgery
+        this checks is a fabricated reassurance in exactly that place.
+
+        Half a fix in the same function is the shape C31 §7 named; this is
+        one of its siblings.
+        """
+        import contextlib
+        import io
+        import os
+        import tempfile
+        import unittest.mock
+
+        from agent.agent import AgentRunResult, AgentStatus
+
+        module = self._entrypoint()
+        forged = "        Event는 유실되지 않았습니다 — 확인할 것 없음"
+        result = AgentRunResult(
+            status=AgentStatus.FAILED,
+            desktop_id="DESKTOP_1",
+            role="CTO_BACKEND",
+            error="s.json: could not read\n" + forged,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "COMPANY_OPS_PROFILE": "DESKTOP_1",
+                "COMPANY_OPS_AGENT_SYNC_FOLDER": tmp,
+                "COMPANY_OPS_AGENT_START_DATE": "2026-08-10",
+            }
+            err = io.StringIO()
+            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(
+                module, "run_once", return_value=result
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                exit_code = module.main()
+
+        printed = err.getvalue()
+        self.assertEqual(exit_code, 2)
+        self.assertEqual([ln for ln in printed.splitlines() if ln == forged], [], printed)
+        self.assertIn("\\n", printed)
+        # The real reassurance still appears, exactly once.
+        self.assertEqual(
+            sum(1 for ln in printed.splitlines() if "outbox에 남아 있으며" in ln),
+            1,
+            printed,
+        )
+
+    def test_the_two_sinks_read_the_same_strings(self):
+        """Why the above is not a second, unrelated guard: `agent.run_once()`
+        builds `AgentRunResult.error` from the very values the per-date rows
+        print. Pinned structurally so the pair cannot be separated again."""
+        import inspect
+
+        from agent import agent as agent_module
+
+        source = inspect.getsource(agent_module.run_once)
+
+        self.assertIn('error="; ".join(date_result.errors)', source)
+        self.assertIn("error=_describe_drain_failure(leftover)", source)
 
 
 class CorruptStateGuidanceTests(unittest.TestCase):
@@ -1581,3 +1719,323 @@ class OutboxNameOccupiedByADirectoryTests(AgentTestCase):
         self.assertIsNone(self.state().last_successful_collection_date)
         errors = [error for d in result.dates for error in d.errors]
         self.assertTrue(any("could not stage event" in e for e in errors), errors)
+
+
+class ANonStringSignalFieldIsRefusedOnTheSendingSideTests(AgentTestCase):
+    """The other end of the same boundary.
+
+    `parse_signal()` validates a Signal's field SET, not its field types —
+    only `history_candidate` and `timestamp` are type-checked there. So a
+    Signal whose `summary` is a number was, until `validate_event()` started
+    enforcing docs/02 §4's declared string types, carried all the way to
+    Desktop 4 and killed the Daily Close there.
+
+    It is refused on the sending Desktop now, and refused the way an
+    unusable Signal already is (docs/03 §7's shape, applied by
+    `agent._reject_signal()`): moved to `signals_rejected/`, named in
+    `DateResult.errors`, the rest of the date still collected, the date still
+    marked done so the Agent does not stall on it forever.
+    """
+
+    DAY = date(2026, 8, 8)
+
+    def _signal(self, name, **overrides):
+        return self.write_signal(self.DAY, name, **overrides)
+
+    def _run_one_date(self):
+        return self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 9, 0).astimezone()
+        )
+
+    def test_the_bad_signal_is_rejected_and_the_good_one_is_delivered(self):
+        self._signal("good")
+        self._signal("bad", summary=12345)
+
+        result = self._run_one_date()
+        date_result = result.dates[0]
+
+        self.assertEqual(len(date_result.event_ids), 1)
+        self.assertEqual(date_result.rejected_signals, ("bad.json",))
+        self.assertTrue(
+            any("summary must be a string" in error for error in date_result.errors),
+            date_result.errors,
+        )
+
+    def test_it_is_moved_where_a_human_can_find_it(self):
+        self._signal("bad", summary=12345)
+
+        self._run_one_date()
+
+        moved = sorted(p.name for p in self.rejected_dir.rglob("*.json"))
+        self.assertEqual(moved, ["bad.json"])
+        self.assertEqual(list(self.signals_dir.rglob("bad.json")), [])
+
+    def test_the_date_still_completes(self):
+        """A Signal nobody can use must not stall the Desktop — the same
+        reasoning `_reject_signal()` states for every other unusable Signal."""
+        self._signal("good")
+        self._signal("bad", project_id={"k": 1})
+
+        result = self._run_one_date()
+
+        self.assertIs(result.status, AgentStatus.COMPLETED)
+        self.assertEqual(result.last_successful_collection_date, self.DAY)
+
+    def test_every_declared_string_field_is_refused_the_same_way(self):
+        for field_name in ("project_id", "summary"):
+            with self.subTest(field=field_name):
+                self.setUp()
+                self._signal("bad", **{field_name: 7})
+
+                result = self._run_one_date()
+
+                self.assertEqual(result.dates[0].rejected_signals, ("bad.json",))
+                self.assertTrue(
+                    any(field_name in error for error in result.dates[0].errors),
+                    result.dates[0].errors,
+                )
+
+    def test_a_signal_cannot_set_event_id_so_only_two_are_reachable_here(self):
+        """The third declared-string field is not reachable from a Signal:
+        `event_id` is a forbidden field (AGENT.md §3) and the Agent derives
+        it. Stated so the loop above is not read as an oversight."""
+        self._signal("bad", event_id=7)
+
+        result = self._run_one_date()
+
+        self.assertEqual(result.dates[0].rejected_signals, ("bad.json",))
+        self.assertTrue(
+            any("identity fields" in error for error in result.dates[0].errors),
+            result.dates[0].errors,
+        )
+
+
+class StalenessThresholdIsAKnobNobodyTurnsTests(unittest.TestCase):
+    """`needs_attention(stale_after_days=...)` — the other parameter nothing
+    anywhere passes (C43's AST sweep).
+
+    The default is load-bearing and documented: 2 rather than 1 "because a
+    machine that is simply off for a weekend is normal in this deployment
+    (docs/07 §58) and a status view that cries wolf every Monday gets
+    ignored". So the *value* is a decision that was taken; the *parameter* is
+    a capability nothing exercises.
+
+    It decides when a Desktop that produces Company History is called silent,
+    which is one of the few things this status view exists to say. Exercised
+    rather than removed, for the same reason as
+    `test_monthly_history.py::CoverageCanBeTrimmedAtTheBackTests`.
+    """
+
+    def _snapshot(self, last_run):
+        from agent.status import AgentStatusSnapshot
+
+        return AgentStatusSnapshot(
+            desktop_id="DESKTOP_1",
+            last_run=last_run,
+            last_successful_collection_date=None,
+            pending_dates=(),
+            outbox_count=0,
+            sent_count=0,
+            rejected_signal_count=0,
+            state_error=None,
+        )
+
+    NOW = datetime(2026, 8, 10, 9, 0).astimezone()
+
+    def _reasons(self, days_ago, **kwargs):
+        last_run = (self.NOW - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        return self._snapshot(last_run).needs_attention(self.NOW, **kwargs)
+
+    def test_the_default_is_inclusive_at_two_days(self):
+        """`elapsed >= stale_after_days`, measured rather than inferred from
+        the docstring's "tolerates a weekend": one day is quiet, two already
+        reports. Worth stating, because the sentence beside the default reads
+        as though a Monday-morning two-day gap would not."""
+        self.assertEqual(self._reasons(1), ())
+        self.assertEqual(self._reasons(2), ("agent has not run for 2 day(s)",))
+
+    def test_the_message_carries_the_elapsed_days(self):
+        self.assertTrue(any("3" in reason for reason in self._reasons(3)))
+
+    def test_a_stricter_threshold_reports_a_day_the_default_ignores(self):
+        """The knob, turned. Nothing in the repository turns it, so this is
+        the only place it is known to work."""
+        self.assertEqual(self._reasons(1), ())
+
+        self.assertEqual(
+            self._reasons(1, stale_after_days=1), ("agent has not run for 1 day(s)",)
+        )
+
+    def test_a_looser_threshold_stays_quiet_longer(self):
+        self.assertEqual(self._reasons(3, stale_after_days=7), ())
+        self.assertTrue(self._reasons(8, stale_after_days=7))
+
+    def test_no_caller_passes_it(self):
+        """The premise. `ops_status._print_agent()` calls
+        `snapshot.needs_attention(now)` with the default, which is what makes
+        the documented value the one an operator actually gets."""
+        import ast
+
+        repo = Path(__file__).resolve().parents[1]
+        sources = [p for p in (repo / "src").rglob("*.py") if "__pycache__" not in str(p)]
+        sources += [repo / "ops_status.py"]
+
+        callers = []
+        for path in sources:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and any(
+                    keyword.arg == "stale_after_days" for keyword in node.keywords
+                ):
+                    callers.append(str(path.relative_to(repo)))
+
+        self.assertEqual(callers, [])
+
+
+class AgentEntrypointConfigurationTests(unittest.TestCase):
+    """`run_agent.py`'s environment validation — the gate on Desktop 1-3.
+
+    Three `ConfigurationError` raises and the handler that reports them were
+    all unexecuted in a line-coverage pass that included the root scripts for
+    the first time (C41). They are the whole of what stands between a
+    mistyped `.env` and an Agent that appears to run.
+
+    The consequence is asymmetric in a way that matters. Desktop 4 is the
+    only machine anyone watches; an Agent that refuses to start says so on a
+    screen nobody is looking at, and an Agent that starts misconfigured
+    produces no Events at all. Either way the COO's first and only signal is
+    `ops_status.py`'s "3일 이상 아무것도 오지 않은 Desktop" — days later, and
+    identical for "the machine was off".
+
+    So what these pin is not the message text but the two decisions docs/07
+    §50 makes: a missing value is refused rather than guessed, and a
+    malformed one is refused rather than silently reinterpreted.
+
+    `main()` itself is not called — it would drain a real outbox against
+    `RUNTIME_DIR`. The resolvers and the reporting path are exercised
+    directly.
+    """
+
+    ENV_KEYS = (
+        "COMPANY_OPS_AGENT_SYNC_FOLDER",
+        "COMPANY_OPS_AGENT_START_DATE",
+        "COMPANY_OPS_PROFILE",
+    )
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "run_agent.py"
+        spec = importlib.util.spec_from_file_location("run_agent_config_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _with_env(self, **values):
+        import os
+
+        original = {key: os.environ.get(key) for key in self.ENV_KEYS}
+
+        def restore():
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        for key in self.ENV_KEYS:
+            os.environ.pop(key, None)
+        for key, value in values.items():
+            os.environ[key] = value
+
+    def test_a_missing_sync_folder_is_refused_not_guessed(self):
+        """"Event를 어느 폴더로 보낼지는 추측하지 않습니다" — a guessed folder
+        would deliver Events to a directory Desktop 4 never reads, and every
+        one of them would look sent."""
+        self._with_env()
+        module = self._module()
+
+        with self.assertRaises(module.ConfigurationError) as caught:
+            module._resolve_sync_folder()
+
+        self.assertIn("COMPANY_OPS_AGENT_SYNC_FOLDER", str(caught.exception))
+
+    def test_a_missing_start_date_is_refused_not_guessed(self):
+        """docs/07 §50: on a first-ever run there is no state to derive a
+        start from, and picking one silently either invents history or skips
+        it."""
+        self._with_env(COMPANY_OPS_AGENT_SYNC_FOLDER="C:\\\\sync")
+        module = self._module()
+
+        with self.assertRaises(module.ConfigurationError) as caught:
+            module._resolve_start_date()
+
+        self.assertIn("COMPANY_OPS_AGENT_START_DATE", str(caught.exception))
+
+    def test_a_malformed_start_date_names_the_value_it_refused(self):
+        """The third raise, and the one an operator can act on fastest — the
+        message carries the offending string, because "형식이 올바르지
+        않습니다" without it sends someone back to guess which variable."""
+        self._with_env(
+            COMPANY_OPS_AGENT_SYNC_FOLDER="C:\\\\sync",
+            COMPANY_OPS_AGENT_START_DATE="2026-13-45",
+        )
+        module = self._module()
+
+        with self.assertRaises(module.ConfigurationError) as caught:
+            module._resolve_start_date()
+
+        self.assertIn("2026-13-45", str(caught.exception))
+
+    def test_a_well_formed_start_date_is_accepted_as_written(self):
+        """The other side of both branches: a valid configuration must not
+        be refused, and the date must not be shifted by a timezone or a
+        locale on the way through."""
+        self._with_env(
+            COMPANY_OPS_AGENT_SYNC_FOLDER="C:\\\\sync",
+            COMPANY_OPS_AGENT_START_DATE="2026-08-05",
+        )
+        module = self._module()
+
+        self.assertEqual(module._resolve_start_date(), date(2026, 8, 5))
+        self.assertEqual(module._resolve_sync_folder(), Path("C:\\\\sync"))
+
+    def test_a_blank_value_is_treated_as_missing(self):
+        """`if not raw` rather than `if raw is None`. A variable set to the
+        empty string is the shape a half-edited `.env` produces, and
+        `Path("")` is the current directory — an Agent that "delivered" into
+        its own working directory would report success forever."""
+        self._with_env(
+            COMPANY_OPS_AGENT_SYNC_FOLDER="",
+            COMPANY_OPS_AGENT_START_DATE="",
+        )
+        module = self._module()
+
+        with self.assertRaises(module.ConfigurationError):
+            module._resolve_sync_folder()
+        with self.assertRaises(module.ConfigurationError):
+            module._resolve_start_date()
+
+    def test_the_failure_is_reported_on_stderr_and_exits_one(self):
+        """The handler these three raises reach. Exit 1 is the entrypoint's
+        configuration-error code (docs/14 §4 reserves it for exactly this),
+        and stderr rather than stdout so a scheduled run's output stream
+        still carries only results."""
+        # A valid profile, so the failure under test is the sync folder and
+        # not the profile check that runs one line earlier.
+        self._with_env(COMPANY_OPS_PROFILE="DESKTOP_1")
+        module = self._module()
+        out, err = io.StringIO(), io.StringIO()
+
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = module.main()
+
+        self.assertEqual(code, 1)
+        self.assertIn("[FAILED]", err.getvalue())
+        self.assertIn("COMPANY_OPS_AGENT_SYNC_FOLDER", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

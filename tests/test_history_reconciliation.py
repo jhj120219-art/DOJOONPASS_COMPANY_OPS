@@ -291,10 +291,6 @@ class ThreadedReadEquivalenceTests(ReconciliationTestCase):
         self.assertEqual(result.checked, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RetentionErasesTheEvidenceOfALossTests(unittest.TestCase):
     """A-20's detector depends on an artifact B-6 is deciding whether to
     delete. NOT FIXED; characterised, because the two are one decision.
@@ -428,3 +424,7 @@ class RetentionErasesTheEvidenceOfALossTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertIs(first, HistoryDecision.KEEP)
+
+
+if __name__ == "__main__":
+    unittest.main()

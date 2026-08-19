@@ -5,6 +5,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# The repository root too: this file imports a root-level script
+# (`ops_status.py` and friends live beside `src/`, not in it). Under
+# pytest the rootdir is already on `sys.path`, so the omission only
+# surfaced once `python tests/<file>.py` started running the whole
+# file instead of stopping at a stray `unittest.main()` (C38).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import review_cli  # noqa: E402
 from events import Event  # noqa: E402

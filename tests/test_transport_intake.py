@@ -202,6 +202,185 @@ class IntakeReplaceFailureTests(IntakeTestCase):
         self.assertEqual(summary.moved, ("E1.json",))
 
 
+class LiveProducerRaceTests(unittest.TestCase):
+    """A sender is still writing into the directory the intake is draining.
+
+    `TransportIntakeConcurrencySafetyTests` races four *consumers* against
+    each other on files that already exist. This is the other axis and the
+    one the atomic-write discipline was built for: a real OneDrive-style
+    sender (`transport.onedrive`, in separate OS processes) producing into
+    the folder while `run_intake()` + the Collector drain it in this one.
+
+    Three guards have to hold together, and none of them was ever exercised
+    against a live writer:
+
+        `.tmp-…json` is skipped          a staging file is a write in
+                                         progress, not an Event
+        `_is_parseable_json()`           a file that is not yet complete
+                                         JSON is left where it is
+        `os.replace()` commits           the name only ever appears once the
+                                         bytes are all there
+
+    Run with `stable_after_seconds=0` on purpose — the most aggressive
+    setting there is. The stability window is what usually hides a torn read
+    behind a delay, and switching it off means only the atomic-write
+    discipline is left holding the line.
+
+    What is asserted is the property, not a duration: every Event the
+    senders reported delivering is accepted **exactly once**, none is
+    rejected as malformed, and every accepted file still carries the whole
+    payload its sender wrote (a 400-character `evidence` entry, large enough
+    that a torn read could not go unnoticed).
+
+    Small on purpose: two senders, twenty Events each. Measured at four
+    senders x sixty during the Sprint that wrote it — 240 Events, 240
+    accepted, 0 duplicates, 0 rejected, 0 torn — and the assertions are the
+    same at any N.
+    """
+
+    SENDERS = 2
+    PER_SENDER = 20
+    DEADLINE_SECONDS = 90
+
+    SENDER_SOURCE = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[5])
+from events import create_event
+from transport.onedrive import OneDriveTransport
+
+sync, outgoing, prefix, count = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+transport = OneDriveTransport(sync_folder=sync, outgoing_dir=outgoing)
+for i in range(count):
+    transport.send(create_event(
+        source="DESKTOP_1", role="CTO_BACKEND", project_id="RACE",
+        event_type="MILESTONE_COMPLETED", status="IN_PROGRESS",
+        summary="race event", milestone="M", history_candidate=True,
+        timestamp="2026-08-01T10:00:00+09:00",
+        event_id="%s-%04d" % (prefix, i), evidence=["e" * 400],
+    ))
+"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.sync = self.root / "sync"
+        self.sync.mkdir(parents=True)
+        self.incoming = self.root / "incoming"
+        self.processed = self.root / "processed"
+        self.rejected = self.root / "rejected"
+        self.script = self.root / "race_sender.py"
+        self.script.write_text(self.SENDER_SOURCE, encoding="utf-8")
+
+    def _drain(self):
+        """One intake + one Collector pass, exactly as the Runner does."""
+        from collector import Collector
+        from collector import run_once as collector_run_once
+        from collector.state import PersistentSeenEventStore
+
+        summary = run_intake(
+            transport_dir=self.sync,
+            incoming_dir=self.incoming,
+            processed_dir=self.processed,
+            rejected_dir=self.rejected,
+            stable_after_seconds=0,
+        )
+        result = collector_run_once(
+            collector=Collector(
+                seen_store=PersistentSeenEventStore(
+                    state_path=self.root / "collector_state.json"
+                )
+            ),
+            incoming_dir=self.incoming,
+            processed_dir=self.processed,
+            rejected_dir=self.rejected,
+            log_path=self.root / "collector.log",
+        )
+        return summary, result
+
+    def _run_the_race(self):
+        import subprocess
+
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(self.script), str(self.sync),
+                 str(self.root / f"out{i}"), f"R{i}", str(self.PER_SENDER), src],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for i in range(self.SENDERS)
+        ]
+        self.addCleanup(lambda: [p.kill() for p in processes if p.poll() is None])
+
+        accepted, rejected, failed = [], [], []
+        self.overlapped = 0
+        deadline = time.time() + self.DEADLINE_SECONDS
+        while time.time() < deadline:
+            summary, result = self._drain()
+            for entry in result.files:
+                if entry.outcome.value == "ACCEPTED":
+                    accepted.append(entry.destination_path.name)
+                elif entry.outcome.value == "REJECTED":
+                    rejected.append(entry.source_path.name)
+                elif entry.outcome.value == "FAILED":
+                    failed.append(entry.source_path.name)
+            senders_done = all(p.poll() is not None for p in processes)
+            if summary.moved and not senders_done:
+                self.overlapped += len(summary.moved)
+            if senders_done and not summary.moved and not result.files:
+                break
+
+        for process in processes:
+            _out, err = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 0, err)
+
+        # The senders may have finished after the last drain; settle.
+        for _ in range(3):
+            _summary, result = self._drain()
+            for entry in result.files:
+                if entry.outcome.value == "ACCEPTED":
+                    accepted.append(entry.destination_path.name)
+                elif entry.outcome.value == "REJECTED":
+                    rejected.append(entry.source_path.name)
+
+        return accepted, rejected, failed
+
+    def test_every_event_arrives_exactly_once_while_the_senders_are_writing(self):
+        accepted, rejected, failed = self._run_the_race()
+
+        expected = {
+            f"R{s}-{i:04d}.json"
+            for s in range(self.SENDERS)
+            for i in range(self.PER_SENDER)
+        }
+
+        self.assertEqual(rejected, [], "a file was promoted before it was complete")
+        self.assertEqual(failed, [])
+        self.assertEqual(set(accepted), expected)
+        self.assertEqual(len(accepted), len(expected), "an Event was accepted twice")
+        self.assertEqual(sorted(p.name for p in self.sync.glob("*")), [])
+        self.assertEqual(sorted(p.name for p in self.incoming.glob("*")), [])
+        # And the test was not vacuous: at least one Event was promoted out
+        # of the folder while a sender process was still writing into it.
+        # Without this the whole class degrades, silently, into "drain a
+        # folder nobody is touching" — which the rest of this file already
+        # covers.
+        self.assertGreater(
+            self.overlapped, 0, "no drain overlapped a live sender; the race never happened"
+        )
+
+    def test_no_accepted_file_carries_a_torn_payload(self):
+        """The read the stability window would normally have hidden."""
+        accepted, _rejected, _failed = self._run_the_race()
+
+        for name in sorted(set(accepted)):
+            with self.subTest(event=name):
+                data = json.loads((self.processed / name).read_text(encoding="utf-8"))
+                self.assertEqual(data["event_id"] + ".json", name)
+                self.assertEqual(data["evidence"], ["e" * 400])
+
+
 class IntakePathSafetyTests(unittest.TestCase):
     def test_no_hardcoded_absolute_windows_paths(self):
         intake_file = Path(__file__).resolve().parents[1] / "src" / "transport" / "intake.py"

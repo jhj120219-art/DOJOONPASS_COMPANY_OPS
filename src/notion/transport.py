@@ -130,6 +130,11 @@ class RealNotionTransport(NotionTransport):
         self._api_token = api_token
         self._base_url = base_url
         self._timeout = timeout
+        # Set by `search_pages()`: True when it stopped at
+        # `_SEARCH_PAGE_LIMIT` with more results still available. Declared
+        # here so a caller can read it before the first search rather than
+        # hitting AttributeError.
+        self.search_truncated = False
 
     def _request(
         self, method: str, path: str, body: Mapping[str, Any] | None = None
@@ -220,13 +225,42 @@ class RealNotionTransport(NotionTransport):
         }
         return self._request("POST", "/databases", body)
 
+    # Notion's /search returns at most 100 results per request and reports
+    # `has_more` / `next_cursor`. Both were ignored, so a workspace with more
+    # than 100 shared pages answered "these are the pages" with a truncated
+    # list and no sign of it — and the one question this call exists to
+    # answer is "is the Company Ops page shared with this integration?",
+    # which a truncated list answers with a confident, wrong "no".
+    #
+    # Bounded rather than unbounded: this is a diagnostic, it runs inside an
+    # operator command, and a paging loop against a remote API is exactly
+    # where an unbounded `while` becomes a hang. Ten requests is 1,000 pages,
+    # far past any workspace this is used on, and stopping there is reported
+    # by `search_truncated` rather than hidden.
+    _SEARCH_PAGE_LIMIT = 10
+
     def search_pages(self) -> list[Mapping[str, Any]]:
-        response = self._request(
-            "POST",
-            "/search",
-            {"filter": {"value": "page", "property": "object"}, "page_size": 100},
-        )
-        return list(response.get("results") or [])
+        results: list[Mapping[str, Any]] = []
+        cursor: str | None = None
+        self.search_truncated = False
+        for _ in range(self._SEARCH_PAGE_LIMIT):
+            body: dict[str, Any] = {
+                "filter": {"value": "page", "property": "object"},
+                "page_size": 100,
+            }
+            if cursor is not None:
+                body["start_cursor"] = cursor
+            response = self._request("POST", "/search", body)
+            results.extend(response.get("results") or [])
+            if not response.get("has_more"):
+                return results
+            cursor = response.get("next_cursor")
+            if not cursor:
+                # `has_more` with no cursor is a response this cannot page
+                # through. Reported as truncated rather than looped on.
+                break
+        self.search_truncated = True
+        return results
 
 
 def _text_value(prop: Mapping[str, Any] | None, kind: str) -> str | None:

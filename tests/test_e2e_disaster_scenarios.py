@@ -314,6 +314,159 @@ class Desktop4RecoveryTests(DisasterScenarioTestCase):
         self.assertFalse((restored / "state").exists())
 
 
+
+class TheFirstRunAfterARestoreTests(DisasterScenarioTestCase):
+    """docs/10 §45 restores Company History. Then what?
+
+    `Desktop4RecoveryTests` above proves what the remote gives back —
+    `daily/` byte-for-byte — and `test_raw_events_and_candidates_are_not_in_the_backup`
+    proves what it does not: Events, Candidates and **all of `runtime/state/`**
+    are gone with the disk. Nothing ran the pipeline afterwards, so the state
+    a restored Desktop 4 actually boots into had never been exercised:
+
+        daily/                     restored, complete
+        state/daily_history_state.json   absent — the watermark is gone
+        events/processed/, seen store    absent
+        history_candidates/              absent
+
+    The pointer that says "these days are done" is the one thing the backup
+    deliberately does not carry, so the first run after a restore sees a full
+    Company History and no memory of having written any of it. docs/10 §46
+    forbids exactly the obvious failure ("프로그램이 임의로 History를 삭제하거나
+    다시 생성하면 안 된다") — a run that decides those days are unwritten and
+    regenerates them from the Candidates it no longer has would replace real
+    History with empty days, and then push that over the only copy.
+
+    Scheduled recovery makes this the normal path, not an exotic one: the
+    Runner runs on a trigger, so the first post-restore run happens on its
+    own, before anyone thinks to look.
+    """
+
+    DAYS = (1, 2, 3)
+    RESTORE_AT = datetime(2026, 8, 6, 9, 0)
+
+    def _build_and_lose_everything(self):
+        for day in self.DAYS:
+            self._write_event(
+                event_id=f"RESTORE-{day:03d}",
+                timestamp=f"2026-08-0{day}T10:00:00+09:00",
+                summary=f"work on day {day}",
+            )
+        self._run(now=datetime(2026, 8, 5, 12, 0).astimezone())
+        original = self._daily_snapshot()
+        self.assertTrue(original, "precondition: the first run wrote Company History")
+
+        # A disk loss takes the lot. Only the bare remote survives.
+        _force_rmtree(self.local_master_dir)
+        _force_rmtree(self.backup_working_copy_dir)
+        _force_rmtree(self.root / "runtime")
+        return original
+
+    def _restore_from_the_remote(self):
+        """docs/10 §45's restore, as an operator would do it: clone the
+        remote into place. The Working Copy is re-initialised the same way a
+        fresh install does, because it is not what carries History."""
+        self._run_git(
+            ["clone", str(self.bare_remote_dir), str(self.local_master_dir)],
+            cwd=self.root,
+        )
+        self._run_git(
+            ["clone", str(self.bare_remote_dir), str(self.backup_working_copy_dir)],
+            cwd=self.root,
+        )
+        self._run_git(
+            ["config", "user.email", "test@example.invalid"],
+            cwd=self.backup_working_copy_dir,
+        )
+        self._run_git(
+            ["config", "user.name", "Disaster Test"], cwd=self.backup_working_copy_dir
+        )
+
+    def test_the_restored_history_survives_the_first_run(self):
+        original = self._build_and_lose_everything()
+        self._restore_from_the_remote()
+
+        self._run(now=self.RESTORE_AT.astimezone())
+
+        after = self._daily_snapshot()
+        for name, text in original.items():
+            with self.subTest(day=name):
+                self.assertIn(name, after, "a restored Daily History file disappeared")
+                self.assertEqual(
+                    after[name],
+                    text,
+                    "the first run after a restore rewrote real History",
+                )
+
+    def test_the_run_does_not_push_emptied_history_over_the_only_copy(self):
+        """The consequence that cannot be undone. Whatever the run decides
+        locally, the remote is the last copy of Company History — if the
+        push carries emptied days, the restore has destroyed what it
+        recovered."""
+        original = self._build_and_lose_everything()
+        self._restore_from_the_remote()
+
+        self._run(now=self.RESTORE_AT.astimezone())
+
+        verify = self.root / "verify_remote"
+        self._run_git(["clone", str(self.bare_remote_dir), str(verify)], cwd=self.root)
+        remote_daily = {
+            p.name: p.read_text(encoding="utf-8") for p in (verify / "daily").glob("*.md")
+        }
+
+        for name, text in original.items():
+            with self.subTest(day=name):
+                self.assertEqual(remote_daily.get(name), text)
+
+    def test_the_missing_watermark_is_visible_rather_than_assumed(self):
+        """Whatever the run does, an operator has to be able to tell that
+        this Desktop has no memory of the History it is holding."""
+        self._build_and_lose_everything()
+        self._restore_from_the_remote()
+
+        self.assertFalse(self.scheduler_state_path.exists())
+
+        result = self._run(now=self.RESTORE_AT.astimezone())
+
+        self.assertIsNotNone(result)
+        self.assertTrue(self.scheduler_state_path.exists())
+
+        scheduler = result[2]
+        # The measurement C39 acted on. Before the split this read
+        # `generated_dates = 08-01 … 08-05` — five days "generated" by a run
+        # that wrote one file, on a Desktop whose History had just come back
+        # from git. It cannot have generated the other four: History
+        # Candidates are not in the backup (docs/08 §26), so the material
+        # those days are made of no longer exists on this machine.
+        self.assertEqual(
+            [d.isoformat() for d in scheduler.reused_dates],
+            ["2026-08-01", "2026-08-02", "2026-08-03", "2026-08-04"],
+        )
+        self.assertEqual(
+            [d.isoformat() for d in scheduler.generated_dates], ["2026-08-05"]
+        )
+        # The watermark ends up where a full close would have put it, which
+        # is why the conflation was harmless to the pipeline and misleading
+        # only to the person reading it.
+        self.assertEqual(len(scheduler.closed_dates), 5)
+
+    def test_the_manifest_does_not_claim_the_pipeline_rebuilt_the_history(self):
+        """The number an operator checks a restore against.
+
+        `app/runner.py` puts `generated_days` in the Run Manifest and
+        `notion/dashboard.py` puts it in the `Generated Days` column. Both
+        read `generated_dates`, so both said 5 for this run.
+        """
+        self._build_and_lose_everything()
+        self._restore_from_the_remote()
+
+        result = self._run(now=self.RESTORE_AT.astimezone())
+
+        daily = result.summary.component("daily")
+        self.assertEqual(daily.metrics["generated_days"], 1)
+        self.assertEqual(daily.metrics["reused_days"], 4)
+
+
 class StateVersusHistoryTests(DisasterScenarioTestCase):
     """docs/10 sections 46-49: History가 State보다 우선하고, 프로그램이 임의로
     History를 삭제하거나 다시 생성하지 않는다."""
@@ -365,8 +518,16 @@ class StateVersusHistoryTests(DisasterScenarioTestCase):
         result = self._run(now=datetime(2026, 8, 5, 13, 0).astimezone())
 
         self.assertEqual(self._daily_snapshot(), before)
+        # The two assertions used to contradict each other one line apart:
+        # "not a single file changed" and "two dates were generated". C39
+        # split the field, so the second one can now say what happened.
+        self.assertEqual([d.isoformat() for d in result[2].generated_dates], [])
         self.assertEqual(
-            [d.isoformat() for d in result[2].generated_dates],
+            [d.isoformat() for d in result[2].reused_dates],
+            ["2026-08-03", "2026-08-04"],
+        )
+        self.assertEqual(
+            [d.isoformat() for d in result[2].closed_dates],
             ["2026-08-03", "2026-08-04"],
         )
 

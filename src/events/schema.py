@@ -112,6 +112,48 @@ def validate_event(data: Mapping[str, Any]) -> list[str]:
         if value is not None and not isinstance(value, str):
             errors.append(f"{field_name} must be a string or null")
 
+    # docs/02 §4's table declares these three `string`, and this function was
+    # the only place that did not enforce it. Every other typed field was
+    # covered — `timestamp` by `_timestamp_error()`, `milestone` / `blocker`
+    # directly above, `evidence` below, `history_candidate` by its own check,
+    # and `source` / `role` / `event_type` / `status` implicitly, because a
+    # non-string cannot be in a frozenset of strings. These three were
+    # checked for presence only.
+    #
+    # It is a trust boundary: an Event arrives as JSON written on another
+    # Desktop and crosses OneDrive, so its types are whatever that file says.
+    # The Signal layer does not close it either — `agent.signals.parse_signal()`
+    # validates the field *set*, not the field types.
+    #
+    # Measured through the real Runner, one crafted Event beside one ordinary
+    # one, before this check existed:
+    #
+    #     summary=12345    Collector ACCEPTED -> KEEP Candidate stored ->
+    #                      daily FAILED "sequence item 2: expected str
+    #                      instance, int found" -> 0 Daily files, exit 2
+    #     project_id=7     ACCEPTED -> notion_sync AND daily both FAILED
+    #                      ("'int' object has no attribute 'replace'") ->
+    #                      0 Daily files, exit 2
+    #     event_id=99      TypeError escapes run_once() entirely, from
+    #                      `collector/state.py`'s sorted() over mixed int and
+    #                      str ids — the run dies inside step 3
+    #
+    # The first two are the worse pair: the Candidate is written to `keep/`,
+    # so **every later run fails the same way** and Company History stops
+    # advancing until a human deletes a file. One malformed Event from one
+    # Desktop takes the pipeline down, and takes that run's innocent Events
+    # with it.
+    #
+    # Refusing them here routes them where docs/03 §7 already sends an
+    # invalid Event — REJECTED, moved to `rejected/`, the run continuing —
+    # instead of into a CRITICAL step. Nothing about *empty* strings changes:
+    # `""` is still accepted, which is BACKLOG A-15's separate, still-open
+    # question.
+    for field_name in ("event_id", "project_id", "summary"):
+        value = data.get(field_name)
+        if value is not None and not isinstance(value, str):
+            errors.append(f"{field_name} must be a string")
+
     event_type = data.get("event_type")
     status = data.get("status")
 

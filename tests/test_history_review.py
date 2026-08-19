@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import re
 import shutil
 import sys
@@ -9,6 +10,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# The repository root too: this file imports a root-level script
+# (`ops_status.py` and friends live beside `src/`, not in it). Under
+# pytest the rootdir is already on `sys.path`, so the omission only
+# surfaced once `python tests/<file>.py` started running the whole
+# file instead of stopping at a stray `unittest.main()` (C38).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from daily import (  # noqa: E402
     LateUpdateOutcome,
@@ -374,10 +381,6 @@ class ReviewedContextReachesNothingTests(unittest.TestCase):
         self.assertNotIn("history_candidates", _ALLOWED_TOP_LEVEL_DIRS)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReviewCandidatesReachNothingTests(unittest.TestCase):
     """CHARACTERIZATION (BACKLOG E-20): a REVIEW candidate has no path into
     Company History, and until now no counter either.
@@ -741,3 +744,263 @@ class ReviewAlertClearsWhenTheWorkIsDoneTests(unittest.TestCase):
 
         self.assertIn("검토 대기 Candidate : 0", printed)
         self.assertEqual(attention, [])
+
+
+class ReviewedButNotRenderedTests(unittest.TestCase):
+    """C33 §3: Decision Context a human wrote that Company History never got.
+
+    Unlike E-17 and A-20, the content lost here is **human-authored** — the
+    most expensive kind this pipeline handles, and the only kind no re-run
+    can reproduce.
+
+    The capability is fully built and, for a KEEP Candidate, unreachable.
+    `review_cli.py` prompts for four fields, `history.review` stores them,
+    `daily/markdown.py` renders each one when present — and the timing makes
+    the middle unable to reach the end:
+
+        step 5   writes the Candidate
+        step 6   renders that date          <- same run, seconds later
+        human reviews                       <- the only window that exists
+        step 6.5 merges only *new* Events onto a closed date (§38 skips an
+                 event_id the file already has)
+        step 6   refuses to overwrite an existing Daily file
+
+    Measured end to end before this check existed: review stored True,
+    re-read from disk True, `update_daily_history` NO_LATE_EVENTS,
+    `generate_daily_history` FileExistsError, Decision Context in the Daily
+    file False, Daily file unchanged. `_kept_but_not_rendered()` reported
+    clean — correctly; the `event_id` really is in the file.
+
+    Detection only. Both repairs are decisions and are recorded in BACKLOG.
+    """
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.keep = root / "keep"
+        self.daily = root / "daily"
+        self.keep.mkdir(parents=True)
+        self.daily.mkdir(parents=True)
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_review", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _candidate(self, event_id="EVT-R1", when="2026-08-10", **review):
+        payload = {
+            "history_id": f"HIST-{event_id}",
+            "event_id": event_id,
+            "timestamp": f"{when}T10:00:00+09:00",
+            "category": "DECISION",
+            "project_id": "PRJ",
+            "role": "COO",
+            "summary": "CEO approved Closed Beta scope",
+            "evidence": [],
+            "filter_result": "KEEP",
+            "decision_context": None,
+            "expected_outcome": None,
+            "actual_outcome": None,
+            "lessons_learned": None,
+        }
+        payload.update(review)
+        (self.keep / f"HIST-{event_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        return payload
+
+    def _daily(self, when="2026-08-10", *, event_id="EVT-R1", extra_lines=()):
+        lines = [
+            f"# Company History — {when}",
+            "",
+            "## Decisions",
+            "",
+            "### PRJ",
+            "- CEO approved Closed Beta scope",
+            "- Owner: COO",
+            f"- Event ID: {event_id}",
+        ]
+        lines.extend(extra_lines)
+        (self.daily / f"{when}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _check(self):
+        module = self._module()
+        candidates, _unreadable = module._read_keep_candidates(self.keep)
+        return module._reviewed_but_not_rendered(candidates, self.daily)
+
+    def test_a_review_the_daily_file_does_not_carry_is_reported(self):
+        self._candidate(decision_context="Board asked for 4 weeks; CEO cut it to 2.")
+        self._daily()
+
+        stranded = self._check()
+
+        self.assertEqual(len(stranded), 1, stranded)
+        self.assertIn("EVT-R1", stranded[0])
+        self.assertIn("Decision Context", stranded[0])
+
+    def test_every_missing_field_is_named(self):
+        """An operator has to know which of the four to re-enter."""
+        self._candidate(
+            decision_context="ctx",
+            expected_outcome="500 signups",
+            lessons_learned="restate the metric",
+        )
+        self._daily()
+
+        stranded = self._check()
+
+        self.assertEqual(len(stranded), 1)
+        for label in ("Decision Context", "Expected Outcome", "Lessons Learned"):
+            self.assertIn(label, stranded[0])
+        self.assertNotIn("Actual Outcome", stranded[0])
+
+    def test_a_rendered_review_is_not_reported(self):
+        """The other direction, and the one that keeps the check usable: a
+        Candidate reviewed BEFORE its day was closed renders normally and
+        must stay silent."""
+        self._candidate(decision_context="ctx")
+        self._daily(extra_lines=["- Decision Context: ctx"])
+
+        self.assertEqual(self._check(), ())
+
+    def test_partially_rendered_reports_only_the_missing_half(self):
+        self._candidate(decision_context="ctx", actual_outcome="shipped")
+        self._daily(extra_lines=["- Decision Context: ctx"])
+
+        stranded = self._check()
+
+        self.assertEqual(len(stranded), 1)
+        self.assertIn("Actual Outcome", stranded[0])
+        self.assertNotIn("Decision Context", stranded[0])
+
+    def test_an_unreviewed_candidate_is_never_reported(self):
+        self._candidate()
+        self._daily()
+
+        self.assertEqual(self._check(), ())
+
+    def test_a_day_with_no_daily_file_yet_is_not_a_loss(self):
+        """The Scheduler window. This Candidate WILL carry its context when
+        the day is closed — reporting it would be an alert that clears
+        itself, which this view refuses on principle."""
+        self._candidate(decision_context="ctx")
+
+        self.assertEqual(self._check(), ())
+
+    def test_an_empty_string_is_not_a_review(self):
+        """`daily/markdown.py` renders each field only `if candidate.<field>`,
+        so an empty string is never rendered and must not be looked for."""
+        self._candidate(decision_context="", expected_outcome="   ")
+        self._daily()
+
+        stranded = self._check()
+
+        self.assertEqual([s for s in stranded if "Decision Context" in s], [])
+
+    def test_a_non_string_review_value_is_ignored_rather_than_crashing(self):
+        """A hand-edited or restored Candidate file is a DR path. This view's
+        contract is to answer even when the evidence is damaged."""
+        self._candidate(decision_context=42, expected_outcome=["a", "b"])
+        self._daily()
+
+        self.assertEqual(self._check(), ())
+
+    def test_a_summary_that_imitates_the_label_line_cannot_mask_a_loss(self):
+        """The trap C30 hit one function over: the renderer writes a summary
+        raw as its block's first bullet, so a summary reading
+        `Decision Context: ctx` produces a line identical to the real one.
+        Summary lines are excluded from the comparison for exactly this."""
+        self._candidate(decision_context="ctx")
+        (self.daily / "2026-08-10.md").write_text(
+            "\n".join(
+                [
+                    "# Company History — 2026-08-10",
+                    "",
+                    "## Decisions",
+                    "",
+                    "### PRJ",
+                    "- Decision Context: ctx",   # the SUMMARY, not the label
+                    "- Owner: COO",
+                    "- Event ID: EVT-R1",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        stranded = self._check()
+
+        self.assertEqual(len(stranded), 1, stranded)
+        self.assertIn("Decision Context", stranded[0])
+
+    def test_a_multi_line_value_is_compared_on_its_label_line(self):
+        """The renderer writes the value raw, so only its first line lands on
+        the label line. Comparing the whole value would report every
+        multi-line review as lost."""
+        self._candidate(decision_context="first line\nsecond line")
+        self._daily(extra_lines=["- Decision Context: first line", "second line"])
+
+        self.assertEqual(self._check(), ())
+
+    def test_two_candidates_on_one_day_are_judged_separately(self):
+        """Presence of *a* label line is not enough — it might belong to the
+        other Candidate."""
+        self._candidate(event_id="EVT-A", decision_context="ctx-a")
+        self._candidate(event_id="EVT-B", decision_context="ctx-b")
+        self._daily(extra_lines=["- Decision Context: ctx-a", "- Event ID: EVT-B"])
+
+        stranded = self._check()
+
+        self.assertEqual(len(stranded), 1, stranded)
+        self.assertIn("EVT-B", stranded[0])
+
+    def test_the_labels_come_from_the_review_cli_not_a_second_list(self):
+        """Asking exactly what the renderer answers. Three modules name these
+        four fields; a fourth private copy is how they drift."""
+        from review_cli import _REVIEW_FIELDS
+
+        module = self._module()
+
+        self.assertIs(module._REVIEW_FIELDS, _REVIEW_FIELDS)
+
+    def test_the_labels_match_what_the_renderer_actually_writes(self):
+        """The pairing is only useful if `daily/markdown.py` writes the same
+        strings. Checked against the renderer's source rather than assumed."""
+        from review_cli import _REVIEW_FIELDS
+
+        renderer = (
+            Path(__file__).resolve().parents[1] / "src" / "daily" / "markdown.py"
+        ).read_text(encoding="utf-8")
+
+        for field, label in _REVIEW_FIELDS:
+            with self.subTest(field=field):
+                self.assertIn(f'f"- {label}: {{candidate.{field}}}"', renderer)
+
+    def test_the_check_is_wired_into_the_history_block(self):
+        """A detector nothing runs detects nothing."""
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("_reviewed_but_not_rendered(keep_candidates, daily_dir)", source)
+
+    def test_the_shared_reader_is_still_read_once(self):
+        """The fourth element rides along on the existing single pass. A
+        third read of every Candidate would undo the 24.3s -> 5.9s that
+        reader exists for."""
+        import inspect
+
+        module = self._module()
+        source = inspect.getsource(module._read_keep_candidates)
+
+        # The construction, not the word — the docstring names the class too.
+        self.assertEqual(source.count("with ThreadPoolExecutor("), 1)
+        self.assertIn("_REVIEW_FIELDS", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

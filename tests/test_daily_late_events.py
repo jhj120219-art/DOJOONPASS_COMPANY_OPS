@@ -21,6 +21,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# The repository root too — `ops_status.py` lives beside `src/`, and one
+# test below reads a Daily file through the operator-facing detector
+# rather than re-deriving what it would have said.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from daily import (  # noqa: E402
     LATE_SECTION_TITLE,
@@ -116,8 +120,16 @@ class EmptyEventIdIsStillAnEventIdTests(LateUpdateTestCase):
     """
 
     def test_an_empty_event_id_is_read_back_from_the_rendered_line(self):
-        self.assertEqual(existing_event_ids("- Event ID: \n"), {""})
-        self.assertEqual(existing_event_ids("- Event ID:\n"), {""})
+        """The fixture is a whole item block, which is the only place the
+        renderer writes a label at all — `item_block_bounds()` now says so
+        structurally, so a bare line with no `### ` above it is prose and
+        would not exercise this rule at all
+        (`OnlyItemBlocksCarryLabelsTests`)."""
+        for line in ("- Event ID: ", "- Event ID:"):
+            with self.subTest(line=line):
+                block = "## Milestones\n\n### P\n\n- did a thing\n" + line + "\n"
+
+                self.assertEqual(existing_event_ids(block), {""})
 
     def test_an_ordinary_id_is_unaffected(self):
         markdown = "### P\n\n- did a thing\n- Owner: COO\n- Event ID: EVT-1\n"
@@ -168,7 +180,7 @@ class EmptyEventIdIsStillAnEventIdTests(LateUpdateTestCase):
 
 class SelectionTests(unittest.TestCase):
     def test_an_event_already_in_the_file_is_not_selected(self):
-        markdown = "- Event ID: EVT-1\n"
+        markdown = "## Milestones\n\n### P\n\n- did a thing\n- Event ID: EVT-1\n"
         selected = select_late_candidates(markdown, [candidate("EVT-1"), candidate("EVT-2")])
         self.assertEqual([c.event_id for c in selected], ["EVT-2"])
 
@@ -431,10 +443,6 @@ class PureFunctionTests(unittest.TestCase):
         self.assertFalse(updated.endswith("\n\n"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class MetadataNotLastTests(LateUpdateTestCase):
     """`_metadata_bounds()` claims to handle a file whose `## Metadata` is not
     the last section. Nothing executed that claim.
@@ -505,6 +513,189 @@ class MetadataNotLastTests(LateUpdateTestCase):
             with self.subTest(field=field):
                 at = next(i for i, line in enumerate(lines) if line.startswith(field))
                 self.assertLess(at, note_at, f"{field} landed after the hand-written section")
+
+
+class TrimmedMetadataFieldsAreRestoredTests(unittest.TestCase):
+    """`_update_metadata()`'s docstring promises "a field that is missing (a
+    hand-trimmed block) is inserted". It was true of two fields out of three.
+
+    Found by branch coverage: of the six ways a Metadata block can be missing
+    some subset of `Last Updated At` / `Late Events Added` / `Event Count`,
+    the suite only ever ran two — all three present, and the first two both
+    absent. The four mixed arrangements had never executed, and one of them
+    was a defect rather than a gap.
+
+    **`Event Count` was rewritten but never restored.** The loop that updates
+    it simply `break`s when it finds the line and does nothing when it does
+    not, and the insertion block below listed only the other two fields. The
+    cost outlives the run: `ops_status._daily_counts_more_than_it_shows()`
+    compares that number against the ids the file carries and *skips a file
+    whose line is missing or unparseable*. So a Metadata block trimmed by
+    hand — docs/06 §57 and docs/11 §71 both permit the edit, and dropping a
+    machine-bookkeeping line is the most natural trim there is — silently
+    switched off the only detector for three real losses (a `category=None`
+    Candidate that reaches no Section, a forged `- Event ID:` line, a
+    hand-deleted item block) for that day, for good.
+
+    The no-block branch of the same function already writes all three when it
+    builds a Metadata block from nothing, so the fix is the same field set
+    reached the other way.
+    """
+
+    HEADER = (
+        "# DOJOONPASS Company History — 2026-08-01\n"
+        "\n"
+        "## Milestones\n"
+        "\n"
+        "### PRJ_A\n"
+        "\n"
+        "- work EVT-1\n"
+        "- Event ID: EVT-1\n"
+        "\n"
+        "## Metadata\n"
+        "\n"
+        "- History Date: 2026-08-01\n"
+        "- Generated At: 2026-08-02T11:00:00+09:00\n"
+        "- Source: DOJOONPASS Company Ops\n"
+    )
+
+    def _temp_dir(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def _document(self, *fields: str) -> str:
+        return self.HEADER + "".join(f"{line}\n" for line in fields)
+
+    def _field(self, text: str, prefix: str) -> str | None:
+        for line in text.splitlines():
+            if line.strip().startswith(prefix):
+                return line.strip()[len(prefix):].strip()
+        return None
+
+    def test_a_metadata_block_with_no_event_count_line_gets_one_back(self):
+        markdown = self._document(
+            "- Last Updated At: 2026-08-05T09:00:00+09:00",
+            "- Late Events Added: 1",
+        )
+
+        updated = append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat())
+
+        self.assertEqual(self._field(updated, "- Event Count:"), "2")
+
+    def test_the_restored_count_is_what_the_loss_detector_reads(self):
+        """The line is not decoration — it is the detector's only input.
+
+        `_daily_counts_more_than_it_shows()` reports `(date, claimed,
+        carried)` and skips any file with no `- Event Count:` line. Before the
+        fix this day was skipped forever; after it, the same day is compared
+        again and reports clean, which is the state a healthy day should be
+        in.
+        """
+        import ops_status
+
+        markdown = self._document(
+            "- Last Updated At: 2026-08-05T09:00:00+09:00",
+            "- Late Events Added: 1",
+        )
+        daily_dir = self._temp_dir()
+        path = daily_dir / f"{DAY.isoformat()}.md"
+
+        path.write_text(markdown, encoding="utf-8")
+        self.assertEqual(
+            ops_status._daily_counts_more_than_it_shows(daily_dir),
+            (),
+            "a file with no count line is skipped, not reported — that is the blindness",
+        )
+        self.assertIsNone(self._field(markdown, "- Event Count:"))
+
+        path.write_text(
+            append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat()),
+            encoding="utf-8",
+        )
+        self.assertEqual(ops_status._daily_counts_more_than_it_shows(daily_dir), ())
+        self.assertEqual(self._field(path.read_text(encoding="utf-8"), "- Event Count:"), "2")
+
+    def test_the_restored_count_reports_a_real_loss_on_the_next_run(self):
+        """And the point of restoring it: the detector can now see a loss.
+
+        A hand-deleted item block leaves the count above what the file
+        carries, which is docs/06 §57's third listed loss.
+        """
+        import ops_status
+
+        markdown = self._document(
+            "- Last Updated At: 2026-08-05T09:00:00+09:00",
+            "- Late Events Added: 1",
+        )
+        updated = append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat())
+        # The operator deletes one item block by hand, leaving the count.
+        without_item = updated.replace("- Event ID: EVT-1\n", "")
+
+        daily_dir = self._temp_dir()
+        (daily_dir / f"{DAY.isoformat()}.md").write_text(without_item, encoding="utf-8")
+
+        self.assertEqual(
+            ops_status._daily_counts_more_than_it_shows(daily_dir),
+            ((DAY.isoformat(), 2, 1),),
+        )
+
+    def test_only_the_missing_last_updated_line_is_inserted(self):
+        markdown = self._document(
+            "- Late Events Added: 3",
+            "- Event Count: 1",
+        )
+
+        updated = append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat())
+
+        self.assertEqual(self._field(updated, "- Last Updated At:"), NOW.isoformat())
+        # accumulated, not replaced
+        self.assertEqual(self._field(updated, "- Late Events Added:"), "4")
+        self.assertEqual(self._field(updated, "- Event Count:"), "2")
+        self.assertEqual(updated.count("- Late Events Added:"), 1)
+
+    def test_only_the_missing_late_events_added_line_is_inserted(self):
+        markdown = self._document(
+            "- Last Updated At: 2026-08-05T09:00:00+09:00",
+            "- Event Count: 1",
+        )
+
+        updated = append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat())
+
+        self.assertEqual(self._field(updated, "- Last Updated At:"), NOW.isoformat())
+        self.assertEqual(self._field(updated, "- Late Events Added:"), "1")
+        self.assertEqual(self._field(updated, "- Event Count:"), "2")
+        self.assertEqual(updated.count("- Last Updated At:"), 1)
+
+    def test_a_block_holding_all_three_is_updated_in_place_and_nothing_added(self):
+        markdown = self._document(
+            "- Last Updated At: 2026-08-05T09:00:00+09:00",
+            "- Late Events Added: 2",
+            "- Event Count: 1",
+        )
+
+        updated = append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat())
+
+        for prefix in ("- Last Updated At:", "- Late Events Added:", "- Event Count:"):
+            with self.subTest(field=prefix):
+                self.assertEqual(updated.count(prefix), 1)
+        self.assertEqual(self._field(updated, "- Late Events Added:"), "3")
+        self.assertEqual(self._field(updated, "- Event Count:"), "2")
+
+    def test_every_inserted_field_lands_inside_the_metadata_block(self):
+        """A hand-edited file may carry a section after Metadata; an inserted
+        bookkeeping line must not cross into it."""
+        markdown = self._document() + "\n## COO Note\n\n사람이 쓴 문단.\n"
+
+        updated = append_late_events(markdown, (candidate("EVT-LATE"),), now_iso=NOW.isoformat())
+
+        lines = updated.splitlines()
+        note_at = next(i for i, line in enumerate(lines) if line.strip() == "## COO Note")
+        for prefix in ("- Last Updated At:", "- Late Events Added:", "- Event Count:"):
+            with self.subTest(field=prefix):
+                at = next(i for i, line in enumerate(lines) if line.startswith(prefix))
+                self.assertLess(at, note_at)
+        self.assertIn("사람이 쓴 문단.", updated)
 
 
 class SummaryShapedLikeALabelTests(unittest.TestCase):
@@ -604,6 +795,268 @@ class SummaryShapedLikeALabelTests(unittest.TestCase):
         self.assertEqual(existing_event_ids(markdown), {"EVT-H"})
 
 
+class OnlyItemBlocksCarryLabelsTests(unittest.TestCase):
+    """REGRESSION. `SummaryShapedLikeALabelTests` closed the door inside the
+    item block. `## Summary` is the same door one section up, and it was open.
+
+    `render_daily_markdown()` writes the `## Summary` section by repeating
+    every candidate's summary **raw** — no `- ` of its own, unlike the copy
+    inside the item block, which is written as `- {summary}` and so reads
+    `- - Event ID: …` for this input. So a summary that is itself a bullet
+    lands in `## Summary` as a bare line indistinguishable from a label, and
+    `summary_line_indices()` cannot reach it: that rule walks `### ` item
+    blocks, and the Summary section has none.
+
+    Measured, one ordinary KEEP Candidate whose summary was `- Event ID: L1`:
+
+        ## Summary
+
+        - Event ID: L1                    <- the summary, verbatim
+
+        existing_event_ids(day)           {'E1', 'L1'}
+        select_late_candidates(day, [L1]) ()      <- never appended
+        append_late_events(...)           file unchanged
+
+    A genuinely late L1 is dropped on arrival and on every run that revisits
+    the date — §38's guard believing it is doing its job, with no counter and
+    no log line. Nothing is hand-edited and nothing is crafted: this
+    repository's own benign fuzz corpus already lists `- leading dash` as a
+    realistic summary, and `Event ID: …` as another.
+
+    Fixed by `daily/markdown.item_block_bounds()`: a label is only ever
+    written inside a `### ` block, so only those lines are read as labels.
+    """
+
+    def _closed_day(self, summary):
+        from daily.markdown import render_daily_markdown
+
+        return render_daily_markdown(DAY, [candidate("EVT-1", summary=summary)], "gen")
+
+    def test_a_bullet_summary_naming_another_event_does_not_suppress_it(self):
+        for summary in (
+            "- Event ID: EVT-999",
+            "-  Event ID: EVT-999",
+            "- Event ID:\tEVT-999",
+        ):
+            with self.subTest(summary=summary):
+                day = self._closed_day(summary)
+
+                self.assertNotIn("EVT-999", existing_event_ids(day))
+                self.assertEqual(
+                    [c.event_id for c in select_late_candidates(day, [candidate("EVT-999")])],
+                    ["EVT-999"],
+                )
+
+    def test_the_suppressed_event_reaches_the_file_and_is_not_re_added(self):
+        day = self._closed_day("- Event ID: EVT-999")
+
+        updated = append_late_events(
+            day, select_late_candidates(day, [candidate("EVT-999")]), now_iso="X"
+        )
+
+        self.assertIn(LATE_SECTION_TITLE, updated)
+        self.assertIn("- Event Count: 2", updated)
+        # The appended block carries its own label, inside a `### ` block, so
+        # the guard sees it from now on — the loss is closed in one direction
+        # without opening an unbounded duplicate in the other.
+        self.assertEqual(select_late_candidates(updated, [candidate("EVT-999")]), ())
+
+    def test_the_summary_section_is_where_it_came_from(self):
+        """Names the mechanism, so a future change to the renderer that stops
+        repeating summaries raw shows up here rather than silently making
+        this class test nothing."""
+        day = self._closed_day("- Event ID: EVT-999")
+        lines = day.splitlines()
+        start = lines.index("## Summary")
+
+        self.assertEqual(lines[start + 2], "- Event ID: EVT-999")
+
+    def test_an_evidence_line_can_no_longer_spell_a_label(self):
+        """The Evidence section renders `- <event_id>: <text>`, which IS a
+        label line when the id is literally `Event ID`. The docstring claimed
+        Evidence lines "deliberately do not match"; only the block rule makes
+        that structurally true rather than incidentally so."""
+        from daily.markdown import render_daily_markdown
+
+        spelling_a_label = candidate("Event ID", summary="Shipped it.")
+        spelling_a_label = HistoryCandidate(
+            **{**spelling_a_label.__dict__, "evidence": ("EVT-PHANTOM",)}
+        )
+        day = render_daily_markdown(DAY, [spelling_a_label], "gen")
+
+        self.assertIn("- Event ID: EVT-PHANTOM", day)  # the Evidence line
+        self.assertEqual(existing_event_ids(day), {"Event ID"})
+
+    def test_hand_written_prose_outside_a_block_is_not_a_label(self):
+        """docs/06 §57 permits a COO note anywhere. A note that mentions an
+        Event must not silently become §38's record that the Event is here."""
+        day = self._closed_day("Shipped it.")
+        annotated = day.replace(
+            "## Metadata",
+            "## COO Notes\n\n- Event ID: EVT-777 was superseded.\n\n## Metadata",
+        )
+
+        self.assertEqual(existing_event_ids(annotated), {"EVT-1"})
+
+    def test_the_cost_of_being_wrong_is_one_duplicate_and_then_it_stops(self):
+        """The claim this narrowing rests on, measured instead of asserted.
+
+        Confining the scan to `### ` blocks can miss a real label — a §57
+        hand edit that deleted an item's `### <project>` heading leaves the
+        block's `- Event ID:` outside every block. The Event is then appended
+        again under `## Late Events`. That is the direction to be wrong in,
+        and this is why: the appended block carries its OWN `### ` heading,
+        so the guard sees it from the next run onwards. One duplicate, in a
+        section named for it, and then it stops — against a phantom id, whose
+        cost is an Event that never reaches Company History at all.
+        """
+        headless = (
+            "# T\n\n## Milestones\n\n- the summary\n- Owner: COO\n- Event ID: EVT-H\n"
+            "\n## Metadata\n\n- Event Count: 1\n"
+        )
+
+        self.assertEqual(existing_event_ids(headless), set())
+
+        first = append_late_events(
+            headless, select_late_candidates(headless, [candidate("EVT-H")]), now_iso="X"
+        )
+
+        self.assertIn(LATE_SECTION_TITLE, first)
+        self.assertEqual(existing_event_ids(first), {"EVT-H"})
+
+        # And it stops: the second pass finds nothing to add.
+        self.assertEqual(select_late_candidates(first, [candidate("EVT-H")]), ())
+        self.assertEqual(
+            append_late_events(
+                first, select_late_candidates(first, [candidate("EVT-H")]), now_iso="Y"
+            ),
+            first,
+        )
+
+    def test_a_real_label_in_a_real_block_is_still_found(self):
+        """The guard must still guard — the fix narrows it, not disables it."""
+        day = self._closed_day("Shipped it.")
+
+        self.assertEqual(existing_event_ids(day), {"EVT-1"})
+        self.assertEqual(select_late_candidates(day, [candidate("EVT-1")]), ())
+
+
+class ACategoryLessLateItemTests(unittest.TestCase):
+    """CHARACTERIZATION — the `- Category:` bullet's absent side.
+
+    `_render_item_block(include_category=True)` writes the bullet only when
+    the candidate actually has a category, and a branch-coverage pass (C43)
+    found the falsy side had never run: no test had ever appended a late item
+    with `category=None`.
+
+    It is a reachable state, not a theoretical one — `test_daily_history.py::
+    test_a_category_less_keep_candidate_silently_loses_its_detail` records
+    the route (docs/11 §71 permits a human to promote a CANCELLED-derived
+    Candidate by hand) and what it costs on the Daily-close path.
+
+    The late path is **not the same**, and the asymmetry is worth having
+    written down. Measured, one such Candidate arriving after the day closed:
+
+        Daily close   summary survives in `## Summary`; Event ID, Owner and
+                      every review field are lost entirely
+        late append   the whole item block reaches `## Late Events` —
+                      summary, Owner AND Event ID — because `## Late Events`
+                      is not one of the four category sections
+        Monthly       drops it (no `- Category:`, and guessing a heading
+                      would be worse) and COUNTS it: `unconsolidated=1`,
+                      which `app/runner.py` logs as MONTHLY_UNCONSOLIDATED
+        next run      not re-added — the id is in the file, so §38 sees it
+
+    So the loss is bounded to the Monthly, and it is not silent. Nothing here
+    is fixed: what a Monthly should do with a category it does not recognise
+    is docs/09 §14's decision, recorded as BACKLOG A-21 together with the
+    Daily-side sibling.
+    """
+
+    def _candidate_without_category(self, event_id="L-NOCAT"):
+        return HistoryCandidate(
+            history_id=f"HIST-{event_id}",
+            event_id=event_id,
+            timestamp=f"{DAY.isoformat()}T11:00:00+09:00",
+            category=None,
+            project_id="PRJ_A",
+            role="COO",
+            summary="a category-less late candidate",
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _closed_day_with_late(self):
+        from daily.markdown import render_daily_markdown
+
+        day = render_daily_markdown(DAY, [candidate("EVT-1")], "gen")
+        late = self._candidate_without_category()
+        return day, late, append_late_events(
+            day, select_late_candidates(day, [late]), now_iso="X"
+        )
+
+    def test_the_item_block_is_written_without_a_category_bullet(self):
+        _day, _late, updated = self._closed_day_with_late()
+        section = updated.split(LATE_SECTION_TITLE, 1)[1]
+
+        self.assertIn("- Event ID: L-NOCAT", section)
+        self.assertIn("- Owner: COO", section)
+        self.assertIn("a category-less late candidate", section)
+        self.assertNotIn("- Category:", section)
+
+    def test_the_event_id_survives_here_unlike_the_daily_close_path(self):
+        """The half that makes this worth recording: the same Candidate loses
+        its id entirely when the day is closed WITH it, and keeps it when it
+        arrives after."""
+        from daily.markdown import render_daily_markdown
+
+        closed_with_it = render_daily_markdown(
+            DAY, [self._candidate_without_category()], "gen"
+        )
+        _day, _late, arrived_after = self._closed_day_with_late()
+
+        self.assertNotIn("L-NOCAT", closed_with_it)
+        self.assertIn("L-NOCAT", arrived_after)
+
+    def test_it_is_not_re_added_on_a_later_run(self):
+        """§38's guard reads the file, and the id IS in the file — so the
+        bounded loss stays bounded rather than growing one block per run."""
+        _day, late, updated = self._closed_day_with_late()
+
+        self.assertIn("L-NOCAT", existing_event_ids(updated))
+        self.assertEqual(select_late_candidates(updated, [late]), ())
+
+    def test_monthly_drops_it_and_says_so(self):
+        """The loss, and the counter that keeps it from being silent."""
+        from monthly.parser import parse_daily_markdown
+
+        _day, _late, updated = self._closed_day_with_late()
+        document = parse_daily_markdown(updated, target_date=DAY)
+
+        self.assertEqual([item.event_id for item in document.items], ["EVT-1"])
+        self.assertEqual(document.unconsolidated, 1)
+
+    def test_a_late_item_that_has_a_category_is_consolidated(self):
+        """The control. Without it this class would pass if the bullet were
+        never written at all."""
+        from monthly.parser import parse_daily_markdown
+
+        from daily.markdown import render_daily_markdown
+
+        day = render_daily_markdown(DAY, [candidate("EVT-1")], "gen")
+        late = candidate("L-CAT", category="DECISION")
+        updated = append_late_events(
+            day, select_late_candidates(day, [late]), now_iso="X"
+        )
+        document = parse_daily_markdown(updated, target_date=DAY)
+
+        self.assertEqual(
+            sorted((item.event_id, item.category) for item in document.items),
+            [("EVT-1", "MILESTONE"), ("L-CAT", "DECISION")],
+        )
+        self.assertEqual(document.unconsolidated, 0)
+
+
 class LateSeamFuzzTests(unittest.TestCase):
     """Seeded fuzz over render -> select -> append -> parse, the whole seam.
 
@@ -630,6 +1083,11 @@ class LateSeamFuzzTests(unittest.TestCase):
         "Expected Outcome: measured it.", "Actual Outcome: measured it.",
         "Lessons Learned: measured it.", "Event ID: E3", "Event ID: L1",
         "Owner: CTO Backend", "- leading dash", "## prose hash",
+        # A summary that is itself a bullet spelling a label. The corpus had
+        # `- leading dash` and `Event ID: L1` separately and neither alone
+        # reaches `## Summary`, where the renderer repeats summaries raw —
+        # `OnlyItemBlocksCarryLabelsTests`.
+        "- Event ID: L1", "- Event ID: E3", "- Owner: CTO Backend",
     )
     PROJECTS = ("SEARCH_BACKEND", "content_os", "한글프로젝트")
     CATEGORIES = ("DECISION", "MILESTONE", "ISSUE", "LEARNING")
@@ -692,3 +1150,7 @@ class LateSeamFuzzTests(unittest.TestCase):
         self.assertEqual(repeated[:5], [], "%d re-added a late Event" % len(repeated))
         self.assertEqual(miscounted[:5], [], "%d wrong Event Count" % len(miscounted))
         self.assertEqual(unparsed[:5], [], "%d lost before Monthly" % len(unparsed))
+
+
+if __name__ == "__main__":
+    unittest.main()

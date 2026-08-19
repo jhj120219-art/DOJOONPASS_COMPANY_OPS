@@ -24,6 +24,7 @@ types are chosen as Select rather than the literal §8 wording, and why.
 from __future__ import annotations
 
 import sys
+from typing import Sequence
 from pathlib import Path
 
 # Same fix as run_company_ops.py (this Sprint's audit): this script's own
@@ -48,8 +49,58 @@ from notion import (  # noqa: E402
     format_report,
 )
 
+# The same two rules `run_company_ops.py` applies to the strings it prints,
+# for strings of the same origin — and applied here for the same reason it
+# could not be applied inside `notion/`: that package may import only
+# `events` (LayeringInvariantTests), so the guard belongs at the sink, and
+# this script is a sink.
+from oplog import one_line, redact  # noqa: E402
+from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 
-def main() -> int:
+
+def _safe(value: object) -> str:
+    """A remote-authored string, rendered so it cannot forge a report line.
+
+    Everything this script prints about the workspace comes back over the
+    network: a Notion error body, a `parent.type`, a Page title someone else
+    named, the `{exc}` embedded in a diagnosis's `required_action`. Each is
+    the same class of string `oplog.append_line()` guards and every one of
+    them reached stdout guarded by nothing — the blind spot C31 §7/§8 closed
+    at `run_company_ops.py`'s two sinks and did not look for at this one.
+
+    Both halves matter, and both are measurable here:
+
+        one_line  a Page titled "Ops\\n  다음 할 일     : 없음 — 설정 완료"
+                  writes that second line into this report, in the exact
+                  position and wording of the line an operator reads to
+                  decide whether anything is left to do.
+        redact    a proxy answering in Notion's place is free to echo the
+                  request headers back, and `NotionAPIError` carries up to
+                  400 bytes of that body verbatim — docs/04 §56.
+    """
+    return redact(one_line(value))
+
+
+def _safe_block(text: str) -> str:
+    """A multi-line report, guarded line by line.
+
+    `format_report()` promises exactly one line per Property, and its
+    `detail` field carries a Notion API error body on the Title-rename
+    failure path. Guarding the block as a whole would collapse the report
+    into one line; guarding each line keeps the format and still confines a
+    forged line to the row it came from.
+    """
+    return "\n".join(_safe(line) for line in text.splitlines())
+
+
+def main(argv: Sequence[str] = ()) -> int:
+    refusal = unexpected_arguments(
+        argv, tool="init_notion.py", configured_by=("COMPANY_OPS_NOTION_API_TOKEN", "COMPANY_OPS_NOTION_PROJECTS_DB",)
+    )
+    if refusal is not None:
+        print(f"[FAILED] {refusal}", file=sys.stderr)
+        return CONFIG_ERROR_EXIT
+
     # 1. 환경변수 확인
     try:
         config = NotionConfig.from_env()
@@ -63,19 +114,19 @@ def main() -> int:
     # 2. Health Check (Authentication + Database 접근)
     health = client.health_check()
     if not health.ok:
-        print(f"[FAILED] Health Check: {health.error}", file=sys.stderr)
+        print(f"[FAILED] Health Check: {_safe(health.error)}", file=sys.stderr)
         return 1
-    print(f"Health Check: PASS (database_id={health.database_id})")
+    print(f"Health Check: PASS (database_id={_safe(health.database_id)})")
 
     # 3-7. Database 조회 -> Title Rename(필요 시) -> Spec 비교 -> 없는 Property만 생성
     try:
         result = bootstrap_database(client)
     except NotionAPIError as exc:
-        print(f"[FAILED] Notion API error: {exc}", file=sys.stderr)
+        print(f"[FAILED] Notion API error: {_safe(exc)}", file=sys.stderr)
         return 1
 
     # 8. 결과 Report 출력
-    print(format_report(result))
+    print(_safe_block(format_report(result)))
     print()
     print(
         f"EXISTS={len(result.existing)} "
@@ -101,17 +152,26 @@ def main() -> int:
     print("Operations Dashboard 준비 상태:")
     diagnosis = diagnose_dashboard_bootstrap(client)
     print(f"  readiness      : {diagnosis.readiness.value}")
-    print(f"  reference 부모 : {diagnosis.reference_parent_type}")
+    print(f"  reference 부모 : {_safe(diagnosis.reference_parent_type)}")
     if diagnosis.hostable_pages:
         print("  사용 가능한 Page:")
         for page in diagnosis.hostable_pages[:5]:
-            print(f"    - {page.title} ({page.page_id})")
+            print(f"    - {_safe(page.title)} ({_safe(page.page_id)})")
+        # The list is truncated at five, and saying so is the difference
+        # between "these are the Pages" and "these are five of them". An
+        # operator who does not see the Page they shared would otherwise
+        # conclude the sharing did not take.
+        if len(diagnosis.hostable_pages) > 5:
+            print(
+                f"    ... 외 {len(diagnosis.hostable_pages) - 5}개 "
+                "(Notion /search 1페이지 = 최대 100개까지만 조회한다)"
+            )
     if not diagnosis.search_available:
         print("  (이 integration은 Workspace 검색 권한이 없어 Page 목록을 확인하지 못했다)")
-    print(f"  다음 할 일     : {diagnosis.required_action}")
+    print(f"  다음 할 일     : {_safe(diagnosis.required_action)}")
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv))

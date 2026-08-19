@@ -1172,10 +1172,6 @@ class AgentToCollectorContractTests(MultiDesktopTestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class _FailingTransport(Transport):
     """A Transport that refuses everything — one Desktop's network is down.
 
@@ -1778,3 +1774,7 @@ class CrashPointRecoveryTests(MultiDesktopTestCase):
         for desktop_id, _, _ in DESKTOPS:
             with self.subTest(desktop=desktop_id):
                 self.assertIn(f"{desktop_id} work", self.daily(self.DAY))
+
+
+if __name__ == "__main__":
+    unittest.main()

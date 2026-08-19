@@ -150,6 +150,51 @@ def _is_sole_identifier(indexed: Sequence[tuple[int, str]]) -> bool:
     return not any(text.startswith(_EVENT_ID_LABEL) for _index, text in indexed[1:])
 
 
+def item_block_bounds(lines: Sequence[str]) -> list[tuple[int, int]]:
+    """(start, end) line ranges of each `### ` item block's body.
+
+    `end` is exclusive; a block ends at the next `### ` or at the next `## `
+    section heading, whichever comes first.
+
+    Split out of `summary_line_indices()` because a second reader needs the
+    same ranges. `late_events.existing_event_ids()` asks "which `- Event ID:`
+    lines are the renderer's *label*", and a label is only ever written
+    inside one of these blocks — `_render_item_block()` is the only place
+    that emits one.
+
+    Everything else in a Daily file that looks like a label is not one:
+
+        ## Summary      `render_daily_markdown()` writes each candidate's
+                        summary there RAW, one per line. A summary reading
+                        `- Event ID: EVT-999` is byte-identical to a label,
+                        and unlike the copy inside the item block (which is
+                        written as `- {summary}`, i.e. `- - Event ID: …`)
+                        nothing distinguished it.
+        ## Evidence     `- <event_id>: <text>`, which spells a label exactly
+                        when an `event_id` is the literal `Event ID`.
+        hand-written    docs/06 §57 permits prose anywhere; a note reading
+        prose           `- Event ID: EVT-9 was superseded` is not the Event.
+
+    All three used to be read as labels, and the first is reachable without
+    a hand edit or a crafted Event — see `existing_event_ids()` for what it
+    cost.
+    """
+    bounds: list[tuple[int, int]] = []
+    block_start: int | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            if block_start is not None:
+                bounds.append((block_start, index))
+            block_start = index + 1
+        elif stripped.startswith("## ") and block_start is not None:
+            bounds.append((block_start, index))
+            block_start = None
+    if block_start is not None:
+        bounds.append((block_start, len(lines)))
+    return bounds
+
+
 def summary_line_indices(lines: Sequence[str]) -> set[int]:
     """Indices of the lines that are item *summaries* rather than labels.
 
@@ -193,7 +238,6 @@ def summary_line_indices(lines: Sequence[str]) -> set[int]:
     the whole item, and now recovers all three fields.
     """
     found: set[int] = set()
-    block_start: int | None = None
 
     def close(start: int, end: int) -> None:
         indexed = [
@@ -219,17 +263,8 @@ def summary_line_indices(lines: Sequence[str]) -> set[int]:
                 found.add(index)
                 return
 
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("### "):
-            if block_start is not None:
-                close(block_start, index)
-            block_start = index + 1
-        elif stripped.startswith("## ") and block_start is not None:
-            close(block_start, index)
-            block_start = None
-    if block_start is not None:
-        close(block_start, len(lines))
+    for start, end in item_block_bounds(lines):
+        close(start, end)
     return found
 
 

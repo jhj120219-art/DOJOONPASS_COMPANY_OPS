@@ -32,6 +32,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
+from .bootstrap import (
+    BootstrapResult,
+    PropertyBootstrapReport,
+    PropertyOutcome,
+    _bootstrap_title_property,
+    diff_properties,
+)
 from .client import NotionClient
 
 # ---------------------------------------------------------------- schemas
@@ -48,6 +55,31 @@ OPS_NOTION_SYNC = "OPS_NOTION_SYNC"
 OPS_RISK = "OPS_RISK"
 OPS_READINESS = "OPS_READINESS"
 
+# The databases the **specification** puts in Notion, as opposed to the ones
+# this module happens to have a schema for.
+#
+# docs/14 §1 fixes the Operational Data Model, and its row for Notion reads:
+#
+#     | Operational Projection | Notion (PROJECTS / OPS_RUNS) | View이며 절대
+#       Source가 아니다 |
+#
+# Two databases, named. PROJECTS belongs to `notion.sync`; the one this
+# module owns is OPS_RUNS. The other four below have schemas and no place in
+# that model — so creating them is not "getting ahead", it is widening the
+# Operational Projection past what docs/14 defines, which is a spec change.
+#
+# This constant exists because the distinction had no name in the code, and
+# an unnamed distinction is one `bootstrap_dashboard_databases()` could not
+# default to. It defaulted to all five instead: an operator following the
+# setup doc got four databases that no code writes and no spec sanctions,
+# permanently empty in their workspace, with a prose warning in docs/13 as
+# the only thing standing in the way.
+#
+# BACKLOG A-16 has recorded this since C10 as "docs/04 §53's 과잉 방지
+# decision", i.e. as *undecided*. docs/14 §1 — written later — decides it.
+# The four are out of contract, not awaiting one.
+CONTRACTED_DATABASES: tuple[str, ...] = (OPS_RUNS,)
+
 # Property payloads use only shapes the Notion API accepts when *creating*
 # a database — same constraint notion.bootstrap already documents (Status
 # is Select, never Notion's non-creatable "status" type).
@@ -56,15 +88,104 @@ DASHBOARD_DATABASES: dict[str, dict[str, Any]] = {
         "Run ID": {"title": {}},
         "Run At": {"date": {}},
         "Transport Moved": {"number": {}},
+        # Files sitting in `transport/` that this run refused to promote for
+        # a reason the next run will reach again — see
+        # `count_blocked_intake()`. Without it the Dashboard had no column
+        # that could ever be non-zero when the inbound path is broken, which
+        # made a broken inbound path indistinguishable from a quiet day.
+        "Transport Blocked": {"number": {}},
         "Accepted": {"number": {}},
         "Duplicate": {"number": {}},
         "Rejected": {"number": {}},
         "Failed": {"number": {}},
         "Scheduler Status": {"select": {}},
         "Generated Days": {"number": {}},
+        # Days this run closed WITHOUT writing, because the file was already
+        # there — a crashed predecessor's (docs/07 §28) or, after a disaster
+        # restore, git's (C39). `Generated Days` alone cannot tell "nothing
+        # happened" from "seventeen days came back from the backup", and the
+        # run an operator scrutinises hardest is exactly the second one.
+        #
+        # C39 split `SchedulerRunResult.generated_dates` for this reason and
+        # the split reached the Run Manifest and `run_company_ops.py`'s
+        # stdout. It did not reach here — the view CEO Decision ④ made the
+        # operator's at-a-glance one ("CLI 확장 금지, Dashboard는 Notion으로").
+        # Measured on the restore `test_e2e_disaster_scenarios.py` performs:
+        # manifest `generated_days=1 reused_days=4`, Dashboard row
+        # `Generated Days: 1` and nothing else.
+        #
+        # Not an input to `Overall`. Reusing a day is the pipeline working;
+        # the verdict's rule ("any future input has to earn a column first")
+        # is about causes of WARN, and this is not one.
+        "Reused Days": {"number": {}},
         "Backup Status": {"select": {}},
+        # Local Master files that disappeared, which is why `Backup Status`
+        # alone is not enough. `BACKUP_FAILED` is written by two completely
+        # different events (BACKLOG E-25): docs/08 §21's credential failure,
+        # and docs/08 §31/§44-47's deletion gate refusing to add/commit/push
+        # because Company History files are gone. The operator's next action
+        # is a token in one case and a search for missing History in the
+        # other, and the row could not tell them apart.
+        #
+        # C31 put the distinction in the Run Manifest (`reason` plus a
+        # `deleted_files` metric) and deliberately left the classification
+        # value alone, because the docs/14 §5 vocabulary is a spec decision.
+        # This changes no value either — it is the same number, in the view
+        # CEO Decision ④ made the at-a-glance one, where the manifest's
+        # `reason` never appears.
+        #
+        # Not an input to `Overall`: `BACKUP_FAILED` already makes the row
+        # FAIL, and a second path to the same verdict would just be two
+        # derivations of one fact.
+        "Deleted Files": {"number": {}},
         "Notion Synced": {"number": {}},
+        # Events that reached Notion and deliberately changed nothing
+        # (docs/04 §35 NOTION_SKIPPED_OLD_EVENT). Split out of "Synced",
+        # which used to include them and therefore reported writes that did
+        # not happen.
+        "Notion Skipped": {"number": {}},
         "Notion Retried": {"number": {}},
+        # Collected Event files, or queued entries, this run could not read
+        # as an Event at all. They never become a SyncResult — inventing an
+        # `event_id` for a file that could not be parsed would put a made-up
+        # id in the log — so without this column they were in none of the
+        # three counts above and the row's arithmetic silently lost them.
+        "Notion Unreadable": {"number": {}},
+        # How many Events are still waiting for Notion *after* this run.
+        # The three counts above are per-run; this is the standing backlog,
+        # and it is the difference between "one Event failed this morning"
+        # and "eight hundred Events have been stuck for a month".
+        "Notion Queued": {"number": {}},
+        # The steps this run recorded as FAILED, by name — the manifest's
+        # own `components`, not a second judgement. Two of the nine steps
+        # (`late_update`, `monthly`) can fail without stopping the run and
+        # had no column at all, so the row said `Overall OK` for a run whose
+        # exit code was 3. Rich Text rather than a count: "which step" is
+        # the question an operator asks next, and it fits in the same glance.
+        "Failed Steps": {"rich_text": {}},
+        # Which Desktops contributed Events to this run, and how many each.
+        # Every other column here is a pipeline-stage number; this is the one
+        # that says *where the work came from*, which is the question layer ④
+        # of the Control Tower asks and the row could not answer at all — a
+        # run that collected fifty Events looked identical whether they came
+        # from four Desktops or from one.
+        #
+        # Rich Text rather than four numbers: `events.SOURCES` is a schema
+        # value that can grow (docs/02 §8), and a column per Desktop would
+        # make every such growth a Database migration. `DESKTOP_1:3` reads at
+        # a glance and costs one column forever.
+        "Desktops Reporting": {"rich_text": {}},
+        # Events in this run whose `source`/`role` pair contradicts docs/02
+        # §8's table. `validate_event()` checks the two fields independently
+        # and never the pair, so a hand-written or restored Event can say it
+        # came from DESKTOP_1 and did the CMO's work — and this row would
+        # then carry an `Owner` and a `Source` pointing at different
+        # Desktops with nothing flagging it.
+        #
+        # Not an input to `Overall`: it is a data-integrity fact about the
+        # Events, not a failed pipeline step, and the verdict's rule is that
+        # any future input has to earn a column before it earns a verdict.
+        "Role Mismatches": {"number": {}},
         "Overall": {"select": {}},
     },
     OPS_BACKUP: {
@@ -312,7 +433,9 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
                 "against this client, or create the OPS_RUNS database by hand "
                 "in the Page above. Either way, set "
                 "NOTION_OPS_RUNS_DATABASE_ID to its id — until that variable "
-                "is set, Dashboard recording is skipped on every run."
+                "is set, Dashboard recording is skipped on every run. "
+                "The exact steps, including the one-liner, are in "
+                "docs/13_NOTION_ENVIRONMENT_SETUP.md step 8."
             ),
         )
 
@@ -329,7 +452,9 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
                 "bootstrap_dashboard_databases() (choosing the Page is an "
                 "operator decision, not this code's) — and note that no "
                 "entrypoint here runs that function, so the creation step is "
-                "yours to perform. Then set NOTION_OPS_RUNS_DATABASE_ID."
+                "yours to perform. Then set NOTION_OPS_RUNS_DATABASE_ID. "
+                "The exact steps are in docs/13_NOTION_ENVIRONMENT_SETUP.md "
+                "step 8."
             ),
         )
 
@@ -344,7 +469,8 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
             "Notion (Share -> Connections). Notion's API cannot create a database at "
             "workspace root, and creating a Page is out of scope. That only clears "
             "the prerequisite — creating the OPS_* databases and setting "
-            "NOTION_OPS_RUNS_DATABASE_ID is still a step no command here performs."
+            "NOTION_OPS_RUNS_DATABASE_ID is still a step no command here performs. "
+            "The exact steps are in docs/13_NOTION_ENVIRONMENT_SETUP.md step 8."
         ),
     )
 
@@ -369,12 +495,26 @@ def bootstrap_dashboard_databases(
     existing database. The caller decides which names to create via `only`,
     and is responsible for not re-creating databases it already has (their
     ids belong in configuration).
+
+    `only` omitted -> **`CONTRACTED_DATABASES`**, not every schema in
+    `DASHBOARD_DATABASES`. The default used to be all five, and the two are
+    not the same thing: docs/14 §1 names the Operational Projection as
+    "Notion (PROJECTS / OPS_RUNS)", so four of the five schemas here have no
+    place in the model and no code that writes them. Creating them left four
+    permanently-empty databases in a real workspace, undoable by this module
+    (it has no delete path, by design), with a prose warning in docs/13 as
+    the only thing in the way.
+
+    Defaulting to the contract does not remove the capability — `only=` still
+    takes any name in `DASHBOARD_DATABASES`. It changes which choice a
+    caller has to make deliberately, and puts the irreversible one on that
+    side.
     """
     resolved_parent_page_id = (
         parent_page_id if parent_page_id is not None else resolve_parent_page_id(client)
     )
 
-    names = list(only) if only is not None else list(DASHBOARD_DATABASES)
+    names = list(only) if only is not None else list(CONTRACTED_DATABASES)
     created: dict[str, str] = {}
     for name in names:
         properties = DASHBOARD_DATABASES[name]
@@ -416,6 +556,77 @@ def bootstrap_dashboard_databases(
     return DashboardBootstrapResult(created=created)
 
 
+def bootstrap_dashboard_properties(client: NotionClient) -> BootstrapResult:
+    """Add whichever `OPS_RUNS` properties are missing from an **existing**
+    database, leaving every existing one untouched — C36.
+
+    `client` must be bound to the OPS_RUNS database id (the one in
+    `NOTION_OPS_RUNS_DATABASE_ID`), not the PROJECTS one. Nothing here can
+    check that: both are databases and both answer `retrieve_database`. The
+    only consequence of getting it wrong is thirteen unwanted properties on
+    PROJECTS, which is why the caller is the operator running a documented
+    command rather than the Runtime.
+
+    **Why this exists.** `bootstrap_dashboard_databases()` creates OPS_RUNS
+    from `DASHBOARD_DATABASES`, and that schema has grown: 13 properties
+    through C31, 15 in C32 (`Transport Blocked`, `Notion Skipped`), 17 in
+    C33 (`Notion Unreadable`, `Notion Queued`). Every one of those was added
+    because the Dashboard could not otherwise say something true. But an
+    operator who created the database before a widening has a database that
+    no longer matches, and `record_run()` then sends a property Notion has
+    never heard of — a 400 on every run, forever.
+
+    That failure is safe but not free: `record_run()` returns FAILED, the row
+    goes to `dashboard_pending.json`, and `app/runner.py` logs
+    `DASHBOARD DRAIN_PENDING … REASON <Notion's own message>`. No data is
+    lost and the reason is legible (C32 §11 measured this). What was missing
+    was the way *out* — the operator could read exactly which property Notion
+    rejected and had no command to add it.
+
+    Deliberately not wired to any entrypoint, for the reason
+    `test_the_setup_cli_does_not_create_anything_from_the_diagnosis` pins:
+    `init_notion.py` must not mutate the Dashboard side of a real Workspace
+    on its own. This is a capability the operator invokes, documented in
+    docs/13 §3-⑧.
+
+    The logic is `notion.bootstrap`'s, not a second copy of it. Two modules
+    asking "which properties are missing" in two different ways is how the
+    two answers drift; `diff_properties()` and `_bootstrap_title_property()`
+    grew parameters in C36 precisely so this could reuse them.
+    """
+    current_properties = client.get_database_schema()
+
+    # `Run ID` is OPS_RUNS' Title, and Notion will not let a second Title be
+    # created — so a hand-made database still carrying Notion's default
+    # `Name` can only be fixed by renaming. That is the likely state for
+    # anyone who followed docs/13's "or create it by hand in the Page above".
+    title_report = _bootstrap_title_property(
+        client, current_properties, title_property=RUN_ID_PROPERTY
+    )
+    if title_report.outcome is PropertyOutcome.RENAMED:
+        # Re-read for `bootstrap_database()`'s reason: the rename just
+        # mutated the live schema, and diffing against the pre-rename
+        # snapshot would treat the old name as an existing property.
+        current_properties = client.get_database_schema()
+
+    to_create, decided = diff_properties(
+        current_properties,
+        targets=DASHBOARD_DATABASES[OPS_RUNS],
+        title_property=RUN_ID_PROPERTY,
+    )
+    reports = [title_report, *decided]
+
+    if to_create:
+        client.create_database_properties(to_create)
+        reports.extend(
+            PropertyBootstrapReport(name, PropertyOutcome.CREATED) for name in to_create
+        )
+
+    order = {name: index for index, name in enumerate(DASHBOARD_DATABASES[OPS_RUNS])}
+    reports.sort(key=lambda report: order[report.name])
+    return BootstrapResult(reports=tuple(reports))
+
+
 # ------------------------------------------------------- property builders
 
 
@@ -439,17 +650,154 @@ def _date(iso_timestamp: str) -> dict:
     return {"date": {"start": iso_timestamp}}
 
 
-def _overall_status(collector_failed: int, scheduler_status: str, backup_status: str) -> str:
+# The two Backup outcomes that need nobody. Written as the healthy set
+# rather than as a list of unhealthy ones because the previous code did the
+# opposite and got it wrong in a way nothing could see: it warned on
+# `"BACKUP_REVIEW"`, a string `backup.result.BackupStatus` has never had —
+# docs/08 §34's optional state is spelled `BACKUP_REVIEW_REQUIRED`, so even
+# adding that state would not have made the branch fire. A closed set of
+# *healthy* values cannot fail that way: a status this module has never
+# heard of reads as "needs a human", which is the safe direction.
+_BACKUP_NEEDS_NOBODY = ("BACKUP_SUCCESS", "BACKUP_NOT_REQUIRED")
+
+
+def count_blocked_intake(intake_summary: Any) -> int:
+    """Files `transport/` is holding that the next run will hold again.
+
+    `run_intake()` sorts what it did not promote into five buckets, and they
+    are not the same kind of thing:
+
+        skipped_not_stable        arrived seconds ago; the next run takes it
+        skipped_already_present   the same Event is already downstream
+        skipped_invalid           not parseable — re-judged, and refused,
+                                  on every run from now on
+        skipped_incomplete        `.tmp-…json` residue from a writer that
+                                  died; nothing on disk ever removes it
+        failed                    the move itself raised
+
+    Only the last three are counted. The first two are the pipeline working;
+    counting them would put a number on the Dashboard that a healthy system
+    cannot clear, which is the standing-alert-with-no-explanation shape
+    `app.desktop_activity.IntakeBacklog` was written to remove — same
+    reasoning, same three-way split, applied one layer up.
+
+    `failed` is included even though an `os.replace` failure *can* be
+    transient: it means an Event that should have moved did not, and the
+    Runner already treats it as a metric worth recording in the manifest.
+    A false WARN that clears on the next run costs one glance; the silence
+    it replaces cost the whole inbound path.
+
+    Why this exists at all — measured, before it did, on a run holding ten
+    unparseable files, one staging file and one failed move:
+
+        Transport Moved 0   Accepted 0   Rejected 0   Overall OK
+
+    which is byte-for-byte the row a completely healthy idle Sunday
+    produces. The absence of data read as health.
+    """
+    return (
+        len(intake_summary.skipped_invalid)
+        + len(intake_summary.skipped_incomplete)
+        + len(intake_summary.failed)
+    )
+
+
+def _overall_status(
+    *,
+    collector_failed: int,
+    rejected: int,
+    transport_blocked: int,
+    scheduler_status: str,
+    backup_status: str,
+    notion_retried: int,
+    notion_unreadable: int,
+    notion_queued: int,
+    failed_steps: int = 0,
+    critical_failed_steps: int = 0,
+) -> str:
     """Single at-a-glance verdict for one run.
 
     Deliberately derived only from statuses the Runner already produced —
     no new health policy is invented here. FAIL when a stage reported an
     outright failure; WARN when nothing failed outright but something needs
-    a human look (rejected/failed events, Backup not successful); else OK.
+    a human look (rejected events, Events that did not reach Notion, Backup
+    not successful); else OK.
+
+    Two of those three WARN causes were in the sentence above and in no
+    branch below, so the verdict disagreed with its own description.
+    Measured against real result objects:
+
+        8 Events REJECTED by the Collector          Rejected 8   Overall OK
+        5 Events that never reached Notion (401)    Retried  5   Overall OK
+
+    Both rows say the run was fine while naming, in the very next column,
+    the number that says it was not. `Overall` is the column an operator
+    sorts and filters a Notion view by — it is the only one a glance reads —
+    so a wrong verdict there is worse than no verdict.
+
+    Every input is also a column of the same row (`Rejected`, `Failed`,
+    `Notion Retried`, `Backup Status`, `Scheduler Status`, `Failed Steps`).
+    That is a deliberate constraint, not a coincidence: a WARN whose cause
+    is not visible beside it tells an operator to go looking with nothing to
+    look at. Any future input to this verdict has to earn a column first.
+
+    **This verdict and the Run Manifest's are two answers to one question
+    about one run, and they must not contradict each other** (C37). They are
+    not the same verdict — the Dashboard is a row an operator scans, so it
+    also warns about per-row facts that do not degrade a run (8 rejected
+    Events, a queue that is not draining). The relation is one-directional
+    and exact, against docs/14 §4's SUCCESS / DEGRADED / FAILED:
+
+        Dashboard OK       => manifest SUCCESS      (never quieter)
+        manifest DEGRADED  => WARN or FAIL, never OK
+        Dashboard FAIL    <=> manifest FAILED       (a CRITICAL step failed)
+
+    Both directions were broken, in exactly the two ways docs/14 §4 warns
+    about ("DEGRADED를 SUCCESS로 접으면 실제 고장이 숨고, FAILED로 접으면
+    늑대 소년이 되어 아무도 안 본다"). Measured:
+
+        collector failed=1     Dashboard FAIL   manifest SUCCESS  / exit 0
+        late_update FAILED     Dashboard OK     manifest DEGRADED / exit 3
+        monthly     FAILED     Dashboard OK     manifest DEGRADED / exit 3
+
+    The first is the wolf: `failed` counts Event *files*, and `app/runner.py`
+    states beside the number that it is "not a component failure — docs/03
+    §53 makes per-file isolation the design, and one malformed Event must
+    not make an ordinary run look broken". The Dashboard escalated it to the
+    same level as a lost Daily Close. It is now WARN — the level its sibling
+    `rejected` has always had, and the level "a person should look at this
+    row" means.
+
+    The last two are the hidden breakage, and they are structural rather
+    than a slip: `late_update` and `monthly` are the two steps that can
+    record FAILED *without* raising, and neither had a column, so neither
+    could reach this function at all. `failed_steps` fixes the class, not
+    the two instances — a step added later is folded in whether or not
+    anyone remembers to give it a number of its own.
+
+    `scheduler_status` and `backup_status` still appear in the FAIL branch
+    below even though a failed `daily`/`backup` component would also arrive
+    in `critical_failed_steps`. Two derivations of one fact that must agree,
+    kept because they come from different places: the count comes from the
+    manifest recorder, the two statuses from the result objects themselves,
+    and a caller that has one but not the other still gets a true verdict.
     """
-    if collector_failed > 0 or scheduler_status == "FAILED" or backup_status == "BACKUP_FAILED":
+    if (
+        critical_failed_steps > 0
+        or scheduler_status == "FAILED"
+        or backup_status == "BACKUP_FAILED"
+    ):
         return "FAIL"
-    if backup_status in ("BACKUP_PENDING", "BACKUP_REVIEW"):
+    if (
+        collector_failed > 0
+        or failed_steps > 0
+        or rejected > 0
+        or transport_blocked > 0
+        or notion_retried > 0
+        or notion_unreadable > 0
+        or notion_queued > 0
+        or backup_status not in _BACKUP_NEEDS_NOBODY
+    ):
         return "WARN"
     return "OK"
 
@@ -459,30 +807,70 @@ def build_ops_run_properties(
     run_id: str,
     run_at: datetime,
     transport_moved: int,
+    transport_blocked: int,
     accepted: int,
     duplicate: int,
     rejected: int,
     failed: int,
     scheduler_status: str,
     generated_days: int,
+    reused_days: int,
     backup_status: str,
+    deleted_files: int,
     notion_synced: int,
+    notion_skipped: int,
     notion_retried: int,
+    notion_unreadable: int,
+    notion_queued: int,
+    desktops_reporting: str = "",
+    role_mismatches: int = 0,
+    failed_steps: Sequence[str] = (),
+    critical_failed_steps: Sequence[str] = (),
 ) -> dict[str, Any]:
+    # Names, not `ComponentResult`s. `notion` may import only `events`
+    # (the layering invariant), so the severity split has to arrive already
+    # made — `app/runner.py` owns `_SEVERITY` and is the only place that
+    # can make it. `critical_failed_steps` is a subset of `failed_steps`;
+    # nothing here enforces that, and nothing needs to: the FAIL branch
+    # reads one and the WARN branch the other, so a caller that got the
+    # subset wrong can only make the verdict too loud, never too quiet.
+    failed_step_names = ", ".join(failed_steps)
     return {
         "Run ID": _title(run_id),
         "Run At": _date(run_at.isoformat(timespec="seconds")),
         "Transport Moved": _number(transport_moved),
+        "Transport Blocked": _number(transport_blocked),
         "Accepted": _number(accepted),
         "Duplicate": _number(duplicate),
         "Rejected": _number(rejected),
         "Failed": _number(failed),
         "Scheduler Status": _select(scheduler_status),
         "Generated Days": _number(generated_days),
+        "Reused Days": _number(reused_days),
         "Backup Status": _select(backup_status),
+        "Deleted Files": _number(deleted_files),
         "Notion Synced": _number(notion_synced),
+        "Notion Skipped": _number(notion_skipped),
         "Notion Retried": _number(notion_retried),
-        "Overall": _select(_overall_status(failed, scheduler_status, backup_status)),
+        "Notion Unreadable": _number(notion_unreadable),
+        "Notion Queued": _number(notion_queued),
+        "Failed Steps": _rich_text(failed_step_names),
+        "Desktops Reporting": _rich_text(desktops_reporting),
+        "Role Mismatches": _number(role_mismatches),
+        "Overall": _select(
+            _overall_status(
+                collector_failed=failed,
+                rejected=rejected,
+                transport_blocked=transport_blocked,
+                scheduler_status=scheduler_status,
+                backup_status=backup_status,
+                notion_retried=notion_retried,
+                notion_unreadable=notion_unreadable,
+                notion_queued=notion_queued,
+                failed_steps=len(failed_steps),
+                critical_failed_steps=len(critical_failed_steps),
+            )
+        ),
     }
 
 
@@ -520,6 +908,12 @@ def record_run(
     scheduler_result: Any,
     backup_entry: Any,
     notion_sync_results: Sequence[Any],
+    notion_unreadable: int = 0,
+    notion_queued: int = 0,
+    desktops_reporting: str = "",
+    role_mismatches: int = 0,
+    failed_steps: Sequence[str] = (),
+    critical_failed_steps: Sequence[str] = (),
 ) -> DashboardResult:
     """Write one OPS_RUNS row for this execution. Never raises.
 
@@ -531,6 +925,33 @@ def record_run(
     된다." Every failure path here returns a DashboardResult instead of
     propagating — including a missing/unconfigured client, which is simply
     SKIPPED_NOT_CONFIGURED rather than an error.
+
+    `notion_unreadable` and `notion_queued` are the two Notion facts that
+    are NOT derivable from `notion_sync_results`, and that is exactly why
+    they are parameters rather than something computed here:
+
+        notion_unreadable   an Event file, or a queued entry, that could not
+                            be parsed. `app/runner.py` deliberately does not
+                            fabricate a SyncResult for it — the `event_id`
+                            is precisely what could not be read — so it is
+                            in none of the three counts derived below.
+        notion_queued       the retry queue's depth *after* the run. A
+                            per-run result set cannot know it; only the
+                            Runner, which just wrote the queue, can.
+
+    Both default to 0 so every existing caller keeps working. That default
+    is safe in a way the ones this module removed were not: it is the value
+    for "this step did not run", not a mask over a renamed field. A caller
+    that has the numbers and does not pass them is reporting a healthier
+    run than happened, which is why `app/runner.py` passes both explicitly
+    and a test asserts it does.
+
+    `failed_steps` / `critical_failed_steps` are the same kind of fact one
+    level up: which *steps* this run recorded as FAILED, and which of those
+    were CRITICAL. They come from the manifest recorder rather than from any
+    result object, because two of the nine steps can record FAILED without
+    stopping the run and produce no result object this module ever sees
+    (C37). Same defaulting reasoning, same test.
     """
     if client is None:
         return DashboardResult(
@@ -538,25 +959,81 @@ def record_run(
         )
 
     try:
-        failed_statuses = ("NOTION_RETRY_REQUIRED", "NOTION_FAILED")
+        # A partition, not two overlapping filters. `synced` used to be
+        # "everything that is not a failure", which swept
+        # NOTION_SKIPPED_OLD_EVENT — docs/04 §35's "적용하지 않았다" — in with
+        # the writes. Measured: four Events, all of them skipped as older
+        # than the row they would have overwritten, reported as
+        # `Notion Synced: 4`. Zero writes reached Notion.
+        #
+        # A status this module does not recognise lands in `retried` rather
+        # than being dropped, so `synced + skipped + retried` always equals
+        # the number of Events the Sync step handled and the arithmetic on
+        # the row closes. `retried` is the right side to fail towards: it is
+        # the count that raises WARN, and an unrecognised sync status is a
+        # thing a person should look at.
+        written_statuses = ("NOTION_CREATED", "NOTION_UPDATED")
+        skipped_statuses = ("NOTION_SKIPPED_OLD_EVENT",)
         statuses = [getattr(r.status, "value", "") for r in notion_sync_results]
-        synced = sum(1 for s in statuses if s and s not in failed_statuses)
-        retried = sum(1 for s in statuses if s in failed_statuses)
+        synced = sum(1 for s in statuses if s in written_statuses)
+        skipped = sum(1 for s in statuses if s in skipped_statuses)
+        retried = len(statuses) - synced - skipped
+        # Direct attribute access, not `getattr(..., <default>)`.
+        #
+        # `app/runner.py` states the rule beside the sibling numbers it feeds
+        # into the Run Manifest — "a default would only be able to hide the
+        # day one is renamed — reporting 0 skipped files forever instead of
+        # failing" — and every one of the Dashboard's own numbers was read
+        # the way that comment forbids. Measured: a `RuntimeSummary` whose
+        # `accepted` had been renamed produced `Accepted 0` for a run that
+        # accepted 50, with `Overall OK`, silently, on every run after the
+        # rename.
+        #
+        # `backup_entry.final_status` below was already direct, and
+        # `test_a_malformed_result_object_fails_the_build_without_raising`
+        # pins what that buys: the missing attribute lands in this `try`,
+        # comes back as DashboardOutcome.FAILED with the AttributeError as
+        # its reason, and the Runner logs it and queues nothing (properties
+        # is None). A Dashboard that stops updating and says why beats one
+        # that keeps updating with zeros.
         properties = build_ops_run_properties(
             run_id=run_id,
             run_at=run_at,
-            transport_moved=len(getattr(intake_summary, "moved", ()) or ()),
-            accepted=getattr(collector_summary, "accepted", 0),
-            duplicate=getattr(collector_summary, "duplicate", 0),
-            rejected=getattr(collector_summary, "rejected", 0),
-            failed=getattr(collector_summary, "failed", 0),
+            transport_moved=len(intake_summary.moved),
+            transport_blocked=count_blocked_intake(intake_summary),
+            accepted=collector_summary.accepted,
+            duplicate=collector_summary.duplicate,
+            rejected=collector_summary.rejected,
+            failed=collector_summary.failed,
             scheduler_status=getattr(scheduler_result.status, "value", str(scheduler_result.status)),
-            generated_days=len(getattr(scheduler_result, "generated_dates", ()) or ()),
+            # Direct, like every sibling — and unlike what these two used to
+            # be. `generated_days` read `getattr(..., "generated_dates", ())`,
+            # which is precisely the shape the comment above forbids: the day
+            # the field is renamed, the column reports 0 forever instead of
+            # failing. C39 renamed what that field *means* in this very
+            # object, which is how close that already came.
+            generated_days=len(scheduler_result.generated_dates),
+            reused_days=len(scheduler_result.reused_dates),
             backup_status=getattr(
                 backup_entry.final_status, "value", str(backup_entry.final_status)
             ),
+            deleted_files=len(backup_entry.deleted_files),
             notion_synced=synced,
+            notion_skipped=skipped,
             notion_retried=retried,
+            notion_unreadable=notion_unreadable,
+            notion_queued=notion_queued,
+            # Where this run's Events came from, and whether any of them
+            # claimed a role its Desktop does not own. Passed rather than
+            # derived here for the same reason `notion_unreadable` and
+            # `notion_queued` are: `app/runner.py` is the only place that
+            # has read this run's Events, and re-reading `processed/` from
+            # here would count every Event this project ever collected
+            # instead of the ones this run handled.
+            desktops_reporting=desktops_reporting,
+            role_mismatches=role_mismatches,
+            failed_steps=failed_steps,
+            critical_failed_steps=critical_failed_steps,
         )
     except Exception as exc:  # noqa: BLE001  (CEO ④: Runtime을 절대 중단시키지 않는다)
         return DashboardResult(

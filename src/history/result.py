@@ -133,6 +133,92 @@ class HistoryCandidate:
         )
 
 
+# The fields whose wrong type or absence the Company History renderer cannot
+# survive — measured, not guessed. See `candidate_errors()`.
+_REQUIRED_CANDIDATE_STRINGS = ("history_id", "event_id", "timestamp", "project_id", "summary")
+
+
+def candidate_errors(data: Mapping[str, Any]) -> list[str]:
+    """Why this stored Candidate cannot be rendered, or `[]` if it can.
+
+    Same shape and same job as `events.validate_event()`, one layer in — and
+    it is needed for the same reason. A Candidate file is JSON on disk under
+    `runtime/history_candidates/`, and docs/11 §71 explicitly permits the COO
+    to edit it by hand. `HistoryCandidate.from_dict()` reads whatever the
+    file says: it type-checks nothing, and a missing key raises a bare
+    `KeyError` naming only the key.
+
+    **Measured through the real Runner (C44)**, one hand-edited KEEP
+    Candidate beside one ordinary one:
+
+        summary=12345      daily FAILED "sequence item 2: expected str
+                           instance, int found" -> 0 Daily files, exit 2
+        project_id=7       daily FAILED -> 0 Daily files, exit 2
+        timestamp=5        daily FAILED -> 0 Daily files, exit 2
+        summary missing    daily FAILED (KeyError) -> 0 Daily files, exit 2
+
+    and in every one of those the ordinary Candidate was not rendered either:
+    the Scheduler builds the KEEP index **once per batch**, so one file stops
+    **every** date (the same blast radius A-7 / BUG-38 record for a Candidate
+    whose JSON or timestamp will not parse). It is permanent — the file stays
+    in `keep/`, so the next run dies identically.
+
+    What the operator was told: `sequence item 2: expected str instance, int
+    found`, in the manifest's `reason` and in `daily_late_update.log`. Not the
+    file, not the field, not even that a Candidate was involved. And
+    `ops_status.py` said `Candidate 정합성 : OK`, because its own reader only
+    checks `timestamp` and `event_id`.
+
+    **This list is deliberately the BLOCKING set, not every type in the
+    dataclass.** Three shapes the renderer survives are left out on purpose,
+    because refusing them would turn a survivable corruption into a stopped
+    pipeline — the exact harm this function exists to reduce:
+
+        role=5         renders `- Owner: 5`
+        category=9     the item is dropped from every section, which
+                       `ops_status._daily_counts_more_than_it_shows()`
+                       already reports (C43)
+        evidence="ab"  `tuple("ab")` becomes two evidence lines; recorded in
+                       BACKLOG as a known limit rather than closed here
+
+    A `timestamp` that is a string but not ISO-8601 is deliberately absent
+    too, and for a sharper reason: A-7 already records that case, the index
+    build already raises on it with `isoformat` in the message, and
+    `test_scheduler.py::OneCorruptCandidateStopsEveryDateTests` pins both.
+    Adding it here would move where that raise happens — `list()` would start
+    refusing a Candidate it used to return — which is a contract change this
+    function has no reason to make. The type check above covers the case that
+    was actually unhandled (`timestamp` not a string at all).
+
+    So this changes **what a failure says and who sees it**, never whether a
+    run fails.
+
+    Costs nothing worth measuring against the read it rides on — a handful of
+    dict lookups per Candidate, against a file open:
+
+        1,000 Candidates   `list()` 52.2 ms   this function 0.5 ms total
+        5,000 Candidates   `list()` 255.5 ms  this function 2.6 ms total
+    """
+    errors: list[str] = []
+    for field_name in _REQUIRED_CANDIDATE_STRINGS:
+        value = data.get(field_name)
+        if value is None:
+            errors.append(f"missing required field: {field_name}")
+        elif not isinstance(value, str):
+            errors.append(f"{field_name} must be a string")
+
+    filter_result = data.get("filter_result")
+    if filter_result is None:
+        errors.append("missing required field: filter_result")
+    else:
+        try:
+            HistoryDecision(filter_result)
+        except ValueError:
+            errors.append(f"invalid filter_result: {filter_result!r}")
+
+    return errors
+
+
 @dataclass(frozen=True)
 class HistoryFilterResult:
     """Outcome of a single HistoryFilter.evaluate() call.

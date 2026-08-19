@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -62,6 +63,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from app.runner import PROJECT_ROOT as runner_project_root  # noqa: E402
 from app.runner import run_once  # noqa: E402
 from backup.git_ops import GitOperationError, is_authentication_failure  # noqa: E402
 from notion import (  # noqa: E402
@@ -80,9 +82,68 @@ from scheduler import SchedulerStatus  # noqa: E402
 # this reason; the pair is needed here because this script prints text that
 # came out of a remote HTTP response.
 from oplog import one_line, redact  # noqa: E402
+from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
+
+
+def _one_runtime_root_or_refuse() -> None:
+    """Refuse to run half-redirected — C34 §3.
+
+    `main()` derives three of `run_once()`'s **nineteen** path parameters
+    from `RUNTIME_DIR`:
+
+        local_master_dir  backup_working_copy_dir  runner_lock_path
+
+    The other sixteen are left to defaults, and those defaults do not come
+    from here. They come from six other modules' own `PROJECT_ROOT`
+    constants — `app.runner`, `collector.runtime`, `scheduler.state`,
+    `backup.state`, `history.file_repository`, `notion.retry_queue` — each
+    frozen at import. So `RUNTIME_DIR` looks like the knob that points this
+    script at a runtime tree, and it moves less than a sixth of one.
+
+    In production the two roots are the same directory and nothing is
+    wrong. The danger is the other case, and it is not hypothetical: this
+    guard exists because rebinding `RUNTIME_DIR` — which is exactly how
+    every test and probe in this repository isolates `ops_status.py` — ran
+    a **real** pipeline that wrote Company History into a temp tree while
+    advancing the *live* `daily_history_state.json` past it. Measured:
+
+        daily/            six files, in a directory that no longer exists
+        live pointer      2026-08-10 -> 2026-08-16
+        consistency       CONSISTENT -> STATE_INCONSISTENCY
+        six days of Company History that no future run will ever create,
+        because the pointer is already past them
+
+    A run that believes it is sandboxed and corrupts production instead is
+    the worst shape a knob can have. C31 §10 recorded this same trap in
+    `ops_status.py` (`AGENT_DIR` frozen at import while `RUNTIME_DIR` moved)
+    and fixed it by deriving per call. That fix is not available here: the
+    sixteen defaults belong to other modules, and re-deriving them would put
+    a second — really a seventh — opinion about the layout in this file,
+    which is what `ops_status._agent_dir()` explicitly argues against.
+
+    So the incompleteness stays and stops being silent. In production this
+    check always passes; the only way to fail it is to have rebound
+    `RUNTIME_DIR`, which is precisely when the run must not proceed.
+    """
+    expected = runner_project_root / "runtime"
+    if RUNTIME_DIR.resolve() == expected.resolve():
+        return
+    print(
+        f"[FAILED] RUNTIME_DIR이 app.runner의 runtime 루트와 다릅니다.\n"
+        f"           RUNTIME_DIR : {RUNTIME_DIR}\n"
+        f"           app.runner  : {expected}\n"
+        f"         이 스크립트는 19개 경로 중 3개만 RUNTIME_DIR에서 만들고 나머지 16개는\n"
+        f"         각 모듈의 기본값(= app.runner 루트)을 씁니다. 두 루트가 다르면 실행이\n"
+        f"         반으로 갈라져 Company History는 한쪽에, State는 다른 쪽에 쓰입니다 —\n"
+        f"         실측된 결과는 영구 STATE_INCONSISTENCY입니다(BACKLOG C34 §3).\n"
+        f"         격리된 실행이 필요하면 이 스크립트가 아니라 app.runner.run_once()에\n"
+        f"         모든 경로를 명시적으로 넘기세요.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 def _build_notion_clients() -> tuple[ExecutionPlanSync | None, NotionClient | None]:
@@ -151,7 +212,27 @@ def _resolve_history_start_date() -> date:
         raise SystemExit(1)
 
 
-def main() -> int:
+def main(argv: Sequence[str] = ()) -> int:
+    _one_runtime_root_or_refuse()
+    # Stays the first statement, and `OneRuntimeRootOrRefuseTests` asserts
+    # that by reading this source line. The argument refusal below writes
+    # nothing and would be safe in either order, but a maintainer reading
+    # that test should find the statement it names -- and a split runtime
+    # root is the more serious of the two mistakes anyway.
+
+    refusal = unexpected_arguments(
+        argv,
+        tool="run_company_ops.py",
+        configured_by=(
+            "COMPANY_OPS_HISTORY_START_DATE",
+            "COMPANY_OPS_NOTION_API_TOKEN",
+            "COMPANY_OPS_NOTION_PROJECTS_DB",
+            "COMPANY_OPS_RUNTIME_DIR",
+        ),
+    )
+    if refusal is not None:
+        print(f"[FAILED] {refusal}", file=sys.stderr)
+        return CONFIG_ERROR_EXIT
     history_start_date = _resolve_history_start_date()
     notion_sync, dashboard_client = _build_notion_clients()
 
@@ -196,9 +277,20 @@ def _report_backup_failure(
     failure. The one thing this function exists to report, decided by an
     unrelated file.
     """
+    # Classified on the RAW message, printed guarded. The order matters:
+    # `is_authentication_failure()` matches git's own wording, and running it
+    # on a redacted string would let a substitution eat the phrase the
+    # classification depends on.
     permanent = is_authentication_failure(str(exc))
 
-    print(f"[FAILED] Backup: {exc}", file=sys.stderr)
+    # `GitOperationError` embeds `result.stderr.strip()` verbatim
+    # (`backup/git_ops._run_git`), so this is multi-line output from another
+    # program — and on a push failure git echoes the remote URL, which in a
+    # `https://<token>@github.com/...` remote carries the credential.
+    # `oplog.SECRET_PATTERNS` already knows the GitHub token shapes; nothing
+    # was applying it here. Same guard, same reason, as the `SyncResult.error`
+    # line below and the manifest block under it.
+    print(f"[FAILED] Backup: {redact(one_line(exc))}", file=sys.stderr)
     print(file=sys.stderr)
     print(
         "Event 수집 · History Filter · Daily · Monthly 단계는 Backup보다 먼저\n"
@@ -242,6 +334,52 @@ def _report_backup_failure(
     except RunSummaryError:
         return 2
     return summary.exit_code if summary is not None else 2
+
+
+# How many dates `_dates()` spells out before it starts counting instead.
+# Ten is a fortnight's catch-up minus weekends — enough that every ordinary
+# run lists everything, and small enough that the abnormal one still fits on
+# a line an operator can read.
+_MAX_LISTED_DATES = 10
+
+
+def _dates(days) -> str:
+    """A day list an operator can read, from a tuple of `date` objects.
+
+    `f"{scheduler_result.generated_dates}"` interpolates the tuple's **repr**.
+    Measured, the production entrypoint run end to end in an isolated copy of
+    this repository, first-ever run with `COMPANY_OPS_HISTORY_START_DATE`
+    seventeen days back:
+
+        Daily History (Scheduler): COMPLETED, generated=(datetime.date(2026,
+        8, 1), datetime.date(2026, 8, 2), … datetime.date(2026, 8, 17))
+
+    606 characters of Python repr on the one line that answers "what did this
+    run close". `AGENT.md` §6a-3 shows the operator a different line —
+
+        Daily History (Scheduler): COMPLETED, generated=(2026-08-05,) reused=(…)
+
+    — and tells them to compare the two numbers ("복구 직후에는 `reused`가 크고
+    `generated`가 작은 것이 정상이며, 그 반대라면 즉시 멈추고 원격을 확인해야
+    한다"). That instruction is at its most important right after a disaster
+    restore, which is exactly when both lists are longest: sixty restored days
+    print as ~1,800 characters of `datetime.date(...)`.
+
+    So the count comes first — it is the number §6a-3 actually asks for — and
+    the dates follow in ISO, which is how every other date in this pipeline is
+    written (filenames, Metadata blocks, the manifest). Past
+    `_MAX_LISTED_DATES` the remainder is COUNTED rather than dropped: a
+    truncation that does not say it truncated would make a long catch-up look
+    like a short one, which is the same misreading this function exists to
+    remove.
+    """
+    if not days:
+        return "0"
+    shown = ", ".join(day.isoformat() for day in days[:_MAX_LISTED_DATES])
+    remaining = len(days) - _MAX_LISTED_DATES
+    if remaining > 0:
+        shown += f", 외 {remaining}일"
+    return f"{len(days)} ({shown})"
 
 
 def _print_result(result) -> int:
@@ -303,7 +441,12 @@ def _print_result(result) -> int:
         )
     print(
         f"Daily History (Scheduler): {scheduler_result.status.value}, "
-        f"generated={scheduler_result.generated_dates}"
+        f"generated={_dates(scheduler_result.generated_dates)}"
+        + (
+            f" reused={_dates(scheduler_result.reused_dates)}"
+            if scheduler_result.reused_dates
+            else ""
+        )
     )
     # A failed Daily Close used to print as "FAILED, generated=[]" and nothing
     # else, even though the result object carries which date died and why
@@ -374,20 +517,44 @@ def _report_run_summary(result) -> int:
         print(f"실행 상태: {status.value}")
         for component in failures:
             failure = component.failure
+            # `redact(one_line(...))`, and this block is where it was most
+            # obviously missing. `_print_result()` twenty lines above already
+            # guards `SyncResult.error` because it is "a remote HTTP response
+            # body carried verbatim" (C31 §7) — and `failure.reason` is
+            # **that same string**: `app/runner.py` records
+            # `reason=queued[0].error` for NOTION_SYNC_INCOMPLETE, and
+            # `runsummary` persists it to `run_summary.json` verbatim. So the
+            # body redacted on one line of this file was printed in full,
+            # from disk, three functions later.
+            #
+            # `ops_status.py` renders the same manifest and reached the
+            # opposite conclusion twice over: it guards `component.name` and
+            # `failure.classification` with `one_line()`, and it does not
+            # print `reason` at all ("`reason` carries that and is
+            # deliberately not printed here"). This entrypoint prints it, so
+            # it needs the guard the other one avoided needing.
+            #
+            # `read_summary()` validates only the three enums; `name`,
+            # `classification`, `reason` and `artifact_refs` come back out of
+            # JSON as whatever the file holds — which on a restored or
+            # hand-edited manifest is a DR path, not an exotic one.
             print(
-                f"  [{component.name}] {failure.classification} "
+                f"  [{one_line(component.name)}] {one_line(failure.classification)} "
                 f"(severity={failure.severity.value}, "
                 f"retry={failure.retryability.value})"
             )
             if failure.reason:
-                print(f"      {failure.reason}")
+                print(f"      {redact(one_line(failure.reason))}")
             if component.artifact_refs:
                 # The Run Summary is a manifest, not a log: it names where
                 # the detail is rather than reproducing it.
-                print(f"      evidence: {', '.join(component.artifact_refs)}")
+                print(
+                    "      evidence: "
+                    + ", ".join(one_line(ref) for ref in component.artifact_refs)
+                )
 
     return summary.exit_code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv))

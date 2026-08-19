@@ -46,7 +46,7 @@ from typing import Sequence
 
 from history import HistoryCandidate
 
-from .markdown import _render_item_block, summary_line_indices
+from .markdown import _render_item_block, item_block_bounds, summary_line_indices
 
 LATE_SECTION_TITLE = "## Late Events"
 METADATA_TITLE = "## Metadata"
@@ -98,38 +98,81 @@ def existing_event_ids(markdown: str) -> set[str]:
     that.
 
     Only `- Event ID:` lines count, and only the ones that are the
-    renderer's *label* — `summary_line_indices()` excludes the bullet that is
-    an item's summary, because the renderer writes a summary raw and one
-    reading `Event ID: EVT-999` is byte-identical to a label. Getting that
-    wrong is not a cosmetic miscount: this set is section 38's duplicate
-    guard, so a phantom id here means a real Event dated that day is dropped
-    on arrival, and again on every run that revisits the date. Measured
-    before the fix, an ordinary KEEP Candidate whose summary was
-    `Event ID: EVT-999`:
+    renderer's *label*. Two rules decide that, and they are separate:
+
+        `item_block_bounds()`     WHERE a label can be — inside a `### `
+                                  item block, the only thing that writes
+                                  one (`_render_item_block()`).
+        `summary_line_indices()`  WHICH bullet inside such a block is the
+                                  summary rather than a label, because the
+                                  renderer writes the summary raw and one
+                                  reading `Event ID: EVT-999` is
+                                  byte-identical to the label below it.
+
+    Getting either wrong is not a cosmetic miscount: this set is section 38's
+    duplicate guard, so a phantom id here means a real Event dated that day
+    is dropped on arrival, and again on every run that revisits the date.
+    Measured before the second rule, an ordinary KEEP Candidate whose summary
+    was `Event ID: EVT-999`:
 
         existing_event_ids(day) == {'EVT-1', 'EVT-999'}
         select_late_candidates(day, [EVT-999]) == ()   # never appended
         `- Event Count: 3` for two real Events
 
-    Nothing about that summary is crafted; it is also how an author would
-    write "Event ID: EVT-999" as a note to themselves. That it doubles as an
-    Event ID spoofing vector — one Event able to suppress a later one by
-    naming it — is the same defect seen from the security side.
+    The first rule was missing, and the same loss came back through
+    `## Summary`. `render_daily_markdown()` repeats every candidate's summary
+    there RAW — no `- ` of its own — so a summary that is itself a bullet
+    lands as a bare line, outside every item block and therefore outside the
+    reach of the summary rule. Measured, one ordinary KEEP Candidate whose
+    summary was `- Event ID: L1`:
 
-    The Evidence section's `- <id>: <text>` lines deliberately do not match —
-    an Event can contribute evidence lines without its own item block only if
-    the file was hand-edited, and in that case the item block's absence is
-    what matters.
+        ## Summary
+        - Event ID: L1                 <- the summary, verbatim
+
+        existing_event_ids(day) == {'E1', 'L1'}
+        select_late_candidates(day, [L1]) == ()   # never appended, ever
+
+    A genuinely late L1 is lost permanently and silently, and the phantom is
+    written by an ordinary Event through an ordinary Daily Close — nothing is
+    hand-edited and nothing is crafted. (`- leading dash` is already in this
+    repository's own benign fuzz corpus as a realistic summary.) Seen from
+    the security side it is Event ID spoofing: one Event can suppress a later
+    one by naming it.
+
+    Confining the scan to item blocks closes that door and two smaller ones
+    the docstring used to only claim were shut — the Evidence section's
+    `- <id>: <text>` lines (which spell a label exactly when an `event_id` is
+    the literal `Event ID`) and §57 hand-written prose anywhere outside a
+    block.
+
+    It is also the safe direction to be wrong in. Missing a real label costs
+    one duplicate item block, appended under `## Late Events` where it is
+    visible and where its own label IS scanned, so the next run stops. Adding
+    a phantom costs an Event that never reaches Company History at all.
+    (`OnlyItemBlocksCarryLabelsTests::test_the_cost_of_being_wrong_is_one_
+    duplicate_and_then_it_stops` measures that, rather than asserting it.)
+
+    Costs nothing measurable. The extra pass over the lines is paid back by
+    scanning fewer of them — measured against the previous whole-document
+    version on documents the real renderer produced:
+
+          5 items (   62 lines)   0.018 -> 0.017 ms
+         50 items (  422 lines)   0.136 -> 0.142 ms
+        300 items ( 2422 lines)   0.798 -> 0.833 ms
+
+    against `_kept_but_not_rendered()`'s own figure of ~30 ms for a year of
+    Candidates, where the file read dominates.
     """
     lines = markdown.splitlines()
     summaries = summary_line_indices(lines)
     found: set[str] = set()
-    for index, line in enumerate(lines):
-        if index in summaries:
-            continue
-        match = _EVENT_ID_LINE.match(line.strip())
-        if match:
-            found.add(match.group(1).strip())
+    for start, end in item_block_bounds(lines):
+        for index in range(start, end):
+            if index in summaries:
+                continue
+            match = _EVENT_ID_LINE.match(lines[index].strip())
+            if match:
+                found.add(match.group(1).strip())
     return found
 
 
@@ -205,9 +248,11 @@ def _update_metadata(lines: list[str], *, now_iso: str, added: int, total_events
 
     start, end = bounds
 
+    count_index = None
     for index in range(start, end):
         if _EVENT_COUNT_LINE.match(lines[index].strip()):
             lines[index] = f"- Event Count: {total_events}"
+            count_index = index
             break
 
     previously_added = 0
@@ -232,7 +277,7 @@ def _update_metadata(lines: list[str], *, now_iso: str, added: int, total_events
     if updated_index is not None:
         lines[updated_index] = f"- Last Updated At: {now_iso}"
 
-    if updated_index is not None and late_index is not None:
+    if updated_index is not None and late_index is not None and count_index is not None:
         return
 
     # Insert whichever line is missing, directly after `Generated At` so the
@@ -250,6 +295,24 @@ def _update_metadata(lines: list[str], *, now_iso: str, added: int, total_events
         new_lines.append(f"- Last Updated At: {now_iso}")
     if late_index is None:
         new_lines.append(f"- Late Events Added: {total_added}")
+    # `Event Count` was the one field this function would rewrite but never
+    # restore, and the block above already restores the other two — the
+    # docstring's "a field that is missing is inserted" was true of two of
+    # the three. The asymmetry had a cost that outlives the run:
+    # `ops_status._daily_counts_more_than_it_shows()` compares this number
+    # against the ids the file carries, and it *skips a file whose line is
+    # missing or unparseable*. So a Metadata block trimmed by hand (docs/06
+    # §57 permits the edit) turns the only detector for three real losses —
+    # a `category=None` Candidate that reaches no Section, a forged
+    # `- Event ID:` line (BUG-11/27), a hand-deleted item block — off for
+    # that day, permanently and with nothing said. Every later late update
+    # rewrote a line that was not there.
+    #
+    # The no-block branch above already writes all three when it builds a
+    # Metadata block from nothing, so this is the same field set, reached
+    # the other way.
+    if count_index is None:
+        new_lines.append(f"- Event Count: {total_events}")
     lines[insert_at:insert_at] = new_lines
 
 

@@ -79,16 +79,49 @@ class UndeliveredEvent:
 
 
 @dataclass(frozen=True)
+class UnreadableSentRecord:
+    """A file in `sent/` that can no longer be read as a delivery record.
+
+    Reported separately rather than counted as undelivered, and for the
+    reason `history.reconciliation.UnreadableEvent` already states: "we
+    cannot tell whether this one arrived" is a different statement from
+    "this one did not arrive", and collapsing them would inflate a number an
+    operator is meant to act on.
+
+    This class exists because that reasoning was *cited* here and not
+    followed. `_verdict()` returned `(None, None, None)` for such a file and
+    the loop simply `continue`d — no field, no count, not even `checked`. So
+    one corrupt record meant one Event's delivery was never verified and
+    `전달 정합성 : OK` was printed anyway. Every sibling in this repository
+    reports its unreadable inputs: `reconciliation.unreadable`,
+    `outbox.DrainSummary.unreadable`, `CompanyActivitySnapshot.unreadable_events`.
+    This was the one that did not.
+    """
+
+    sent_record: Path
+    reason: str
+
+
+@dataclass(frozen=True)
 class DeliveryResult:
     undelivered: tuple[UndeliveredEvent, ...] = ()
     checked: int = 0
     # Filed as sent with no destination present. Counted, never reported:
     # this is what a normally-consumed Event looks like.
     absent: int = 0
+    # Records this scan could not read, so it has no opinion about them.
+    unreadable_records: tuple[UnreadableSentRecord, ...] = ()
 
     @property
     def is_clean(self) -> bool:
-        return not self.undelivered
+        """Nothing needs a person.
+
+        Includes `unreadable_records`, matching
+        `ReconciliationResult.is_clean` — an Event whose delivery cannot be
+        checked at all is not a clean result, it is an unknown one, and the
+        caller must be able to tell those apart from "all verified".
+        """
+        return not self.undelivered and not self.unreadable_records
 
 
 def _problem(destination: Path, event_id: str) -> str | None:
@@ -139,13 +172,14 @@ def find_undelivered_events(*, sent_dir: Path, sync_folder: Path) -> DeliveryRes
         return DeliveryResult()
 
     undelivered: list[UndeliveredEvent] = []
+    unreadable_records: list[UnreadableSentRecord] = []
     checked = absent = 0
 
     records = sorted(sent_dir.glob("*.json"))
 
     def _verdict(record: Path):
         """(event_id, destination, problem). `event_id` None when the local
-        record itself cannot be read.
+        record itself cannot be read, and `problem` then carries why.
 
         The whole per-record unit runs here — reading the record, stating
         the destination, reading it — because every one of those is a file
@@ -154,15 +188,17 @@ def find_undelivered_events(*, sent_dir: Path, sync_folder: Path) -> DeliveryRes
         try:
             data = json.loads(record.read_text(encoding="utf-8"))
             event_id = data["event_id"]
-        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             # `RecursionError` for the same reason as in `_problem()` above:
             # deeply nested JSON does not raise `ValueError`.
             #
             # The local record itself is damaged. Not a delivery verdict —
             # `history/reconciliation.py` reports unreadable inputs
             # separately for the same reason, and inventing a verdict from
-            # a file we cannot read would be the worst of both.
-            return None, None, None
+            # a file we cannot read would be the worst of both. The reason
+            # travels out so it can be *reported* separately, which is the
+            # half this used to drop on the floor.
+            return None, None, str(exc)
         destination = sync_folder / safe_event_filename(event_id)
         if not destination.exists():
             return event_id, destination, "ABSENT"
@@ -178,6 +214,9 @@ def find_undelivered_events(*, sent_dir: Path, sync_folder: Path) -> DeliveryRes
 
     for record, (event_id, destination, problem) in zip(records, verdicts):
         if event_id is None:
+            unreadable_records.append(
+                UnreadableSentRecord(sent_record=record, reason=problem or "")
+            )
             continue
 
         checked += 1
@@ -196,5 +235,8 @@ def find_undelivered_events(*, sent_dir: Path, sync_folder: Path) -> DeliveryRes
             )
 
     return DeliveryResult(
-        undelivered=tuple(undelivered), checked=checked, absent=absent
+        undelivered=tuple(undelivered),
+        checked=checked,
+        absent=absent,
+        unreadable_records=tuple(unreadable_records),
     )

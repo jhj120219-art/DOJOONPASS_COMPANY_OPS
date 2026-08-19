@@ -116,6 +116,20 @@ def run_once(
     # 3. Working Copy Sync
     sync_result = sync_to_working_copy(master_dir, working_copy_dir)
 
+    # `changed_files` on the two blocked paths below is the SYNC's per-file
+    # list, not git's — and that is deliberate, because on these paths there
+    # is no commit for git's list to describe. Neither `git add -A` nor
+    # `git status` runs after this point, so "what the commit carries" has no
+    # answer; "what the sync had prepared when it was stopped" does, and it
+    # is what an operator needs in order to know what did not get backed up.
+    #
+    # Step 7's SUCCESS entry reads git instead, for the opposite reason: there
+    # the commit exists and is the only thing that cannot understate what was
+    # pushed (it includes files that reached the Working Copy by routes the
+    # sync never saw — BACKLOG E-21). So one field name carries two meanings,
+    # keyed by `final_status`, and both are the right meaning for their own
+    # path. `ChangedFilesMeansTheSameThingAsTheStatusTests` pins the pair.
+    #
     # 4. 삭제 파일 존재 -> add/commit/push 하지 않고 BACKUP_FAILED로 종료
     if sync_result.deleted:
         final_status = BackupStatus.FAILED
@@ -220,6 +234,56 @@ def run_once(
     # 7. 변경 존재 -> add -> commit -> push -> BACKUP_SUCCESS
     try:
         git_add_all(working_copy_dir)
+        # What actually went into the commit, per file.
+        #
+        # The status at step 5 cannot answer that. `git status --porcelain`
+        # collapses an untracked DIRECTORY into one entry — measured, three
+        # brand-new Daily files in a working copy that has never had a
+        # `daily/` committed:
+        #
+        #     before add   ?? daily/                       1 entry
+        #     after add    A  daily/2026-08-01.md          3 entries
+        #                  A  daily/2026-08-02.md
+        #                  A  daily/2026-08-03.md
+        #
+        # and it was the first list that reached `BackupLogEntry`, the Run
+        # Manifest metric `changed_files`, and OPS_BACKUP's `Changed Files`.
+        # So a backup carrying a whole restored Company History reported
+        # `changed_files=1` and named `daily/` rather than one day of it —
+        # BUG-39 added that metric precisely to answer "what did this backup
+        # carry", and on the runs where the answer matters most it did not.
+        #
+        # Not a rare shape. It is every FIRST backup of a working copy the
+        # operator has just `git init`-ed (docs/08 §30), every disaster
+        # restore that re-inits one (docs/10 §45), and the run that first
+        # writes `monthly/` — which happens once in ordinary operation. Once
+        # a directory holds one tracked file, git lists new files inside it
+        # individually and the count was right all along, which is why this
+        # only ever showed up on the runs nobody had a baseline for.
+        #
+        # Taken from git rather than from `sync_result` on purpose, even
+        # though that object has per-file `added`/`modified` lists and the
+        # two FAILED branches above already use them. `git add -A` stages the
+        # WHOLE working copy, so anything that arrived there by a route other
+        # than the sync — an operator's own file, an editor swap file, the
+        # stray `.env` of BACKLOG E-21 — is in the commit and is in this
+        # list, and is in no sync result. Reporting the commit's own contents
+        # is the only version of this number that cannot understate what was
+        # pushed.
+        #
+        # No new git command: `status --porcelain` is already in the approved
+        # set (`test_spec_conformance.py::
+        # test_git_ops_runs_only_the_approved_command_set`), and this is a
+        # second call to it. Measured on this machine against a Backup step
+        # that already spawns four git processes and a push:
+        #
+        #     empty working copy          15.2 / 15.5 / 18.5 ms
+        #     2,688 files (7.4 years of
+        #     Daily History), first ever  15.7 ms before add, 30.7 ms after
+        #
+        # The second row is also this fix at its largest: that run used to
+        # report `changed_files=1` and now reports 2,688.
+        staged = git_status(working_copy_dir)
         commit_hash = git_commit(
             working_copy_dir,
             _commit_message(
@@ -256,8 +320,8 @@ def run_once(
         run_id=resolved_run_id,
         backup_start=backup_start,
         source=resolved_source,
-        changed_files=status.changed_files,
-        deleted_files=status.deleted_files,
+        changed_files=staged.changed_files,
+        deleted_files=staged.deleted_files,
         commit_hash=commit_hash,
         push_result="SUCCESS",
         backup_end=backup_end,

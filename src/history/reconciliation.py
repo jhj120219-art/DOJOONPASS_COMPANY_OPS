@@ -116,6 +116,24 @@ def find_orphaned_events(
     The expected filename comes from `safe_candidate_filename()` — the same
     function the repository writes with — so a sanitised `event_id` cannot
     make a present Candidate look missing.
+
+    Cost, measured in an isolated runtime rather than reasoned about (C38).
+    `ops_status.py` calls this in the same command that calls
+    `app.desktop_activity.read_company_activity()`, and both read every file
+    in `processed/` — which looks like paying twice and is not:
+
+        read every processed Event, cold      5.09 s   (6,000 files)
+        the same read again, warm             0.43 s
+        this function, own read (warm)        0.40 s
+        this function, handed the parsed data 0.02 s
+
+    The first read pays the cold open; the OS page cache absorbs the second.
+    Sharing one read between the two consumers was implemented, measured on
+    alternating orders, and reverted: 3% of the command, for a parameter
+    crossing the `app` -> `history` boundary into a data-loss detector whose
+    blind spots have already had to be closed twice. What actually costs is
+    the first, unavoidable pass over a directory that never shrinks — which
+    is BACKLOG B-6's retention decision, not an optimisation.
     """
     processed_dir = Path(processed_dir)
     if not processed_dir.is_dir():

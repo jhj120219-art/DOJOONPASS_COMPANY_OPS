@@ -125,9 +125,52 @@ class AgentStatusSnapshot:
             reasons.append(
                 f"{self.rejected_signal_count} signal(s) rejected and awaiting a human"
             )
+        # Two facts, and they were reported as one. `days_since_last_run()`
+        # answers None both for "no `last_run` at all" and for "`last_run` is
+        # there but is not a timestamp", and this branch called both of them
+        # "never completed a run".
+        #
+        # `agent/state.load_state()` validates that `last_run` is a *string*
+        # and stops there — its sibling `last_successful_collection_date` is
+        # additionally parsed and rejected if it will not, so one of the two
+        # date fields is checked and the other is not. A restored, older, or
+        # hand-edited state file (docs/11 §71 permits the edit) therefore
+        # loads fine with `last_run` set to something like `2026-08-0` or
+        # `yesterday`. Measured, four such values against a state that had
+        # collected through the day before:
+        #
+        #     last_run '2026-08-18T09:00:00+09:00'   days 1      ATTENTION —
+        #     last_run '2026-08-0'                   days None   'agent has
+        #                                                         never
+        #                                                         completed a
+        #                                                         run'
+        #
+        # — a sentence that contradicts the `last_run` line `ops_status.py`
+        # prints three lines above it, and that sends an operator to install
+        # an Agent that is already installed. Worse, it is the branch that
+        # *silences* staleness: an Agent that really has been down for weeks
+        # reports the newcomer's line instead of `has not run for N day(s)`.
+        #
+        # Not fixed by validating the field on load. `last_run` is
+        # informational — `last_successful_collection_date` is what decides
+        # what gets collected — so rejecting it there would turn a cosmetic
+        # corruption into a stopped Agent, which is the wrong direction. The
+        # status view is where the distinction is worth having.
+        #
+        # The value itself is deliberately not quoted into the message: it is
+        # a file's *contents*, and `ops_status.main()`'s ATTENTION block
+        # states that its messages are built from filenames, ids and counts
+        # rather than contents. The printed `last_run` line is where the
+        # value already is.
         elapsed = self.days_since_last_run(now)
-        if elapsed is None:
+        if self.last_run is None:
             reasons.append("agent has never completed a run")
+        elif elapsed is None:
+            reasons.append(
+                "agent state's last_run is not a timestamp — when this Agent last ran "
+                "cannot be told, so staleness is not checked (the value is on the "
+                "last_run line)"
+            )
         elif elapsed >= stale_after_days:
             reasons.append(f"agent has not run for {elapsed} day(s)")
         if self.pending_dates:

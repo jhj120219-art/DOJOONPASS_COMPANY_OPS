@@ -30,12 +30,29 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 DOCS = REPO_ROOT / "docs"
 sys.path.insert(0, str(SRC))
+
+
+def _load_entrypoint_module():
+    """`run_company_ops.py` as a module, loaded under its own name.
+
+    A file rather than a package import, and by path rather than by putting
+    the repo root on `sys.path`, so nothing this test does changes what any
+    other test imports.
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "run_company_ops.py"
+    spec = importlib.util.spec_from_file_location("run_company_ops_hygiene", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git(*args) -> subprocess.CompletedProcess:
@@ -331,10 +348,6 @@ class DeadCodeCharacterizationTests(unittest.TestCase):
                 self.assertGreater(self._reference_count(name), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestIsolationGuardTests(unittest.TestCase):
     """A test must never write into the developer's real `runtime/`.
 
@@ -584,11 +597,15 @@ class OperatorGuideMatchesTheToolTests(unittest.TestCase):
     """`AGENT.md` §6 describes `ops_status.py`. It had drifted.
 
     The guide said the tool "shows two things" and named COMPANY and AGENT.
-    The tool prints **four** blocks — COMPANY, HISTORY, LAST RUN, AGENT — and
-    two of the four are where the state-vs-artifact consistency checks, the
-    Backup Working Copy warnings, the Run Manifest and both lock checks live.
-    An operator following the guide would not know the halves that carry most
-    of the diagnostics exist at all.
+    The tool prints COMPANY, HISTORY, LAST RUN, NOTION and AGENT — and most
+    of those are where the state-vs-artifact consistency checks, the Backup
+    Working Copy warnings, the Run Manifest, the Notion queue ages and both
+    lock checks live. An operator following the guide would not know the
+    halves that carry most of the diagnostics exist at all.
+
+    It has since caught the drift it was written for: C32 added the NOTION
+    block to the tool and this test failed on the same run, before the block
+    could ship undocumented.
 
     Drift is the expected outcome, not an accident: this Sprint alone added
     lines to HISTORY and LAST RUN, and nothing anywhere connected the guide
@@ -608,7 +625,18 @@ class OperatorGuideMatchesTheToolTests(unittest.TestCase):
     # shape when empty, and the guide already explains it. It is in this
     # list because the tool prints it, not because it looked like a
     # block — the second test below is what put it here.
-    BLOCK_HEADINGS = ("COMPANY", "HISTORY", "LAST RUN", "AGENT", "ATTENTION")
+    BLOCK_HEADINGS = (
+        "COMPANY",
+        "HISTORY",
+        # The business layer, added in C46. Every other block is
+        # operational; this one answers which projects moved, which are
+        # blocked, and which team is silent.
+        "CONTROL TOWER",
+        "LAST RUN",
+        "NOTION",
+        "AGENT",
+        "ATTENTION",
+    )
 
     def test_the_guide_names_every_block_the_tool_prints(self):
         guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
@@ -641,7 +669,7 @@ class OperatorGuideMatchesTheToolTests(unittest.TestCase):
         guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
         source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
 
-        main = source.split("def main()", 1)[1]
+        main = source.split("def main(", 1)[1]
         returned = set(re.findall(r"return (\d+)", main))
 
         self.assertEqual(returned, {"0", "3"}, returned)
@@ -799,6 +827,17 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
                                           # no entrypoint calls it, and
                                           # wiring it writes to a real Notion
                                           # Workspace (A-8)
+        "bootstrap_dashboard_properties",  # C36: adds OPS_RUNS columns that
+                                           # a widening introduced. Same
+                                           # reason as the line above — it
+                                           # mutates a real Database, and
+                                           # `init_notion.py` is pinned to
+                                           # diagnose without creating
+                                           # (test_the_setup_cli_does_not_
+                                           # create_anything_from_the_
+                                           # diagnosis). The operator runs
+                                           # it deliberately; docs/13 §3-⑧
+                                           # carries the command.
         "build_ops_backup_properties",    # A-16: OPS_BACKUP is never written
         "remove_pending",                 # B-7: deletion is the open decision
         # --- unwired capability, recorded ---------------------------------
@@ -811,7 +850,9 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         "enqueue",                        # retry_queue's one-shot API; the
         "dequeue",                        # Runner uses the batch API (B안)
         # --- convenience accessors nothing needed yet ---------------------
-        "component",                      # RunSummary lookup; callers iterate
+        # `component` left this list in C46: `ops_status._same_instant_skips_
+        # from_the_last_run()` needs one named component's metrics out of the
+        # manifest, which is exactly the lookup it was written for.
         "read_event_json",                # local_output read seam
     }
 
@@ -1075,3 +1116,876 @@ class AtomicWriteLeavesNoResidueTests(unittest.TestCase):
             "these mkstemp writers have no `except BaseException` cleanup, so an "
             f"interrupted write leaves a .tmp- file behind: {offenders}",
         )
+
+
+class RecoveryTableMatchesTheRunnerTests(unittest.TestCase):
+    """AGENT.md §6a-2 tells an operator which aborted steps recover on their
+    own. That is a claim about `app/runner.py`, so it is checked.
+
+    C35 measured every row of it (`RerunAfterAbortTests` in
+    `test_runner_notion_integration.py` pins the behaviour). What this class
+    pins is the *document* — that the table names every step the Runner has,
+    and that it still singles out the one step whose abort no later run
+    undoes.
+
+    Drift here is the same failure `OperatorGuideMatchesTheToolTests` was
+    written for, one section further down: a tenth pipeline step would be
+    absent from the table and an operator following it would assume a
+    recovery that never happens.
+    """
+
+    def _section(self):
+        guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+        self.assertIn("### 6a-2.", guide, "AGENT.md §6a-2 heading moved or renamed")
+        body = guide.split("### 6a-2.", 1)[1]
+        return body.split("\n## ", 1)[0]
+
+    def test_the_table_names_every_pipeline_step(self):
+        from app.runner import PIPELINE_COMPONENTS
+
+        section = self._section()
+
+        for component in PIPELINE_COMPONENTS:
+            with self.subTest(component=component):
+                self.assertIn(
+                    component,
+                    section,
+                    f"AGENT.md §6a-2 does not say what an abort in {component} leaves behind",
+                )
+
+    def test_history_filter_is_still_the_one_that_does_not_recover(self):
+        """A-20's window. If this ever stops being true — a recovery pass, or
+        a Collector that records the Candidate before marking seen — the
+        table is wrong in the most dangerous direction: it would tell an
+        operator to intervene where nothing is broken, or worse, the reverse.
+        """
+        section = self._section()
+
+        self.assertIn("history_filter", section)
+        self.assertIn("A-20", section)
+        self.assertIn("이어받지 못한다", section)
+
+    def test_it_points_at_the_line_ops_status_actually_prints(self):
+        """The guide quotes two ATTENTION messages. Quoting text the tool does
+        not produce sends an operator looking for a string that never
+        appears."""
+        section = self._section()
+        ops_status = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        for quoted in (
+            "수집됐지만 History에 들어가지 못한 Event",
+            "History 반영 여부를 판단할 수 없다",
+        ):
+            with self.subTest(message=quoted):
+                self.assertIn(quoted, section)
+                self.assertIn(quoted, ops_status)
+
+    def test_the_manifest_really_is_a_single_file(self):
+        """The section's closing note explains why SUCCESS can sit next to a
+        standing ATTENTION line. That rests on `last_run.json` holding only
+        the last run."""
+        from app.runner import DEFAULT_RUN_SUMMARY_PATH
+
+        section = self._section()
+
+        self.assertEqual(DEFAULT_RUN_SUMMARY_PATH.name, "last_run.json")
+        self.assertIn("last_run.json", section)
+
+
+
+
+
+class BacklogEvidenceLinksResolveTests(unittest.TestCase):
+    """Every test class `BACKLOG.md` cites as evidence still exists.
+
+    The BACKLOG's whole value is that each entry names what was measured and
+    where the measurement lives. A citation to a class that no longer exists
+    is worse than no citation: it reads as coverage, and the entry beside it
+    reads as verified.
+
+    E-11 is this repository's own name for the shape ("고쳤다는 기록을
+    저장소가 검증하지 않는다"), and C38 fenced two other halves of it —
+    `docs/NN §M` pointers and backticked file paths. This is the third.
+
+    Measured before pinning: 119 test classes cited, **one missing** —
+    `ReconciliationLockAwarenessTests`, listed as the four-test evidence for
+    the ops_status half of `is_locked()` (A-20). The behaviour was live and
+    had no test at all, including the part that decides whether a data-loss
+    report can be silenced by a lock file. Written in C40; the citation now
+    resolves.
+
+    **Method names are deliberately not checked.** The same sweep over
+    `test_[a-z_]+` flags 33 names, and all of them are false positives:
+    module names (`test_observability`), and citations wrapped across a line
+    break mid-identifier. A check whose failures are mostly noise is one
+    people learn to silence.
+    """
+
+    def test_every_cited_test_class_exists(self):
+        import re
+
+        backlog = (REPO_ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+        suite = chr(10).join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((REPO_ROOT / "tests").glob("test_*.py"))
+        )
+
+        cited = sorted(set(re.findall(r"\b([A-Z][A-Za-z0-9]*Tests)\b", backlog)))
+        missing = [name for name in cited if f"class {name}(" not in suite]
+
+        self.assertGreater(len(cited), 100, "the citation pattern stopped matching")
+        self.assertEqual(missing, [])
+
+    def test_the_check_would_notice_a_removed_class(self):
+        """Guards the guard: the pattern has to be able to fail."""
+        import re
+
+        sample = "evidence: `tests/test_x.py::SomeVanishedTests` (4건)"
+        cited = re.findall(r"\b([A-Z][A-Za-z0-9]*Tests)\b", sample)
+
+        self.assertEqual(cited, ["SomeVanishedTests"])
+        # And the second half of the check — "is it defined anywhere" — run
+        # against the real suite, so a citation to a class nobody wrote is
+        # demonstrably reported rather than assumed to be.
+        suite = chr(10).join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((REPO_ROOT / "tests").glob("test_*.py"))
+        )
+        missing = [name for name in cited if f"class {name}(" not in suite]
+
+        self.assertEqual(missing, ["SomeVanishedTests"])
+
+
+class ReleaseEnvironmentCheckStaysSafeTests(unittest.TestCase):
+    """`docs/11` §101 item 4 is `python -m src.app.runner`, run as one of five
+    Release Environment Checks. `src/app/runner.py` has no `__main__` block,
+    so today that is an import and nothing else — the same thing item 5
+    (`python -c "import src.app.runner"`) does.
+
+    Which is exactly why the absence has to be pinned. Add a `__main__` block
+    to that module and the release checklist silently becomes "run the full
+    pipeline against whatever runtime this machine has", executed by whoever
+    is verifying an environment — on a production Desktop 4, before anyone
+    has decided a run should happen. `run_company_ops.py` is the entrypoint
+    that may do that, and it guards itself (`_one_runtime_root_or_refuse()`);
+    the library module has no such guard because it is not supposed to need
+    one.
+
+    Verified against the runbook rather than asserted in a vacuum: the test
+    reads §101 and only demands the invariant while that command is in it.
+    """
+
+    def _release_check_section(self):
+        runbook = (DOCS / "11_DEPLOYMENT_RUNBOOK.md").read_text(encoding="utf-8")
+        self.assertIn("Release Environment Check", runbook)
+        return runbook.split("Release Environment Check", 1)[1]
+
+    def test_the_runbook_still_runs_the_runner_as_a_module(self):
+        self.assertIn("python -m src.app.runner", self._release_check_section())
+
+    def test_the_runner_module_does_nothing_when_executed(self):
+        import ast
+
+        source = (REPO_ROOT / "src" / "app" / "runner.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        guards = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        ]
+
+        self.assertEqual(
+            guards,
+            [],
+            "src/app/runner.py gained a __main__ block — docs/11 §101 item 4 "
+            "would then run a real pipeline as part of an environment check",
+        )
+
+    def test_the_entrypoint_that_may_run_it_still_guards_itself(self):
+        """The other half of the split: `run_company_ops.py` is allowed to
+        run the pipeline, and refuses when the runtime root is ambiguous."""
+        source = (REPO_ROOT / "run_company_ops.py").read_text(encoding="utf-8")
+
+        self.assertIn("_one_runtime_root_or_refuse", source)
+        self.assertIn('if __name__ == "__main__":', source)
+
+
+class RestoreSectionMatchesTheCodeTests(unittest.TestCase):
+    """AGENT.md §6a-3 tells an operator what the first run after a disaster
+    restore does. Every claim in it is a claim about code.
+
+    Written because the restore path had never been *run*: the disaster
+    tests proved what the remote gives back and stopped there, so nobody had
+    measured the state a restored Desktop 4 boots into — a complete Company
+    History with no watermark. C39 measured it
+    (`TheFirstRunAfterARestoreTests`), and this pins the document against
+    the same code the measurement went through.
+
+    The section's one instruction to a human — "if `generated` is large and
+    `reused` is small after a restore, stop" — is only actionable while
+    those two words are what the run actually prints.
+    """
+
+    def _section(self):
+        guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+        self.assertIn("### 6a-3.", guide, "AGENT.md §6a-3 heading moved or renamed")
+        return guide.split("### 6a-3.", 1)[1].split("\n## ", 1)[0]
+
+    def test_the_two_words_it_tells_the_operator_to_compare_are_printed(self):
+        """Asserted by RUNNING the reporter, not by finding an f-string.
+
+        The source-text version of this test is what let the drift below
+        happen: it pinned `f"generated={scheduler_result.generated_dates}"`,
+        which is a claim about how the line is *written* and not about what
+        it *says*. Interpolating a tuple of `date` objects prints their
+        repr, so the program's real line was
+
+            generated=(datetime.date(2026, 8, 5),) reused=(datetime.date(...
+
+        while the section this class exists to hold it to shows
+
+            generated=(2026-08-05,) reused=(08-01 … 08-04)
+
+        Both halves passed. Running the function is the only version of this
+        assertion the rendering cannot slip past.
+        """
+        section = self._section()
+
+        self.assertIn("generated=", section)
+        self.assertIn("reused=", section)
+
+        line = self._scheduler_line(
+            generated=(date(2026, 8, 5),),
+            reused=(date(2026, 8, 1), date(2026, 8, 2)),
+        )
+
+        self.assertIn("generated=", line)
+        self.assertIn("reused=", line)
+
+    def test_the_printed_line_is_dates_a_human_reads_not_python_reprs(self):
+        """REGRESSION, and the reason the test above now runs the code.
+
+        §6a-3's instruction — compare `generated` against `reused` — is at
+        its most important right after a disaster restore, which is exactly
+        when both lists are longest. Measured, the production entrypoint run
+        end to end in an isolated copy of this repository:
+
+            before   generated=(datetime.date(2026, 8, 1), … )   606 chars
+            after    generated=17 (2026-08-01, 2026-08-02, … 외 7일)
+
+        and the restored-state reading it exists for, state removed and the
+        Daily files left in place:
+
+            generated=0 reused=17 (2026-08-01, …, 외 7일)
+        """
+        line = self._scheduler_line(
+            generated=(date(2026, 8, 5),),
+            reused=tuple(date(2026, 8, day) for day in range(1, 5)),
+        )
+
+        self.assertNotIn("datetime.date(", line)
+        self.assertIn("generated=1 (2026-08-05)", line)
+        self.assertIn("reused=4 (2026-08-01, 2026-08-02, 2026-08-03, 2026-08-04)", line)
+
+    def test_a_long_list_says_how_many_it_did_not_print(self):
+        """A truncation that does not say it truncated would make a long
+        catch-up read as a short one — the same misreading in a new place."""
+        line = self._scheduler_line(
+            generated=tuple(date(2026, 8, day) for day in range(1, 18)), reused=()
+        )
+
+        self.assertIn("generated=17 (2026-08-01,", line)
+        self.assertIn("외 7일", line)
+        self.assertNotIn("reused=", line)
+
+    def _scheduler_line(self, *, generated, reused):
+        """The real `_print_result()` line, from real result objects."""
+        import contextlib
+        import io as _io
+
+        from backup.log import BackupLogEntry
+        from backup.result import BackupStatus
+        from collector.runtime import RuntimeSummary
+        from scheduler.result import SchedulerRunResult, SchedulerStatus
+        from transport.intake import IntakeSummary
+
+        module = _load_entrypoint_module()
+        result = (
+            IntakeSummary((), (), (), (), (), ()),
+            RuntimeSummary(files=(), accepted=0, duplicate=0, rejected=0, failed=0),
+            SchedulerRunResult(
+                status=SchedulerStatus.COMPLETED,
+                generated_dates=generated,
+                reused_dates=reused,
+            ),
+            BackupLogEntry(
+                run_id="R", backup_start=datetime(2026, 8, 18, 11, 0),
+                source="s", changed_files=(), deleted_files=(),
+                commit_hash=None, push_result=None,
+                backup_end=datetime(2026, 8, 18, 11, 0),
+                final_status=BackupStatus.NOT_REQUIRED,
+            ),
+            (),
+        )
+
+        buffer = _io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_result(result)
+        return next(
+            item
+            for item in buffer.getvalue().splitlines()
+            if item.startswith("Daily History (Scheduler):")
+        )
+
+    def test_the_result_object_really_has_both_halves(self):
+        from scheduler.result import SchedulerRunResult
+
+        fields = SchedulerRunResult.__dataclass_fields__
+
+        self.assertIn("generated_dates", fields)
+        self.assertIn("reused_dates", fields)
+        self.assertTrue(hasattr(SchedulerRunResult, "closed_dates"))
+
+    def test_the_scheduler_still_checks_before_it_writes(self):
+        """The whole reason restored History survives. If this guard were
+        removed, §6a-3's measured table would become a lie in the most
+        expensive direction — real History overwritten by empty days and
+        pushed to the only copy."""
+        source = (REPO_ROOT / "src" / "scheduler" / "scheduler.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("if not final_path.is_file():", source)
+
+    def test_the_backup_scope_the_table_states_is_the_backup_scope(self):
+        """§6a-3's table says `daily/` and `monthly/` come back and nothing
+        else does. That is `docs/08` §26, and it is what makes the missing
+        watermark unavoidable rather than an oversight."""
+        source = (REPO_ROOT / "src" / "backup" / "working_copy.py").read_text(
+            encoding="utf-8"
+        )
+        section = self._section()
+
+        self.assertIn("daily", section)
+        self.assertIn("monthly", section)
+        self.assertIn("runtime/state/", section)
+        # The writer's own list of what it copies.
+        self.assertIn('"daily"', source)
+        self.assertIn('"monthly"', source)
+        self.assertNotIn('"state"', source)
+
+
+class NoDocumentFreezesATestCountTests(unittest.TestCase):
+    """C35: a test count written into a live document goes stale by the next
+    Sprint, and nothing notices.
+
+    Found by sweeping for it: `docs/13` carried "2244 passed" in two places,
+    written three Sprints earlier, while the suite had grown past 2300. Both
+    lines were release-readiness claims, so the stale number was doing real
+    work — a reader checking the checklist would compare it against a run
+    that no longer matches and have no way to tell which is right.
+
+    The fix was to remove the number rather than update it, for the reason
+    C33 §2 already applied to a property count in a docstring: a figure
+    restated outside the thing that produces it is one more place that has
+    to be remembered, and it will not be.
+
+    **`BACKLOG.md` is deliberately exempt.** Its per-Sprint lines
+    ("전체 Regression 2,331 passed") are dated historical records, not live
+    claims — being fixed in time is what makes them useful. The distinction
+    this test draws is between *what the suite is* (must not be frozen) and
+    *what it was on a date* (must be).
+    """
+
+    #  "1234 passed" / "1,234 passed" — the shape a pasted pytest summary has.
+    COUNT = re.compile(r"\b\d{1,3}(?:,\d{3})?\d*\s+passed\b")
+
+    def _live_documents(self):
+        docs = [REPO_ROOT / "README.md", REPO_ROOT / "AGENT.md"]
+        docs += sorted(DOCS.glob("*.md"))
+        return docs
+
+    def test_no_live_document_states_a_pytest_pass_count(self):
+        offenders = []
+        for path in self._live_documents():
+            text = path.read_text(encoding="utf-8")
+            for match in self.COUNT.finditer(text):
+                line = text[: match.start()].count("\n") + 1
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{line}: {match.group()}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a live document froze a test count — it will be wrong by the next "
+            "Sprint. State the command instead, and let BACKLOG.md hold the "
+            "dated figures.",
+        )
+
+    def test_the_pattern_would_actually_catch_one(self):
+        """Guards the guard: a regex that matches nothing passes forever."""
+        for sample in ("2244 passed", "2,331 passed", "전체 회귀 267 passed"):
+            with self.subTest(sample=sample):
+                self.assertTrue(self.COUNT.search(sample))
+
+    def test_backlog_is_exempt_and_still_carries_its_dated_figures(self):
+        """The exemption is load-bearing: if BACKLOG stopped recording them,
+        there would be no measured history at all."""
+        backlog = (REPO_ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+
+        self.assertNotIn(REPO_ROOT / "BACKLOG.md", self._live_documents())
+        self.assertTrue(self.COUNT.search(backlog))
+
+
+class DocumentPointersResolveTests(unittest.TestCase):
+    """Every `docs/NN §M` the code cites points at a section that exists.
+
+    The comments in this repository carry their reasoning by reference — 89
+    such pointers across `src/` and the root scripts, and they are the main
+    way a reader gets from a line of code to the decision behind it. A
+    pointer to a section that was renumbered or removed is worse than no
+    pointer: it sends the reader to the wrong paragraph, or to nothing, and
+    it reads as authority the whole time.
+
+    Same lens as E-11 ("a claim in a comment that outlived the code") and
+    `NoDocumentFreezesATestCountTests` above, aimed at the one kind of claim
+    those two do not cover — a cross-reference rather than a number.
+
+    Measured before pinning: all 89 resolve today. This is a fence around a
+    property the repository already has, not a cleanup.
+    """
+
+    # "docs/13_NOTION_ENVIRONMENT_SETUP.md §3-⑧-4", "docs/04 §66", and the
+    # range form "docs/09 §50-51" — which is two pointers, both of which
+    # must resolve. The trailing "-4"/"-⑧" of a sub-section is deliberately
+    # not checked: documents number their sub-items in prose, inconsistently,
+    # and the section is the part that gets renumbered.
+    POINTER = re.compile(r"docs/(\d{2})[_A-Za-z0-9]*(?:\.md)?\s*§\s*(\d+)(?:\s*-\s*(\d+))?")
+
+    def _sources(self):
+        return [
+            p
+            for p in list((REPO_ROOT / "src").glob("**/*.py")) + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in str(p)
+        ]
+
+    def _documents(self):
+        return {path.name[:2]: path for path in DOCS.glob("*.md")}
+
+    def _sections_defined_in(self, text):
+        """A section is "defined" if the document writes `§N` anywhere, or has
+        a heading starting with the number. Both forms are in use — docs/04
+        writes "§66" inline, docs/13 uses "## 3. ..." headings — and this
+        test is about dangling pointers, not about house style.
+        """
+        return set(re.findall(r"§\s*(\d+)", text)) | set(
+            re.findall(r"^#{1,6}\s*(\d+)[\.\s]", text, re.M)
+        )
+
+    def _collect(self):
+        pointers = {}
+        for path in self._sources():
+            text = path.read_text(encoding="utf-8")
+            for match in self.POINTER.finditer(text):
+                document, first, last = match.group(1), match.group(2), match.group(3)
+                for section in (first, last) if last else (first,):
+                    line = text[: match.start()].count("\n") + 1
+                    pointers.setdefault((document, section), set()).add(
+                        f"{path.relative_to(REPO_ROOT)}:{line}"
+                    )
+        return pointers
+
+    def test_every_cited_section_exists(self):
+        documents = self._documents()
+        defined = {
+            number: self._sections_defined_in(path.read_text(encoding="utf-8"))
+            for number, path in documents.items()
+        }
+
+        dangling = []
+        for (document, section), sites in sorted(self._collect().items()):
+            if document not in documents:
+                dangling.append(f"docs/{document} does not exist — {sorted(sites)[0]}")
+            elif section not in defined[document]:
+                dangling.append(
+                    f"docs/{document} §{section} not found — {sorted(sites)[0]}"
+                )
+
+        self.assertEqual(dangling, [])
+
+    def test_the_pattern_finds_the_pointers_that_are_actually_written(self):
+        """Guards the guard, twice over: a regex that matches nothing passes
+        forever, and one that misses the range form silently checks half."""
+        found = self._collect()
+        self.assertGreater(len(found), 50)
+
+        samples = {
+            "docs/04_NOTION_SYNC_SPEC.md §8": [("04", "8")],
+            "docs/09 §50-51": [("09", "50"), ("09", "51")],
+            "docs/13 §3-⑧-4": [("13", "3")],
+        }
+        for text, expected in samples.items():
+            with self.subTest(text=text):
+                matches = []
+                for match in self.POINTER.finditer(text):
+                    document, first, last = match.group(1), match.group(2), match.group(3)
+                    matches += [
+                        (document, section)
+                        for section in ((first, last) if last else (first,))
+                    ]
+                self.assertEqual(matches, expected)
+
+class DocumentPathsResolveTests(unittest.TestCase):
+    """Every repository file a document names in backticks actually exists.
+
+    The sibling of `DocumentPointersResolveTests` above, aimed at the other
+    half of what a document points at. A `docs/NN §M` that no longer exists
+    sends a reader to the wrong paragraph; a `src/notion/foo.py` that no
+    longer exists sends them to nothing at all, and these documents are how
+    an operator finds the file they are being told to run.
+
+    Measured before pinning: 186 such references across README, AGENT.md and
+    `docs/`, all resolving. A fence around a property the repository has,
+    not a cleanup — same as the pointer test.
+
+    Three kinds of reference are deliberately out of scope, each because it
+    is not a claim about a file in this repository:
+
+        runtime artifacts       `dashboard_pending.json`, `runtime/...` —
+                                written by a run, absent on a fresh clone,
+                                and their absence is normal rather than a
+                                documentation error.
+        filename patterns       `YYYY-MM-DD.md` is a shape, not a path.
+        the other repository    `DOJOONPASS_OS/...` — README and docs/00
+                                both name it in a sentence that says it is
+                                a different repository (the Repository
+                                Contract). A reference across that boundary
+                                is correct and cannot be checked here.
+    """
+
+    PATH_LIKE = re.compile(
+        r"`((?:[\w.\-]+/)*[\w.\-]+\.(?:py|md|json|ps1|txt|cfg|toml|yml|yaml))`"
+    )
+
+    # Written out rather than pattern-matched: an exemption list that grows
+    # by accident is how this kind of test stops meaning anything.
+    RUNTIME_ARTIFACTS = frozenset(
+        {
+            "dashboard_pending.json",
+            "notion_retry_queue.json",
+            "daily_history_state.json",
+            "monthly_history_state.json",
+            "collector_state.json",
+            "backup_state.json",
+            "agent_state.json",
+            "last_run.json",
+            "run_summary.json",
+            "collector.log",
+            "notion_sync.log",
+            "daily_late_update.log",
+            "agent.log",
+            "YYYY-MM-DD.md",
+            "YYYY-MM.md",
+        }
+    )
+
+    def _documents(self):
+        return [REPO_ROOT / "README.md", REPO_ROOT / "AGENT.md"] + sorted(
+            DOCS.glob("*.md")
+        )
+
+    def _is_exempt(self, raw):
+        if raw.startswith(("runtime/", "backup_working_copy/", "DOJOONPASS_OS/")):
+            return True
+        return Path(raw).name in self.RUNTIME_ARTIFACTS
+
+    def _collect(self):
+        found = {}
+        for document in self._documents():
+            text = document.read_text(encoding="utf-8")
+            for match in self.PATH_LIKE.finditer(text):
+                raw = match.group(1)
+                line = text[: match.start()].count("\n") + 1
+                found.setdefault(raw, []).append(
+                    f"{document.relative_to(REPO_ROOT)}:{line}"
+                )
+        return found
+
+    def test_every_documented_repository_path_exists(self):
+        dangling = []
+        for raw, sites in sorted(self._collect().items()):
+            if self._is_exempt(raw):
+                continue
+            if (REPO_ROOT / raw).exists():
+                continue
+            # A bare filename is allowed to live anywhere in the tree —
+            # documents say `runner.py` far more often than `src/app/runner.py`.
+            if "/" not in raw and list(REPO_ROOT.glob(f"**/{raw}")):
+                continue
+            dangling.append(f"{raw} — {sorted(sites)[0]}")
+
+        self.assertEqual(dangling, [])
+
+    def test_the_pattern_finds_the_paths_that_are_actually_written(self):
+        """Guards the guard: a regex matching nothing passes forever."""
+        found = self._collect()
+        self.assertGreater(len(found), 40)
+        self.assertIn("ops_status.py", found)
+        self.assertIn("src/app/runner.py", found)
+
+    def test_the_exemptions_are_all_still_needed(self):
+        """An exemption for a path that now resolves is an exemption that
+        has stopped being a statement about anything — and the next reader
+        would take it as evidence the file is a runtime artifact."""
+        stale = [
+            name
+            for name in self.RUNTIME_ARTIFACTS
+            if (REPO_ROOT / name).exists() and name not in ("README.md",)
+        ]
+        self.assertEqual(stale, [])
+
+
+class NoTestFileHidesTestsBelowItsMainGuardTests(unittest.TestCase):
+    """`if __name__ == "__main__": unittest.main()` must be the last thing in
+    a test file, because `unittest.main()` runs at the point it is reached.
+
+    Measured, before this test existed: twenty of the fifty-four test files
+    carried that guard somewhere in the middle, with **760 test methods
+    defined below it**. Running such a file directly executed only the part
+    above the guard and printed `OK`:
+
+        python tests/test_observability.py     Ran  44 tests ... OK
+        pytest tests/test_observability.py     411 passed
+
+    Nothing was broken — the suite runs under pytest, which imports the
+    module and never reaches the guard — and that is exactly why it lasted.
+    A green `OK` covering 11% of a file is the repository's own recurring
+    failure mode (a silent pass that reads as coverage) sitting inside the
+    tests that exist to catch it.
+
+    Moving the twenty guards to EOF then surfaced a second thing they had
+    been hiding: ten tests in `test_observability.py` and five in
+    `test_monthly_history.py` import `ops_status`, which lives beside `src/`
+    rather than in it, and only pytest had been putting the repository root
+    on `sys.path`. Those fifteen raised `ModuleNotFoundError` the moment the
+    direct run reached them. Fixed in the five affected headers.
+
+    Both halves are pinned here: the guard is last, and every test file can
+    still be run on its own.
+    """
+
+    def _test_files(self):
+        return sorted((REPO_ROOT / "tests").glob("test_*.py"))
+
+    def test_nothing_is_defined_below_a_main_guard(self):
+        import ast
+
+        offenders = []
+        for path in self._test_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            guards = [
+                node
+                for node in tree.body
+                if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+            ]
+            if not guards:
+                continue
+            below = [
+                node for node in tree.body if node.lineno > guards[-1].lineno
+            ]
+            if below:
+                hidden = sum(
+                    1
+                    for node in below
+                    if isinstance(node, ast.ClassDef)
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.FunctionDef)
+                    and child.name.startswith("test_")
+                )
+                offenders.append(f"{path.name}: {hidden} test methods below the guard")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "`unittest.main()` runs where it is written — everything after it "
+            "is skipped by `python tests/<file>.py` while the run still prints OK",
+        )
+
+    def test_a_file_importing_a_root_script_puts_the_root_on_sys_path(self):
+        """The gap the guards were hiding.
+
+        `src/` is inserted by every test file; the repository root is not,
+        and `ops_status.py` / `run_company_ops.py` / `review_cli.py` live
+        there. pytest adds the rootdir itself, so a missing insert is
+        invisible under the runner the suite actually uses.
+        """
+        import re
+
+        root_scripts = tuple(
+            path.stem for path in REPO_ROOT.glob("*.py") if path.stem != "conftest"
+        )
+        self.assertIn("ops_status", root_scripts)
+
+        offenders = []
+        for path in self._test_files():
+            source = path.read_text(encoding="utf-8")
+            imports_root = any(
+                re.search(rf"^\s*(?:from|import)\s+{script}\b", source, re.M)
+                for script in root_scripts
+            )
+            if not imports_root:
+                continue
+            if "parents[1]))" not in source:
+                offenders.append(path.name)
+
+        self.assertEqual(offenders, [])
+
+    def test_the_detector_would_catch_a_reintroduced_guard(self):
+        """Guards the guard: run the same AST check against a file that has
+        the defect, so an always-empty `offenders` list cannot pass forever.
+        """
+        import ast
+
+        source = (
+            "import unittest\n"
+            'if __name__ == "__main__":\n'
+            "    unittest.main()\n"
+            "class LateTests(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            "        pass\n"
+        )
+        tree = ast.parse(source)
+        guards = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        ]
+        below = [node for node in tree.body if node.lineno > guards[-1].lineno]
+
+        self.assertTrue(below)
+
+
+class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
+    """C47, Release audit: every tool here silently ignored `sys.argv`.
+
+    None of the four entrypoints reads `sys.argv`, `argparse` or
+    `ArgumentParser` -- configuration is entirely environmental, and
+    `scripts/install_agent_task.ps1` registers its action with no arguments
+    at all. That is a coherent design, and it had one silent edge:
+
+        python run_company_ops.py --dry-run
+
+    ran a full production run. Real git push, real Notion writes, exit 0.
+    The flag was not rejected, not warned about, not read. An operator
+    reaching for `--dry-run` before a first production run is reaching for
+    exactly the safety this had none of, and the tool answered by doing the
+    unsafe thing and reporting success.
+
+    `--help` was the same shape: it printed
+    `COMPANY_OPS_HISTORY_START_DATE 환경변수가 없습니다`, a true sentence
+    about a question nobody asked.
+
+    Each entrypoint is run as a real subprocess, because that is the only way
+    to check the thing that matters -- what the operating system sees when a
+    person types the command.
+    """
+
+    ENTRYPOINTS = (
+        "run_company_ops.py",
+        "run_agent.py",
+        "init_notion.py",
+        "ops_status.py",
+    )
+
+    def _run(self, name, *arguments):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / name), *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=REPO_ROOT,
+            timeout=180,
+        )
+
+    def test_an_argument_is_refused_before_anything_happens(self):
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                result = self._run(name, "--dry-run")
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("--dry-run", result.stderr)
+                self.assertIn("환경변수", result.stderr)
+
+    def test_asking_for_help_says_there_is_none(self):
+        """The failure that reads as a bug report otherwise: `--help` used to
+        answer with whichever environment variable happened to be checked
+        first, which tells an operator nothing about why."""
+        for name in self.ENTRYPOINTS:
+            for flag in ("--help", "-h"):
+                with self.subTest(entrypoint=name, flag=flag):
+                    result = self._run(name, flag)
+
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("--help가 없습니다", result.stderr)
+                    self.assertIn("AGENT.md", result.stderr)
+
+    def test_no_arguments_still_reaches_the_tool(self):
+        """The half that must not change. `ops_status.py` is the one that can
+        run with no configuration at all -- the others stop at their own
+        environment check, which is the pre-existing behaviour and a
+        different message.
+        """
+        result = self._run("ops_status.py")
+
+        self.assertIn(result.returncode, (0, 3))
+        self.assertIn("DOJOONPASS Company Ops", result.stdout)
+        self.assertNotIn("명령줄 인자", result.stderr)
+
+    def test_the_variables_named_are_variables_the_project_reads(self):
+        """A refusal message whose whole value is telling an operator what to
+        set instead. A stale name there sends them to a variable nothing
+        looks at, which is worse than saying nothing.
+
+        So the names are checked against the ones the source actually
+        mentions, rather than against a list restated in this test.
+        """
+        known = set()
+        for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py")):
+            known.update(
+                re.findall(r"COMPANY_OPS_[A-Z_]+", path.read_text(encoding="utf-8"))
+            )
+        self.assertIn("COMPANY_OPS_PROFILE", known)  # the scan itself works
+
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                message = self._run(name, "--dry-run").stderr
+                named = set(re.findall(r"COMPANY_OPS_[A-Z_]+", message))
+
+                self.assertTrue(named, f"{name} names no variable at all")
+                self.assertEqual(named - known, set())
+
+    def test_the_rule_lives_in_one_place(self):
+        """Four copies of "reject unknown arguments" is four chances for one
+        of them to keep running. Each entrypoint imports the shared helper
+        rather than restating the check."""
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                source = (REPO_ROOT / name).read_text(encoding="utf-8")
+
+                self.assertIn("from cli import", source)
+                self.assertIn("unexpected_arguments(", source)
+
+    def test_the_helper_passes_an_empty_command_line_through(self):
+        from cli import unexpected_arguments
+
+        self.assertIsNone(
+            unexpected_arguments(["run_agent.py"], tool="t", configured_by=("A",))
+        )
+        self.assertIsNotNone(
+            unexpected_arguments(["run_agent.py", "x"], tool="t", configured_by=("A",))
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

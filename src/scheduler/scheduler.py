@@ -152,6 +152,11 @@ def _generate_pending_dates(
         keep_index = None
 
     generated: list[date] = []
+    # Split from `generated` in C39. The loop's own reasoning below is
+    # unchanged — a date whose file is already there is done, and the
+    # watermark advances past it either way — but "closed" and "written" are
+    # two different facts and only one of them was being reported.
+    reused: list[date] = []
     for target_date in pending_dates:
         final_path = daily_dir / f"{target_date.isoformat()}.md"
         # `is_file()`, not `exists()`. The question here is "is this day's
@@ -170,6 +175,7 @@ def _generate_pending_dates(
         # `generate_daily_history()` refuses to write over a non-file, and
         # the run stops there with `failed_date` naming it, which is what
         # §30 asks for.
+        wrote_it = False
         if not final_path.is_file():
             try:
                 generate_daily_history(
@@ -181,14 +187,25 @@ def _generate_pending_dates(
                 return SchedulerRunResult(
                     status=SchedulerStatus.FAILED,
                     generated_dates=tuple(generated),
+                    reused_dates=tuple(reused),
                     failed_date=target_date,
                     error=str(exc),
                 )
+            wrote_it = True
         # Either just generated, or the file already existed from a
         # prior run that crashed after writing it but before saving
         # state (section 28) — either way this date is now done.
+        #
+        # Which of the two it was is recorded rather than flattened (C39):
+        # a restored Desktop 4 closes every day it was handed back by git
+        # without writing one of them, and calling that "generated" told an
+        # operator the pipeline had rebuilt History it cannot rebuild.
         state.last_successful_daily_close = target_date
         save_state(state_path, state)
-        generated.append(target_date)
+        (generated if wrote_it else reused).append(target_date)
 
-    return SchedulerRunResult(status=SchedulerStatus.COMPLETED, generated_dates=tuple(generated))
+    return SchedulerRunResult(
+        status=SchedulerStatus.COMPLETED,
+        generated_dates=tuple(generated),
+        reused_dates=tuple(reused),
+    )

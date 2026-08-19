@@ -426,10 +426,6 @@ class SecretLeakTests(FaultTestCase):
         self.assertEqual(list((self.root / "outgoing").glob("*.json")), [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DeliveredButUnfiledTests(FaultTestCase):
     """The send succeeded and the `sent/` move did not.
 
@@ -560,3 +556,7 @@ class DeliveredButUnfiledTests(FaultTestCase):
         self.assertEqual(result.status, AgentStatus.FAILED)
         self.assertIsNone(load_state(self.state_path).last_successful_collection_date)
         self.assertEqual(len(pending(self.outbox)), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

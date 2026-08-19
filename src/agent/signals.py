@@ -89,9 +89,22 @@ _SECRET_RE = SECRET_RE
 class SignalError(ValueError):
     """Raised when a Signal file cannot be read as a valid Signal.
 
-    Carries the offending filename so `agent.py` can route it to the
-    rejected/ directory the same way Collector Runtime routes a rejected
-    Event file (docs/03 §7), instead of stalling the date forever.
+    `filename` and `reason` exist to build the message — `"<filename>:
+    <reason>"` — which is what `agent.py` records in `DateResult.errors`
+    and what an operator reads. Neither attribute is read back by anything.
+
+    This docstring used to say `filename` was carried "so `agent.py` can
+    route it to the rejected/ directory". It is not: `load_signals()`
+    returns `(Path, SignalError)` pairs and `_collect_one_date()` routes
+    with the `Path`, which is the right source — a `Path` can be moved and
+    a name cannot. Corrected rather than deleted, because the claim was
+    the kind that makes someone treat an unused attribute as load-bearing
+    (found by sweeping for attributes nothing reads, C33 §6).
+
+    The routing itself is unchanged and is the one this describes: a Signal
+    that cannot be read moves to rejected/ the same way Collector Runtime
+    routes a rejected Event file (docs/03 §7), instead of stalling the date
+    forever.
     """
 
     def __init__(self, filename: str, reason: str):

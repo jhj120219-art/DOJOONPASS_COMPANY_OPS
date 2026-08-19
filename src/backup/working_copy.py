@@ -40,6 +40,7 @@ themselves are unchanged; only which files they ever see is restricted.
 from __future__ import annotations
 
 import filecmp
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,7 +141,107 @@ def _relative_files(root: Path) -> set[str]:
     resolves to. Reproduced end to end this Sprint: a symlink named
     `notes.md` pointing at an external `.env` was not flagged by the scan
     and its content was copied into the Working Copy verbatim.
+
+    Walked with `os.scandir` rather than `rglob("*")`, and only into the
+    top-level names `_is_in_scope()` can accept. The result is the same set
+    by construction — every path this skips has a `parts[0]` that predicate
+    already rejects — and `RelativeFilesWalkTests` asserts it against the
+    `rglob` form over an adversarial tree rather than by argument.
+
+    Two reasons it was worth doing rather than left alone.
+
+      * `rglob("*")` walks **everything**, and the Working Copy is a git
+        repository: `.git/` is the largest directory in it and not one file
+        of it can ever be in scope. Every entry there cost two stat calls
+        (`is_symlink()`, then `is_file()`) to be thrown away.
+      * The cost is paid twice per Runner execution and, since C45, once per
+        `ops_status.py` invocation as well — and that script's whole premise
+        is that a person runs it first, casually.
+
+    Measured on this machine, warm, listing Master **and** Working Copy
+    (which is what one `sync_to_working_copy()` and one `ops_status.py`
+    each do):
+
+        one year    730 files, 600-object .git   55.4 ms -> 2.6 ms   21.3x
+        three years 2190 files                   82.6 ms -> 6.3 ms   13.2x
+        ten years   7300 files                  271.1 ms -> 23.1 ms  11.7x
+
+    Within `ops_status._print_history()` that is 29.6% of the block down to
+    1.9% at one year, and 29.2% down to 3.2% at ten.
+
+    Same shape, and the same reason, as the `glob+is_file` -> `scandir` swap
+    `ops_status._daily_dates()` already carries (16x there).
+
+    A *file* named `daily` sitting directly in the root is still considered,
+    not pruned: `_is_in_scope("daily")` is True (`parts[0]` is `daily` and
+    the basename is not a staging name), so the walk keeps any top-level
+    entry whose NAME is in scope and only decides afterwards whether it is a
+    directory to descend or a file to test. Dropping it would have been a
+    behaviour change hidden inside an optimisation.
     """
+    root = Path(root)
+    if not root.is_dir():
+        return set()
+
+    result: set[str] = set()
+
+    def _walk(directory: Path, prefix: str) -> None:
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        for entry in entries:
+            rel = f"{prefix}{entry.name}" if prefix else entry.name
+            try:
+                # `is_symlink()` first, and `follow_symlinks=False` on the
+                # directory test, for the reason above: a link is refused,
+                # never followed, in either shape.
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    _walk(Path(entry.path), rel + os.sep)
+                    continue
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            if _is_in_scope(rel):
+                result.add(rel)
+
+    try:
+        top = list(os.scandir(root))
+    except OSError:
+        return set()
+    for entry in top:
+        if entry.name not in _ALLOWED_TOP_LEVEL_DIRS:
+            # Nothing under it can pass `_is_in_scope()`, which tests
+            # `parts[0]` — so this is the whole of `.git/`, and every other
+            # out-of-scope tree, never opened.
+            continue
+        try:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                _walk(Path(entry.path), entry.name + os.sep)
+                continue
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        if _is_in_scope(entry.name):
+            result.add(entry.name)
+    return result
+
+
+def _relative_files_by_rglob(root: Path) -> set[str]:
+    """The previous implementation, kept only as the optimisation's oracle.
+
+    `_relative_files()` replaced this for speed; nothing in the pipeline
+    calls this. `RelativeFilesWalkTests` runs both over an adversarial tree
+    and asserts they agree, which is what makes "the result is the same set
+    by construction" a checked claim rather than a sentence.
+    """
+    root = Path(root)
     if not root.is_dir():
         return set()
     result: set[str] = set()

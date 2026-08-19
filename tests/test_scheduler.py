@@ -350,7 +350,15 @@ class CrashRecoveryTests(SchedulerTestCase):
         result = self._run(now=datetime(2026, 8, 4, 11, 0))
 
         self.assertEqual(result.status, SchedulerStatus.COMPLETED)
-        self.assertEqual(result.generated_dates, (date(2026, 8, 2), date(2026, 8, 3)))
+        # Split in C39. This assertion used to read
+        # `generated_dates == (08-02, 08-03)` — both dates, one of which the
+        # run demonstrably did not write, as the very next assertion proves.
+        # Not a weakened check: it now says which date was written and which
+        # was inherited, and `closed_dates` still pins the union the old
+        # single tuple carried.
+        self.assertEqual(result.generated_dates, (date(2026, 8, 3),))
+        self.assertEqual(result.reused_dates, (date(2026, 8, 2),))
+        self.assertEqual(result.closed_dates, (date(2026, 8, 2), date(2026, 8, 3)))
         # the pre-existing file must not have been touched/overwritten
         self.assertEqual(
             (self.daily_dir / "2026-08-02.md").read_text(encoding="utf-8"), "already generated"
@@ -416,10 +424,6 @@ class SchedulerPathSafetyTests(unittest.TestCase):
             content = py_file.read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, content, f"{token} found in {py_file}")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class OneCorruptCandidateStopsEveryDateTests(unittest.TestCase):
@@ -558,3 +562,7 @@ class OneCorruptCandidateStopsEveryDateTests(unittest.TestCase):
 
         self.assertIn("모든 날짜의", source)
         self.assertIn("A-7", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

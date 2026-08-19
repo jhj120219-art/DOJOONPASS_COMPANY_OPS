@@ -25,6 +25,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# The repository root too: this file imports a root-level script
+# (`ops_status.py` and friends live beside `src/`, not in it). Under
+# pytest the rootdir is already on `sys.path`, so the omission only
+# surfaced once `python tests/<file>.py` started running the whole
+# file instead of stopping at a stray `unittest.main()` (C38).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import review_cli  # noqa: E402
 from collector import Collector, InMemorySeenEventStore, run_once as collector_run_once  # noqa: E402
@@ -191,10 +197,13 @@ class EndToEndLocalPipelineTests(unittest.TestCase):
             daily_output_dir=self.daily_dir,
         )
         self.assertEqual(result.status, SchedulerStatus.COMPLETED)
-        # generated_dates lists every date now confirmed complete this run
-        # — 08-01 was adopted (pre-existing file, not recreated; verified
-        # below via untouched content) and 08-02 was freshly generated.
-        self.assertEqual(result.generated_dates, (date(2026, 8, 1), date(2026, 8, 2)))
+        # This comment already knew the distinction the field could not
+        # express — "08-01 was adopted (pre-existing file, not recreated)"
+        # sat directly above an assertion calling both dates generated. C39
+        # split the field; the comment's own words are now the assertion.
+        self.assertEqual(result.generated_dates, (date(2026, 8, 2),))
+        self.assertEqual(result.reused_dates, (date(2026, 8, 1),))
+        self.assertEqual(result.closed_dates, (date(2026, 8, 1), date(2026, 8, 2)))
 
         state = load_state(self.scheduler_state_path)
         self.assertEqual(state.last_successful_daily_close, date(2026, 8, 2))

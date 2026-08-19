@@ -27,7 +27,9 @@ Nothing here changes production code, Runtime behaviour, or any spec.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
+import io
 import json
 import os
 import re
@@ -919,6 +921,14 @@ class AtomicWriteFailureCleanupTests(unittest.TestCase):
     Failure is injected at `os.replace` rather than at each writer's
     serialiser because it is the one step all eight share, so the same
     assertion applies uniformly.
+
+    **"Eight" is the set of sources that Sprint changed, not the set of
+    atomic writers.** Sweeping for `mkstemp` finds fourteen, and a line
+    coverage pass over the whole suite (C40) showed the Company History
+    writers' cleanup lines never executing. Those three now have their own
+    class — `CompanyHistoryWritersCleanUpTooTests` — because two of them
+    report failure instead of raising it, which needs a different assertion
+    for the same property.
     """
 
     def setUp(self):
@@ -1085,6 +1095,257 @@ class AtomicWriteFailureCleanupTests(unittest.TestCase):
 
                 written = [p.name for p in directory.rglob("*.json") if p.is_file()]
                 self.assertEqual(written, [], f"{name} left {written}")
+
+
+class AtomicWritesReachTheDiskBeforeTheRenameTests(unittest.TestCase):
+    """Every atomic writer flushes its data to disk before committing the name.
+
+    `test_every_state_writer_uses_the_same_atomic_idiom` proves the writers
+    stage through `tempfile.mkstemp` and commit with `os.replace`, and
+    `AtomicWriteFailureCleanupTests` proves the failure path cleans up. Both
+    are about *atomicity* — a reader never sees a half-written file. Neither
+    says anything about *durability*, and until this class existed nothing in
+    this repository did: not one of the fourteen writers called `fsync`.
+
+    The gap is the other half of an accident this repository already reasons
+    about. `reporter/local_output.INCOMPLETE_WRITE_PREFIX` follows the
+    *staging* file left by "a write the process never returned from — power
+    loss, SIGKILL, a container stop" through every reader. The same power cut
+    has a second outcome: `os.replace()` is a metadata operation NTFS
+    journals while the bytes are still in the page cache, so the rename can
+    land first and the file comes back under its real name, the right size,
+    full of zeros. That one is worse — a leftover `.tmp-…json` is visibly not
+    an artifact, while a zero-filled `2026-08-05.md` is a day of Company
+    History that `_holes_in_the_daily_sequence()` (which looks for a *missing*
+    file) accepts, and that Backup commits and pushes.
+
+    Asserted by behaviour, not by grepping the source: `os.fsync` and
+    `os.replace` are both recorded, and each writer must have fsynced before
+    it renamed. A writer that flushed *after* the commit, or not at all,
+    fails here.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+        self.events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def recording_fsync(fd):
+            self.events.append("fsync")
+            return real_fsync(fd)
+
+        def recording_replace(src, dst):
+            self.events.append("replace")
+            return real_replace(src, dst)
+
+        os.fsync = recording_fsync
+        os.replace = recording_replace
+        self.addCleanup(setattr, os, "fsync", real_fsync)
+        self.addCleanup(setattr, os, "replace", real_replace)
+
+    def _writers(self):
+        """(name, directory, callable) for every `mkstemp` + `os.replace` site.
+
+        Deliberately a superset of `AtomicWriteFailureCleanupTests._writers()`,
+        which covers eight. Sweeping `src/` for `os.fdopen(fd` finds fifteen;
+        fourteen are here and the fifteenth is `scheduler/lock.py`, which is
+        excluded on purpose — a lock is not a durable artifact, and a lock
+        whose contents did not survive a crash is read as unparseable, judged
+        stale, and taken over, which is the direction that recovers.
+        """
+        from agent.state import AgentState
+        from agent.state import save_state as agent_save_state
+        from backup.result import BackupStatus
+        from backup.state import BackupState
+        from backup.state import save_state as backup_save_state
+        from collector.state import PersistentSeenEventStore
+        from daily import generate_daily_history, update_daily_history
+        from monthly.generator import consolidate_month
+        from monthly.state import MonthlyState
+        from monthly.state import save_state as monthly_save_state
+        from notion.dashboard_pending import save_pending
+        from notion.retry_queue import RetryQueueEntry, save_queue
+        from reporter.local_output import write_event_json
+        from scheduler.state import SchedulerState
+        from scheduler.state import save_state as scheduler_save_state
+        from transport.onedrive import OneDriveTransport
+
+        now = datetime(2026, 8, 6, 11, 0).astimezone()
+        day = date(2026, 8, 5)
+        event = create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="PRJ-FSYNC",
+            event_type="MILESTONE_COMPLETED",
+            status="IN_PROGRESS",
+            summary="durability probe",
+            milestone="M1",
+            history_candidate=True,
+            timestamp="2026-08-05T10:00:00+09:00",
+            event_id="FSYNC-001",
+        )
+        candidate = _candidate(1, day)
+
+        def daily_first_write(d):
+            repository = FileHistoryRepository(keep_dir=d / "keep", review_dir=d / "review")
+            repository.save(candidate)
+            generate_daily_history(repository, day, output_dir=d / "daily")
+
+        def daily_late_update(d):
+            repository = FileHistoryRepository(keep_dir=d / "keep", review_dir=d / "review")
+            repository.save(candidate)
+            generate_daily_history(repository, day, output_dir=d / "daily")
+            repository.save(_candidate(2, day))
+            self.events.clear()  # only the late-update write is under test
+            result = update_daily_history(repository, day, output_dir=d / "daily", now=now)
+            self.assertEqual(result.outcome.value, "UPDATED_LATE_EVENT", result.error)
+
+        def monthly_write(d):
+            daily_dir = d / "daily"
+            daily_dir.mkdir(parents=True, exist_ok=True)
+            for stamp in ("2026-07-30", "2026-07-31"):
+                (daily_dir / f"{stamp}.md").write_text(
+                    f"# DOJOONPASS Company History - {stamp}\n\n"
+                    "No material company history recorded.\n",
+                    encoding="utf-8",
+                )
+            result = consolidate_month(
+                year=2026,
+                month=7,
+                daily_dir=daily_dir,
+                monthly_dir=d / "monthly",
+                history_start_date=date(2026, 7, 30),
+                now=datetime(2026, 8, 2, 9, 0).astimezone(),
+            )
+            self.assertTrue(
+                (d / "monthly" / "2026-07.md").is_file(),
+                f"monthly not written: {result.status} {result.error}",
+            )
+
+        return [
+            (
+                "collector/state.py::_save",
+                self.root / "collector",
+                lambda d: PersistentSeenEventStore(
+                    state_path=d / "collector_state.json"
+                ).mark_seen("FSYNC-001"),
+            ),
+            (
+                "scheduler/state.py::save_state",
+                self.root / "scheduler",
+                lambda d: scheduler_save_state(d / "daily_history_state.json", SchedulerState()),
+            ),
+            (
+                "backup/state.py::save_state",
+                self.root / "backup",
+                lambda d: backup_save_state(
+                    d / "backup_state.json", BackupState(backup_status=BackupStatus.PENDING)
+                ),
+            ),
+            (
+                "monthly/state.py::save_state",
+                self.root / "monthly_state",
+                lambda d: monthly_save_state(d / "monthly_history_state.json", MonthlyState()),
+            ),
+            (
+                "agent/state.py::save_state",
+                self.root / "agent_state",
+                lambda d: agent_save_state(d / "agent_state.json", AgentState(desktop_id="DESKTOP_1")),
+            ),
+            (
+                "notion/retry_queue.py::save_queue",
+                self.root / "retry",
+                lambda d: save_queue(
+                    d / "notion_retry_queue.json",
+                    [
+                        RetryQueueEntry(
+                            event_id=event.event_id,
+                            project_id=event.project_id,
+                            event_data=event.to_dict(),
+                            added_at=now.isoformat(timespec="seconds"),
+                            attempt_count=1,
+                        )
+                    ],
+                ),
+            ),
+            (
+                "notion/dashboard_pending.py::save_all",
+                self.root / "pending",
+                lambda d: save_pending(
+                    d / "dashboard_pending.json",
+                    run_id="RUN-FSYNC-001",
+                    properties={"Name": {"title": []}},
+                    now=now,
+                ),
+            ),
+            (
+                "history/file_repository.py::save",
+                self.root / "history",
+                lambda d: FileHistoryRepository(keep_dir=d, review_dir=d / "review").save(
+                    candidate
+                ),
+            ),
+            (
+                "reporter/local_output.py::write_event_json",
+                self.root / "reporter",
+                lambda d: write_event_json(event, directory=d),
+            ),
+            (
+                "transport/onedrive.py::_write_atomic",
+                self.root / "onedrive",
+                lambda d: OneDriveTransport(sync_folder=d / "sync", outgoing_dir=d).send(event),
+            ),
+            (
+                "runsummary.py::write_summary",
+                self.root / "runsummary",
+                lambda d: write_summary(
+                    d / "last_run.json",
+                    RunSummary(
+                        run_id="RUN-FSYNC-001",
+                        started_at="2026-08-06T11:00:00+09:00",
+                        finished_at="2026-08-06T11:00:01+09:00",
+                        components=(
+                            ComponentResult(name="intake", status=ComponentStatus.SUCCESS),
+                        ),
+                    ),
+                ),
+            ),
+            ("daily/generator.py::generate_daily_history", self.root / "daily1", daily_first_write),
+            ("daily/generator.py::update_daily_history", self.root / "daily2", daily_late_update),
+            ("monthly/generator.py::consolidate_month", self.root / "monthly", monthly_write),
+        ]
+
+    def test_every_atomic_writer_fsyncs_before_it_renames(self):
+        for name, directory, write in self._writers():
+            with self.subTest(writer=name):
+                directory.mkdir(parents=True, exist_ok=True)
+                self.events.clear()
+                write(directory)
+
+                self.assertIn("fsync", self.events, f"{name} never called os.fsync")
+                self.assertIn("replace", self.events, f"{name} never reached os.replace")
+                self.assertEqual(
+                    self.events[0],
+                    "fsync",
+                    f"{name} renamed before flushing to disk: {self.events}",
+                )
+                # Every rename this writer performs must be preceded by a
+                # flush of the file it is about to publish, not just the
+                # first one — `update_daily_history()` and `OneDriveTransport`
+                # both write more than once.
+                pending_fsync = 0
+                for entry in self.events:
+                    if entry == "fsync":
+                        pending_fsync += 1
+                    else:
+                        self.assertGreater(
+                            pending_fsync, 0, f"{name} renamed an unflushed file: {self.events}"
+                        )
+                        pending_fsync -= 1
 
 
 class TestDoubleFidelityTests(unittest.TestCase):
@@ -1654,6 +1915,180 @@ def _force_rmtree_if_present(path: Path) -> None:
             shutil.rmtree(path, onerror=onerror)
 
 
+class RunnerEntrypointConfigurationTests(unittest.TestCase):
+    """`run_company_ops.py`'s environment gate — the Desktop 4 mirror of
+    `test_agent.py::AgentEntrypointConfigurationTests`.
+
+    Found the same way and left in the same state: a line-coverage pass over
+    the root scripts showed `_resolve_history_start_date()`'s two refusal
+    paths, and `main()`'s whole body, had never executed. Nothing here is a
+    new rule — docs/07 §50 already says the start date is never guessed —
+    but nothing was checking that the rule still fires.
+
+    Its consequence is the opposite shape to the Agent's and no smaller. A
+    guessed start date on Desktop 4 does not fail loudly: it silently decides
+    where Company History begins, on the one machine that writes it, and
+    `daily_history_state.json` then advances past whatever it decided.
+    """
+
+    KEY = "COMPANY_OPS_HISTORY_START_DATE"
+
+    def _module(self):
+        import importlib.util
+
+        path = REPO_ROOT / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_config", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _with(self, value):
+        original = os.environ.get(self.KEY)
+
+        def restore():
+            if original is None:
+                os.environ.pop(self.KEY, None)
+            else:
+                os.environ[self.KEY] = original
+
+        self.addCleanup(restore)
+        if value is None:
+            os.environ.pop(self.KEY, None)
+        else:
+            os.environ[self.KEY] = value
+
+    def _refusal(self, value):
+        self._with(value)
+        module = self._module()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                module._resolve_history_start_date()
+        return caught.exception.code, err.getvalue()
+
+    def test_a_missing_start_date_is_refused_not_guessed(self):
+        code, err = self._refusal(None)
+
+        self.assertEqual(code, 1)
+        self.assertIn(self.KEY, err)
+
+    def test_a_blank_value_is_treated_as_missing(self):
+        """`if not raw`, the same reading `run_agent.py` uses. A half-edited
+        `.env` produces the empty string, and `date.fromisoformat("")` would
+        raise a bare ValueError out of the entrypoint instead."""
+        code, err = self._refusal("")
+
+        self.assertEqual(code, 1)
+        self.assertIn(self.KEY, err)
+
+    def test_a_malformed_value_names_the_value_it_refused(self):
+        code, err = self._refusal("2026-13-45")
+
+        self.assertEqual(code, 1)
+        self.assertIn("2026-13-45", err)
+
+    def test_a_well_formed_date_is_accepted_as_written(self):
+        """The other side of both branches — and that nothing shifts the
+        date on the way through."""
+        self._with("2026-08-05")
+        module = self._module()
+
+        self.assertEqual(module._resolve_history_start_date(), date(2026, 8, 5))
+
+    def test_it_exits_rather_than_returning_a_code(self):
+        """1 is `main()`'s configuration-error code, and this function is
+        called before `main()` has anything to report — so it raises
+        SystemExit rather than returning, which is what keeps a run that
+        never started from producing a Run Manifest (docs/14 §7)."""
+        source = inspect.getsource(self._module()._resolve_history_start_date)
+
+        self.assertIn("raise SystemExit(1)", source)
+        self.assertNotIn("return 1", source)
+
+
+class BackupFailureExitCodeFallbackTests(unittest.TestCase):
+    """`_report_backup_failure()`'s two fallbacks, neither of which ran.
+
+    The function's own comment states the rule: the exit code comes from the
+    Run Manifest, not from a literal, so the process cannot disagree with
+    the manifest it just wrote. What it also says — and what nothing
+    exercised — is what happens when the manifest is *not* readable. A
+    Backup failure with no manifest is genuinely unclassified, and 2 is the
+    conservative reading of an unclassified failure; returning 0 there would
+    tell Task Scheduler the run was fine.
+    """
+
+    def _module(self):
+        import importlib.util
+
+        path = REPO_ROOT / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_fallback", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _report(self, path):
+        module = self._module()
+        from backup.git_ops import GitOperationError
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = module._report_backup_failure(
+                GitOperationError("git push failed (exit 128): remote unreachable"), path
+            )
+        return code, err.getvalue()
+
+    def test_no_manifest_path_is_the_conservative_two(self):
+        code, _err = self._report(None)
+
+        self.assertEqual(code, 2)
+
+    def test_an_unreadable_manifest_is_the_conservative_two(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        broken = Path(tmp.name) / "last_run.json"
+        broken.write_text("{not json", encoding="utf-8")
+
+        code, _err = self._report(broken)
+
+        self.assertEqual(code, 2)
+
+    def test_a_readable_manifest_decides_instead_of_the_fallback(self):
+        """The half that makes the two above meaningful: when the manifest
+        IS readable, its own classification wins — and for a failed push
+        that is DEGRADED/3, not the fallback's 2."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "last_run.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "run_id": "R",
+                    "started_at": "2026-08-18T11:00:00+09:00",
+                    "finished_at": "2026-08-18T11:00:01+09:00",
+                    "components": [
+                        {
+                            "name": "backup",
+                            "status": "FAILED",
+                            "failure": {
+                                "classification": "BACKUP_PENDING",
+                                "reason": "remote unreachable",
+                                "retryability": "RETRYABLE",
+                                "severity": "DEGRADED",
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code, err = self._report(path)
+
+        self.assertEqual(code, 3)
+        self.assertIn("ops_status.py", err)
+
+
 class ResultFieldConsumptionTests(unittest.TestCase):
     """BUG-39 — RESOLVED. Kept as the guard that it stays resolved.
 
@@ -1797,6 +2232,155 @@ class ResultFieldConsumptionTests(unittest.TestCase):
         self.assertIn("error=str(exc)", scheduler_source)
 
 
+class TheTwoVerdictsAboutOneRunTests(unittest.TestCase):
+    """The Run Manifest and the Dashboard both judge the same execution.
+    They are allowed to differ in detail; they are not allowed to contradict.
+
+    Two artifacts, two audiences, one run: `last_run.json` is what Task
+    Scheduler and `ops_status.py` read, the OPS_RUNS row is what a person
+    looks at in Notion. Nothing connected them, and C37 measured both
+    directions of the resulting disagreement:
+
+        collector failed=1     Dashboard FAIL   manifest SUCCESS  / exit 0
+        late_update FAILED     Dashboard OK     manifest DEGRADED / exit 3
+        monthly     FAILED     Dashboard OK     manifest DEGRADED / exit 3
+
+    docs/14 §4 names both failure modes in one sentence — "DEGRADED를
+    SUCCESS로 접으면 실제 고장이 숨고, FAILED로 접으면 늑대 소년이 되어
+    아무도 안 본다" — and the row managed both at once.
+
+    The relation pinned here is one-directional, because the two verdicts
+    are not the same question. The Dashboard also warns about per-row facts
+    that do not degrade a run (8 rejected Events, a queue that is not
+    draining), so WARN is wider than DEGRADED. What must hold:
+
+        Dashboard OK       => manifest SUCCESS      (never quieter)
+        manifest DEGRADED  => WARN or FAIL, never OK
+        Dashboard FAIL    <=> manifest FAILED
+
+    Checked against `app.runner._SEVERITY` rather than a copy of it, over
+    every component in `PIPELINE_COMPONENTS`, so a step added later is
+    covered the day it is added.
+    """
+
+    def _dashboard(self, **overrides):
+        from notion.dashboard import build_ops_run_properties
+
+        kwargs = dict(
+            run_id="r", run_at=datetime(2026, 8, 17, 9, 0), transport_moved=0,
+            transport_blocked=0, accepted=0, duplicate=0, rejected=0, failed=0,
+            scheduler_status="COMPLETED", generated_days=0, reused_days=0,
+            backup_status="BACKUP_SUCCESS", notion_synced=0, notion_skipped=0,
+            deleted_files=0,
+            notion_retried=0, notion_unreadable=0, notion_queued=0,
+        )
+        kwargs.update(overrides)
+        return build_ops_run_properties(**kwargs)["Overall"]["select"]["name"]
+
+    def _manifest(self, *components):
+        from runsummary import overall_status
+
+        return overall_status(components)
+
+    def _failed(self, name, severity):
+        from runsummary import (
+            ComponentResult,
+            ComponentStatus,
+            Failure,
+            Retryability,
+        )
+
+        return ComponentResult(
+            name,
+            ComponentStatus.FAILED,
+            failure=Failure(
+                classification=f"{name.upper()}_FAILED",
+                severity=severity,
+                retryability=Retryability.PERMANENT,
+                reason="injected",
+            ),
+        )
+
+    def test_each_step_failing_alone_produces_two_compatible_verdicts(self):
+        from app.runner import PIPELINE_COMPONENTS, _SEVERITY, C_DASHBOARD
+        from runsummary import OverallStatus, Severity
+
+        for name in PIPELINE_COMPONENTS:
+            if name == C_DASHBOARD:
+                # The Dashboard cannot report its own failure in the row it
+                # failed to write. That absence is reported elsewhere — the
+                # manifest's `dashboard` component and the pending queue —
+                # and is the one component this comparison cannot cover.
+                continue
+            severity = _SEVERITY[name]
+            with self.subTest(step=name, severity=severity.value):
+                manifest = self._manifest(self._failed(name, severity))
+                dashboard = self._dashboard(
+                    failed_steps=[name],
+                    critical_failed_steps=(
+                        [name] if severity is Severity.CRITICAL else []
+                    ),
+                )
+
+                self.assertNotEqual(
+                    dashboard,
+                    "OK",
+                    f"{name} failed and the row calls the run OK",
+                )
+                self.assertEqual(
+                    dashboard == "FAIL",
+                    manifest is OverallStatus.FAILED,
+                    f"{name}: Dashboard {dashboard} vs manifest {manifest.value}",
+                )
+
+    def test_a_run_with_nothing_failed_is_ok_on_both_sides(self):
+        from runsummary import OverallStatus
+
+        self.assertEqual(self._dashboard(), "OK")
+        self.assertIs(self._manifest(), OverallStatus.SUCCESS)
+
+    def test_a_per_file_failure_warns_without_claiming_the_run_failed(self):
+        """The wolf-crying half, kept explicit because it is the one case
+        where the two verdicts legitimately differ.
+
+        `failed` counts Event files. `app/runner.py` records the collector
+        SUCCESS with `failed` as a metric — docs/03 §53's per-file isolation
+        — so the manifest is SUCCESS / exit 0. The row must not say FAIL,
+        and must not say OK either: the file did not get processed.
+        """
+        from runsummary import ComponentResult, ComponentStatus, OverallStatus
+
+        self.assertEqual(self._dashboard(failed=1, accepted=9), "WARN")
+        self.assertIs(
+            self._manifest(
+                ComponentResult(
+                    "collector",
+                    ComponentStatus.SUCCESS,
+                    metrics={"accepted": 9, "failed": 1},
+                )
+            ),
+            OverallStatus.SUCCESS,
+        )
+
+    def test_the_runner_passes_both_lists_rather_than_letting_them_default(self):
+        """The defaults exist for callers that do not have the numbers. The
+        Runner has them — it owns the recorder — and a run that silently
+        defaulted would report a healthier row than happened, which is the
+        exact shape C32 removed from this module's other inputs.
+        """
+        source = (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+
+        self.assertIn("failed_steps=[", source)
+        self.assertIn("critical_failed_steps=[", source)
+        self.assertIn("Severity.CRITICAL", source)
+
+    def test_the_severity_split_is_read_from_the_runner_not_restated(self):
+        """Guards the guard: if `_SEVERITY` stopped covering every pipeline
+        component, the loop above would skip the gap instead of failing."""
+        from app.runner import PIPELINE_COMPONENTS, _SEVERITY
+
+        self.assertEqual(set(_SEVERITY), set(PIPELINE_COMPONENTS))
+
 class DashboardSchemaMappingTests(unittest.TestCase):
     """Adopted decisions: Notion Dashboard / Dashboard Bootstrap.
 
@@ -1807,13 +2391,19 @@ class DashboardSchemaMappingTests(unittest.TestCase):
     until the day the Dashboard is finally wired — and then every run would
     fail with an HTTP 400.
 
-    Verified: OPS_RUNS is exact — 13 properties, every name present in the
-    schema, every Notion type identical. Nothing extra, nothing missing.
+    Verified: OPS_RUNS is exact — every name present in the schema, every
+    Notion type identical. Nothing extra, nothing missing.
+
+    The property count is deliberately not restated here. It was "13", and
+    C32 added `Transport Blocked` and `Notion Skipped` (two facts a run
+    produced and the row could not show); a number in a docstring is one more
+    place that has to be remembered, while the three tests below check the
+    two sets agree, which is the property that actually matters.
 
     Audit finding GAP-11 (new): bootstrap creates FIVE databases, but only
     OPS_RUNS is ever written to.
 
-        OPS_RUNS         13 props   record_run()                  writes
+        OPS_RUNS                    record_run()                  writes
         OPS_BACKUP        7 props   build_ops_backup_properties() exists,
                                     exported, but no caller anywhere
         OPS_NOTION_SYNC   5 props   no builder, no writer
@@ -1833,15 +2423,21 @@ class DashboardSchemaMappingTests(unittest.TestCase):
             run_id="RUN-1",
             run_at=datetime(2026, 8, 5, 11, 0).astimezone(),
             transport_moved=1,
+            transport_blocked=0,
             accepted=2,
             duplicate=0,
             rejected=0,
             failed=0,
             scheduler_status="COMPLETED",
             generated_days=1,
+            reused_days=0,
             backup_status="BACKUP_SUCCESS",
+            deleted_files=0,
             notion_synced=2,
+            notion_skipped=0,
             notion_retried=0,
+            notion_unreadable=0,
+            notion_queued=0,
         )
 
     def test_record_run_emits_no_property_absent_from_the_ops_runs_schema(self):
@@ -1927,6 +2523,133 @@ class DashboardSchemaMappingTests(unittest.TestCase):
         self.assertEqual(len(DASHBOARD_DATABASES), 5)
         # Only OPS_RUNS receives rows today.
         self.assertEqual(len(DASHBOARD_DATABASES) - 1, 4)
+
+
+class ProjectsSchemaMappingTests(unittest.TestCase):
+    """The same cross-check `DashboardSchemaMappingTests` runs for OPS_RUNS,
+    applied to the database that is written on **every Event**.
+
+    `notion/bootstrap.TARGET_PROPERTIES` is what one-time setup creates in
+    the PROJECTS database; `properties.build_create_properties()` /
+    `build_update_properties()` are what `ExecutionPlanSync` sends to it on
+    every sync. Nothing held the two together. A property renamed on one
+    side, or one added by `_type_specific_properties()` and not the other,
+    is a 400 from the real API on the first sync after the change — and this
+    repository's own `TestDoubleFidelityTests` records that
+    `InMemoryNotionTransport` accepts *both* "property name not in the
+    schema" and "wrong property type", so no existing Notion test could
+    catch it.
+
+    OPS_RUNS got these three checks because a mismatch there loses one
+    Dashboard row per run. Here it loses the Operational Projection
+    entirely: docs/04 §38 keeps the Event rather than dropping it, so the
+    Events queue up in `notion_retry_queue.json` and fail identically on
+    every retry, forever, because nothing about a schema mismatch changes by
+    retrying.
+
+    Every `event_type` is walked rather than one sample: the payload is not
+    fixed — `_type_specific_properties()` adds `Blocker`,
+    `Current Milestone` and `Completed Date` on different branches, and a
+    property that only one branch emits is exactly the one a single-sample
+    test would miss.
+    """
+
+    EVENT_TYPES = (
+        "STARTED", "BLOCKED", "RESUMED", "DECISION_APPROVED",
+        "MILESTONE_COMPLETED", "ISSUE_RESOLVED", "COMPLETED", "CANCELLED",
+    )
+
+    def _event(self, event_type):
+        status = {
+            "COMPLETED": "COMPLETED",
+            "CANCELLED": "CANCELLED",
+        }.get(event_type, "IN_PROGRESS")
+        return create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="SEARCH_FRONTEND",
+            event_type=event_type,
+            status=status,
+            summary="schema mapping probe",
+            milestone="Search UI",
+            blocker="blocked on X" if event_type == "BLOCKED" else None,
+            history_candidate=True,
+            timestamp="2026-08-01T10:00:00+09:00",
+            event_id=f"SCHEMA-{event_type}",
+        )
+
+    def _payloads(self):
+        """(label, properties) for every payload the Sync can send."""
+        from notion.properties import (
+            build_create_properties,
+            build_update_properties,
+            humanize_project_id,
+        )
+
+        for event_type in self.EVENT_TYPES:
+            event = self._event(event_type)
+            yield (
+                f"create/{event_type}",
+                build_create_properties(
+                    event, project_name=humanize_project_id(event.project_id)
+                ),
+            )
+            yield f"update/{event_type}", build_update_properties(event)
+
+    def test_the_sync_emits_no_property_absent_from_the_projects_schema(self):
+        """The mismatch that would 400 on the first real sync."""
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        for label, properties in self._payloads():
+            with self.subTest(payload=label):
+                self.assertEqual(set(properties) - set(TARGET_PROPERTIES), set())
+
+    def test_every_projects_schema_property_is_reachable_from_some_payload(self):
+        """The other direction: a column bootstrap creates that nothing ever
+        fills is a column an operator reads as "no data" forever."""
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        emitted = set()
+        for _label, properties in self._payloads():
+            emitted |= set(properties)
+
+        self.assertEqual(set(TARGET_PROPERTIES) - emitted, set())
+
+    def test_every_emitted_property_uses_the_schema_declared_notion_type(self):
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        for label, properties in self._payloads():
+            for name, value in properties.items():
+                with self.subTest(payload=label, property=name):
+                    self.assertEqual(
+                        next(iter(value)), next(iter(TARGET_PROPERTIES[name]))
+                    )
+
+    def test_the_title_property_is_the_one_bootstrap_renames_to(self):
+        """`bootstrap._bootstrap_title_property()` renames whatever Title the
+        database has to `TITLE_PROPERTY_NAME`, and the create payload has to
+        use that same name or the rename buys nothing."""
+        from notion.bootstrap import TARGET_PROPERTIES, TITLE_PROPERTY_NAME
+        from notion.properties import build_create_properties, humanize_project_id
+
+        event = self._event("MILESTONE_COMPLETED")
+        properties = build_create_properties(
+            event, project_name=humanize_project_id(event.project_id)
+        )
+
+        self.assertIn("title", TARGET_PROPERTIES[TITLE_PROPERTY_NAME])
+        self.assertIn("title", properties[TITLE_PROPERTY_NAME])
+
+    def test_the_two_readers_read_properties_the_schema_declares(self):
+        """`extract_last_updated()` / `extract_last_event_id()` are the guards
+        §29-30 and §62 rest on. Both key on a property *name*, and a name
+        that is not in the schema reads as None forever — which is the
+        direction that silently disables a guard rather than failing."""
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        for name, kind in (("Last Updated", "date"), ("Last Event ID", "rich_text")):
+            with self.subTest(property=name):
+                self.assertIn(kind, TARGET_PROPERTIES[name])
 
 
 class TransportIntakeConcurrencySafetyTests(unittest.TestCase):
@@ -2353,10 +3076,6 @@ class ConcurrentRunnerDataLossTests(unittest.TestCase):
         self.assertNotIn("except", history_step)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AgentBoundaryInvariantTests(unittest.TestCase):
     """The Agent is the SENDING side. It must not grow a dependency on the
     Desktop 4 collection layer.
@@ -2548,6 +3267,11 @@ class LayeringInvariantTests(unittest.TestCase):
     ALLOWED = {
         "events": set(),
         "oplog": set(),
+        # `sys.argv` handling for the four entrypoints, which read no
+        # arguments at all. A leaf for the same reason as `oplog` and
+        # `runsummary`: every entrypoint sits above it, so it may sit
+        # under none of them.
+        "cli": set(),
         # Like `oplog`: vocabulary and arithmetic, no project imports. It
         # must stay a leaf for the same reason — `app` is its only consumer
         # today, but the Run Contract is meant to be readable by
@@ -2565,6 +3289,19 @@ class LayeringInvariantTests(unittest.TestCase):
         "backup": set(),
         "agent": {"events", "oplog", "reporter", "scheduler", "transport"},
         "review_cli": {"history"},
+        # Read-only rollups over Execution Evidence. Three edges, each for
+        # exactly one thing it must not restate (C28):
+        #   events    parse the Event files
+        #   notion    docs/04 §20-28's blocker/completion rule, read out of
+        #             `properties._type_specific_properties()`
+        #   reporter  docs/02 §8's Desktop->role table, which lives in
+        #             `profiles.PROFILES` and whose own comment says it "only
+        #             pairs them the way the spec already does"
+        # It writes nothing and nothing writes to it, so it sits beside the
+        # other derivations rather than under them. `reporter` is a writer
+        # package, but the edge reaches `profiles.py` — pure vocabulary — and
+        # `reporter` imports nothing from here, so the graph stays acyclic.
+        "controltower": {"events", "notion", "reporter"},
         "app": None,  # composition root: unrestricted
     }
 
@@ -3012,6 +3749,310 @@ class SerialisationFidelityTests(unittest.TestCase):
 
         self.assertEqual(back, candidate)
         self.assertEqual(back.event_id, awkward)
+
+
+
+class DuplicatedRulesStayInStepTests(unittest.TestCase):
+    """The copies this repository keeps on purpose, checked rather than
+    promised.
+
+    Three rules exist in more than one module because the layering forbids
+    the import that would remove the duplication. Two of the three already
+    had a test comparing the copies. One did not — and it was the one whose
+    docstring said it did:
+
+        INCOMPLETE_WRITE_PREFIX   4 copies   `IncompleteWriteInvariantTests`
+                                             collects the literal from each
+                                             file and compares  -> covered
+        safe_event_filename       2 copies   "tests assert the two copies
+                                             agree"  -> no such test existed
+        _is_sole_identifier       2 copies   "Mirrors
+                                             daily/markdown._is_sole_identifier()"
+                                             -> nothing checked it
+
+    That is E-11's shape ("a claim in a comment that outlived the code"),
+    landing on a sanitiser that exists because of a path-traversal defect
+    (BUG-15) and a Windows path-length failure. `reporter.local_output` is
+    the sending side's copy and `transport.onedrive` is the one that names
+    the file OneDrive carries to Desktop 4; if they drifted, the same Event
+    would be written under two different names by two code paths, and every
+    lookup keyed on one of them would miss.
+
+    Compared by behaviour, not by source text. "The two copies agree" is a
+    statement about what they return, and a formatting change to one of them
+    is not a defect — the test that fails on reindentation is a test people
+    learn to edit rather than read.
+    """
+
+    # Every input here is a shape that has actually mattered somewhere in
+    # this repository, not a generic fuzz list.
+    EVENT_IDS = (
+        "EVT-001",                       # the ordinary case
+        "evt.with.dots",
+        "EVT_WITH_UNDERSCORES-1",
+        "../target/X",                   # BUG-15, POSIX separator
+        "..\\target\\X",                 # BUG-15, Windows separator
+        "/absolute/path",
+        "C:\\Windows\\System32\\x",
+        "a:b",                           # NTFS alternate data stream
+        'weird<>:"|?*chars',
+        "...",                           # sanitises to nothing
+        "",                              # empty
+        "   ",                           # whitespace only
+        "한글-이벤트-1",                  # non-ASCII
+        "E" * 119,                       # just under the stem bound
+        "E" * 120,                       # exactly at it
+        "E" * 121,                       # just over
+        "E" * 250,                       # the WinError 123 case
+        "with\nnewline",
+        "with\ttab",
+        "trailing.",
+        "_leading",
+    )
+
+    def test_both_safe_event_filename_copies_return_the_same_name(self):
+        from reporter.local_output import safe_event_filename as sending_side
+        from transport.onedrive import safe_event_filename as transport_side
+
+        for event_id in self.EVENT_IDS:
+            with self.subTest(event_id=event_id[:40]):
+                self.assertEqual(sending_side(event_id), transport_side(event_id))
+
+    def test_the_shared_rule_still_does_its_two_jobs(self):
+        """Not a tautology check: two identical-but-wrong copies would pass
+        the comparison above. These are the two properties the duplication
+        exists to provide."""
+        from reporter.local_output import safe_event_filename
+
+        for event_id in self.EVENT_IDS:
+            with self.subTest(event_id=event_id[:40]):
+                name = safe_event_filename(event_id)
+                # No separator survives, so no id can address another
+                # directory (BUG-15).
+                self.assertNotIn("/", name)
+                self.assertNotIn("\\", name)
+                self.assertNotIn("..", name)
+                # Bounded, so no id can produce a path Windows refuses.
+                self.assertLessEqual(len(name), 140)
+                self.assertTrue(name.endswith(".json"))
+
+    def test_distinct_ids_never_collide_on_one_filename(self):
+        """Both sanitising and truncating are many-to-one, which is why the
+        rule appends a digest whenever it changes the name at all. The two
+        copies agreeing is worthless if the rule they agree on loses Events.
+        """
+        from reporter.local_output import safe_event_filename
+
+        names = [safe_event_filename(event_id) for event_id in self.EVENT_IDS]
+
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_both_is_sole_identifier_copies_agree(self):
+        from daily.markdown import _is_sole_identifier as daily_side
+        from monthly.parser import _is_sole_identifier as monthly_side
+
+        cases = (
+            [(0, "Event ID: EVT-1")],
+            [(0, "Event ID: EVT-1"), (1, "Summary: did a thing")],
+            [(0, "Event ID: EVT-1"), (1, "Event ID: EVT-2")],
+            [(0, "Summary: did a thing"), (1, "Event ID: EVT-1")],
+            [(0, "Summary: did a thing")],
+            [(0, "Event ID: EVT-1"), (1, "Status: DONE"), (2, "Event ID: EVT-2")],
+            [(0, "Event IDs: EVT-1")],          # a label that merely starts alike
+            [(0, "event id: EVT-1")],           # case differs
+        )
+        for indexed in cases:
+            with self.subTest(first=indexed[0][1]):
+                self.assertEqual(daily_side(indexed), monthly_side(list(indexed)))
+
+    def test_the_comparison_would_notice_a_drifted_copy(self):
+        """Guards the guard. Two functions that never disagree on any input
+        in the corpus would let a real divergence through if the corpus were
+        the problem, so this checks the corpus can separate two rules that
+        differ by exactly one of the properties above.
+        """
+        from reporter.local_output import safe_event_filename
+
+        def drifted(event_id: str) -> str:
+            """The same rule without the length bound — the half that was
+            added later, and the half a copy would most plausibly miss."""
+            import re
+
+            return re.sub(r"[^A-Za-z0-9_.-]", "_", event_id).strip("._") + ".json"
+
+        differing = [
+            event_id
+            for event_id in self.EVENT_IDS
+            if safe_event_filename(event_id) != drifted(event_id)
+        ]
+
+        self.assertTrue(differing)
+        self.assertIn("E" * 250, differing)
+
+
+
+class CompanyHistoryWritersCleanUpTooTests(unittest.TestCase):
+    """The atomic-write cleanup check, extended to the writers that matter
+    most — and were not in it.
+
+    `AtomicWriteFailureCleanupTests` above injects a failing `os.replace` and
+    proves eight writers remove their staging file. Measured with a
+    stdlib-only line-coverage pass over the whole suite (97.7% of `src/`),
+    the cleanup lines of **the Company History writers never executed**:
+
+        src/daily/generator.py     154-158, 301-307
+        src/monthly/generator.py   291-295
+
+    Those are `daily/YYYY-MM-DD.md` and `monthly/YYYY-MM.md` — the files this
+    entire pipeline exists to produce, the only ones the backup carries, and
+    the ones the Monthly consolidator reads back. A leaked `.tmp-` file there
+    is worse than one in `runtime/state/`: `git add -A` stages it, so it
+    reaches the remote and stays in history.
+
+    The eight-writer list was the set of sources changed in the Sprint that
+    wrote it, not the set of atomic writers. Sweeping for `mkstemp` finds
+    fourteen real ones (two further hits are comments).
+
+    Two of the three write through a `try` that *reports* rather than
+    propagates — `update_daily_history()` returns `LateUpdateOutcome.FAILED`
+    and `consolidate_month()` returns a failed `MonthlyResult` — so the
+    injected error is asserted through the returned value instead of
+    `assertRaises`. The leak assertion is identical either way, and the leak
+    is the property under test.
+    """
+
+    MARKER = "simulated: destination held open by another process"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.daily_dir = self.root / "daily"
+        self.monthly_dir = self.root / "monthly"
+        self.daily_dir.mkdir(parents=True)
+        self.monthly_dir.mkdir(parents=True)
+
+        self.candidate = HistoryCandidate(
+            history_id="HIST-ATOMIC-DAILY-1",
+            event_id="ATOMIC-DAILY-1",
+            timestamp="2026-08-06T10:00:00+09:00",
+            category="MILESTONE",
+            project_id="PRJ-ATOMIC",
+            role="COO",
+            summary="atomic cleanup probe",
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+        keep = self.root / "keep"
+        review = self.root / "review"
+        keep.mkdir()
+        review.mkdir()
+        self.repository = FileHistoryRepository(keep_dir=keep, review_dir=review)
+        self.repository.save(self.candidate)
+
+    def _break_replace(self):
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            raise OSError(5, self.MARKER)
+
+        os.replace = failing_replace
+        self.addCleanup(setattr, os, "replace", real_replace)
+
+    def _leftovers(self, directory):
+        return [
+            p.name
+            for p in directory.rglob("*")
+            if p.is_file() and p.name.startswith(".tmp-")
+        ]
+
+    def test_generate_daily_history_removes_its_staging_file(self):
+        from daily.generator import generate_daily_history
+
+        self._break_replace()
+
+        with self.assertRaises(OSError) as caught:
+            generate_daily_history(
+                self.repository, date(2026, 8, 6), output_dir=self.daily_dir
+            )
+
+        self.assertIn(self.MARKER, str(caught.exception))
+        self.assertEqual(self._leftovers(self.daily_dir), [])
+
+    def test_update_daily_history_removes_its_staging_file(self):
+        """Reports instead of raising, so the injected failure is checked on
+        the result. The staging file must be gone all the same — this one
+        runs on a date whose Daily file already exists, which is exactly the
+        state a Late Event merge finds."""
+        from daily.generator import update_daily_history
+        from daily import LateUpdateOutcome
+
+        generate_daily_history(
+            self.repository, date(2026, 8, 6), output_dir=self.daily_dir
+        )
+        self._break_replace()
+
+        result = update_daily_history(
+            self.repository,
+            date(2026, 8, 6),
+            output_dir=self.daily_dir,
+            now=datetime(2026, 8, 7, 9, 0),
+            keep_candidates=[
+                HistoryCandidate(
+                    history_id="HIST-ATOMIC-LATE-1",
+                    event_id="ATOMIC-LATE-1",
+                    timestamp="2026-08-06T18:00:00+09:00",
+                    category="MILESTONE",
+                    project_id="PRJ-ATOMIC",
+                    role="COO",
+                    summary="late arrival",
+                    evidence=(),
+                    filter_result=HistoryDecision.KEEP,
+                )
+            ],
+        )
+
+        self.assertEqual(result.outcome, LateUpdateOutcome.FAILED)
+        self.assertIn(self.MARKER, result.error)
+        self.assertEqual(self._leftovers(self.daily_dir), [])
+
+    def test_consolidate_month_removes_its_staging_file(self):
+        from monthly.generator import consolidate_month
+
+        # Every day of the month: `consolidate_month()` refuses a month with
+        # a gap and returns before it ever reaches the write, so a single
+        # day would make this test pass without exercising the path it
+        # exists for. Measured while writing it — the first attempt failed
+        # with "30 day(s) missing" and never staged a file.
+        for day in range(1, 32):
+            generate_daily_history(
+                self.repository, date(2026, 8, day), output_dir=self.daily_dir
+            )
+        self._break_replace()
+
+        result = consolidate_month(
+            year=2026,
+            month=8,
+            daily_dir=self.daily_dir,
+            monthly_dir=self.monthly_dir,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 9, 1, 9, 0),
+        )
+
+        self.assertIsNotNone(result.error)
+        self.assertIn(self.MARKER, result.error)
+        self.assertEqual(self._leftovers(self.monthly_dir), [])
+
+    def test_the_probe_would_notice_a_leak(self):
+        """Guards the guard: with the cleanup bypassed, the same assertions
+        fail. Without this, a writer that stopped staging at all — writing
+        straight to the destination — would pass every check above by
+        producing no temp file to leak."""
+        self._break_replace()
+        staged = self.daily_dir / ".tmp-leaked"
+        staged.write_text("residue", encoding="utf-8")
+
+        self.assertEqual(self._leftovers(self.daily_dir), [".tmp-leaked"])
 
 
 class IncompleteWriteInvariantTests(unittest.TestCase):
@@ -3690,3 +4731,598 @@ class BackupLogFieldsThatReachAnArtifactTests(unittest.TestCase):
 
         self.assertIn("if component.status is ComponentStatus.SUCCESS:", ops_status)
         self.assertIn("continue", ops_status)
+
+
+class OneLogWriterInvariantTests(unittest.TestCase):
+    """C32 §19's second lens, made enforceable: every log line in this
+    repository goes through `oplog.append_line()`.
+
+    C32 found five sinks that printed a remote- or disk-authored string
+    without `one_line()`/`redact()` (§3, §16, §17 twice, §18). Every one was
+    a `print()`, and the natural next question is whether the *log* files
+    have the same holes — the log is where docs/04 §56 lives, and a forged
+    log line is BUG-6 itself.
+
+    Swept and clean: `collector/runtime._log`, `agent/agent._log` and
+    `app/runner._append_log_line` are all aliases of, or thin wrappers over,
+    `oplog.append_line()`, which applies both guards unconditionally at the
+    write point. That was a claim about the code, so it is checked here
+    rather than remembered — the failure mode E-11 names.
+
+    The check is structural: **no production module may open a file in
+    append mode except `oplog.py`**. Append mode is what a log writer needs
+    and what nothing else in this repository does; every other writer here
+    is an atomic `mkstemp` + `os.replace`. So a new log writer that
+    bypasses the guards cannot be added without failing this.
+    """
+
+    def _production_files(self):
+        return [
+            path
+            for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in str(path)
+        ]
+
+    @staticmethod
+    def _append_mode_calls(tree):
+        """Every call that opens a file for appending, by mode string."""
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr
+                if isinstance(func, ast.Attribute)
+                else None
+            )
+            if name not in ("open", "fdopen"):
+                continue
+            modes = [
+                arg.value
+                for arg in node.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            ]
+            modes += [
+                kw.value.value
+                for kw in node.keywords
+                if kw.arg == "mode"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ]
+            if any("a" in mode for mode in modes):
+                found.append((name, node.lineno))
+        return found
+
+    def test_only_oplog_opens_a_file_in_append_mode(self):
+        offenders = {}
+        for path in self._production_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            calls = self._append_mode_calls(tree)
+            if calls and path.name != "oplog.py":
+                offenders[str(path.relative_to(REPO_ROOT))] = calls
+
+        self.assertEqual(
+            offenders,
+            {},
+            "a log writer that bypasses oplog.append_line()'s one_line()/redact() "
+            "guards was added",
+        )
+
+    def test_oplog_really_is_the_one_that_appends(self):
+        """The other half — if `oplog.py` stopped appending, the test above
+        would pass by being vacuously true."""
+        tree = ast.parse((SRC / "oplog.py").read_text(encoding="utf-8"))
+
+        self.assertTrue(self._append_mode_calls(tree))
+
+    def test_append_line_applies_both_guards_at_the_write_point(self):
+        """Not at a caller, where one caller can forget."""
+        import inspect
+
+        import oplog
+
+        source = inspect.getsource(oplog.append_line)
+
+        self.assertIn("redact(one_line(body))", source)
+
+    def test_every_log_writing_module_uses_it(self):
+        """Named so the sweep's result is a list, not a claim. A module that
+        writes a log line and is not here is either new or bypassing."""
+        expected = {
+            "src/app/runner.py",
+            "src/agent/agent.py",
+            "src/collector/runtime.py",
+        }
+        # By AST, not by substring: the four root entrypoints import
+        # `one_line`/`redact` from the same module and mention
+        # `append_line` in their comments, so a text search finds seven
+        # "log writers" and three of them are prose.
+        importers = set()
+        for path in self._production_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or node.module != "oplog":
+                    continue
+                if any(alias.name == "append_line" for alias in node.names):
+                    importers.add(
+                        str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+                    )
+
+        self.assertEqual(importers, expected)
+
+
+class OpsStatusCannotHoldADataclassTests(unittest.TestCase):
+    """C33 §4: `ops_status.py` + `@dataclass` + the test loader = 293 failures.
+
+    Three ordinary things combine into one that is not:
+
+      1. `ops_status.py` starts with `from __future__ import annotations`,
+         so every annotation in it is a string;
+      2. `dataclasses` resolves those strings against
+         `sys.modules[cls.__module__]` while checking for `KW_ONLY`;
+      3. every test helper that touches this file loads it with
+         `importlib.util.spec_from_file_location(...)` + `exec_module()`
+         and does **not** register the module in `sys.modules` first —
+         which is how `RUNTIME_DIR` gets redirected per test.
+
+    Under that loader the lookup in (2) yields `None` and the decorator dies
+    with `AttributeError: 'NoneType' object has no attribute '__dict__'` —
+    at *import* time, so every test that loads the module fails, whatever it
+    was actually testing. Measured when `StoredCandidate` was first written
+    as a dataclass: 293 failures across `test_observability.py` and
+    `test_history_review.py`, none of them about candidates.
+
+    `NamedTuple` does no such resolution, which is why `StoredCandidate` is
+    one. This test exists because the next person to want a record in this
+    file will reach for `@dataclass` — it is what the rest of the repository
+    uses — and the failure they get will point at 293 unrelated tests rather
+    than at the decorator.
+
+    Two assertions rather than one: the ban, and the reason for the ban. If
+    the `from __future__ import annotations` line ever goes, the ban can go
+    with it, and the second assertion is what says so.
+    """
+
+    def test_ops_status_declares_no_dataclass(self):
+        source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        decorated = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            for d in node.decorator_list
+            if (isinstance(d, ast.Name) and d.id == "dataclass")
+            or (
+                isinstance(d, ast.Call)
+                and isinstance(d.func, ast.Name)
+                and d.func.id == "dataclass"
+            )
+        ]
+
+        self.assertEqual(
+            decorated,
+            [],
+            "ops_status.py cannot hold a @dataclass while it uses "
+            "`from __future__ import annotations` and the tests load it via "
+            "spec_from_file_location without registering it in sys.modules "
+            "— use NamedTuple (see StoredCandidate)",
+        )
+
+    def test_the_condition_that_makes_the_ban_necessary_still_holds(self):
+        source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        self.assertIn("from __future__ import annotations", source)
+
+    def test_the_module_really_does_load_under_that_loader(self):
+        """The ban is only worth having if this is the thing it protects."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "ops_status_dataclass_guard", REPO_ROOT / "ops_status.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+
+        spec.loader.exec_module(module)  # must not raise
+
+        self.assertTrue(hasattr(module, "StoredCandidate"))
+
+
+class EveryStepAnnouncesItselfTests(unittest.TestCase):
+    """C34 §1: two of the nine steps never called `recorder.begin()`.
+
+    `_Recorder.begin()` has one job, stated in its own class docstring: it
+    "knows which step is currently in flight so that an exception escaping
+    any step can still be attributed to it". `run_once()`'s `finally` reads
+    `recorder.current` and, if it is set, records a `STEP_ABORTED` failure
+    for that component.
+
+    `notion_sync` (step 4) and `daily` (step 6) never called it. Both are
+    steps whose **first action** reads a state file that docs/10 §46
+    explicitly expects to find damaged — `notion_retry_queue.json` and
+    `daily_history_state.json` — so both had a live path from "ordinary
+    corruption" to "unattributed abort".
+
+    The consequence was not misattribution. It was a false SUCCESS.
+    `overall_status()` folds recorded FAILED components; recording none makes
+    an aborted run identical to a clean one. Measured before the fix:
+
+        crash in step 4   STEP_ABORTED NONE   manifest SUCCESS / exit 0
+        crash in step 6   STEP_ABORTED NONE   manifest SUCCESS / exit 0
+        crash in step 7   STEP_ABORTED backup manifest FAILED  / exit 2
+
+    Step 7 is the control: it calls `begin()`, and it behaves correctly.
+    `ops_status.py`'s LAST RUN block — the first thing AGENT.md §6 tells an
+    operator to read — printed `종합 상태 : SUCCESS (exit 0)` for a run that
+    never wrote Company History and never reached Backup.
+
+    This class is the structural half, so a tenth step cannot repeat it.
+    """
+
+    def _run_once_source(self):
+        return (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+
+    def _recorder_calls(self):
+        """(kind, component) for every `recorder.<kind>(C_X, ...)` in
+        `run_once()`, in source order."""
+        source = self._run_once_source()
+        tree = ast.parse(source)
+        consts = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        }
+        fn = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "run_once"
+        )
+        calls = []
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "recorder"
+                and node.func.attr in ("begin", "ok", "failed", "skipped")
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                # Only the statically-named steps. The `finally` calls
+                # `recorder.failed(in_flight, ...)` with a *variable* — that
+                # is the attribution mechanism itself, not a step, and it is
+                # reachable precisely because some step announced itself.
+                and node.args[0].id in consts
+            ):
+                calls.append((node.lineno, node.func.attr, consts[node.args[0].id]))
+        return sorted(calls)
+
+    def test_every_recorded_component_is_announced_first(self):
+        calls = self._recorder_calls()
+        announced = {component for _, kind, component in calls if kind == "begin"}
+        recorded = {
+            component for _, kind, component in calls if kind in ("ok", "failed", "skipped")
+        }
+
+        self.assertEqual(
+            recorded - announced,
+            set(),
+            "a step records an outcome without recorder.begin() — an exception "
+            "escaping it would be unattributed, and an aborted run would fold "
+            "to SUCCESS (C34 §1)",
+        )
+
+    def test_the_announcement_comes_before_the_outcome(self):
+        """`begin()` after the work would attribute nothing: the exception
+        escapes before the line runs."""
+        calls = self._recorder_calls()
+        first_begin, first_outcome = {}, {}
+        for lineno, kind, component in calls:
+            if kind == "begin":
+                first_begin.setdefault(component, lineno)
+            else:
+                first_outcome.setdefault(component, lineno)
+
+        for component, outcome_line in sorted(first_outcome.items()):
+            with self.subTest(component=component):
+                self.assertLess(first_begin[component], outcome_line)
+
+    def test_every_pipeline_component_is_announced(self):
+        """The list an operator is shown and the list the Runner announces
+        must be the same set, or `never_started` reports a step that ran."""
+        from app.runner import PIPELINE_COMPONENTS
+
+        announced = {c for _, kind, c in self._recorder_calls() if kind == "begin"}
+
+        self.assertEqual(announced, set(PIPELINE_COMPONENTS))
+
+    def test_the_two_that_were_missing_are_named(self):
+        """Pinned by name, so the fix cannot be reverted quietly."""
+        source = self._run_once_source()
+
+        self.assertIn("recorder.begin(C_NOTION_SYNC)", source)
+        self.assertIn("recorder.begin(C_DAILY)", source)
+
+    def test_begin_is_what_the_finally_reads(self):
+        """The link that makes the above matter. If the `finally` stopped
+        reading `recorder.current`, `begin()` would be decoration."""
+        import inspect
+
+        from app import runner
+
+        source = inspect.getsource(runner.run_once)
+        tail = source[source.index("finally:"):]
+
+        self.assertIn("recorder.current", tail)
+        self.assertIn("STEP_ABORTED", tail)
+
+
+class ExecutionOrderIsTheDocumentedOrderTests(unittest.TestCase):
+    """C34 §2: the step order is a specification, enforced by source layout.
+
+    Three documents fix it — docs/07 §37 lists the twelve steps, docs/09
+    §50-51 puts Monthly after Daily Catch-up and before Backup, and
+    `run_once()`'s own comments state two more constraints in prose:
+
+        6.5  "Backup(7단계)보다 먼저 실행해야 갱신된 Daily 파일이 같은
+              실행에서 백업된다"
+        6.7  "Monthly는 이미 이 실행에서 확정된 Daily 파일만 읽는다"
+
+    Every one of those is a *data* dependency: Late Event Update rewrites a
+    Daily file that Backup must then ship, and Monthly reads Daily files
+    that must already be final. Moving a step is therefore not a stylistic
+    change — it silently drops a day of Company History out of that run's
+    backup, or consolidates a month from Daily files that are about to
+    change.
+
+    Nothing checked any of it. `PIPELINE_COMPONENTS` is derived from
+    `_ARTIFACT_REFS`, a dict whose order is its *declaration* order, and a
+    test pinned only that the two are equal and nine long. C34 §1 found the
+    two lists had in fact drifted apart — `notion_sync` and `daily` were
+    declared but never announced — which is how the drift became visible at
+    all.
+
+    Order is taken from `recorder.begin()` calls in source order, which is
+    the same signal the `finally` uses to attribute an abort, so this test
+    and the runtime behaviour cannot disagree about what "the current step"
+    means.
+    """
+
+    def _execution_order(self):
+        source = (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        consts = {
+            node.targets[0].id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        }
+        fn = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "run_once"
+        )
+        begins = sorted(
+            (node.lineno, consts[node.args[0].id])
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "recorder"
+            and node.func.attr == "begin"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in consts
+        )
+        return [component for _, component in begins]
+
+    def test_the_declared_order_is_the_execution_order(self):
+        """`PIPELINE_COMPONENTS` is what `ops_status.py` walks to report
+        "시작되지 못한 단계", and an operator reads that list as a sequence."""
+        from app.runner import PIPELINE_COMPONENTS
+
+        self.assertEqual(self._execution_order(), list(PIPELINE_COMPONENTS))
+
+    def test_the_order_is_the_one_the_pipeline_depends_on(self):
+        """Each pair below is a data dependency, not a preference."""
+        order = self._execution_order()
+        position = {name: i for i, name in enumerate(order)}
+
+        must_precede = [
+            # intake fills incoming/ before the Collector drains it
+            ("transport", "collector"),
+            # Notion Sync and History Filter both read the files the
+            # Collector moved into processed/
+            ("collector", "notion_sync"),
+            ("collector", "history_filter"),
+            # the Scheduler renders the Candidates step 5 wrote
+            ("history_filter", "daily"),
+            # docs/06 §37: Late Event Update merges into a Daily file the
+            # Scheduler has already closed
+            ("daily", "late_update"),
+            # docs/09 §50-51: Monthly reads Daily files that are final,
+            # which includes this run's Late Event merges
+            ("late_update", "monthly"),
+            # run_once 6.5's own comment: the updated Daily file has to be
+            # backed up in the same run
+            ("late_update", "backup"),
+            ("monthly", "backup"),
+            # CEO Decision 4: the Dashboard records results the other steps
+            # have already produced
+            ("backup", "dashboard"),
+        ]
+        for earlier, later in must_precede:
+            with self.subTest(dependency=f"{earlier} -> {later}"):
+                self.assertLess(
+                    position[earlier],
+                    position[later],
+                    f"{earlier} must run before {later}",
+                )
+
+    def test_the_dashboard_is_last(self):
+        """It reports on the run, so anything after it would go unreported —
+        which is BACKLOG A-18's shape, arrived at by reordering instead of
+        by an abort."""
+        self.assertEqual(self._execution_order()[-1], "dashboard")
+
+    def test_the_lock_is_taken_before_the_first_step_and_released_after(self):
+        """The order's outer bracket. Every dependency above assumes one
+        Runner at a time (docs/07 §25)."""
+        import inspect
+
+        from app import runner
+
+        source = inspect.getsource(runner.run_once)
+        acquire = source.index("try_acquire_lock(")
+        first_begin = source.index("recorder.begin(")
+        release = source.index("release_lock(")
+
+        self.assertLess(acquire, first_begin)
+        self.assertLess(first_begin, release)
+        self.assertIn("finally:", source[:release])
+
+    def test_every_documented_pair_names_a_real_component(self):
+        """A typo in the table above would silently assert nothing."""
+        from app.runner import PIPELINE_COMPONENTS
+
+        order = self._execution_order()
+
+        self.assertEqual(set(order), set(PIPELINE_COMPONENTS))
+        self.assertEqual(len(order), len(set(order)), "a step announces itself twice")
+
+
+class OneRuntimeRootOrRefuseTests(unittest.TestCase):
+    """C34 §3: `RUNTIME_DIR` looked like a knob and moved 3 of 19 paths.
+
+    `run_company_ops.main()` derives `local_master_dir`,
+    `backup_working_copy_dir` and `runner_lock_path` from its own
+    `RUNTIME_DIR`. The other sixteen path parameters of `run_once()` are
+    left to defaults that belong to six *other* modules, each with its own
+    `PROJECT_ROOT` frozen at import.
+
+    In production the roots are the same directory and nothing is wrong.
+    The failure mode is the other case, and it was reached for real during
+    C34: rebinding `RUNTIME_DIR` — the way every test and probe in this
+    repository isolates `ops_status.py` — ran a genuine pipeline that wrote
+    Company History into a temp tree while advancing the **live**
+    `daily_history_state.json` past those days.
+
+        daily/        six files written under the temp root
+        live pointer  2026-08-10 -> 2026-08-16
+        consistency   CONSISTENT -> STATE_INCONSISTENCY
+
+    Six days that no future run will create, because the pointer is already
+    past them. A run that believes it is sandboxed and corrupts production
+    instead is the worst shape a knob can have.
+
+    C31 §10 recorded the same trap in `ops_status.py` and fixed it by
+    deriving per call. That fix is unavailable here — the sixteen defaults
+    belong to other modules — so the incompleteness stays and stops being
+    silent.
+    """
+
+    def _entrypoint(self):
+        import importlib.util
+
+        path = REPO_ROOT / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_guard", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_production_roots_agree_so_the_guard_is_invisible(self):
+        """It must never fire on a real deployment."""
+        module = self._entrypoint()
+
+        module._one_runtime_root_or_refuse()  # must not raise
+
+    def test_a_rebound_runtime_dir_is_refused(self):
+        module = self._entrypoint()
+        module.RUNTIME_DIR = Path(tempfile.mkdtemp()) / "runtime"
+        self.addCleanup(shutil.rmtree, module.RUNTIME_DIR.parent, True)
+
+        with self.assertRaises(SystemExit) as caught:
+            module._one_runtime_root_or_refuse()
+
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_the_refusal_names_both_roots(self):
+        """An operator (or a maintainer mid-probe) has to see *which* two
+        paths disagree — that is the whole content of the mistake."""
+        module = self._entrypoint()
+        stray = Path(tempfile.mkdtemp()) / "runtime"
+        self.addCleanup(shutil.rmtree, stray.parent, True)
+        module.RUNTIME_DIR = stray
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            module._one_runtime_root_or_refuse()
+        message = err.getvalue()
+
+        self.assertIn(str(stray), message)
+        self.assertIn("app.runner", message)
+        self.assertIn("STATE_INCONSISTENCY", message)
+
+    def test_the_guard_runs_before_anything_else_in_main(self):
+        """After the first write it would be too late — the split has
+        already happened."""
+        import inspect
+
+        module = self._entrypoint()
+        body = inspect.getsource(module.main)
+        first_line = body.split("\n")[1].strip()
+
+        self.assertEqual(first_line, "_one_runtime_root_or_refuse()")
+
+    def test_the_count_in_the_message_matches_the_real_signature(self):
+        """`19 paths, 3 set here` is a claim about the code. Checked, so it
+        cannot quietly stop being true."""
+        import ast
+
+        runner_source = (SRC / "app" / "runner.py").read_text(encoding="utf-8")
+        run_once = next(
+            n
+            for n in ast.walk(ast.parse(runner_source))
+            if isinstance(n, ast.FunctionDef) and n.name == "run_once"
+        )
+        path_params = [
+            a.arg for a in run_once.args.kwonlyargs if a.arg.endswith(("_dir", "_path"))
+        ]
+
+        entry_source = (REPO_ROOT / "run_company_ops.py").read_text(encoding="utf-8")
+        call = next(
+            n
+            for n in ast.walk(ast.parse(entry_source))
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "run_once"
+        )
+        supplied = {kw.arg for kw in call.keywords if kw.arg in path_params}
+
+        self.assertEqual(len(path_params), 19)
+        self.assertEqual(
+            supplied,
+            {"local_master_dir", "backup_working_copy_dir", "runner_lock_path"},
+        )
+        self.assertIn("19개 경로 중 3개", entry_source)
+
+    def test_ops_status_keeps_its_complete_knob(self):
+        """The contrast that makes this guard the right shape rather than a
+        workaround: `ops_status.py` really does redirect everything from
+        `RUNTIME_DIR`, which is why its tests can rebind it safely. Only the
+        entrypoint cannot."""
+        source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _agent_dir()", source)
+        self.assertIn("return RUNTIME_DIR /", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

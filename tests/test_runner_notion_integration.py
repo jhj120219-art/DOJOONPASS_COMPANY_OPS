@@ -35,6 +35,7 @@ from runsummary import (  # noqa: E402
 )
 from notion import (  # noqa: E402
     ExecutionPlanSync,
+    NotionAPIError,
     InMemoryNotionTransport,
     NotionClient,
     SyncStatus,
@@ -390,6 +391,636 @@ class RunnerNotionIntegrationTests(RunnerNotionTestCase):
         self.assertEqual(scheduler_result.generated_dates, (date(2026, 8, 1),))
 
 
+class TheQueueIsWrittenOncePerRunTests(RunnerNotionTestCase):
+    """The Batch Save guarantee (CEO 승인 B안), asserted by RUNNING the
+    Runner instead of by reading its source.
+
+    `test_architecture_invariants.py::
+    test_runner_batches_queue_writes_into_a_single_save` pins the property as
+    source text: the load call is there, the in-memory helpers are there,
+    `save_retry_queue(` appears exactly once, the per-file helpers do not.
+    Every one of those is a claim about how step 4 is *written*.
+
+    What the property is actually about is how many times the file is
+    rewritten while Notion is down — the O(n^2) byte cost the batch replaced
+    (measured then: 7.9 ms/enqueue at 50 entries, 19.3 ms at 800). A source
+    assertion cannot see a second save added inside a helper, a loop that
+    calls the surviving save per Event, or a refactor that renames it. This
+    counts the writes a real run performs.
+
+    Both are kept. The source one still catches "someone used the per-file
+    helpers", which is invisible from the outside when n is 1.
+    """
+
+    class _AlwaysDown(InMemoryNotionTransport):
+        """Notion refusing every write, which is what fills the queue."""
+
+        def create_page(self, database_id, properties):
+            raise NotionAPIError("service unavailable", status_code=503)
+
+        def update_page(self, page_id, properties):
+            raise NotionAPIError("service unavailable", status_code=503)
+
+    def _run_counting_saves(self, event_count):
+        import app.runner as runner_module
+        from notion import NotionClient
+        from notion.sync import ExecutionPlanSync
+
+        for index in range(event_count):
+            self._write_event(event_id=f"QUEUE-{index}", project_id=f"P{index}")
+
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=self._AlwaysDown(), database_id="DB-1")
+        )
+
+        original = runner_module.save_retry_queue
+        calls = []
+
+        def counting(path, entries):
+            calls.append(len(entries))
+            return original(path, entries)
+
+        runner_module.save_retry_queue = counting
+        try:
+            result = self._run(notion_sync=sync)
+        finally:
+            runner_module.save_retry_queue = original
+        return result, calls
+
+    def test_one_write_however_many_events_are_queued(self):
+        _result, calls = self._run_counting_saves(8)
+
+        self.assertEqual(len(calls), 1, f"the queue file was rewritten {len(calls)} times")
+        self.assertEqual(calls[0], 8)
+
+    def test_the_queue_on_disk_still_holds_every_event(self):
+        """Writing once must not mean writing less — the whole delta has to
+        survive the run, or a Notion outage would lose the retries it was
+        collecting."""
+        _result, _calls = self._run_counting_saves(8)
+
+        entries = json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))
+        queued = entries.get("entries", entries) if isinstance(entries, dict) else entries
+
+        self.assertEqual(len(queued), 8)
+
+    def test_a_run_with_nothing_to_queue_does_not_write_at_all(self):
+        """The other side: `queue_dirty` gates the save, so a healthy run
+        must not touch the file. A save-per-run would rewrite it on every
+        scheduled execution forever."""
+        import app.runner as runner_module
+
+        self._write_event(event_id="HEALTHY-1")
+
+        original = runner_module.save_retry_queue
+        calls = []
+
+        def counting(path, entries):
+            calls.append(len(entries))
+            return original(path, entries)
+
+        runner_module.save_retry_queue = counting
+        try:
+            self._run(notion_sync=self.notion_sync)
+        finally:
+            runner_module.save_retry_queue = original
+
+        self.assertEqual(calls, [])
+
+    def test_the_second_run_drains_and_writes_once_more(self):
+        """Cross-run: the drain path mutates the same in-memory list and must
+        also settle on one write."""
+        import app.runner as runner_module
+
+        self._run_counting_saves(3)
+
+        original = runner_module.save_retry_queue
+        calls = []
+
+        def counting(path, entries):
+            calls.append(len(entries))
+            return original(path, entries)
+
+        runner_module.save_retry_queue = counting
+        try:
+            self._run(notion_sync=self.notion_sync,
+                      now=datetime(2026, 8, 2, 12, 0))
+        finally:
+            runner_module.save_retry_queue = original
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], 0, "the drained queue should end empty")
+
+
+class EveryDashboardNumberMatchesDiskTests(RunnerNotionTestCase):
+    """The OPS_RUNS row against the filesystem, on one rich run.
+
+    Every other Dashboard test asserts one column from one hand-built result
+    object. That is the right way to test a mapping and it cannot answer the
+    question docs/14 §1 actually poses — Notion is a **View, never a Source**,
+    so the row is only worth reading if it agrees with the Source. The
+    agreement had been checked by hand (C42, C43) and by nothing that runs.
+
+    One run, deliberately messy, so that no column is zero by accident:
+
+        3 Events that reach the Collector, one of whose project Notion
+        refuses forever (503) -> it queues
+        1 duplicate arriving through `transport/`
+        1 unparseable file aged past the stability window -> intake invalid
+        1 `.tmp-` staging residue                          -> intake incomplete
+        1 unreadable file already in `incoming/`            -> collector reject
+
+    Each assertion below reads the row on one side and the FILESYSTEM (or the
+    result object the filesystem produced) on the other — never the same
+    computation twice.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import os
+        import time
+
+        transport = self._RefusingTransport()
+        self.notion_sync = ExecutionPlanSync(
+            client=NotionClient(transport=transport, database_id="DB-1")
+        )
+
+        for index, project in enumerate(("P1", "P2", "BADPROJ")):
+            self._write_event(
+                event_id=f"EV-{index}", project_id=project,
+                timestamp="2026-08-01T10:00:00+09:00",
+            )
+
+        self.transport_dir.mkdir(parents=True, exist_ok=True)
+        duplicate = json.loads((self.incoming_dir / "EV-0.json").read_text(encoding="utf-8"))
+        duplicate["event_id"] = "EV-DUP"
+        (self.transport_dir / "EV-DUP.json").write_text(json.dumps(duplicate), encoding="utf-8")
+
+        garbage = self.transport_dir / "garbage.json"
+        garbage.write_text("{nope", encoding="utf-8")
+        aged = time.time() - 3600
+        os.utime(garbage, (aged, aged))
+        (self.transport_dir / ".tmp-half.json").write_text("{}", encoding="utf-8")
+        (self.incoming_dir / "broken.json").write_text("{not json", encoding="utf-8")
+
+        self.result = self._run(
+            notion_sync=self.notion_sync,
+            dashboard_client=self.dashboard_client,
+            now=datetime(2026, 8, 3, 12, 0),
+        )
+        self.intake, self.collector, self.scheduler, self.backup, self.syncs = self.result
+        page = list(self.dashboard_transport._pages.values())[-1]
+        self.row = page["properties"]
+
+    class _RefusingTransport(InMemoryNotionTransport):
+        """Notion permanently refusing one project, so `Notion Retried` and
+        `Notion Queued` are non-zero for a reason the disk can confirm."""
+
+        def create_page(self, database_id, properties):
+            if "BADPROJ" in json.dumps(properties):
+                raise NotionAPIError("unavailable", status_code=503)
+            return super().create_page(database_id, properties)
+
+    def _number(self, name):
+        return self.row[name]["number"]
+
+    def _select(self, name):
+        return self.row[name]["select"]["name"]
+
+    # ---- transport -------------------------------------------------------
+
+    def test_transport_moved_matches_what_left_the_transport_directory(self):
+        moved = sorted(p.name for p in self.processed_dir.glob("*.json"))
+        still_there = sorted(p.name for p in self.transport_dir.glob("*"))
+
+        self.assertEqual(self._number("Transport Moved"), len(self.intake.moved))
+        # Nothing this run promoted is still sitting in transport/.
+        for name in self.intake.moved:
+            self.assertNotIn(name, still_there)
+        self.assertTrue(moved)
+
+    def test_transport_blocked_matches_the_files_left_behind_for_good(self):
+        """The three buckets `count_blocked_intake()` counts, read back off
+        the disk rather than off the summary."""
+        left = {p.name for p in self.transport_dir.glob("*")}
+
+        self.assertIn("garbage.json", left)
+        self.assertIn(".tmp-half.json", left)
+        self.assertEqual(
+            self._number("Transport Blocked"),
+            len(self.intake.skipped_invalid)
+            + len(self.intake.skipped_incomplete)
+            + len(self.intake.failed),
+        )
+        self.assertGreaterEqual(self._number("Transport Blocked"), 2)
+
+    # ---- collector -------------------------------------------------------
+
+    def test_accepted_matches_the_processed_directory(self):
+        self.assertEqual(
+            self._number("Accepted"), len(list(self.processed_dir.glob("*.json")))
+        )
+
+    def test_rejected_matches_the_rejected_directory(self):
+        self.assertEqual(self._number("Rejected"), len(list(self.rejected_dir.glob("*"))))
+        self.assertGreaterEqual(self._number("Rejected"), 1)
+
+    def test_duplicate_and_failed_match_the_collector_state(self):
+        state = json.loads(self.collector_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(self._number("Duplicate"), self.collector.duplicate)
+        self.assertEqual(self._number("Failed"), self.collector.failed)
+        # Every accepted Event is remembered, which is what makes a re-run a
+        # duplicate rather than a second Event.
+        self.assertEqual(
+            len(state["processed_event_ids"]), self._number("Accepted")
+        )
+
+    # ---- daily -----------------------------------------------------------
+
+    def test_generated_days_matches_the_files_on_disk(self):
+        written = sorted((self.local_master_dir / "daily").glob("*.md"))
+
+        self.assertEqual(self._number("Generated Days"), len(written))
+        self.assertEqual(self._select("Scheduler Status"), self.scheduler.status.value)
+
+    def test_reused_days_is_zero_on_a_first_run_and_the_pair_covers_the_watermark(self):
+        state = json.loads(self.scheduler_state_path.read_text(encoding="utf-8"))
+        closed = self._number("Generated Days") + self._number("Reused Days")
+
+        self.assertEqual(self._number("Reused Days"), 0)
+        self.assertEqual(closed, len(self.scheduler.closed_dates))
+        self.assertEqual(
+            state["last_successful_daily_close"],
+            max(self.scheduler.closed_dates).isoformat(),
+        )
+
+    # ---- backup ----------------------------------------------------------
+
+    def test_backup_status_matches_the_backup_state_file(self):
+        state = json.loads(self.backup_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(self._select("Backup Status"), state["backup_status"])
+
+    def test_deleted_files_is_zero_and_the_remote_holds_the_history(self):
+        pushed = self._run_git(
+            ["ls-tree", "-r", "--name-only", "main"], cwd=self.backup_working_copy_dir
+        ).split()
+        written = sorted(p.name for p in (self.local_master_dir / "daily").glob("*.md"))
+
+        self.assertEqual(self._number("Deleted Files"), 0)
+        for name in written:
+            self.assertIn(f"daily/{name}", pushed)
+
+    # ---- notion ----------------------------------------------------------
+
+    def test_the_three_sync_counts_partition_the_events_handled(self):
+        total = (
+            self._number("Notion Synced")
+            + self._number("Notion Skipped")
+            + self._number("Notion Retried")
+        )
+
+        self.assertEqual(total, len(self.syncs))
+
+    def test_notion_queued_matches_the_queue_file(self):
+        entries = json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))
+        queued = entries.get("entries", entries) if isinstance(entries, dict) else entries
+
+        self.assertEqual(self._number("Notion Queued"), len(queued))
+        self.assertGreaterEqual(self._number("Notion Queued"), 1)
+
+    def test_notion_synced_matches_the_rows_notion_actually_holds(self):
+        """The strongest of these: the column against the other side of the
+        wire, not against this side's own count."""
+        self.assertEqual(
+            self._number("Notion Synced"), len(self.notion_sync._client._transport._pages)
+        )
+
+    # ---- the verdict -----------------------------------------------------
+
+    def test_failed_steps_names_the_manifests_own_failed_components(self):
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+        failed = [
+            component.name
+            for component in summary.components
+            if component.status is ComponentStatus.FAILED
+        ]
+        printed = "".join(
+            part["text"]["content"] for part in self.row["Failed Steps"]["rich_text"]
+        )
+
+        self.assertEqual(sorted(printed.split(", ")) if printed else [], sorted(failed))
+
+    def test_the_row_verdict_never_contradicts_the_manifest(self):
+        """C37's one-directional relation, checked on a real run rather than
+        on constructed inputs: Dashboard OK => manifest SUCCESS, and a
+        DEGRADED manifest is never an OK row."""
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+        overall = self._select("Overall")
+
+        self.assertEqual(overall, "WARN")
+        self.assertIs(summary.overall_status, OverallStatus.DEGRADED)
+        if overall == "OK":
+            self.assertIs(summary.overall_status, OverallStatus.SUCCESS)
+
+    def test_the_row_is_keyed_by_the_manifest_run_id(self):
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+        run_id = "".join(
+            part["text"]["content"] for part in self.row["Run ID"]["title"]
+        )
+
+        self.assertEqual(run_id, summary.run_id)
+
+
+class NothingIsLostBetweenEventAndMonthlyTests(RunnerNotionTestCase):
+    """The whole delivery chain, counted at every stage in one run.
+
+    Each stage of this pipeline has its own suite, and each one asserts its
+    own contract. What none of them asks is the question an operator asks —
+    **did the Event I sent end up in Company History, and in the Monthly?**
+    That is a property of the seams, not of any stage, and every loss this
+    repository has found lived in a seam.
+
+    Nine Events across three days, three per day, one of each Event Type that
+    routes differently:
+
+        MILESTONE_COMPLETED  -> KEEP    -> a Daily item -> a Monthly item
+        DECISION_APPROVED    -> KEEP    -> a Daily item -> a Monthly item
+        BLOCKED              -> REVIEW  -> not rendered until a human acts
+
+    Then August is closed out and consolidated, and the three sets are
+    compared: stored KEEP ids, ids parseable out of the Daily files by
+    `monthly/parser.py`, and ids the Monthly file carries.
+    """
+
+    EVENT_TYPES = ("MILESTONE_COMPLETED", "DECISION_APPROVED", "BLOCKED")
+    DAYS = ("2026-08-01", "2026-08-02", "2026-08-03")
+
+    def setUp(self):
+        super().setUp()
+        self.planned = []
+        for day in self.DAYS:
+            for index, event_type in enumerate(self.EVENT_TYPES):
+                event_id = f"EV-{day[-2:]}-{index}"
+                extra = {}
+                if event_type == "BLOCKED":
+                    extra["blocker"] = "waiting on review"
+                if event_type == "MILESTONE_COMPLETED":
+                    extra["milestone"] = f"M{index}"
+                self._write_event(
+                    event_id=event_id,
+                    project_id=f"PRJ_{index}",
+                    event_type=event_type,
+                    status="IN_PROGRESS",
+                    summary=f"work {event_id}",
+                    history_candidate=True,
+                    timestamp=f"{day}T1{index}:00:00+09:00",
+                    **extra,
+                )
+                self.planned.append(event_id)
+
+        self.result = self._run(
+            notion_sync=self.notion_sync, now=datetime(2026, 8, 5, 12, 0)
+        )
+        # Close the rest of the month so it is consolidatable at all
+        # (docs/09 §10/§39 refuse a month with a hole).
+        self._run(notion_sync=self.notion_sync, now=datetime(2026, 9, 1, 12, 0))
+
+        self.daily_dir = self.local_master_dir / "daily"
+        self.monthly_dir = self.local_master_dir / "monthly"
+
+    def _stored(self, directory):
+        if not directory.is_dir():
+            return set()
+        return {
+            json.loads(path.read_text(encoding="utf-8"))["event_id"]
+            for path in directory.glob("*.json")
+        }
+
+    def _daily_ids(self):
+        from monthly.parser import read_daily_document
+
+        found, unconsolidated = set(), 0
+        for path in sorted(self.daily_dir.glob("*.md")):
+            document = read_daily_document(path, date.fromisoformat(path.stem))
+            found |= {item.event_id for item in document.items}
+            unconsolidated += document.unconsolidated
+        return found, unconsolidated
+
+    def _monthly_ids(self):
+        text = (self.monthly_dir / "2026-08.md").read_text(encoding="utf-8")
+        return {
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("- Event ID:")
+        }, text
+
+    # ---- stage by stage --------------------------------------------------
+
+    def test_every_event_reaches_the_collector(self):
+        _intake, collector, _scheduler, _backup, _syncs = self.result
+
+        self.assertEqual(collector.accepted, len(self.planned))
+        self.assertEqual(
+            len(list(self.processed_dir.glob("*.json"))), len(self.planned)
+        )
+
+    def test_the_filter_routes_each_type_where_docs_05_says(self):
+        keep = self._stored(self.keep_dir)
+        review = self._stored(self.review_dir)
+
+        self.assertEqual(keep | review, set(self.planned))
+        self.assertEqual(keep & review, set())
+        # BLOCKED is index 2 of every day.
+        self.assertEqual(review, {f"EV-{d[-2:]}-2" for d in self.DAYS})
+
+    def test_every_kept_candidate_reaches_company_history(self):
+        keep = self._stored(self.keep_dir)
+        in_daily, unconsolidated = self._daily_ids()
+
+        self.assertEqual(keep - in_daily, set(), "KEEP Candidates missing from Daily")
+        self.assertEqual(unconsolidated, 0)
+
+    def test_a_reviewed_candidate_is_not_in_history_yet(self):
+        """The other direction — REVIEW must NOT appear, or the filter would
+        be doing nothing."""
+        review = self._stored(self.review_dir)
+        in_daily, _ = self._daily_ids()
+
+        self.assertEqual(review & in_daily, set())
+
+    def test_every_daily_item_reaches_the_monthly(self):
+        in_daily, _ = self._daily_ids()
+        in_monthly, _text = self._monthly_ids()
+
+        self.assertEqual(in_daily - in_monthly, set(), "items lost between Daily and Monthly")
+
+    def test_the_monthly_invents_nothing(self):
+        in_daily, _ = self._daily_ids()
+        in_monthly, _text = self._monthly_ids()
+
+        self.assertEqual(in_monthly - in_daily, set(), "Monthly carries an id no Daily has")
+
+    def test_the_monthly_total_matches_what_it_carries(self):
+        """`- Consolidated Items:` against the ids in the same file — the
+        pair `ops_status._monthly_counts_more_than_it_shows()` compares."""
+        in_monthly, text = self._monthly_ids()
+        claimed = next(
+            int(line.split(":", 1)[1])
+            for line in text.splitlines()
+            if line.startswith("- Consolidated Items:")
+        )
+
+        self.assertEqual(claimed, len(in_monthly))
+        self.assertEqual(claimed, len(self._stored(self.keep_dir)))
+
+    def test_the_two_standing_detectors_are_quiet_on_this_run(self):
+        """The chain being intact and the detectors saying so are two facts,
+        and a green pipeline with a noisy detector is still a bug."""
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_chain", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module._daily_counts_more_than_it_shows(self.daily_dir), ())
+        self.assertEqual(module._monthly_counts_more_than_it_shows(self.monthly_dir), ())
+
+
+class ANonStringFieldIsRejectedNotCrashedIntoTests(RunnerNotionTestCase):
+    """The consequence of the schema gap, and its fix, through the pipeline.
+
+    `docs/02` §4 declares `event_id` / `project_id` / `summary` as `string`
+    and `validate_event()` did not enforce it, so the Collector ACCEPTED such
+    an Event and the failure surfaced deep inside a CRITICAL step. Measured
+    before the fix, one crafted Event arriving beside one ordinary one:
+
+        summary=12345    daily FAILED, 0 Daily files, exit 2 — and the KEEP
+                         Candidate is on disk, so EVERY later run fails the
+                         same way until a human deletes it
+        project_id=7     notion_sync and daily both FAILED, 0 Daily files
+        event_id=99      TypeError escaped run_once() entirely
+
+    docs/03 §7 already says where an invalid Event goes — `rejected/`, run
+    continuing — and that is what these assert now. The innocent Event of the
+    same run must survive, which is the property the old behaviour destroyed.
+    """
+
+    BASE = {
+        "schema_version": "1.0",
+        "timestamp": "2026-08-01T10:00:00+09:00",
+        "source": "DESKTOP_1",
+        "role": "CTO_BACKEND",
+        "event_type": "MILESTONE_COMPLETED",
+        "status": "IN_PROGRESS",
+        "evidence": [],
+        "history_candidate": True,
+        "milestone": "M",
+    }
+
+    CRAFTED = {
+        "summary=int": {"event_id": "EV-A", "project_id": "P", "summary": 12345},
+        "summary=dict": {"event_id": "EV-B", "project_id": "P", "summary": {"t": "x"}},
+        "project_id=int": {"event_id": "EV-C", "project_id": 7, "summary": "ok"},
+        "event_id=int": {"event_id": 99, "project_id": "P", "summary": "ok"},
+        "event_id=list": {"event_id": ["a"], "project_id": "P", "summary": "ok"},
+    }
+
+    def _run_with(self, override):
+        import os
+        import time
+
+        self.transport_dir.mkdir(parents=True, exist_ok=True)
+        data = dict(self.BASE)
+        data.update(override)
+        crafted = self.transport_dir / "crafted.json"
+        crafted.write_text(json.dumps(data), encoding="utf-8")
+        aged = time.time() - 3600
+        os.utime(crafted, (aged, aged))
+
+        self._write_event(
+            event_id="EV-OK", project_id="PRJ_OK",
+            timestamp="2026-08-01T11:00:00+09:00",
+        )
+        return self._run(
+            notion_sync=self.notion_sync,
+            dashboard_client=self.dashboard_client,
+            now=datetime(2026, 8, 3, 12, 0),
+        )
+
+    def test_it_is_rejected_and_the_run_survives(self):
+        for label, override in self.CRAFTED.items():
+            with self.subTest(case=label):
+                self.setUp()
+                result = self._run_with(override)
+                summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+                self.assertEqual(
+                    sorted(p.name for p in self.rejected_dir.glob("*")), ["crafted.json"]
+                )
+                self.assertEqual(
+                    sorted(p.name for p in self.processed_dir.glob("*")), ["EV-OK.json"]
+                )
+                self.assertIs(summary.overall_status, OverallStatus.SUCCESS)
+                self.assertEqual(summary.exit_code, 0)
+
+    def test_company_history_is_still_written(self):
+        """The property the old behaviour destroyed: one malformed Event from
+        one Desktop must not stop the day being closed."""
+        for label, override in self.CRAFTED.items():
+            with self.subTest(case=label):
+                self.setUp()
+                self._run_with(override)
+
+                self.assertTrue(
+                    sorted((self.local_master_dir / "daily").glob("*.md")),
+                    "no Daily History was written",
+                )
+
+    def test_nothing_reaches_the_history_candidates(self):
+        """The reason the old failure repeated forever: the Candidate was
+        written to `keep/` before the renderer choked on it, so the next run
+        found it again and died the same way.
+
+        Asserted as "the crafted id is in no stored Candidate" rather than
+        "keep/ holds EV-OK" — the ordinary Event here is a `STARTED`, which
+        `history.filter` does not keep, and pinning that would be asserting
+        the filter's mapping in the wrong file.
+        """
+        for label, override in self.CRAFTED.items():
+            with self.subTest(case=label):
+                self.setUp()
+                self._run_with(override)
+                stored = []
+                for directory in (self.keep_dir, self.review_dir):
+                    if directory.is_dir():
+                        stored += [
+                            json.loads(path.read_text(encoding="utf-8"))["event_id"]
+                            for path in directory.glob("*.json")
+                        ]
+
+                self.assertNotIn(override["event_id"], stored)
+
+    def test_the_rejection_is_counted_where_an_operator_reads_it(self):
+        """`rejected` is a WARN input on the Dashboard, so the row says a
+        person should look — a refused Event is not a silent one."""
+        self._run_with(self.CRAFTED["summary=int"])
+        row = list(self.dashboard_transport._pages.values())[-1]["properties"]
+
+        self.assertEqual(row["Rejected"]["number"], 1)
+        self.assertEqual(row["Overall"]["select"]["name"], "WARN")
+
+    def test_the_collector_log_names_the_refused_file(self):
+        self._run_with(self.CRAFTED["project_id=int"])
+        log = self.collector_log_path.read_text(encoding="utf-8")
+
+        self.assertIn("REJECTED", log)
+        self.assertIn("project_id", log)
+
+
 class DashboardRunIdTraceabilityTests(RunnerNotionTestCase):
     """The OPS_RUNS row and the Run Manifest must name the same run.
 
@@ -580,6 +1211,34 @@ class DegradedStepDoesNotAbortCriticalStepsTests(RunnerNotionTestCase):
             result.summary.component("dashboard").status, ComponentStatus.SUCCESS
         )
         self.assertEqual(len(self.dashboard_transport._pages), 1)
+
+    def test_the_dashboard_row_does_not_call_this_run_ok(self):
+        """C37: the same run, described twice, disagreeing at the top of both.
+
+        Measured before the fix, on exactly this scenario — a Late Event
+        whose merge fails against an undecodable Daily file:
+
+            manifest    DEGRADED / exit 3
+            Dashboard   Overall OK
+
+        `Overall` is the column an operator sorts a Notion view by, so it is
+        the one place the disagreement is certain to be seen and certain to
+        be believed. `late_update` and `monthly` are the two steps that can
+        record FAILED without stopping the run, and neither had a column on
+        the row, so neither could reach the verdict at all.
+        """
+        self._close_a_day_then_corrupt_it()
+
+        result = self._run_with_a_late_event()
+
+        row = list(self.dashboard_transport._pages.values())[0]["properties"]
+        self.assertEqual(result.summary.overall_status, OverallStatus.DEGRADED)
+        self.assertNotEqual(row["Overall"]["select"]["name"], "OK")
+        self.assertEqual(row["Overall"]["select"]["name"], "WARN")
+        # And it names the step, which is the question a WARN raises.
+        self.assertEqual(
+            row["Failed Steps"]["rich_text"][0]["text"]["content"], "late_update"
+        )
 
     def test_the_run_is_degraded_not_failed(self):
         """A DEGRADED-severity failure must not produce exit 2 — that is
@@ -979,6 +1638,966 @@ class FailedBackupLeavesNoTraceTests(RunnerNotionTestCase):
             traces.append("logs/backup/")
 
         self.assertEqual(traces, [])
+
+
+class DashboardCarriesUnreadableAndQueuedTests(RunnerNotionTestCase):
+    """C33 §1 end to end, through a real `run_once()`.
+
+    The unit tests in `test_notion_dashboard.py` prove the two columns carry
+    what they are handed. These prove the Runner hands over the right
+    numbers — which is the half that was missing, since both values live in
+    local variables of step 4 and the Dashboard step is five steps later.
+    """
+
+    def _row(self):
+        pages = list(self.dashboard_transport._pages.values())
+        self.assertEqual(len(pages), 1, pages)
+        return pages[0]["properties"]
+
+    def test_a_queued_event_shows_as_queued_on_the_dashboard(self):
+        """Notion refuses the sync, the Event lands in the retry queue, and
+        the row says so. Before this the row was indistinguishable from a
+        run with nothing to sync."""
+        self._write_event(event_id="EVT-QUEUE")
+        self.transport.fail_next_call = True
+
+        self._run(
+            notion_sync=self.notion_sync, dashboard_client=self.dashboard_client
+        )
+
+        row = self._row()
+        self.assertEqual(row["Notion Retried"]["number"], 1)
+        self.assertEqual(row["Notion Queued"]["number"], 1)
+        self.assertEqual(row["Overall"]["select"]["name"], "WARN")
+
+    def test_the_queue_depth_is_what_the_queue_file_actually_holds(self):
+        """Read from the in-memory list the step just saved. Pinned against
+        the file so the two cannot drift."""
+        self._write_event(event_id="EVT-QUEUE-2")
+        self.transport.fail_next_call = True
+
+        self._run(
+            notion_sync=self.notion_sync, dashboard_client=self.dashboard_client
+        )
+
+        on_disk = json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self._row()["Notion Queued"]["number"], len(on_disk["entries"])
+        )
+
+    def test_an_unparseable_queued_entry_is_counted_and_stays_queued(self):
+        """The case no `queued=` metric can see: `to_event()` raises, so the
+        entry never becomes a SyncResult, and `app/runner.py` leaves it in
+        the queue. It must appear in `Notion Unreadable`, and the queue it
+        is still sitting in must appear in `Notion Queued`."""
+        self.notion_retry_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.notion_retry_queue_path.write_text(
+            json.dumps(
+                {
+                    "entries": [
+                        {
+                            "event_id": "EVT-BROKEN",
+                            "project_id": "PRJ",
+                            "event_data": {"event_id": "EVT-BROKEN"},
+                            "added_at": "2026-08-01T10:00:00+09:00",
+                            "attempt_count": 3,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self._run(
+            notion_sync=self.notion_sync, dashboard_client=self.dashboard_client
+        )
+
+        row = self._row()
+        self.assertEqual(row["Notion Unreadable"]["number"], 1)
+        self.assertEqual(row["Notion Queued"]["number"], 1)
+        self.assertEqual(row["Overall"]["select"]["name"], "WARN")
+
+    def test_a_clean_run_reports_zero_for_both(self):
+        self._write_event(event_id="EVT-CLEAN")
+
+        self._run(
+            notion_sync=self.notion_sync, dashboard_client=self.dashboard_client
+        )
+
+        row = self._row()
+        self.assertEqual(row["Notion Unreadable"]["number"], 0)
+        self.assertEqual(row["Notion Queued"]["number"], 0)
+
+    def test_the_dashboard_records_when_notion_sync_is_unconfigured(self):
+        """`run_once()`'s contract allows a Dashboard client with **no**
+        Notion Sync client, and this pins that the new pass-through did not
+        quietly break it.
+
+        Honest about what this is: not a bug that was found, but a trap that
+        was avoided. Both counters live in step 4, inside
+        `if notion_sync is not None`. Passing them to step 9b without also
+        binding them outside that branch would raise NameError on exactly
+        this supported configuration — absorbed by the step's own `except`,
+        logged as `DASHBOARD FAILED`, and the row lost for good, every run,
+        for every deployment that has a Dashboard and no Sync. The test
+        exists because that failure would have been invisible in every other
+        test in this file, all of which pass a `notion_sync`.
+        """
+        self._write_event(event_id="EVT-NO-SYNC")
+
+        self._run(notion_sync=None, dashboard_client=self.dashboard_client)
+
+        row = self._row()
+        self.assertEqual(row["Notion Unreadable"]["number"], 0)
+        self.assertEqual(row["Notion Queued"]["number"], 0)
+        self.assertEqual(row["Overall"]["select"]["name"], "OK")
+        log = self.notion_sync_log_path
+        if log.exists():
+            self.assertNotIn("DASHBOARD FAILED", log.read_text(encoding="utf-8"))
+
+
+class PermanentlyRefusedSyncReachesAttentionTests(RunnerNotionTestCase):
+    """C33 §5: the transport classified, and nothing read the classification.
+
+    `NotionAPIError.status_code` was set on every HTTP failure, asserted by
+    four tests, and read by **zero** production code. It is precisely the
+    signal BUG-13 is about — the one separating "Notion was briefly down"
+    from "Notion will refuse this forever" — and BUG-13's fix was to append
+    the reason *string* to the log so a person could tell them apart by
+    reading prose.
+
+    The cost was structural, not cosmetic. `ops_status.py` lists only
+    PERMANENT failures in ATTENTION (deliberately: a RETRYABLE one is what
+    the next run is for, and a self-clearing alert trains people to skim).
+    Every Notion failure was RETRYABLE. So a request Notion will refuse
+    forever could not reach ATTENTION through the manifest at all — it
+    surfaced only once C32 §14's NOTION block noticed the queue entry had
+    aged past three days.
+
+    Nothing about the queue changes: docs/04 §38 forbids dropping the Event,
+    and it stays queued exactly as before. Nothing about the exit code
+    changes either: `runsummary.overall_status()` folds **severity**, and
+    Notion Sync's severity is untouched.
+    """
+
+    class _StatusTransport(InMemoryNotionTransport):
+        """Answers the first query with a chosen HTTP status."""
+
+        def __init__(self, status_code, **kwargs):
+            super().__init__(**kwargs)
+            self.status_code = status_code
+            self.first = True
+
+        def query_database(self, database_id, filter_):
+            if self.first:
+                self.first = False
+                raise NotionAPIError(
+                    f"Notion API returned {self.status_code}: refused",
+                    status_code=self.status_code,
+                )
+            return super().query_database(database_id, filter_)
+
+    def _run_with_status(self, status_code):
+        transport = self._StatusTransport(status_code)
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=transport, database_id="DB-1")
+        )
+        self._write_event(event_id=f"EVT-{status_code}")
+
+        self._run(notion_sync=sync)
+
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+        return summary.component("notion_sync")
+
+    def test_a_permanently_refusing_status_is_classified_permanent(self):
+        for status_code in (400, 401, 403, 404):
+            with self.subTest(status_code=status_code):
+                self.setUp()
+                component = self._run_with_status(status_code)
+                self.assertEqual(component.status, ComponentStatus.FAILED)
+                self.assertIs(component.failure.retryability, Retryability.PERMANENT)
+
+    def test_a_transient_status_stays_retryable(self):
+        """The other direction, and the one that keeps ATTENTION usable: a
+        503 is exactly what the retry queue exists for."""
+        for status_code in (429, 500, 502, 503):
+            with self.subTest(status_code=status_code):
+                self.setUp()
+                component = self._run_with_status(status_code)
+                self.assertIs(component.failure.retryability, Retryability.RETRYABLE)
+
+    def test_the_severity_and_exit_code_are_unchanged(self):
+        """This reclassification must not promote Notion onto the critical
+        path — README RULE 5 and docs/14 §5 both put it off it."""
+        component = self._run_with_status(401)
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+        self.assertIs(component.failure.severity, Severity.DEGRADED)
+        self.assertIs(summary.overall_status, OverallStatus.DEGRADED)
+        self.assertEqual(summary.exit_code, 3)
+
+    def test_the_event_is_still_queued_not_dropped(self):
+        """docs/04 §38: a Notion failure must never delete the Event. The
+        classification says "a person must act", not "give up"."""
+        self._run_with_status(400)
+
+        queued = json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(queued["entries"]), 1)
+
+    def test_the_reason_prefers_the_unrecoverable_failure(self):
+        """With a transient and a permanent failure in one batch, `reason` is
+        the only sentence that reaches the operator — it must name the one
+        they can act on."""
+        statuses = iter([503, 400])
+
+        class _Mixed(InMemoryNotionTransport):
+            def query_database(self, database_id, filter_):
+                try:
+                    code = next(statuses)
+                except StopIteration:
+                    return super().query_database(database_id, filter_)
+                raise NotionAPIError(
+                    f"Notion API returned {code}: refused", status_code=code
+                )
+
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=_Mixed(), database_id="DB-1")
+        )
+        self._write_event(event_id="EVT-A", project_id="PRJ_A")
+        self._write_event(event_id="EVT-B", project_id="PRJ_B")
+
+        self._run(notion_sync=sync)
+
+        component = read_summary(self.notion_sync_log_path.parent / "last_run.json").component("notion_sync")
+        self.assertIs(component.failure.retryability, Retryability.PERMANENT)
+        self.assertIn("400", component.failure.reason)
+        self.assertEqual(component.metrics["refused"], 1)
+        self.assertEqual(component.metrics["queued"], 2)
+
+    def test_an_unreadable_entry_still_wins_as_unknown(self):
+        """UNKNOWN outranks PERMANENT. Claiming a request is permanently
+        refused when this step could not even read the Event is the same
+        overreach BUG-13 warns about, pointed the other way."""
+        self.notion_retry_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self.notion_retry_queue_path.write_text(
+            json.dumps(
+                {
+                    "entries": [
+                        {
+                            "event_id": "EVT-BROKEN",
+                            "project_id": "PRJ",
+                            "event_data": {"event_id": "EVT-BROKEN"},
+                            "added_at": "2026-08-01T10:00:00+09:00",
+                            "attempt_count": 1,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        component = self._run_with_status(400)
+
+        self.assertIs(component.failure.retryability, Retryability.UNKNOWN)
+
+    def test_a_network_failure_has_no_status_and_stays_retryable(self):
+        """No status at all is information: the request never got an answer,
+        which is the retryable case."""
+
+        class _Down(InMemoryNotionTransport):
+            def query_database(self, database_id, filter_):
+                raise NotionAPIError("Notion API request failed: [Errno 111]")
+
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=_Down(), database_id="DB-1")
+        )
+        self._write_event(event_id="EVT-DOWN")
+
+        self._run(notion_sync=sync)
+
+        component = read_summary(self.notion_sync_log_path.parent / "last_run.json").component("notion_sync")
+        self.assertIs(component.failure.retryability, Retryability.RETRYABLE)
+
+    def test_the_status_code_survives_onto_the_sync_result(self):
+        """The field the transport was already setting, now actually read."""
+        transport = self._StatusTransport(403)
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=transport, database_id="DB-1")
+        )
+        self._write_event(event_id="EVT-403")
+
+        result = self._run(notion_sync=sync)
+        _intake, _collector, _scheduler, _backup, sync_results = result
+
+        self.assertEqual([r.status_code for r in sync_results], [403])
+        self.assertTrue(sync_results[0].is_permanently_refused)
+
+    def test_the_permanent_set_is_short_and_deliberate(self):
+        """A blanket "any 4xx" would sweep in 408, 429 and 409 — three that
+        DO clear by waiting or by a retry winning the conflict."""
+        from notion.sync import PERMANENTLY_REFUSING_STATUS_CODES
+
+        self.assertEqual(set(PERMANENTLY_REFUSING_STATUS_CODES), {400, 401, 403, 404})
+        for transient in (408, 409, 429):
+            with self.subTest(status_code=transient):
+                self.assertNotIn(transient, PERMANENTLY_REFUSING_STATUS_CODES)
+
+
+class AnAbortedRunNeverReportsSuccessTests(RunnerNotionTestCase):
+    """C34 §1, behavioural: a run that aborted must not fold to SUCCESS.
+
+    `overall_status()` folds the FAILED components that were *recorded*. The
+    `finally` records one — `STEP_ABORTED` — for whatever step was in flight,
+    and "in flight" means "called `recorder.begin()`". Two steps did not, so
+    for them the fold saw nothing and returned SUCCESS.
+
+    Both trigger files are the ordinary ones: docs/10 §46 is written around
+    the expectation that a runtime state file can be found damaged, and each
+    of these two steps reads one as its first action.
+
+    Measured before the fix, and pinned here after it:
+
+        crash in step 4   STEP_ABORTED NONE   ->  SUCCESS / 0
+        crash in step 6   STEP_ABORTED NONE   ->  SUCCESS / 0
+        crash in step 7   STEP_ABORTED backup ->  FAILED  / 2   (control)
+
+    The step 6 row is the one that matters most. That step writes Company
+    History; the same corrupt file aborts every following run identically, so
+    Company History stops advancing for good while every manifest says the
+    run succeeded.
+    """
+
+    def _corrupt(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+
+    def _summary_after_abort(self, expected_error):
+        with self.assertRaises(expected_error):
+            self._run(notion_sync=self.notion_sync)
+        return read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+    def _aborted(self, summary):
+        return [
+            c.name
+            for c in summary.components
+            if c.failure and c.failure.classification == "STEP_ABORTED"
+        ]
+
+    def test_a_corrupt_retry_queue_is_attributed_to_notion_sync(self):
+        from notion.retry_queue import RetryQueueError
+
+        self._write_event(event_id="EVT-Q")
+        self._corrupt(self.notion_retry_queue_path)
+
+        summary = self._summary_after_abort(RetryQueueError)
+
+        self.assertEqual(self._aborted(summary), ["notion_sync"])
+
+    def test_that_abort_is_degraded_not_a_false_success(self):
+        """Notion is off the History critical path (README RULE 5), so
+        DEGRADED is right — but SUCCESS never was."""
+        from notion.retry_queue import RetryQueueError
+
+        self._write_event(event_id="EVT-Q2")
+        self._corrupt(self.notion_retry_queue_path)
+
+        summary = self._summary_after_abort(RetryQueueError)
+
+        self.assertIs(summary.overall_status, OverallStatus.DEGRADED)
+        self.assertEqual(summary.exit_code, 3)
+
+    def test_a_corrupt_scheduler_state_is_attributed_to_daily(self):
+        from scheduler.state import SchedulerStateError
+
+        self._write_event(event_id="EVT-D")
+        self._corrupt(self.scheduler_state_path)
+
+        summary = self._summary_after_abort(SchedulerStateError)
+
+        self.assertEqual(self._aborted(summary), ["daily"])
+
+    def test_that_abort_is_a_failure_because_daily_is_critical(self):
+        """The row that matters: this step writes Company History, and the
+        run neither wrote it nor reached Backup."""
+        from scheduler.state import SchedulerStateError
+
+        self._write_event(event_id="EVT-D2")
+        self._corrupt(self.scheduler_state_path)
+
+        summary = self._summary_after_abort(SchedulerStateError)
+
+        self.assertIs(summary.overall_status, OverallStatus.FAILED)
+        self.assertEqual(summary.exit_code, 2)
+        self.assertIs(summary.component("daily").failure.severity, Severity.CRITICAL)
+
+    def test_the_steps_before_the_abort_keep_their_real_outcomes(self):
+        """The manifest is still a summary of what happened, not just of the
+        crash — that is the property the `finally` exists for."""
+        from scheduler.state import SchedulerStateError
+
+        self._write_event(event_id="EVT-D3")
+        self._corrupt(self.scheduler_state_path)
+
+        summary = self._summary_after_abort(SchedulerStateError)
+        recorded = {c.name: c.status for c in summary.components}
+
+        self.assertEqual(recorded["transport"], ComponentStatus.SUCCESS)
+        self.assertEqual(recorded["collector"], ComponentStatus.SUCCESS)
+        self.assertEqual(recorded["history_filter"], ComponentStatus.SUCCESS)
+
+    def test_the_steps_after_the_abort_are_reported_as_never_started(self):
+        """And `daily` is no longer among them — it started."""
+        from app.runner import PIPELINE_COMPONENTS
+        from scheduler.state import SchedulerStateError
+
+        self._write_event(event_id="EVT-D4")
+        self._corrupt(self.scheduler_state_path)
+
+        summary = self._summary_after_abort(SchedulerStateError)
+        recorded = {c.name for c in summary.components}
+        never_started = [n for n in PIPELINE_COMPONENTS if n not in recorded]
+
+        self.assertNotIn("daily", never_started)
+        self.assertEqual(
+            never_started, ["late_update", "monthly", "backup", "dashboard"]
+        )
+
+    def test_the_backup_control_is_unchanged(self):
+        """Step 7 always called `begin()`. Pinned so the fix is shown to have
+        aligned the other two with it rather than altered it."""
+        from backup.state import BackupStateError
+
+        self._write_event(event_id="EVT-B")
+        self._corrupt(self.backup_state_path)
+
+        summary = self._summary_after_abort(BackupStateError)
+
+        self.assertEqual(self._aborted(summary), ["backup"])
+        self.assertIs(summary.overall_status, OverallStatus.FAILED)
+
+    def test_a_clean_run_still_records_no_abort(self):
+        """The other direction. `begin()` on two more steps must not invent a
+        STEP_ABORTED on a run that finished."""
+        self._write_event(event_id="EVT-OK")
+
+        self._run(notion_sync=self.notion_sync)
+
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+        self.assertEqual(self._aborted(summary), [])
+        self.assertIs(summary.overall_status, OverallStatus.SUCCESS)
+
+    def test_an_unconfigured_notion_still_records_skipped_not_aborted(self):
+        """`begin(C_NOTION_SYNC)` now runs even when `notion_sync is None`.
+        The `skipped()` in the else-branch has to clear it, or every
+        Notion-less deployment would report an abort."""
+        self._write_event(event_id="EVT-NONE")
+
+        self._run(notion_sync=None)
+
+        summary = read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+        self.assertEqual(self._aborted(summary), [])
+        self.assertEqual(
+            summary.component("notion_sync").status, ComponentStatus.SKIPPED
+        )
+        self.assertIs(summary.overall_status, OverallStatus.SUCCESS)
+
+
+class AnUnreadableCollectedFileAbortsAtHistoryFilterTests(RunnerNotionTestCase):
+    """C34 §4: step 4 handles it, step 5 dies on it. Both are correct.
+
+    Step 4b guards its read of a collected Event file and records
+    `NOTION_UNREADABLE`. Step 5 reads the *same* file with no guard at all,
+    eleven lines later. So the guard does not keep the run alive — and the
+    comment beside it used to say it did, with a measurement block:
+
+        run ABORTED: ValueError / Daily files : NONE / backup state: MISSING
+
+    Re-measured on the same scenario, that block is still what happens. The
+    abort simply moved from step 4 to step 5.
+
+    Neither half is a defect to fix:
+
+      * step 5 aborting is BUG-20's deliberate design — History is the
+        CRITICAL record and a file that cannot be read must not be silently
+        dropped from it;
+      * step 4's guard still buys two real things, and this class pins both.
+
+    What it buys is attribution and evidence, not survival:
+
+        the run is charged to `history_filter` (CRITICAL) rather than to
+        `notion_sync` (DEGRADED) — the severity inversion is gone
+        `NOTION_UNREADABLE <file>` reaches the log, naming the file, which
+        step 5's bare traceback never does
+
+    The consequence worth knowing, and pinned here: `Notion Unreadable` on
+    the Dashboard (C33 §1) can only be non-zero from the 4a retry-queue
+    path. A 4b unreadable file kills the run before step 9b writes the row.
+    """
+
+    def _corrupt_after_collection(self):
+        """Corrupt the Event file in the window step 4's guard is for: after
+        the Collector moved it, before Notion Sync reads it back. Reachable
+        on this deployment — `runtime/` sits under OneDrive (docs/11)."""
+        import app.runner as runner_module
+        import collector.runtime as collector_runtime
+
+        original = collector_runtime.run_once
+
+        def corrupting(**kwargs):
+            summary = original(**kwargs)
+            for processed in summary.files:
+                if processed.destination_path and processed.destination_path.is_file():
+                    processed.destination_path.write_bytes(b"\xff\xfe not utf-8")
+            return summary
+
+        runner_module.collector_run_once = corrupting
+        self.addCleanup(setattr, runner_module, "collector_run_once", original)
+
+    def _run_and_read_manifest(self):
+        self._write_event(event_id="EVT-UNREADABLE")
+        self._corrupt_after_collection()
+
+        with self.assertRaises(UnicodeDecodeError):
+            self._run(notion_sync=self.notion_sync)
+
+        return read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+    def test_step_four_records_it_and_does_not_abort(self):
+        summary = self._run_and_read_manifest()
+        notion_sync = summary.component("notion_sync")
+
+        self.assertEqual(notion_sync.status, ComponentStatus.FAILED)
+        self.assertEqual(notion_sync.metrics["unreadable"], 1)
+        self.assertNotEqual(notion_sync.failure.classification, "STEP_ABORTED")
+
+    def test_step_five_is_the_step_that_aborts(self):
+        """The severity inversion the guard removed: a DEGRADED step is no
+        longer recorded as the one that killed the run."""
+        summary = self._run_and_read_manifest()
+        aborted = [
+            c.name
+            for c in summary.components
+            if c.failure and c.failure.classification == "STEP_ABORTED"
+        ]
+
+        self.assertEqual(aborted, ["history_filter"])
+        self.assertIs(
+            summary.component("history_filter").failure.severity, Severity.CRITICAL
+        )
+
+    def test_the_run_still_dies_and_says_so(self):
+        """The half the old comment got wrong. The guard did not keep Daily
+        History or Backup alive, and the manifest must not pretend it did."""
+        summary = self._run_and_read_manifest()
+
+        self.assertIs(summary.overall_status, OverallStatus.FAILED)
+        self.assertEqual(summary.exit_code, 2)
+        self.assertFalse((self.local_master_dir / "daily").exists())
+        self.assertFalse(self.backup_state_path.exists())
+
+    def test_the_operator_is_told_which_file(self):
+        """The other thing the guard genuinely buys. Step 5's traceback names
+        an exception, not a filename."""
+        self._run_and_read_manifest()
+        log = self.notion_sync_log_path.read_text(encoding="utf-8")
+
+        self.assertIn("NOTION_UNREADABLE", log)
+        self.assertIn("EVT-UNREADABLE", log)
+
+    def test_the_dashboard_row_is_never_written_on_this_path(self):
+        """Why `Notion Unreadable` (C33 §1) can only be non-zero from the 4a
+        retry-queue path: step 9b is five steps after the abort."""
+        summary = self._run_and_read_manifest()
+
+        self.assertIsNone(summary.component("dashboard"))
+        self.assertEqual(self.dashboard_transport._pages, {})
+
+    def test_step_five_still_has_no_per_event_guard(self):
+        """BUG-20's characterization, restated where it now matters. If this
+        ever changes, the whole class above needs rewriting — the run would
+        survive and the Dashboard row would appear."""
+        import inspect
+
+        from app import runner
+
+        source = inspect.getsource(runner.run_once)
+        step5 = source[source.index("# 5. History Filter"):source.index("# 6. Daily History")]
+
+        self.assertIn("Event.from_json(", step5)
+        self.assertNotIn("except", step5)
+
+
+# The Scheduler never processes "today" (docs/07), and the shared fixture's
+# default `now` is the day the test Events are dated — so a run at the default
+# renders no Daily at all and every recovery assertion would pass vacuously.
+RUN_ONE = datetime(2026, 8, 2, 9, 0)
+RUN_TWO = datetime(2026, 8, 3, 9, 0)
+
+
+class RerunAfterAbortTests(RunnerNotionTestCase):
+    """C35: what does run N+1 make of run N's leftovers?
+
+    `WholePipelineIdempotencyTests` above covers **success -> rerun**: a
+    second identical run changes nothing that matters. The other half was
+    covered by nothing — **abort -> rerun**, which is the case an operator
+    actually meets, because a scheduled Runner retries on its next trigger
+    whatever happened last time.
+
+    The two halves need different assertions. After a success, the property
+    is "nothing changed". After an abort, run N has already written *some*
+    of its artifacts, and the property is one of exactly two things:
+
+        recovered   run N+1 finishes the work run N started, without
+                    duplicating the part that was already done
+        detected    the work is unrecoverable and something says so —
+                    silence is the failure mode, not the loss
+
+    Each test below aborts one step, then runs a clean second time, and
+    asserts which of the two happened. Measured first, then pinned.
+
+    Why per-step rather than one generic case: each step leaves a different
+    half-state behind. Step 5 leaves a consumed Event with no Candidate
+    (A-20); step 6 leaves a Candidate with no Daily file; step 7 leaves
+    Company History that is not yet backed up. Only step 6 and step 7 are
+    recoverable, and it matters that the tests say which.
+    """
+
+    # ------------------------------------------------------------ helpers
+    def _keepable_event(self, event_id):
+        """An Event the History Filter KEEPs.
+
+        The shared fixture's default is `STARTED`, which docs/05 always
+        DROPs — so a Candidate is never written and every assertion about
+        recovery would pass vacuously.
+        """
+        return self._write_event(
+            event_id=event_id,
+            event_type="MILESTONE_COMPLETED",
+            status="IN_PROGRESS",
+            milestone="M1",
+        )
+
+    def _manifest(self):
+        return read_summary(self.notion_sync_log_path.parent / "last_run.json")
+
+    def _abort_in(self, attribute, exception=RuntimeError("simulated crash")):
+        """Replace one of run_once's step callables with a raise, for one run."""
+        import app.runner as runner_module
+
+        original = getattr(runner_module, attribute)
+
+        def boom(*args, **kwargs):
+            raise exception
+
+        setattr(runner_module, attribute, boom)
+        self.addCleanup(setattr, runner_module, attribute, original)
+        return original
+
+    def _daily_dir(self):
+        return self.local_master_dir / "daily"
+
+    def _daily_event_ids(self):
+        ids = []
+        if self._daily_dir().is_dir():
+            for path in sorted(self._daily_dir().glob("*.md")):
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("- Event ID: "):
+                        ids.append(line[len("- Event ID: ") :])
+        return ids
+
+    def _candidates(self):
+        return sorted(p.stem for p in self.keep_dir.glob("*.json")) \
+            if self.keep_dir.is_dir() else []
+
+    def _commits(self):
+        return len(
+            self._run_git(["log", "--oneline"], cwd=self.backup_working_copy_dir)
+            .strip()
+            .splitlines()
+        )
+
+    # -------------------------------------------------- abort in step 6
+    def test_an_abort_in_daily_is_recovered_by_the_next_run(self):
+        """Run 1 wrote the Candidate and died before rendering it. The
+        Candidate is durable, so run 2 must finish the job."""
+        self._keepable_event("EVT-D6")
+        restore = self._abort_in("scheduler_run_once")
+
+        with self.assertRaises(RuntimeError):
+            self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+
+        self.assertEqual(self._candidates(), ["HIST-EVT-D6"])
+        self.assertEqual(self._daily_event_ids(), [], "nothing rendered yet")
+        self.assertEqual(
+            [c.name for c in self._manifest().components
+             if c.failure and c.failure.classification == "STEP_ABORTED"],
+            ["daily"],
+        )
+
+        import app.runner as runner_module
+        runner_module.scheduler_run_once = restore
+        self._run(notion_sync=self.notion_sync, now=RUN_TWO)
+
+        self.assertIn("EVT-D6", self._daily_event_ids())
+        self.assertIs(self._manifest().overall_status, OverallStatus.SUCCESS)
+
+    def test_that_recovery_does_not_duplicate_the_candidate(self):
+        """Run 1 already wrote it. Re-writing would raise FileExistsError
+        (BUG-10); re-rendering would double the Event in Company History."""
+        self._keepable_event("EVT-D6B")
+        restore = self._abort_in("scheduler_run_once")
+        with self.assertRaises(RuntimeError):
+            self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+
+        import app.runner as runner_module
+        runner_module.scheduler_run_once = restore
+        self._run(notion_sync=self.notion_sync, now=RUN_TWO)
+
+        self.assertEqual(self._candidates(), ["HIST-EVT-D6B"])
+        self.assertEqual(self._daily_event_ids().count("EVT-D6B"), 1)
+
+    # -------------------------------------------------- abort in step 7
+    def test_an_abort_in_backup_leaves_history_intact_and_is_recovered(self):
+        """Company History is written before Backup on purpose. An abort
+        there must cost the backup, never the history."""
+        self._keepable_event("EVT-B7")
+        restore = self._abort_in("backup_run_once")
+
+        with self.assertRaises(RuntimeError):
+            self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+
+        self.assertIn("EVT-B7", self._daily_event_ids())
+        self.assertFalse(self.backup_state_path.exists())
+        before = self._commits()
+
+        import app.runner as runner_module
+        runner_module.backup_run_once = restore
+        self._run(notion_sync=self.notion_sync, now=RUN_TWO)
+
+        self.assertGreater(self._commits(), before, "run 2 must ship the backlog")
+        tracked = self._run_git(["ls-files"], cwd=self.backup_working_copy_dir)
+        self.assertIn("daily/2026-08-01.md", tracked)
+
+    # -------------------------------------------------- abort in step 5
+    def test_an_abort_in_history_filter_is_not_recovered_but_is_detected(self):
+        """A-20's window. The Collector already consumed the Event, so no
+        later run reconsiders it — the Event is gone from Company History
+        for good. The requirement is therefore detection, not recovery."""
+        from history.reconciliation import find_orphaned_events
+
+        self._keepable_event("EVT-H5")
+
+        # The window itself: the Collector moves the file and marks it seen,
+        # then the run dies before step 5 writes the Candidate. Injected at
+        # the Collector boundary rather than inside step 5, because that is
+        # where the irreversible half happens — once `mark_seen()` is saved
+        # and the file has moved out of `incoming/`, no later run
+        # reconsiders the Event.
+        import app.runner as runner_module
+        import collector.runtime as collector_runtime
+        original = collector_runtime.run_once
+
+        def consume_then_die(**kwargs):
+            original(**kwargs)
+            raise RuntimeError("crash between Collector and History Filter")
+
+        runner_module.collector_run_once = consume_then_die
+        self.addCleanup(setattr, runner_module, "collector_run_once", original)
+
+        with self.assertRaises(RuntimeError):
+            self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+
+        runner_module.collector_run_once = original
+        self._run(notion_sync=self.notion_sync, now=RUN_TWO)
+
+        # Not recovered: no Candidate, not in Company History.
+        self.assertEqual(self._candidates(), [])
+        self.assertNotIn("EVT-H5", self._daily_event_ids())
+        # And run 2 reports success, which is why detection has to exist.
+        self.assertIs(self._manifest().overall_status, OverallStatus.SUCCESS)
+
+        # Detected: the reconciler names the Event.
+        result = find_orphaned_events(
+            processed_dir=self.processed_dir,
+            keep_dir=self.keep_dir,
+            review_dir=self.review_dir,
+        )
+        self.assertEqual([o.event_id for o in result.orphaned], ["EVT-H5"])
+
+    def test_an_unreadable_consumed_event_is_reported_separately(self):
+        """The same window with a file that cannot be parsed. "I cannot tell
+        whether this one is missing" is a different statement from "this one
+        is missing", and the reconciler must not conflate them."""
+        from history.reconciliation import find_orphaned_events
+
+        self._keepable_event("EVT-U5")
+        import app.runner as runner_module
+        import collector.runtime as collector_runtime
+        original = collector_runtime.run_once
+
+        def corrupt_then_die(**kwargs):
+            summary = original(**kwargs)
+            for processed in summary.files:
+                if processed.destination_path and processed.destination_path.is_file():
+                    processed.destination_path.write_bytes(b"\xff\xfe")
+            raise RuntimeError("crash after corruption")
+
+        runner_module.collector_run_once = corrupt_then_die
+        self.addCleanup(setattr, runner_module, "collector_run_once", original)
+        with self.assertRaises(RuntimeError):
+            self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+
+        runner_module.collector_run_once = original
+        self._run(notion_sync=self.notion_sync, now=RUN_TWO)
+
+        result = find_orphaned_events(
+            processed_dir=self.processed_dir,
+            keep_dir=self.keep_dir,
+            review_dir=self.review_dir,
+        )
+        self.assertEqual(result.orphaned, ())
+        self.assertEqual([u.event_path.name for u in result.unreadable], ["EVT-U5.json"])
+
+    # -------------------------------------------------- lock left behind
+    def test_a_stale_lock_from_a_dead_run_is_taken_over(self):
+        """A crashed run cannot release its lock. If the next run refused it,
+        every later run would skip — and `run_company_ops.py` returns 0 for a
+        skip, so the scheduler would see success forever."""
+        self.runner_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.runner_lock_path.write_text(
+            json.dumps({"pid": 999999, "acquired_at": "2026-08-01T09:00:00+09:00"}),
+            encoding="utf-8",
+        )
+        self._keepable_event("EVT-LOCK")
+
+        result = self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+
+        self.assertIsNotNone(result, "the run must take over a dead run's lock")
+        self.assertIn("EVT-LOCK", self._daily_event_ids())
+
+    # -------------------------------------------------- manifest honesty
+    def test_the_second_runs_manifest_describes_the_second_run(self):
+        """`runs/last_run.json` is one file. Run N's abort record is replaced
+        by run N+1 — by design, the name says "last run" — so the manifest
+        must never carry a stale component from the aborted run."""
+        self._keepable_event("EVT-M")
+        restore = self._abort_in("backup_run_once")
+        with self.assertRaises(RuntimeError):
+            self._run(notion_sync=self.notion_sync, now=RUN_ONE)
+        self.assertEqual(
+            [c.name for c in self._manifest().components
+             if c.failure and c.failure.classification == "STEP_ABORTED"],
+            ["backup"],
+        )
+
+        import app.runner as runner_module
+        runner_module.backup_run_once = restore
+        self._run(notion_sync=self.notion_sync, now=RUN_TWO)
+
+        summary = self._manifest()
+        self.assertEqual(
+            [c.name for c in summary.components
+             if c.failure and c.failure.classification == "STEP_ABORTED"],
+            [],
+        )
+        self.assertEqual(summary.component("backup").status, ComponentStatus.SUCCESS)
+        self.assertIs(summary.overall_status, OverallStatus.SUCCESS)
+
+
+class SameInstantSkipReachesTheManifestTests(RunnerNotionTestCase):
+    """BACKLOG E-23, made countable without touching either specification.
+
+    Two Signals written for one date with no timestamp of their own get the
+    same midnight (docs/06 §12), so for one project the Late Event guard
+    (docs/04 §29-30) lets only the first reach Notion. Company History keeps
+    both. Neither spec is wrong and neither is changed here — what C40 adds
+    is that the run can now *say* it happened.
+
+    Driven through the real Runner rather than the sync module alone,
+    because the claim is about the Run Manifest an operator reads, not about
+    a return value.
+    """
+
+    STAMP = "2026-08-10T00:00:00+09:00"
+
+    def _two_signals_of_the_same_instant(self):
+        # `MILESTONE_COMPLETED`, not the fixture's default `STARTED`: the
+        # History Filter DROPs STARTED, so a default-typed Event produces no
+        # Candidate and the "Company History keeps both" assertion below
+        # would pass or fail for a reason that has nothing to do with E-23.
+        # Measured while writing it — the first run left `Event Count: 1`.
+        self._write_event(
+            event_id="TIE-RUNNER-1",
+            event_type="MILESTONE_COMPLETED",
+            milestone="first signal of the day",
+            summary="first signal of the day",
+            timestamp=self.STAMP,
+        )
+        self._write_event(
+            event_id="TIE-RUNNER-2",
+            event_type="MILESTONE_COMPLETED",
+            milestone="second signal of the day",
+            summary="second signal of the day",
+            timestamp=self.STAMP,
+        )
+
+    def test_the_manifest_counts_the_skip(self):
+        self._two_signals_of_the_same_instant()
+
+        result = self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 11, 9, 0))
+
+        component = result.summary.component("notion_sync")
+        self.assertEqual(component.status, ComponentStatus.SUCCESS)
+        self.assertEqual(component.metrics["same_instant_skips"], 1)
+
+    def test_an_ordinary_run_carries_no_such_metric(self):
+        """`or None` in the Runner: the number appears only when it happened,
+        so it never becomes a standing `same_instant_skips=0` that a reader
+        learns to scroll past."""
+        self._write_event(event_id="TIE-RUNNER-SOLO", timestamp=self.STAMP)
+
+        result = self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 11, 9, 0))
+
+        component = result.summary.component("notion_sync")
+        self.assertNotIn("same_instant_skips", component.metrics)
+
+    def test_the_reason_reaches_the_notion_log(self):
+        """The existing sink, unchanged: `_log_notion_sync()` writes whenever
+        a result carries an error, and this note is why that condition was
+        widened from status-based in C34."""
+        self._two_signals_of_the_same_instant()
+
+        self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 11, 9, 0))
+
+        log = self.notion_sync_log_path.read_text(encoding="utf-8")
+        self.assertIn("same-instant skip", log)
+        self.assertIn("TIE-RUNNER-2", log)
+
+    def test_the_run_is_still_a_success(self):
+        """The severity claim, pinned. Company History has both Events and
+        the Notion row is a View (docs/14 §1). Turning this into a failure
+        would cry wolf on a run that lost nothing."""
+        self._two_signals_of_the_same_instant()
+
+        result = self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 11, 9, 0))
+
+        self.assertEqual(result.summary.overall_status, OverallStatus.SUCCESS)
+        self.assertEqual(result.summary.exit_code, 0)
+
+    def test_company_history_kept_the_event_notion_dropped(self):
+        """The half that makes the severity judgement true. If this ever
+        stops holding, the metric above is no longer 'a View is behind' — it
+        is data loss, and the severity has to be revisited with it."""
+        self._two_signals_of_the_same_instant()
+
+        self._run(notion_sync=self.notion_sync, now=datetime(2026, 8, 11, 9, 0))
+
+        daily = self.local_master_dir / "daily" / "2026-08-10.md"
+        text = daily.read_text(encoding="utf-8")
+        self.assertIn("TIE-RUNNER-1", text)
+        self.assertIn("TIE-RUNNER-2", text)
 
 
 if __name__ == "__main__":

@@ -1409,15 +1409,21 @@ class NotionPayloadBoundaryTests(unittest.TestCase):
         common = dict(
             run_at=datetime(2026, 8, 5, 11, 0).astimezone(),
             transport_moved=0,
+            transport_blocked=0,
             accepted=0,
             duplicate=0,
             rejected=0,
             failed=0,
             scheduler_status="COMPLETED",
             generated_days=0,
+            reused_days=0,
             backup_status="BACKUP_SUCCESS",
+            deleted_files=0,
             notion_synced=0,
+            notion_skipped=0,
             notion_retried=0,
+            notion_unreadable=0,
+            notion_queued=0,
         )
 
         self.assertEqual(longest(build_ops_run_properties(run_id="R" * 2000, **common)), 2000)
@@ -1426,10 +1432,6 @@ class NotionPayloadBoundaryTests(unittest.TestCase):
         # The default the Runner actually uses is nowhere near the limit.
         default_run_id = common["run_at"].isoformat(timespec="seconds")
         self.assertLess(len(default_run_id), 40)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class WorkingCopyStrayFileTests(unittest.TestCase):
@@ -1982,3 +1984,7 @@ class EventIdForgesDailyMarkdownStructureTests(unittest.TestCase):
             if line.strip().startswith("- Event ID:")
         ]
         self.assertEqual(lines, ["- Event ID: EVT-ORDINARY"])
+
+
+if __name__ == "__main__":
+    unittest.main()

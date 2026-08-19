@@ -113,6 +113,9 @@ def save_queue(path: Path, entries: list[RetryQueueEntry]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
+            # Durability, not only atomicity — see reporter/local_output.py.
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         try:

@@ -117,20 +117,31 @@ def _has_title_property(current_properties: Mapping[str, Any]) -> tuple[bool, st
 
 def diff_properties(
     current_properties: Mapping[str, Any],
+    *,
+    targets: Mapping[str, dict[str, Any]] | None = None,
+    title_property: str | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[PropertyBootstrapReport]]:
     """§4 Spec 비교: 없는 Property만 골라 생성 대상(payload dict)과, 이미
     존재하는 Property의 EXISTS 결과를 돌려준다. CREATED 여부는 실제 생성
     호출 이후에만 확정되므로 이 함수가 직접 보고하지 않는다.
 
-    Title(`Project`)은 여기서 다루지 않는다 — V1.1부터 `_bootstrap_title_property`가
+    Title은 여기서 다루지 않는다 — V1.1부터 `_bootstrap_title_property`가
     전담한다(생성이 아니라 Rename 대상이므로 이 함수의 "없으면 생성" 로직과
     성격이 다르다).
+
+    `targets`/`title_property`는 C36에서 매개변수가 됐다. `notion.dashboard`의
+    `OPS_RUNS`도 같은 질문("어느 Property가 빠져 있는가")을 하게 됐고, 그 답을
+    두 번 쓰는 것이 곧 두 답이 갈라지는 방법이다. 기본값은 §8의 PROJECTS
+    그대로라 기존 호출자는 한 글자도 바뀌지 않는다.
     """
+    targets = TARGET_PROPERTIES if targets is None else targets
+    title_property = TITLE_PROPERTY_NAME if title_property is None else title_property
+
     to_create: dict[str, dict[str, Any]] = {}
     decided: list[PropertyBootstrapReport] = []
 
-    for name, payload in TARGET_PROPERTIES.items():
-        if name == TITLE_PROPERTY_NAME:
+    for name, payload in targets.items():
+        if name == title_property:
             continue
 
         if name in current_properties:
@@ -143,11 +154,13 @@ def diff_properties(
 
 
 def _bootstrap_title_property(
-    client: NotionClient, current_properties: Mapping[str, Any]
+    client: NotionClient,
+    current_properties: Mapping[str, Any],
+    title_property: str | None = None,
 ) -> PropertyBootstrapReport:
     """V1.1 정책 변경(CEO/COO, 이번 Sprint)에 따른 Title 전용 예외 처리.
 
-    - 이미 이름이 `Project`면: 아무 작업도 하지 않고 SKIPPED(작업 3).
+    - 이미 이름이 목표 이름이면: 아무 작업도 하지 않고 SKIPPED(작업 3).
     - 다른 이름(예: `Name`)이면: `rename_property()`로 자동 Rename 시도.
       성공하면 RENAMED.
     - Rename이 실패하면(NotionAPIError) 예외를 여기서 흡수하고 FAILED로
@@ -155,32 +168,38 @@ def _bootstrap_title_property(
       중단 없이 Error 반환").
     - Title Property가 전혀 없는 경우(이론상 발생하지 않음 — Notion이 항상
       정확히 하나를 강제 생성)는 방어적으로 FAILED 처리한다.
+
+    `title_property`가 매개변수인 이유는 `diff_properties()`와 같다 —
+    `OPS_RUNS`의 Title은 `Run ID`이고, 손으로 만든 Database는 Notion이 강제한
+    `Name`을 그대로 갖고 있을 가능성이 높다. Notion API는 두 번째 Title을
+    만들 수 없으므로 그 경우 Rename이 유일한 길이다.
     """
+    title_property = TITLE_PROPERTY_NAME if title_property is None else title_property
     title_exists, title_name = _has_title_property(current_properties)
 
     if not title_exists:
         return PropertyBootstrapReport(
-            TITLE_PROPERTY_NAME,
+            title_property,
             PropertyOutcome.FAILED,
             detail="no Title property found; Notion API cannot add one via update",
         )
 
-    if title_name == TITLE_PROPERTY_NAME:
-        return PropertyBootstrapReport(TITLE_PROPERTY_NAME, PropertyOutcome.SKIPPED)
+    if title_name == title_property:
+        return PropertyBootstrapReport(title_property, PropertyOutcome.SKIPPED)
 
     try:
-        client.rename_property(current_name=title_name, new_name=TITLE_PROPERTY_NAME)
+        client.rename_property(current_name=title_name, new_name=title_property)
     except NotionAPIError as exc:
         return PropertyBootstrapReport(
-            TITLE_PROPERTY_NAME,
+            title_property,
             PropertyOutcome.FAILED,
-            detail=f"rename {title_name!r} -> {TITLE_PROPERTY_NAME!r} failed: {exc}",
+            detail=f"rename {title_name!r} -> {title_property!r} failed: {exc}",
         )
 
     return PropertyBootstrapReport(
-        TITLE_PROPERTY_NAME,
+        title_property,
         PropertyOutcome.RENAMED,
-        detail=f"renamed {title_name!r} -> {TITLE_PROPERTY_NAME!r}",
+        detail=f"renamed {title_name!r} -> {title_property!r}",
     )
 
 

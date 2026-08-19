@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Sequence
 from datetime import date
 from pathlib import Path
 
@@ -72,6 +73,7 @@ from transport import OneDriveTransport  # noqa: E402
 # `redact()`s these strings at the point it builds them; what it does not do
 # is stop one of them ending a line.
 from oplog import one_line  # noqa: E402
+from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -120,7 +122,14 @@ def _resolve_start_date() -> date:
         ) from exc
 
 
-def main() -> int:
+def main(argv: Sequence[str] = ()) -> int:
+    refusal = unexpected_arguments(
+        argv, tool="run_agent.py", configured_by=("COMPANY_OPS_PROFILE", "COMPANY_OPS_AGENT_SYNC_FOLDER", "COMPANY_OPS_AGENT_START_DATE",)
+    )
+    if refusal is not None:
+        print(f"[FAILED] {refusal}", file=sys.stderr)
+        return CONFIG_ERROR_EXIT
+
     try:
         profile = resolve_profile()
         sync_folder = _resolve_sync_folder()
@@ -223,8 +232,16 @@ def main() -> int:
     print(f"last_successful_collection_date = {result.last_successful_collection_date}")
 
     if result.status is AgentStatus.FAILED:
+        # `one_line()`, for the reason the loop above already gives — and it
+        # is the *same strings*. `agent.run_once()` builds this value as
+        # `"; ".join(date_result.errors)` on the failed-date path and as
+        # `_describe_drain_failure(leftover)` (`f"{event_id}: {reason}"`) on
+        # the outbox path. So this line printed, unguarded, the content the
+        # line twenty above guards item by item: half a fix, and the half
+        # that lands inside the `[FAILED]` block an operator reads to decide
+        # whether Events were lost.
         print(
-            f"[FAILED] {result.error}\n"
+            f"[FAILED] {one_line(result.error)}\n"
             f"        Event는 유실되지 않았습니다 — outbox에 남아 있으며 다음 "
             f"실행에서 같은 날짜부터 다시 시도합니다.",
             file=sys.stderr,
@@ -235,4 +252,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv))

@@ -1922,10 +1922,6 @@ class RoleDisplayTableCoverageTests(unittest.TestCase):
                     self.assertTrue(display and display.strip())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RunContractSpecTableTests(unittest.TestCase):
     """docs/14 §7's Overall Status table, read from the spec and compared to
     the code that implements it.
@@ -2010,7 +2006,7 @@ class RunContractSpecTableTests(unittest.TestCase):
 
         table = self._spec_table()
         ops_status = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
-        main = ops_status.split("def main()", 1)[1]
+        main = ops_status.split("def main(", 1)[1]
 
         self.assertEqual(exit_code_for(OverallStatus.DEGRADED), table["DEGRADED"])
         self.assertIn(f"return {table['DEGRADED']}", main)
@@ -2181,3 +2177,7 @@ class BacklogIdCitationsResolveTests(unittest.TestCase):
                     f"| {identifier} |" in backlog,
                     f"{identifier} lost its row in the BACKLOG index",
                 )
+
+
+if __name__ == "__main__":
+    unittest.main()

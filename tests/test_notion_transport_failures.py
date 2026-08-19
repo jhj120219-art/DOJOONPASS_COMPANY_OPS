@@ -28,6 +28,8 @@ No network access: every case is served by `http.server` on an ephemeral
 localhost port, or by a raw socket that accepts and never answers.
 """
 
+import contextlib
+import io
 import socket
 import sys
 import threading
@@ -307,10 +309,6 @@ class CallerContractTests(LocalServerTestCase):
         self.assertEqual(result.status, SyncStatus.NOTION_RETRY_REQUIRED)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BlankConfigurationTests(unittest.TestCase):
     """A configuration value that looks set but is blank.
 
@@ -364,7 +362,14 @@ class BlankConfigurationTests(unittest.TestCase):
         """`run_company_ops.py` used to print a fixed "the variables are
         absent" line. For a blank value that is wrong, and the operator is
         looking straight at the variable in their own `.env` while being
-        told it is missing."""
+        told it is missing.
+
+        Kept as a source check because it pins the *shape* of the message
+        (interpolate the reason, do not restate a guess). What it cannot do
+        is watch the function behave —
+        `BuildNotionClientsDecidesWhatRunsTests::test_a_blank_value_is_reported_as_blank_rather_than_missing`
+        does that, and until C41 nothing did.
+        """
         import importlib.util
 
         path = Path(__file__).resolve().parents[1] / "run_company_ops.py"
@@ -375,3 +380,159 @@ class BlankConfigurationTests(unittest.TestCase):
         source = __import__("inspect").getsource(module._build_notion_clients)
         self.assertIn("{exc}", source)
         self.assertNotIn("NOTION_PROJECTS_DATABASE_ID 없음", source)
+
+
+class BuildNotionClientsDecidesWhatRunsTests(unittest.TestCase):
+    """`run_company_ops.py::_build_notion_clients()` — the one function that
+    decides whether Notion Sync and the Operations Dashboard run at all.
+
+    Three outcomes, from environment variables alone:
+
+        no token / no PROJECTS id      (None, None)      neither runs
+        no NOTION_OPS_RUNS_DATABASE_ID (sync, None)      Sync only
+        all three set                  (sync, dashboard) both run
+
+    **None of them had a behavioural test.** A line-coverage pass that
+    included the root scripts for the first time (C41) put this file at 67%
+    — the worst in the repository — with essentially the whole function
+    unexecuted. What existed instead was `inspect.getsource()` string checks
+    here and in `test_spec_conformance.py`, plus
+    `test_run_company_ops_encoding.py`, which does run it but **in a
+    subprocess** and only to prove the "미설정" line does not crash a cp949
+    console. None of those can see which objects come back.
+
+    Why that matters more than the percentage:
+
+        The middle case is what this deployment takes on every run (docs/13:
+        `NOTION_OPS_RUNS_DATABASE_ID` is unset). If it ever returned a
+        dashboard client instead of None, `record_run()` would write OPS_RUNS
+        rows into whatever database that client held.
+
+        The third case is the one the operator reaches by finishing docs/13
+        §3-⑧. Both clients are built from **one** transport, and the two
+        database ids are the only thing keeping them apart — `record_run()`'s
+        own docstring says "client must be bound to the OPS_RUNS database id
+        ... nothing can check that". This is where it is decided, so this is
+        where it can be checked.
+
+    No network: `RealNotionTransport(api_token=...)` stores the token, and
+    `NotionClient` stores the id — neither connects until a request is made,
+    and none is made here.
+    """
+
+    TOKEN = "ntn_" + "x" * 28  # built at runtime; a literal would trip
+    PROJECTS_DB = "projects-db-id"  # `SecretExposureGuardTests`
+    OPS_RUNS_DB = "ops-runs-db-id"
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "run_company_ops.py"
+        spec = importlib.util.spec_from_file_location("run_company_ops_wiring", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _with_env(self, **values):
+        import os
+
+        keys = (
+            "NOTION_API_TOKEN",
+            "NOTION_PROJECTS_DATABASE_ID",
+            "NOTION_OPS_RUNS_DATABASE_ID",
+        )
+        original = {key: os.environ.get(key) for key in keys}
+
+        def restore():
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        for key in keys:
+            os.environ.pop(key, None)
+        for key, value in values.items():
+            os.environ[key] = value
+
+    def _build(self, **env):
+        self._with_env(**env)
+        module = self._module()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sync, dashboard = module._build_notion_clients()
+        return sync, dashboard, out.getvalue()
+
+    def test_nothing_configured_builds_neither(self):
+        sync, dashboard, printed = self._build()
+
+        self.assertIsNone(sync)
+        self.assertIsNone(dashboard)
+        self.assertIn("Notion 미설정", printed)
+
+    def test_sync_configured_alone_leaves_the_dashboard_off(self):
+        """The case this deployment is in. `None`, not a client pointed at
+        some other database."""
+        sync, dashboard, printed = self._build(
+            NOTION_API_TOKEN=self.TOKEN,
+            NOTION_PROJECTS_DATABASE_ID=self.PROJECTS_DB,
+        )
+
+        self.assertIsNotNone(sync)
+        self.assertIsNone(dashboard)
+        self.assertIn("Operations Dashboard 미설정", printed)
+
+    def test_both_configured_builds_two_clients_on_the_right_databases(self):
+        """The wiring `record_run()` cannot verify for itself."""
+        sync, dashboard, _printed = self._build(
+            NOTION_API_TOKEN=self.TOKEN,
+            NOTION_PROJECTS_DATABASE_ID=self.PROJECTS_DB,
+            NOTION_OPS_RUNS_DATABASE_ID=self.OPS_RUNS_DB,
+        )
+
+        self.assertIsNotNone(sync)
+        self.assertIsNotNone(dashboard)
+        self.assertEqual(dashboard._database_id, self.OPS_RUNS_DB)
+        self.assertEqual(sync._client._database_id, self.PROJECTS_DB)
+
+    def test_the_two_clients_are_never_pointed_at_one_database(self):
+        """The failure this function is the only place that can prevent:
+        an OPS_RUNS row written into PROJECTS, or a project row into
+        OPS_RUNS. They share a transport on purpose; the ids are what keep
+        them apart."""
+        sync, dashboard, _printed = self._build(
+            NOTION_API_TOKEN=self.TOKEN,
+            NOTION_PROJECTS_DATABASE_ID=self.PROJECTS_DB,
+            NOTION_OPS_RUNS_DATABASE_ID=self.OPS_RUNS_DB,
+        )
+
+        self.assertNotEqual(dashboard._database_id, sync._client._database_id)
+
+    def test_a_blank_value_is_reported_as_blank_rather_than_missing(self):
+        """The reason the message interpolates `{exc}` — an operator staring
+        at the variable in their own `.env` must not be told it is absent.
+        The string check this replaces could only see that `{exc}` appears
+        in the source."""
+        sync, dashboard, printed = self._build(
+            NOTION_API_TOKEN="   ",
+            NOTION_PROJECTS_DATABASE_ID=self.PROJECTS_DB,
+        )
+
+        self.assertIsNone(sync)
+        self.assertIsNone(dashboard)
+        self.assertIn("NOTION_API_TOKEN", printed)
+
+    def test_the_token_is_never_printed(self):
+        """docs/04 §40-41. This function is one of the few that holds the
+        token in a local, and it prints on two of its three paths."""
+        _sync, _dashboard, printed = self._build(
+            NOTION_API_TOKEN=self.TOKEN,
+            NOTION_PROJECTS_DATABASE_ID=self.PROJECTS_DB,
+        )
+
+        self.assertNotIn(self.TOKEN, printed)
+
+
+if __name__ == "__main__":
+    unittest.main()

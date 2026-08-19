@@ -622,19 +622,438 @@ class OperationalObservabilityTests(OperationsScenarioTestCase):
             self.assertNotIn(secret_marker, log)
 
 
+class ProductionEntrypointE2ETests(unittest.TestCase):
+    """`python run_company_ops.py` — the command Windows Task Scheduler runs.
+
+    Every other test in this repository calls `app.runner.run_once()` with
+    all nineteen paths passed explicitly. That is the right way to test the
+    pipeline and it is NOT what production does: production runs this script,
+    which passes three paths and lets sixteen defaults come from six other
+    modules' frozen `PROJECT_ROOT` constants (C34 §3). A line-coverage pass
+    including the root scripts found `main()`'s body had never executed —
+    the wiring between the two was covered by nothing.
+
+    It cannot be exercised in place. `_one_runtime_root_or_refuse()` exists
+    precisely to stop `RUNTIME_DIR` being rebound, because doing that once
+    ran a REAL pipeline that advanced the live watermark past History it had
+    written into a temp tree. So the whole repository is COPIED — `src/` and
+    the script — and the copy is run as a subprocess. Both roots then move
+    together, the guard passes for the right reason, and nothing outside the
+    temp directory is touched.
+
+    Notion is left unconfigured, which is also the only Notion state a test
+    may create here: the alternative reaches a real workspace.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.sandbox = Path(cls._tmp.name) / "repo"
+        repo = Path(__file__).resolve().parents[1]
+        shutil.copytree(
+            repo / "src",
+            cls.sandbox / "src",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        shutil.copy2(repo / "run_company_ops.py", cls.sandbox / "run_company_ops.py")
+
+        working_copy = cls.sandbox / "runtime" / "backup_working_copy"
+        working_copy.mkdir(parents=True)
+        bare = Path(cls._tmp.name) / "remote.git"
+        cls._git(["init", "--bare", "-b", "main", str(bare)], Path(cls._tmp.name))
+        cls._git(["init", "-b", "main"], working_copy)
+        cls._git(["config", "user.email", "t@example.invalid"], working_copy)
+        cls._git(["config", "user.name", "Entrypoint E2E"], working_copy)
+        cls._git(["remote", "add", "origin", str(bare)], working_copy)
+        (working_copy / ".gitkeep").write_text("", encoding="utf-8")
+        cls._git(["add", "-A"], working_copy)
+        cls._git(["commit", "-m", "init"], working_copy)
+        cls._git(["push", "-u", "origin", "main"], working_copy)
+        cls.bare = bare
+
+        cls.first = cls._run_entrypoint()
+        cls.second = cls._run_entrypoint()
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        import stat as _stat
+
+        def onexc(func, target, exc):
+            try:
+                Path(target).chmod(_stat.S_IWRITE)
+                func(target)
+            except OSError:
+                pass
+
+        shutil.rmtree(cls._tmp.name, onexc=onexc)
+
+    @classmethod
+    def _git(cls, args, cwd):
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            raise RuntimeError("git %s: %s" % (" ".join(args), result.stderr))
+        return result.stdout
+
+    @classmethod
+    def _environment(cls, *, start_date="2026-08-01"):
+        """The scheduled task's environment, minus everything Notion.
+
+        Unset rather than blanked: `NotionConfig.from_env()` distinguishes
+        the two, and "never set" is the pre-Notion deployment this run is
+        meant to be.
+        """
+        import os
+
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("NOTION_")
+        }
+        env.pop("COMPANY_OPS_HISTORY_START_DATE", None)
+        if start_date is not None:
+            env["COMPANY_OPS_HISTORY_START_DATE"] = start_date
+        env["PYTHONIOENCODING"] = "utf-8"
+        return env
+
+    @classmethod
+    def _run_entrypoint(cls, **kwargs):
+        return subprocess.run(
+            [sys.executable, "run_company_ops.py"],
+            cwd=cls.sandbox,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=cls._environment(**kwargs),
+            timeout=300,
+        )
+
+    def _scheduler_line(self, completed):
+        return next(
+            item
+            for item in completed.stdout.splitlines()
+            if item.startswith("Daily History (Scheduler):")
+        )
+
+    # ---- what the scheduled task actually gets --------------------------
+
+    def test_the_scheduled_task_sees_exit_zero(self):
+        self.assertEqual(self.first.returncode, 0, self.first.stderr)
+
+    def test_an_unconfigured_notion_is_reported_as_information_not_failure(self):
+        """README RULE 9 / docs/11 §18: Company History records before Notion
+        exists, and the message must not read like a fault."""
+        self.assertIn("[INFO]", self.first.stdout)
+        self.assertNotIn("[FAILED]", self.first.stdout)
+        self.assertNotIn("Traceback", self.first.stderr)
+
+    def test_company_history_is_written_under_the_runtime_root(self):
+        daily = sorted(
+            path.name
+            for path in (self.sandbox / "runtime" / "local_master" / "daily").glob("*.md")
+        )
+
+        self.assertIn("2026-08-01.md", daily)
+        self.assertGreater(len(daily), 1)
+
+    def test_the_state_files_land_in_the_same_tree_as_the_history(self):
+        """C34 §3's whole point, asserted from the filesystem. Sixteen of the
+        nineteen paths are module defaults; this is what proves they resolve
+        to the copy's own runtime tree and not to the real repository's."""
+        state = self.sandbox / "runtime" / "state"
+
+        self.assertTrue((state / "daily_history_state.json").is_file())
+        self.assertTrue((state / "backup_state.json").is_file())
+        self.assertTrue((self.sandbox / "runtime" / "runs" / "last_run.json").is_file())
+
+    def test_the_backup_reached_the_remote(self):
+        listed = self._git(["ls-tree", "-r", "--name-only", "main"], self.bare).split()
+
+        self.assertIn("daily/2026-08-01.md", listed)
+
+    def test_the_scheduler_line_is_readable_and_counts_first(self):
+        """AGENT.md §6a-3's instruction is "compare the two numbers", and
+        this is the line it is about — printed by the real entrypoint rather
+        than reconstructed."""
+        line = self._scheduler_line(self.first)
+
+        self.assertNotIn("datetime.date(", line)
+        self.assertRegex(line, r"generated=\d+ \(2026-08-01,")
+
+    def test_a_second_run_adds_nothing_and_still_exits_zero(self):
+        """Idempotency, through the entrypoint rather than through
+        `run_once()`. The second run closes no new dates and must not report
+        a failure for having nothing to do."""
+        self.assertEqual(self.second.returncode, 0, self.second.stderr)
+
+        line = self._scheduler_line(self.second)
+
+        self.assertIn("generated=0", line)
+
+    def test_the_manifest_the_exit_code_came_from_is_on_disk(self):
+        """docs/14 §3: the process's answer and the manifest's must be the
+        same answer. The entrypoint derives its code from the manifest, so
+        the two can only disagree if the manifest is missing."""
+        manifest = json.loads(
+            (self.sandbox / "runtime" / "runs" / "last_run.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        names = {component["name"] for component in manifest["components"]}
+
+        self.assertIn("backup", names)
+        self.assertIn("daily", names)
+
+    def test_the_missing_start_date_gate_stops_the_scheduled_task(self):
+        """The one configuration error this entrypoint can hit, exercised as
+        the scheduled task would: no run, exit 1, and the reason on stderr
+        where a captured log keeps it."""
+        result = self._run_entrypoint(start_date=None)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("COMPANY_OPS_HISTORY_START_DATE", result.stderr)
+
+
+class RestoreThroughTheProductionEntrypointTests(unittest.TestCase):
+    """docs/10 §45's restore, run the way an operator actually runs it.
+
+    C39 measured this through `app.runner.run_once()` with all nineteen paths
+    passed explicitly. That is not the command a restored Desktop 4 executes —
+    Task Scheduler runs `run_company_ops.py`, which passes three and lets
+    sixteen defaults come from six other modules (C34 §3). The restore had
+    never been driven through it, so the one thing an operator does after
+    losing the machine was covered by nothing end to end.
+
+    The scenario is the real one and nothing is faked:
+
+        run 1     an ordinary run builds Company History and pushes it
+        disaster  the ENTIRE `runtime/` tree is deleted — History, state,
+                  working copy, locks
+        restore   `git clone` the backup remote, copy `daily/` back into
+                  Local Master. That is docs/10 §45's procedure, and it
+                  leaves the machine holding a complete Company History with
+                  **no memory of having written it** (`runtime/state/` is
+                  gone), which is the dangerous shape: a run that decided
+                  those days were unwritten would overwrite real History
+                  with empty days and push that to the only copy.
+        run 2     the first run after the restore
+        run 3     and the one after that, to show it settles
+
+    Measured (C43): 17 restored files, **all 17 byte-identical afterwards**,
+    none missing, no new file, watermark forward to the last restored day,
+    remote unchanged, `generated=0 reused=17`, exit 0 throughout.
+    """
+
+    START_DATE = "2026-08-01"
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name)
+        cls.sandbox = cls.tmp / "repo"
+        repo = Path(__file__).resolve().parents[1]
+        shutil.copytree(repo / "src", cls.sandbox / "src",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy2(repo / "run_company_ops.py", cls.sandbox / "run_company_ops.py")
+
+        working_copy = cls.sandbox / "runtime" / "backup_working_copy"
+        working_copy.mkdir(parents=True)
+        cls.bare = cls.tmp / "remote.git"
+        cls._git(["init", "--bare", "-b", "main", str(cls.bare)], cls.tmp)
+        cls._init_working_copy(working_copy)
+        (working_copy / ".gitkeep").write_text("", encoding="utf-8")
+        cls._git(["add", "-A"], working_copy)
+        cls._git(["commit", "-m", "init"], working_copy)
+        cls._git(["push", "-u", "origin", "main"], working_copy)
+
+        cls.first = cls._run()
+        cls.daily_dir = cls.sandbox / "runtime" / "local_master" / "daily"
+        cls.before = {p.name: cls._digest(p) for p in sorted(cls.daily_dir.glob("*.md"))}
+        cls.remote_before = cls._remote_files()
+
+        cls._lose_everything()
+        cls._restore_from_the_remote()
+        cls.restored_count = len(list(cls.daily_dir.glob("*.md")))
+        cls.state_dir_after_restore = (cls.sandbox / "runtime" / "state").exists()
+
+        cls.second = cls._run()
+        cls.after = {p.name: cls._digest(p) for p in sorted(cls.daily_dir.glob("*.md"))}
+        cls.third = cls._run()
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        import stat as _stat
+
+        def onexc(func, target, exc):
+            try:
+                Path(target).chmod(_stat.S_IWRITE)
+                func(target)
+            except OSError:
+                pass
+
+        shutil.rmtree(cls._tmp.name, onexc=onexc)
+
+    # -- scaffolding ------------------------------------------------------
+
+    @classmethod
+    def _git(cls, args, cwd):
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace")
+        if result.returncode != 0:
+            raise RuntimeError("git %s: %s" % (" ".join(args), result.stderr))
+        return result.stdout
+
+    @classmethod
+    def _init_working_copy(cls, path):
+        cls._git(["init", "-b", "main"], path)
+        cls._git(["config", "user.email", "t@example.invalid"], path)
+        cls._git(["config", "user.name", "Restore E2E"], path)
+        cls._git(["remote", "add", "origin", str(cls.bare)], path)
+
+    @classmethod
+    def _digest(cls, path):
+        import hashlib
+
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @classmethod
+    def _remote_files(cls):
+        return sorted(cls._git(["ls-tree", "-r", "--name-only", "main"], cls.bare).split())
+
+    @classmethod
+    def _run(cls):
+        import os
+
+        env = {k: v for k, v in os.environ.items() if not k.startswith("NOTION_")}
+        env["COMPANY_OPS_HISTORY_START_DATE"] = cls.START_DATE
+        env["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.run([sys.executable, "run_company_ops.py"], cwd=cls.sandbox,
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env=env, timeout=300)
+
+    @classmethod
+    def _lose_everything(cls):
+        import shutil
+        import stat as _stat
+
+        def onexc(func, target, exc):
+            try:
+                Path(target).chmod(_stat.S_IWRITE)
+                func(target)
+            except OSError:
+                pass
+
+        shutil.rmtree(cls.sandbox / "runtime", onexc=onexc)
+
+    @classmethod
+    def _restore_from_the_remote(cls):
+        import shutil
+
+        working_copy = cls.sandbox / "runtime" / "backup_working_copy"
+        working_copy.parent.mkdir(parents=True)
+        cls._git(["clone", str(cls.bare), str(working_copy)], cls.tmp)
+        cls._git(["config", "user.email", "t@example.invalid"], working_copy)
+        cls._git(["config", "user.name", "Restore E2E"], working_copy)
+        master = cls.sandbox / "runtime" / "local_master"
+        master.mkdir(parents=True)
+        shutil.copytree(working_copy / "daily", master / "daily")
+
+    def _scheduler_line(self, completed):
+        return next(item for item in completed.stdout.splitlines()
+                    if item.startswith("Daily History (Scheduler):"))
+
+    # -- the premise ------------------------------------------------------
+
+    def test_the_restore_really_left_history_without_a_watermark(self):
+        """If this stops holding, every assertion below is about a different
+        situation than the one docs/10 §45 describes."""
+        self.assertGreater(self.restored_count, 1)
+        self.assertEqual(self.restored_count, len(self.before))
+        self.assertFalse(self.state_dir_after_restore)
+
+    # -- the property that matters ----------------------------------------
+
+    def test_not_one_restored_byte_changes(self):
+        changed = [n for n in self.before if self.after.get(n) != self.before[n]]
+
+        self.assertEqual(changed, [], "restored Company History was rewritten")
+
+    def test_nothing_restored_goes_missing(self):
+        self.assertEqual(sorted(set(self.before) - set(self.after)), [])
+
+    def test_no_empty_day_is_invented_for_a_restored_date(self):
+        self.assertEqual(sorted(set(self.after) - set(self.before)), [])
+
+    def test_the_run_reports_them_as_reused_not_generated(self):
+        """AGENT.md §6a-3's instruction is "compare the two numbers", and a
+        restore is the case it exists for: `reused` large, `generated` zero.
+        The opposite would mean the pipeline was rebuilding History it cannot
+        rebuild (Candidates are not in the backup, docs/08 §26)."""
+        line = self._scheduler_line(self.second)
+
+        self.assertIn("generated=0", line)
+        self.assertRegex(line, r"reused=\d+ \(")
+        self.assertNotIn("datetime.date(", line)
+
+    def test_the_watermark_moves_to_the_last_restored_day(self):
+        state = json.loads(
+            (self.sandbox / "runtime" / "state" / "daily_history_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(
+            state["last_successful_daily_close"],
+            max(name[: -len(".md")] for name in self.after),
+        )
+
+    def test_the_remote_is_not_rewritten(self):
+        self.assertEqual(self._remote_files(), self.remote_before)
+
+    def test_the_restored_run_is_a_clean_success(self):
+        self.assertEqual(self.second.returncode, 0, self.second.stderr)
+        self.assertNotIn("Traceback", self.second.stderr)
+
+    def test_and_it_settles(self):
+        """The run after the restore closes nothing and still exits 0 — a
+        restore that needed a second pass would be a restore that was not
+        finished."""
+        self.assertEqual(self.third.returncode, 0, self.third.stderr)
+        self.assertIn("generated=0", self._scheduler_line(self.third))
+
+
 class LateEventGuardCharacterizationTests(unittest.TestCase):
-    """Audit finding BUG-14.
+    """Audit finding BUG-14 / BUG-29 — FIXED in C32 §7. Was
+    CHARACTERIZATION, now GUARANTEE.
 
     docs/04 sections 29-30's Late Event guard compares
     `datetime.fromisoformat(event.timestamp)` with the stored "Last Updated".
     Notion's date property can legitimately hold a date-only value
-    ("2026-08-05"), which parses to a naive datetime — comparing it with the
-    Event's timezone-aware timestamp raises TypeError.
+    ("2026-08-05") — that is what its date picker writes when no time is
+    chosen — which parses to a naive datetime, and comparing it with the
+    Event's timezone-aware timestamp raised TypeError.
 
     ExecutionPlanSync.sync() only catches NotionAPIError, so the TypeError
-    escapes. app/runner.py's broad handler then records NOTION_FAILED and
-    enqueues the event, which puts it in the same unbounded retry loop as
+    escaped. app/runner.py's broad handler then recorded NOTION_FAILED and
+    enqueued the event, which put it in the same unbounded retry loop as
     BUG-13 — for a condition that retrying can never resolve.
+
+    `_as_comparable_timestamp()` now answers "can these two be compared?"
+    *before* the comparison, and an unreadable stored value gets the same
+    answer the already-existing `current_last_updated is None` branch gives:
+    proceed, and say so on `SyncResult.error`. The structural half below is
+    unchanged and still asserted — the fix is a parse check, not a wider
+    `except`, which would also have hidden a genuine defect in the
+    comparison itself.
     """
 
     def setUp(self):
@@ -665,14 +1084,45 @@ class LateEventGuardCharacterizationTests(unittest.TestCase):
         newer = self.sync.sync(self._event("LG-003", "2026-08-06T10:00:00+09:00"))
         self.assertIs(newer.status, SyncStatus.NOTION_UPDATED)
 
-    def test_date_only_last_updated_raises_a_typeerror_out_of_sync(self):
+    def test_a_date_only_last_updated_no_longer_escapes_sync(self):
         self.sync.sync(self._event("LG-004", "2026-08-05T10:00:00+09:00"))
 
         page = list(self.transport._pages.values())[0]
         page["properties"]["Last Updated"] = {"date": {"start": "2026-08-05"}}
 
-        with self.assertRaises(TypeError):
-            self.sync.sync(self._event("LG-005", "2026-08-06T10:00:00+09:00"))
+        result = self.sync.sync(self._event("LG-005", "2026-08-06T10:00:00+09:00"))
+
+        self.assertIs(result.status, SyncStatus.NOTION_UPDATED)
+        self.assertIn("Late Event guard skipped", result.error or "")
+
+    def test_the_event_does_not_land_in_the_unbounded_retry_loop(self):
+        """BUG-14's actual damage. `NOTION_FAILED` carries retryability
+        UNKNOWN and parks the Event in the retry queue, where it fails
+        identically on every run because retrying cannot change a stored
+        date."""
+        self.sync.sync(self._event("LG-006", "2026-08-05T10:00:00+09:00"))
+        page = list(self.transport._pages.values())[0]
+        page["properties"]["Last Updated"] = {"date": {"start": "2026-08-05"}}
+
+        result = self.sync.sync(self._event("LG-007", "2026-08-06T10:00:00+09:00"))
+
+        from app.runner import _FAILED_SYNC_STATUSES
+
+        self.assertNotIn(result.status, _FAILED_SYNC_STATUSES)
+
+    def test_the_next_event_finds_a_comparable_value_again(self):
+        """Self-healing, which is why proceeding beats refusing: the update
+        writes a well-formed `Last Updated`, so the guard is back on for the
+        Event after it."""
+        self.sync.sync(self._event("LG-008", "2026-08-05T10:00:00+09:00"))
+        page = list(self.transport._pages.values())[0]
+        page["properties"]["Last Updated"] = {"date": {"start": "2026-08-05"}}
+        self.sync.sync(self._event("LG-009", "2026-08-06T10:00:00+09:00"))
+
+        late = self.sync.sync(self._event("LG-010", "2026-08-04T10:00:00+09:00"))
+
+        self.assertIs(late.status, SyncStatus.NOTION_SKIPPED_OLD_EVENT)
+        self.assertIsNone(late.error)
 
     def test_sync_only_guards_against_notion_api_error(self):
         """The structural reason the TypeError escapes."""

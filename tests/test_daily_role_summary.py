@@ -161,10 +161,6 @@ class AgreementWithTheDailyFileTests(unittest.TestCase):
         self.assertFalse(summary.for_role("COO").has_activity)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class MixedOffsetOrderingTests(unittest.TestCase):
     """Company History must be ordered by when things happened, not by how
     the timestamp happens to spell.
@@ -412,3 +408,7 @@ class NoProductionCallerTests(unittest.TestCase):
         self.assertEqual(
             set(summary.silent_roles), set(ROLE_ORDER) - {"COO"}
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

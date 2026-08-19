@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 
 from .repository import HistoryRepository
-from .result import HistoryCandidate, HistoryDecision
+from .result import HistoryCandidate, HistoryDecision, candidate_errors
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_KEEP_DIR = PROJECT_ROOT / "runtime" / "history_candidates" / "keep"
@@ -45,6 +45,30 @@ INCOMPLETE_WRITE_PREFIX = ".tmp-"
 def is_incomplete_write(name: str) -> bool:
     """Whether `name` is an atomic writer's staging file, not a finished artifact."""
     return name.startswith(INCOMPLETE_WRITE_PREFIX)
+
+
+class HistoryCandidateError(ValueError):
+    """A stored Candidate file that cannot be turned into a HistoryCandidate.
+
+    Carries the path, because that is the whole point of it existing. Before
+    it, the same condition surfaced as a bare `KeyError('summary')` or, worse,
+    as a `TypeError` thrown by the Markdown renderer three steps later —
+    measured, `sequence item 2: expected str instance, int found`, which
+    reached the Run Manifest's `reason` and `daily_late_update.log` naming
+    neither the file nor the field.
+
+    `ValueError` subclass on purpose, so every caller that already writes
+    `except ValueError` around a repository read keeps catching it —
+    `scheduler._generate_pending_dates()` wraps `repository.list()` in
+    `except Exception` and turns it into `SchedulerRunResult(FAILED, error=...)`,
+    which is how this message reaches the operator. Same relationship
+    `monthly.parser.DailyParseError` has to its own readers.
+    """
+
+    def __init__(self, path, errors):
+        self.path = path
+        self.errors = list(errors)
+        super().__init__(f"unusable history candidate: {path} ({'; '.join(self.errors)})")
 
 
 def safe_candidate_filename(history_id: str) -> str:
@@ -120,6 +144,9 @@ class FileHistoryRepository(HistoryRepository):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(candidate.to_dict(), handle, ensure_ascii=False, indent=2)
+                # Durability, not only atomicity — see reporter/local_output.py.
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(tmp_path, final_path)
         except BaseException:
             try:
@@ -129,14 +156,42 @@ class FileHistoryRepository(HistoryRepository):
             raise
         return True
 
+    def _candidate_from(self, path: Path) -> HistoryCandidate:
+        """Parse one stored Candidate, or raise naming the file.
+
+        Every failure mode of this read used to reach the caller as something
+        that did not say where it came from: a `JSONDecodeError` (BUG-38), a
+        `KeyError` for a missing field, or — for a wrong-typed field —
+        nothing at all here, because `from_dict()` type-checks nothing and the
+        Markdown renderer is what eventually died.
+
+        The validation is `result.candidate_errors()`, shared with
+        `ops_status._read_keep_candidates()` so the status view and the
+        pipeline cannot disagree about which files are usable. It is
+        deliberately the blocking set only — see that function.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            raise HistoryCandidateError(path, [f"could not read file ({exc})"]) from exc
+        try:
+            data = json.loads(text)
+        except (ValueError, RecursionError) as exc:
+            raise HistoryCandidateError(path, [f"not valid JSON ({exc})"]) from exc
+        if not isinstance(data, dict):
+            raise HistoryCandidateError(path, ["candidate must be a JSON object"])
+        errors = candidate_errors(data)
+        if errors:
+            raise HistoryCandidateError(path, errors)
+        return HistoryCandidate.from_dict(data)
+
     def get(self, history_id: str) -> HistoryCandidate | None:
         for directory in (self.keep_dir, self.review_dir):
             # Must derive the name the same way save() does, or a sanitised
             # candidate would be unreachable by its own history_id.
             path = directory / safe_candidate_filename(history_id)
             if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return HistoryCandidate.from_dict(data)
+                return self._candidate_from(path)
         return None
 
     def list(self, decision: HistoryDecision | None = None) -> list[HistoryCandidate]:
@@ -166,6 +221,5 @@ class FileHistoryRepository(HistoryRepository):
                     # returns the *same* Candidate twice, once under its real
                     # name and once under the staging name.
                     continue
-                data = json.loads(path.read_text(encoding="utf-8"))
-                results.append(HistoryCandidate.from_dict(data))
+                results.append(self._candidate_from(path))
         return results

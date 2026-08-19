@@ -164,7 +164,9 @@ def _is_sole_identifier(indexed: list[tuple[int, str]]) -> bool:
     """Whether the block's first bullet carries its only `Event ID:`.
 
     The one thing that overrides the order rule in `_first_bullet()` — see
-    there. Mirrors `daily/markdown._is_sole_identifier()`.
+    there. Mirrors `daily/markdown._is_sole_identifier()`, and
+    `DuplicatedRulesStayInStepTests` holds the two to the same answers
+    (C38 — the mirror was asserted in prose only).
     """
     if not indexed[0][1].startswith(_EVENT_ID_LABEL):
         return False
@@ -383,6 +385,26 @@ def parse_daily_markdown(
     # one item, and a forged line (BUG-11/27) inflates it too. Over-counting
     # in those directions is the safe way round — this number never claims a
     # loss that is not at least a discrepancy worth opening the file for.
+    #
+    # A second, known inflation IS left in, and it is worth naming because it
+    # fires on an ordinary day. `daily/markdown.render_daily_markdown()`
+    # repeats every candidate's summary RAW in `## Summary` — no `- ` of its
+    # own — so a summary that is itself a bullet lands there as a bare line
+    # spelling a label. Measured, one ordinary KEEP Candidate:
+    #
+    #     summary 'Event ID: L1'      items 1   unconsolidated 0
+    #     summary '- Event ID: L1'    items 1   unconsolidated 1
+    #
+    # The second is a false `MONTHLY_UNCONSOLIDATED`, repeated on every
+    # rebuild of that month. The same line cost the Daily side a real Event —
+    # `late_events.existing_event_ids()` read it as §38's record that L1 was
+    # already present — and there it is fixed, because there the failure was
+    # data loss. Here it is a false alarm, and the narrowing that would remove
+    # it (count only lines inside `### ` blocks) is exactly what would blind
+    # the early-ended-section case above. Over-counting stays the safe side;
+    # BACKLOG carries the candidate fix and
+    # `ParserTests::test_a_bullet_shaped_summary_inflates_the_unconsolidated_count`
+    # pins today's numbers so the trade-off cannot change unnoticed.
     #
     # One inflation is *not* left in, because it is not a discrepancy at all:
     # a summary reading `Event ID: measured it.` is a line this function has

@@ -266,6 +266,9 @@ def write_summary(path: Path, summary: RunSummary) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(summary.to_json())
+                # Durability, not only atomicity — see reporter/local_output.py.
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(tmp_path, path)
         except BaseException:
             try:

@@ -286,6 +286,9 @@ def consolidate_month(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(markdown)
+                # Durability, not only atomicity — see reporter/local_output.py.
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(tmp_path, final_path)
         except BaseException:
             try:

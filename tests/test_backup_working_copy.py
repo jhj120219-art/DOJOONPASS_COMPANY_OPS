@@ -1,3 +1,4 @@
+import shutil
 import sys
 import tempfile
 import unittest
@@ -146,6 +147,178 @@ class SyncToWorkingCopyTests(unittest.TestCase):
 
         self.assertEqual(result.added, ())
         self.assertFalse((self.working_copy_dir / "decisions").exists())
+
+
+class RelativeFilesWalkTests(unittest.TestCase):
+    """The scandir walk and the `rglob` form it replaced must agree exactly.
+
+    `_relative_files()` is the listing three different things depend on: the
+    sync's `added`/`modified`, the deletion gate's `deleted` (docs/08
+    §43-47), and — since C45 — `ops_status._history_gone_from_local_master()`.
+    A faster walk that returns a *slightly* different set would move the
+    deletion gate, which is the one gate in this project that stops a backup
+    outright.
+
+    So the previous implementation is kept beside it as
+    `_relative_files_by_rglob()` and this class runs both over a tree built
+    to break them apart: out-of-scope siblings, a `.git` directory, nesting,
+    staging residue, a directory wearing a `.md` name, a *file* named `daily`
+    at the root, unicode, and (where the OS allows it) symlinks in every
+    position that matters.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def _both(self):
+        from backup.working_copy import _relative_files, _relative_files_by_rglob
+
+        return _relative_files(self.root), _relative_files_by_rglob(self.root)
+
+    def _assert_agree(self):
+        fast, oracle = self._both()
+        self.assertEqual(fast, oracle)
+        return fast
+
+    def _write(self, rel, body="x"):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def _adversarial_tree(self):
+        self._write("daily/2026-08-01.md")
+        self._write("daily/2026-08-02.md")
+        self._write("monthly/2026-08.md")
+        # nested under an in-scope directory
+        self._write("daily/notes/deep/inner.md")
+        # staging residue on both sides
+        self._write("daily/.tmp-abandoned.md")
+        self._write("monthly/.tmp-abandoned.md")
+        # out of scope, in every shape
+        self._write("decisions/2026-08-01.md")
+        self._write("README.md")
+        self._write(".gitkeep", "")
+        self._write(".git/objects/ab/cdef", "loose object")
+        self._write(".git/HEAD", "ref: refs/heads/main")
+        self._write("Daily/2026-08-03.md")  # case-folded sibling (BUG-55)
+        self._write("daily/한글.md")
+        # a directory wearing a day's name
+        (self.root / "daily" / "2026-08-09.md").mkdir(parents=True)
+        # an empty in-scope directory
+        (self.root / "monthly" / "empty").mkdir(parents=True)
+
+    def test_the_two_walks_agree_on_an_adversarial_tree(self):
+        self._adversarial_tree()
+
+        found = self._assert_agree()
+
+        self.assertIn(str(Path("daily") / "2026-08-01.md"), found)
+        self.assertIn(str(Path("daily") / "notes" / "deep" / "inner.md"), found)
+        self.assertIn(str(Path("monthly") / "2026-08.md"), found)
+        self.assertNotIn(str(Path("daily") / ".tmp-abandoned.md"), found)
+        self.assertNotIn("README.md", found)
+        self.assertNotIn(str(Path(".git") / "HEAD"), found)
+        self.assertNotIn(str(Path("decisions") / "2026-08-01.md"), found)
+
+    def test_a_file_named_like_a_scope_directory_is_not_pruned(self):
+        """`_is_in_scope("daily")` is True — `parts[0]` is `daily` and the
+        basename is not a staging name. Pruning by name alone would have
+        dropped it, which is a behaviour change hidden inside a speed-up."""
+        self._write("daily2", "not a directory")   # out of scope
+        (self.root / "daily").mkdir()
+        (self.root / "daily").rmdir()
+        self._write("daily", "a file, not a directory")
+        self._write("monthly/2026-08.md")
+
+        found = self._assert_agree()
+
+        self.assertIn("daily", found)
+        self.assertNotIn("daily2", found)
+
+    def test_an_empty_root_agrees(self):
+        self._assert_agree()
+
+    def test_a_missing_root_agrees(self):
+        from backup.working_copy import _relative_files, _relative_files_by_rglob
+
+        missing = self.root / "not-here"
+
+        self.assertEqual(_relative_files(missing), set())
+        self.assertEqual(_relative_files(missing), _relative_files_by_rglob(missing))
+
+    def test_a_root_that_is_a_file_agrees(self):
+        from backup.working_copy import _relative_files, _relative_files_by_rglob
+
+        path = self.root / "plain.txt"
+        path.write_text("x", encoding="utf-8")
+
+        self.assertEqual(_relative_files(path), set())
+        self.assertEqual(_relative_files(path), _relative_files_by_rglob(path))
+
+    def test_symlinks_are_refused_in_both_walks(self):
+        """The property the fast walk must not lose: a link is never followed
+        and never listed, whether it names a file or a directory. Skipped
+        where the OS will not let this process create one."""
+        self._write("daily/2026-08-01.md")
+        outside = self.root.parent / "outside-target.md"
+        outside.write_text("secret", encoding="utf-8")
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        outside_dir = self.root.parent / "outside-dir"
+        outside_dir.mkdir(exist_ok=True)
+        (outside_dir / "inner.md").write_text("secret", encoding="utf-8")
+        self.addCleanup(shutil.rmtree, outside_dir, True)
+
+        try:
+            (self.root / "daily" / "linked.md").symlink_to(outside)
+            (self.root / "daily" / "linked-dir").symlink_to(
+                outside_dir, target_is_directory=True
+            )
+            (self.root / "monthly").mkdir(exist_ok=True)
+            (self.root / "linked-scope").symlink_to(outside_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        found = self._assert_agree()
+
+        self.assertEqual(found, {str(Path("daily") / "2026-08-01.md")})
+
+    def test_a_top_level_symlink_named_like_a_scope_directory_is_refused(self):
+        """The one the pruning could have got wrong: a link named `daily`
+        pointing outside would have had its target's files listed as Company
+        History if the walk followed it."""
+        outside_dir = self.root.parent / "outside-daily"
+        outside_dir.mkdir(exist_ok=True)
+        (outside_dir / "2026-01-01.md").write_text("elsewhere", encoding="utf-8")
+        self.addCleanup(shutil.rmtree, outside_dir, True)
+
+        try:
+            (self.root / "daily").symlink_to(outside_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+        self.assertEqual(self._assert_agree(), set())
+
+    def test_the_sync_and_the_gate_still_see_the_same_thing(self):
+        """End of the chain: the numbers the fast walk feeds are the ones the
+        deletion gate and the status view act on."""
+        from backup.working_copy import sync_to_working_copy
+
+        master = self.root / "master"
+        copy = self.root / "copy"
+        (master / "daily").mkdir(parents=True)
+        (copy / "daily").mkdir(parents=True)
+        (master / "daily" / "2026-08-02.md").write_text("b", encoding="utf-8")
+        (copy / "daily" / "2026-08-01.md").write_text("a", encoding="utf-8")
+        (copy / ".git").mkdir()
+        (copy / ".git" / "HEAD").write_text("ref", encoding="utf-8")
+
+        result = sync_to_working_copy(master, copy)
+
+        self.assertEqual(result.deleted, (str(Path("daily") / "2026-08-01.md"),))
+        self.assertEqual(result.added, (str(Path("daily") / "2026-08-02.md"),))
 
 
 class LongPathBoundaryTests(unittest.TestCase):

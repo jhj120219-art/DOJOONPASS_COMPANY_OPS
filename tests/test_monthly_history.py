@@ -17,6 +17,7 @@ which is what §14/§30/§64/§65 require and what markdown.py documents.
 """
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -24,6 +25,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# The repository root too: this file imports a root-level script
+# (`ops_status.py` and friends live beside `src/`, not in it). Under
+# pytest the rootdir is already on `sys.path`, so the omission only
+# surfaced once `python tests/<file>.py` started running the whole
+# file instead of stopping at a stray `unittest.main()` (C38).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from daily import generate_daily_history, update_daily_history  # noqa: E402
 from history import HistoryCandidate, HistoryDecision  # noqa: E402
@@ -321,7 +328,72 @@ class ParserTests(unittest.TestCase):
         is visible rather than inferred from two files."""
         from daily.late_events import existing_event_ids
 
-        self.assertEqual(existing_event_ids("- Event ID: \n"), {""})
+        body = (
+            "# H\n\n## Milestones\n\n"
+            "### P\n\n- Real work happened.\n- Owner: COO\n- Event ID: \n"
+        )
+
+        self.assertEqual(existing_event_ids(body), {""})
+
+    def test_a_bullet_shaped_summary_inflates_the_unconsolidated_count(self):
+        """CHARACTERIZATION — asserts today's behaviour, deliberately.
+
+        The other half of `test_daily_late_events.py::
+        OnlyItemBlocksCarryLabelsTests`. `render_daily_markdown()` repeats
+        every summary RAW in `## Summary`, so a summary of `- Event ID: L1`
+        lands there as a bare line that spells a label. The Daily side read
+        it as one and lost a real late Event (fixed there); this side counts
+        it, and the count is what `MONTHLY_UNCONSOLIDATED` reports.
+
+        Measured, one ordinary KEEP Candidate, four summaries:
+
+            'Shipped it.'      items 1   unconsolidated 0
+            'Event ID: L1'     items 1   unconsolidated 0   <- prose rule
+            '- Event ID: L1'   items 1   unconsolidated 1   <- this
+            '- Owner: COO'     items 1   unconsolidated 0
+
+        So the operator is told to open a Daily file that lost nothing, on
+        every rebuild of that month, forever.
+
+        Left as it is on purpose. This counter deliberately scans the WHOLE
+        document rather than the sections it walked — that is what catches a
+        section that ended early, taking innocent Events with it — and its
+        own contract says over-counting is the safe direction. Narrowing it
+        to `### ` blocks (the fix used on the Daily side, where the failure
+        was *data loss* rather than a false alarm) would trade a real
+        guarantee for precision. BACKLOG records the candidate fix; if this
+        test starts failing, that decision was made and BACKLOG must say so.
+        """
+        from daily.markdown import render_daily_markdown
+
+        measured = {}
+        for summary in ("Shipped it.", "Event ID: L1", "- Event ID: L1", "- Owner: COO"):
+            document = self._daily(
+                render_daily_markdown(
+                    date(2026, 8, 5),
+                    [
+                        HistoryCandidate(
+                            history_id="HIST-E1", event_id="E1",
+                            timestamp="2026-08-05T10:00:00+09:00",
+                            category="MILESTONE", project_id="P", role="COO",
+                            summary=summary, evidence=(),
+                            filter_result=HistoryDecision.KEEP,
+                        )
+                    ],
+                    "g",
+                )
+            )
+            measured[summary] = (len(document.items), document.unconsolidated)
+
+        self.assertEqual(
+            measured,
+            {
+                "Shipped it.": (1, 0),
+                "Event ID: L1": (1, 0),
+                "- Event ID: L1": (1, 1),
+                "- Owner: COO": (1, 0),
+            },
+        )
 
     def test_an_item_block_with_no_summary_bullet_is_dropped_and_counted(self):
         """The remaining `summary is None` drop, which nothing executed.
@@ -1413,10 +1485,6 @@ class MonthlyIsNotNotionTests(unittest.TestCase):
             self.assertNotIn(judgement, rendered_sections)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class StateLagsTheMonthlyFileTests(MonthlyTestCase):
     """A Monthly file exists for a month the state says is still open.
 
@@ -1716,6 +1784,123 @@ class LabelNamedSummaryTests(unittest.TestCase):
                 self.assertEqual(mine, set() if index is None else {index})
 
 
+class CoverageCanBeTrimmedAtTheBackTests(unittest.TestCase):
+    """`check_coverage(today=...)` — declared, documented, and passed by
+    nobody.
+
+    Found by an AST sweep of every keyword-only parameter in `src/` against
+    every call site in `src/`, the root entrypoints and the whole test suite
+    (C43). 275 parameters, 17 that no production caller passes, and **two
+    that nothing anywhere passes**. This is one of them; the other is
+    `agent.status.needs_attention(stale_after_days=)`.
+
+    That matters here more than "unused code" usually does, because this
+    parameter trims the set of days a month is **expected** to have — the set
+    `consolidate_month()` compares against what is on disk to decide whether
+    a month is complete enough to consolidate at all (docs/09 §10/§39). A
+    caller who started passing it could make an incomplete month look
+    complete, and no test would have noticed.
+
+    Not removed: deleting a documented capability is a decision, and this
+    repository already keeps one such case on record rather than taking it
+    (`notion.dashboard_pending.remove_pending()`, BACKLOG B-7). Exercised
+    instead, so the capability is known to work and so the first real caller
+    inherits a test rather than a surprise.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.daily = self.root / "daily"
+        self.daily.mkdir()
+
+    def _write(self, *days):
+        for day in days:
+            (self.daily / f"{day}.md").write_text("# d\n", encoding="utf-8")
+
+    def test_without_it_a_month_in_progress_is_incomplete(self):
+        """The behaviour every caller gets today."""
+        self._write("2026-08-01", "2026-08-02")
+
+        coverage = check_coverage(self.daily, 2026, 8)
+
+        self.assertFalse(coverage.is_complete)
+        self.assertEqual(len(coverage.missing_dates), 29)
+
+    def test_with_it_the_same_month_reads_complete(self):
+        """What the parameter does, stated as an assertion rather than as a
+        docstring sentence."""
+        self._write("2026-08-01", "2026-08-02")
+
+        coverage = check_coverage(self.daily, 2026, 8, today=date(2026, 8, 2))
+
+        self.assertTrue(coverage.is_complete)
+        self.assertEqual(coverage.missing_dates, ())
+        self.assertEqual(len(coverage.present_dates), 2)
+
+    def test_it_still_reports_a_hole_inside_the_trimmed_range(self):
+        """Trimming the back must not trim the middle — a gap before `today`
+        is still a gap, which is the property that makes the parameter safe
+        at all."""
+        self._write("2026-08-01", "2026-08-03")
+
+        coverage = check_coverage(self.daily, 2026, 8, today=date(2026, 8, 3))
+
+        self.assertFalse(coverage.is_complete)
+        self.assertEqual([d.isoformat() for d in coverage.missing_dates], ["2026-08-02"])
+
+    def test_it_composes_with_the_front_trim(self):
+        """Both ends at once, since `history_start_date` is the one every
+        production caller does pass."""
+        self._write("2026-08-05", "2026-08-06")
+
+        coverage = check_coverage(
+            self.daily, 2026, 8,
+            history_start_date=date(2026, 8, 5), today=date(2026, 8, 6),
+        )
+
+        self.assertTrue(coverage.is_complete)
+        self.assertTrue(coverage.starts_mid_month)
+
+    def test_no_production_caller_passes_it(self):
+        """The premise, from the source. If this starts failing, a caller
+        appeared and the tests above stopped being characterization —
+        BACKLOG must then say who calls it and why."""
+        import ast
+
+        repo = Path(__file__).resolve().parents[1]
+        sources = [p for p in (repo / "src").rglob("*.py") if "__pycache__" not in str(p)]
+        sources += [
+            repo / name
+            for name in ("ops_status.py", "run_company_ops.py", "run_agent.py")
+        ]
+
+        callers = []
+        for path in sources:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and any(
+                    keyword.arg == "today" for keyword in node.keywords
+                ):
+                    callers.append(str(path.relative_to(repo)))
+
+        self.assertEqual(callers, [])
+
+    def test_a_month_in_progress_is_kept_out_by_a_different_rule(self):
+        """And why the dead parameter is not a hole: what stops the current
+        month being consolidated is `pending_months()`'s calendar arithmetic
+        (docs/09 §49), not this trim."""
+        from monthly.generator import pending_months
+
+        months = pending_months(
+            last_successful_monthly_close=None,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 8, 20, 12, 0),
+        )
+
+        self.assertEqual(months, [])
+
+
 class RendererParserFuzzTests(unittest.TestCase):
     """Seeded fuzz over renderer -> parser. The enumerated cases above cover
     the shapes someone thought of; this looks for the ones nobody did.
@@ -1742,6 +1927,7 @@ class RendererParserFuzzTests(unittest.TestCase):
         "Shipped it.", "Fixed: login token refresh loop.", "Note: paused.",
         "한글 요약입니다.", "A" * 300, "a", "- leading dash", "## prose hash",
         "tabs\tinside", "  spaced  ", "Resolved #1234 — duplicate charge.",
+        "- Event ID: E0", "- Owner: COO",
         "Owner: measured it.", "Event ID: measured it.", "Category: measured it.",
         "Decision Context: measured it.", "Expected Outcome: measured it.",
         "Actual Outcome: measured it.", "Lessons Learned: measured it.",
@@ -2266,3 +2452,7 @@ class MonthlyShortfallHasTwoCausesTests(MonthlyTestCase):
         self.assertIn("다시 만들어도 같은 결과", source)
         self.assertIn("복구된다", source)
         self.assertIn("둘 중 어느 쪽인지는", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

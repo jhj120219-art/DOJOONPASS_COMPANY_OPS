@@ -42,6 +42,7 @@ import sys
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
+from typing import Mapping, NamedTuple, Sequence
 
 # `line_buffering=True` keeps this script's own output in the order it was
 # written. Python block-buffers stdout when it is not a terminal and leaves
@@ -61,7 +62,8 @@ from agent.status import read_status  # noqa: E402
 from app.desktop_activity import read_company_activity  # noqa: E402
 from app.runner import DEFAULT_RUN_SUMMARY_PATH, PIPELINE_COMPONENTS  # noqa: E402
 from backup.state import BackupStateError  # noqa: E402
-from daily.markdown import summary_line_indices  # noqa: E402
+from daily.markdown import item_block_bounds, summary_line_indices  # noqa: E402
+from daily.late_events import existing_event_ids  # noqa: E402
 from backup.state import load_state as load_backup_state  # noqa: E402
 from backup.working_copy import scan_for_secrets  # noqa: E402
 
@@ -73,9 +75,36 @@ from backup.working_copy import _looks_like_secret  # noqa: E402
 # The scope set the Backup gate enforces, imported rather than restated so a
 # third scope directory is diagnosed without editing this file.
 from backup.working_copy import _ALLOWED_TOP_LEVEL_DIRS  # noqa: E402
+
+# The gate's own listing, for the same reason as the two above. `deleted` in
+# `sync_to_working_copy()` is literally `_relative_files(working_copy) -
+# _relative_files(master)`, so asking it here is not a second opinion about
+# which files count as Company History — it is the same question, asked
+# read-only. Anything else (a `glob("*.md")` of my own) would drift from the
+# scope, symlink and `.tmp-` rules that function already applies.
+from backup.working_copy import _relative_files  # noqa: E402
 from history.file_repository import is_incomplete_write  # noqa: E402
+from history.result import candidate_errors  # noqa: E402
 from history.reconciliation import find_orphaned_events  # noqa: E402
+
+# The field->label pairing `review_cli.py` prompts with and
+# `daily/markdown.py` renders with. Imported rather than restated so
+# `_reviewed_but_not_rendered()` asks exactly what the renderer answers —
+# the same rule `_kept_but_not_rendered()` follows for the Event ID line.
+from review_cli import _REVIEW_FIELDS  # noqa: E402
+
+# The two Notion queues. `notion` imports only `events`
+# (LayeringInvariantTests), so reading them from here adds no cycle — and
+# their loaders are the same ones the Runner uses, not a second parser.
+from notion.dashboard_pending import DashboardPendingError  # noqa: E402
+from notion.dashboard_pending import load_pending as load_dashboard_pending  # noqa: E402
+from notion.retry_queue import RetryQueueError  # noqa: E402
+from notion.retry_queue import load_queue as load_notion_retry_queue  # noqa: E402
 from monthly import MonthlyStateError, monthly_history_path  # noqa: E402
+
+# The parser Monthly consolidates with, so "an item" means the same thing
+# here as it does there — see `_monthly_lags_its_daily_source()`.
+from monthly.parser import read_daily_document  # noqa: E402
 from monthly import load_state as load_monthly_state  # noqa: E402
 from runsummary import (  # noqa: E402
     ComponentStatus,
@@ -88,7 +117,20 @@ from scheduler.consistency import (  # noqa: E402
     ConsistencyStatus,
     check_state_consistency,
 )
-from oplog import one_line  # noqa: E402
+from oplog import one_line, redact  # noqa: E402
+
+# The same compiled rule the Agent refuses a Signal with and `redact()`
+# scrubs a log line with. A second opinion about what a secret looks like is
+# how the door that refuses and the door that reports drift apart (C28).
+from oplog import SECRET_RE  # noqa: E402
+
+# The business layer of the view. `controltower` writes nothing and reads the
+# same `processed/` directory this file already reads twice — see
+# `_print_control_tower()`.
+from controltower import UNSOURCED_LAYERS, build_company_rollup  # noqa: E402
+from controltower import read_events  # noqa: E402
+from notion.properties import ROLE_DISPLAY_NAMES  # noqa: E402
+from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 from scheduler.lock import (  # noqa: E402
     is_locked,
     lock_held_since,
@@ -97,6 +139,11 @@ from scheduler.lock import (  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
+
+# How many Project lines CONTROL TOWER prints before it says "외 N건". A
+# status block a person scrolls is a block a person stops reading; the full
+# list is one `python -c` away and the blocked ones sort to the top.
+_CONTROL_TOWER_PROJECT_LINES = 8
 
 
 def _agent_dir() -> Path:
@@ -376,6 +423,68 @@ def _holes_in_the_monthly_sequence(monthly_dir: Path) -> tuple[str, ...]:
     return tuple(missing)
 
 
+def _history_gone_from_local_master(local_master: Path, working_copy: Path) -> tuple[str, ...]:
+    """Company History the Backup Working Copy holds and Local Master no longer does.
+
+    The mirror image of `_history_newer_than_the_last_backup()`. That one asks
+    "is what is on this machine actually off it"; this asks **"is what got off
+    this machine still on it"** — and until now nothing did.
+
+    Why the two hole checks cannot answer it. `_holes_in_the_daily_sequence()`
+    bounds its range by the files that are present, and states the premise
+    plainly: *"whatever came before it is outside this machine's History"*.
+    That is exactly false when the days that went missing are the **earliest**
+    ones — a partial restore that stopped part-way, a OneDrive folder that
+    synced from the top, a hand deletion of "the old ones". The first present
+    file simply moves forward and the range moves with it, so a missing prefix
+    is silence by construction. `check_state_consistency()` covers the last
+    closed day and `_kept_but_not_rendered()` skips a date with no file, so
+    neither reaches it either.
+
+    Measured, `2026-08-01.md` replaced by a **directory of the same name**
+    (the shape C31 chased across six call sites, and the one a half-finished
+    copy leaves) with 08-01..08-04 closed:
+
+        _holes_in_the_daily_sequence()      ()
+        _kept_but_not_rendered()            ()
+        check_state_consistency()           CONSISTENT
+        _daily_counts_more_than_it_shows()  ()
+        _misnamed_scope_directories()       ()
+        ATTENTION                           nothing naming 2026-08-01
+
+    A whole day of Company History, gone, with every Company History
+    indicator green. Backup does fail — its deletion gate (docs/08 §31) sees
+    the same thing — but the manifest's `reason` is the only place the
+    filename appears and `_print_last_run()` deliberately does not print
+    `reason`, so what an operator reads is `backup: BACKUP_FAILED`, which is
+    the same line a credential failure produces. The Runner's own comment
+    beside that gate names precisely that confusion as the thing it was
+    written to remove.
+
+    Why the answer needs no configuration and cannot be wrong. The Working
+    Copy is written one direction only, and `sync_to_working_copy()` never
+    deletes from it — a detected deletion makes it apply *nothing* (docs/08
+    §31/§44-47). So it is a monotonic record of every Company History file
+    that ever reached backup scope, and a name in it that Local Master does
+    not have is a file that existed and does not now.
+
+    `_relative_files()` is the gate's own listing rather than a `glob()` of
+    my own, so "Company History" means here exactly what it means there:
+    inside `daily/`/`monthly/`, a regular file, not a symlink, not `.tmp-`.
+    A directory wearing a day's name is therefore absent on the Master side
+    and present on the Working Copy side, which is the measurement above.
+
+    Detection only, like every check in this file. What to do about it is an
+    operator decision (docs/10 §64), and restoring the file is the operator's
+    to make — the Working Copy still has it, which is why the caller says so.
+    """
+    working_copy = Path(working_copy)
+    local_master = Path(local_master)
+    if not working_copy.is_dir() or not local_master.is_dir():
+        return ()
+    return tuple(sorted(_relative_files(working_copy) - _relative_files(local_master)))
+
+
 def _history_newer_than_the_last_backup(local_master: Path, last_backup: datetime | None):
     """Company History files written after the last successful backup.
 
@@ -584,6 +693,104 @@ def _secret_names_the_gate_will_not_recognise(root: Path) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
+def _authored(text: str) -> str:
+    """`one_line()` and `redact()` for a value a person wrote on another Desktop.
+
+    `main()`'s ATTENTION sink applies `one_line()` to every message and
+    deliberately does NOT apply `redact()`, for the reason recorded there:
+    almost every message is built from paths, ids and counts, and
+    over-redacting a path an operator has to go and open costs more than it
+    protects. That reasoning held one assumption -- that an **id** is not
+    content -- and it is false.
+
+    `event_id` and `project_id` are ordinary strings that `validate_event()`
+    only type-checks. On the Agent's own door a Signal may not set `event_id`
+    at all (`FORBIDDEN_SIGNAL_FIELDS`) and its content is scanned, but an
+    Event arriving from another Desktop sets both fields itself and is never
+    scanned -- the same asymmetry `_secret_shaped_event_content()` measures.
+    A regression test caught this the honest way: it asserted the new secret
+    report does not print the string it found, and the *orphan* line two
+    blocks above printed the same Event's id raw.
+
+    So every site that prints an Event-authored identifier calls this, and
+    the sink stays as it is: a message that carries authored text redacts at
+    the place it is produced, exactly as `_print_control_tower()`'s blocker
+    line already did.
+    """
+    return redact(one_line(text))
+
+
+# Which Event fields carry text a person wrote, and therefore could carry a
+# credential. Not a judgement call left loose: `EveryEventTextFieldIsScanned`
+# compares this tuple against `Event.to_dict()`, so a string field added to
+# the schema is either scanned here or fails the suite. `evidence` is handled
+# separately below because it is a list, not a string.
+_EVENT_TEXT_FIELDS = ("event_id", "project_id", "milestone", "summary", "blocker")
+
+
+def _secret_shaped_event_content(
+    processed_dir: Path,
+) -> tuple[tuple[str, str, str, str], ...]:
+    """`(event_id, source, filename, fields)` for Events whose text is secret-shaped.
+
+    Every other secret report in this file is about a **filename**. This one
+    is about **content**, and it exists because the project's strongest
+    secret guard is applied at exactly one of the two doors an Event can come
+    through.
+
+        Signal written on this machine   `find_secret_material()` scans the
+                                         whole payload and `parse_signal()`
+                                         REFUSES it. Nothing is sent.
+        Event arriving over OneDrive     `validate_event()` type-checks
+        from another Desktop, or a       fields and cross-checks event_type
+        file written by hand             against status. It reads no content
+                                         at all.
+
+    Measured end to end, an Event carrying a secret-shaped `summary` that did
+    not pass through this machine's Agent:
+
+        validate_event()          no errors
+        Daily History written     yes, with the string in it
+        pushed to the remote      yes (`git show origin/main:daily/...`)
+        scan_for_secrets()        () -- it compares names, never content
+        oplog.redact() on a log   [REDACTED]
+
+    So the one place the string is scrubbed is the log, and the one place it
+    is kept forever is Company History and the backup remote.
+
+    **This reports; it refuses nothing.** Making `validate_event()` reject it
+    would send the Event to `rejected/` and delete that work from Company
+    History, which is the same trade recorded for the source/role mismatch --
+    a policy decision, not a code cleanup, and SKIPped for a decision.
+
+    Cost, measured over 2,000 Events: 90 ms to read, 25 ms to scan. The scan
+    is one pass of the combined `SECRET_RE` over the Event's own strings;
+    running `find_secret_material()` per Event instead costs 193 ms for the
+    same answer, because it applies seven uncompiled patterns to every string
+    separately. The pattern *names* are what that function returns and they
+    are regexes -- an operator needs the field name, which this gives.
+
+    The matched text is never returned, for `find_secret_material()`'s stated
+    reason: a report of a leaked credential must not become the second copy
+    of it. Callers still redact what they print, because `event_id` and
+    `project_id` are themselves scanned fields.
+    """
+    pairs, _ = read_events(processed_dir)
+    found: list[tuple[str, str, str, str]] = []
+    for event, filename in pairs:
+        texts = {name: (getattr(event, name, None) or "") for name in _EVENT_TEXT_FIELDS}
+        joined = "\n".join(texts.values())
+        if event.evidence:
+            joined = joined + "\n" + "\n".join(event.evidence)
+        if not SECRET_RE.search(joined):
+            continue
+        fields = [name for name, text in texts.items() if text and SECRET_RE.search(text)]
+        if any(SECRET_RE.search(item) for item in event.evidence):
+            fields.append("evidence")
+        found.append((event.event_id, event.source, filename, "/".join(fields)))
+    return tuple(found)
+
+
 def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
     """`(path, target)` for directory junctions inside the backup scope.
 
@@ -776,13 +983,51 @@ def _history_start_date() -> date | None:
         return None
 
 
+class StoredCandidate(NamedTuple):
+    """The part of a stored KEEP Candidate the status view needs.
+
+    A bare 3-tuple until C33, unpacked positionally at every call site.
+    Adding `reviewed` made it a 4-tuple and broke all of them at once — the
+    second time the shape had grown — so it is named now. The next check
+    that needs a fifth fact adds a field and touches nothing else, which is
+    the property the bare tuple did not have.
+
+    `NamedTuple`, deliberately, and **not** `@dataclass`. This module begins
+    with `from __future__ import annotations`, so every annotation is a
+    string; `dataclasses` resolves those against `sys.modules[cls.__module__]`
+    while checking for `KW_ONLY`, and every test helper here loads this file
+    through `importlib.util.spec_from_file_location(...)` + `exec_module()`
+    **without registering the module in `sys.modules` first**. Under that
+    loader the lookup yields None and the decorator dies with
+    `AttributeError: 'NoneType' object has no attribute '__dict__'`.
+    Measured: adding the first dataclass to this file failed 293 tests
+    across `test_observability.py` and `test_history_review.py`, none of
+    them about candidates. `NamedTuple` does no such resolution.
+
+    Not `HistoryCandidate`: that one is the full domain object, and
+    `FileHistoryRepository.list()` raises on the first unreadable file
+    (BUG-38), which would take the whole status view down. This is
+    deliberately the subset three read-only checks can agree on, parsed
+    defensively.
+    """
+
+    stem: str
+    event_id: str
+    when: date
+    # `(label, value)` for the Decision Context fields a human filled in —
+    # empty for the overwhelming majority of Candidates, which nobody has
+    # reviewed.
+    reviewed: tuple[tuple[str, str], ...] = ()
+
+
 def _read_keep_candidates(
     keep_dir: Path,
-) -> tuple[tuple[tuple[str, str, date], ...], tuple[str, ...]]:
-    """`(stem, event_id, date)` for every readable KEEP Candidate, read once.
+) -> tuple[tuple[StoredCandidate, ...], tuple[str, ...]]:
+    """A `StoredCandidate` for every readable KEEP Candidate, read once.
 
-    Two checks need these files — `_candidates_before()` (BUG-46) and
-    `_kept_but_not_rendered()` (E-17) — and reading them twice was measured,
+    Three checks need these files — `_candidates_before()` (BUG-46),
+    `_kept_but_not_rendered()` (E-17) and `_reviewed_but_not_rendered()`
+    (C33 §3) — and reading them twice was measured,
     cold, at 24.3 s for 5,000 Candidates. Warm it was 0.28 s, an 87x
     difference: the cost is the file *open*, exactly as this repository's
     `_READ_WORKERS` comments have said since C21, and exactly the bias C27
@@ -821,13 +1066,41 @@ def _read_keep_candidates(
     def _read(path: Path):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        # The repository's own predicate, not a second opinion (C28's rule).
+        # This used to check `timestamp` and `event_id` and nothing else, so a
+        # Candidate whose `summary` or `project_id` had the wrong type counted
+        # as perfectly readable here — and stopped every date in the pipeline.
+        # Measured (C44), one such file beside one ordinary Candidate:
+        #
+        #     Runner        daily FAILED, 0 Daily files, exit 2, permanently
+        #     this view     "Candidate 정합성 : OK", nothing else
+        #
+        # `candidate_errors()` is what `FileHistoryRepository` refuses on, so
+        # the two now answer the same question the same way and the ATTENTION
+        # line below fires for exactly the files that stop the Scheduler.
+        if candidate_errors(data):
+            return None
+        try:
             when = datetime.fromisoformat(data["timestamp"]).date()
-            event_id = data["event_id"]
-        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        except (TypeError, ValueError):
             return None
-        if not isinstance(event_id, str):
-            return None
-        return (path.stem, event_id, when)
+        event_id = data["event_id"]
+        # Fourth element: the Decision Context a human has filled in, as
+        # `(label, value)` pairs for the fields that are actually populated.
+        # Carried by this reader rather than by a second pass for the reason
+        # this function exists at all — the cost is the file OPEN, measured
+        # cold at 24.3 s for 5,000 Candidates read twice against 5.9 s read
+        # once. A third check reading them a third time would undo that.
+        reviewed = tuple(
+            (label, value)
+            for field, label in _REVIEW_FIELDS
+            if isinstance(value := data.get(field), str) and value
+        )
+        return StoredCandidate(path.stem, event_id, when, reviewed)
 
     with ThreadPoolExecutor(max_workers=_READ_WORKERS) as pool:
         # `map` preserves input order, so the sorted-filename ordering of the
@@ -840,7 +1113,9 @@ def _read_keep_candidates(
     return parsed, unreadable
 
 
-def _candidates_before(candidates: tuple[tuple[str, str, date], ...], start: date) -> tuple[str, ...]:
+def _candidates_before(
+    candidates: tuple[StoredCandidate, ...], start: date
+) -> tuple[str, ...]:
     """KEEP Candidates dated before `start` — stored, and unrenderable.
 
     BUG-46's permanent half. C22 measured that the description was wider than
@@ -863,14 +1138,58 @@ def _candidates_before(candidates: tuple[tuple[str, str, date], ...], start: dat
     reports a fact, and an unreadable file is not evidence of one.
     """
     return tuple(
-        f"{stem} ({when.isoformat()})"
-        for stem, _event_id, when in candidates
-        if when < start
+        f"{item.stem} ({item.when.isoformat()})"
+        for item in candidates
+        if item.when < start
     )
 
 
+def _label_lines(lines: list[str]) -> set[str]:
+    """The stripped lines of a rendered Daily that are the renderer's labels.
+
+    Both detectors below ask the same question — "did the renderer write this
+    exact line" — and both used to ask it of the WHOLE document minus the
+    item-block summaries. Two things are wrong with that, and they are one
+    root:
+
+        `## Summary`   `render_daily_markdown()` repeats every candidate's
+                       summary there RAW. A summary of `- Event ID: EVT-B`
+                       lands as a bare line identical to EVT-B's own label,
+                       and `summary_line_indices()` cannot reach it — that
+                       rule walks `### ` blocks and the Summary section has
+                       none.
+        `## Evidence`  `- <event_id>: <text>`, which spells a label exactly
+                       when an `event_id` is the literal `Event ID`.
+
+    Measured on `_kept_but_not_rendered()`, EVT-A rendered with three
+    different summaries and EVT-B genuinely absent from the file:
+
+        'Shipped it.'         ('EVT-B (2026-08-05)',)
+        'Event ID: EVT-B'     ('EVT-B (2026-08-05)',)   <- the C30 fix
+        '- Event ID: EVT-B'   ()                        <- silenced
+
+    The third row is E-17's data loss going unreported again, switched off by
+    one ordinary Candidate's summary — the very failure the long comment in
+    `_kept_but_not_rendered()` says it closed, arriving through the section
+    one layer up. `daily/late_events.existing_event_ids()` lost a real late
+    Event to the same line; that is where the shared rule now lives.
+
+    Confining the set to `### ` item blocks is the whole fix: a label is only
+    ever written inside one (`daily/markdown._render_item_block()`), so
+    nothing genuinely rendered leaves the set and nothing outside a block can
+    join it.
+    """
+    summaries = summary_line_indices(lines)
+    return {
+        lines[index].strip()
+        for start, end in item_block_bounds(lines)
+        for index in range(start, end)
+        if index not in summaries
+    }
+
+
 def _kept_but_not_rendered(
-    candidates: tuple[tuple[str, str, date], ...], daily_dir: Path
+    candidates: tuple[StoredCandidate, ...], daily_dir: Path
 ) -> tuple[str, ...]:
     """KEEP Candidates whose date **has** a Daily file that does not carry them.
 
@@ -910,8 +1229,8 @@ def _kept_but_not_rendered(
     if not daily_dir.is_dir():
         return ()
     by_date: dict[str, list[str]] = {}
-    for _stem, event_id, when in candidates:
-        by_date.setdefault(when.isoformat(), []).append(event_id)
+    for item in candidates:
+        by_date.setdefault(item.when.isoformat(), []).append(item.event_id)
 
     stranded: list[str] = []
     for when, event_ids in sorted(by_date.items()):
@@ -962,18 +1281,224 @@ def _kept_but_not_rendered(
         # Candidates, well past what this repository holds (13 when the
         # function was written).
         lines = text.splitlines()
-        summaries = summary_line_indices(lines)
-        rendered_lines = {
-            line.strip()
-            for index, line in enumerate(lines)
-            if index not in summaries
-        }
+        rendered_lines = _label_lines(lines)
         stranded.extend(
-            f"{event_id} ({when})"
+            f"{_authored(event_id)} ({when})"
             for event_id in event_ids
             if f"{_EVENT_ID_LINE_PREFIX}{event_id}".strip() not in rendered_lines
         )
     return tuple(stranded)
+
+
+def _reviewed_but_not_rendered(
+    candidates: tuple[StoredCandidate, ...], daily_dir: Path
+) -> tuple[str, ...]:
+    """Decision Context a human wrote that Company History does not carry.
+
+    C33 §3, and unlike its two siblings this one loses **human-authored**
+    content, which is the most expensive kind this pipeline handles.
+
+    The capability is fully built and, for a KEEP Candidate, unreachable.
+    `review_cli.py` prompts for the four fields, `history.review` stores
+    them, `daily/markdown.py` renders each one when present — and nothing
+    connects the middle to the end:
+
+        step 5   writes the Candidate
+        step 6   renders that date's Daily file   <- same run, seconds later
+        ...
+        a human reviews the Candidate             <- the only window there is
+        step 6.5 merges Late Events into an already-closed date, but only
+                 for dates *this run* collected, and its §38 guard skips an
+                 `event_id` the file already has
+        step 6   refuses to overwrite an existing Daily file
+
+    Measured end to end. A `DECISION_APPROVED` Event, filtered KEEP,
+    rendered; then `submit_review()` with three of the four fields:
+
+        review stored (returned object)          True
+        re-read from disk                        True
+        update_daily_history                     NO_LATE_EVENTS
+        generate_daily_history                   FileExistsError
+        Decision Context in Company History      False
+        Daily file changed at all                False
+
+    Nothing warned. `_kept_but_not_rendered()` asks whether the Candidate's
+    `event_id` is in the file — it is — so its verdict is clean, and the
+    reviewer's own return value says success.
+
+    **Detection only**, the same restraint `scheduler/consistency.py`,
+    `history/reconciliation.py` and `agent/delivery.py` all apply and for
+    the same reason: every repair is a decision. Re-rendering from the
+    review layer would put Company History writes in a module whose
+    docstring says it "only operates on what a HistoryRepository already has
+    stored"; teaching step 6.5 to refresh items it already merged would
+    redefine docs/06 §37's "Late Event" from *new* to *changed*. Both are
+    recorded in BACKLOG rather than chosen here.
+
+    Matched by building the line the renderer builds, for the reason
+    `_kept_but_not_rendered()` gives at length: taking a rendered line apart
+    has edges, constructing it has none. A multi-line value is compared on
+    its first line, which is what the renderer put on the label line.
+    """
+    if not daily_dir.is_dir():
+        return ()
+
+    by_date: dict[str, list[tuple[str, tuple[tuple[str, str], ...]]]] = {}
+    for item in candidates:
+        if item.reviewed:
+            by_date.setdefault(item.when.isoformat(), []).append(
+                (item.event_id, item.reviewed)
+            )
+
+    stranded: list[str] = []
+    for when, entries in sorted(by_date.items()):
+        rendered = daily_dir / f"{when}.md"
+        # Not yet rendered is not a loss — the Scheduler window, exactly as
+        # `_kept_but_not_rendered()` treats it. Such a Candidate WILL carry
+        # its Decision Context when the day is closed.
+        if not rendered.is_file():
+            continue
+        try:
+            text = rendered.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        lines = text.splitlines()
+        rendered_lines = _label_lines(lines)
+        for event_id, reviewed in entries:
+            missing = [
+                label
+                for label, value in reviewed
+                if f"- {label}: {value}".splitlines()[0].strip() not in rendered_lines
+            ]
+            if missing:
+                stranded.append(
+                    f"{_authored(event_id)} ({when}): "
+                    + ", ".join(_authored(item) for item in missing)
+                )
+    return tuple(stranded)
+
+
+_EVENT_COUNT_LINE_PREFIX = "- Event Count: "
+
+
+def _daily_counts_more_than_it_shows(daily_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Daily files whose own two numbers disagree. `(date, claimed, carried)`.
+
+    The Daily counterpart of `_monthly_counts_more_than_it_shows()`, and it
+    was missing while the Monthly one existed.
+
+    A Daily file states its own total — `daily/markdown._metadata_block()`
+    writes `- Event Count: {len(candidates)}`, and `late_events` rewrites it
+    to `len(existing_event_ids(...))` on every late update. It also carries
+    the Event IDs themselves, and `existing_event_ids()` is the function that
+    reads them back. As generated the two agree, which is what makes this
+    decidable inside one file with no window and no second opinion: the
+    comparison reuses the very function §38's duplicate guard uses, rather
+    than counting `- Event ID:` lines a second way.
+
+    **Three real losses reach an operator through it, and none of them had a
+    reporter before.**
+
+    1. A KEEP Candidate with `category=None` is dropped from every category
+       section by `render_daily_markdown()` — its Event ID never reaches the
+       file at all. `test_daily_history.py::
+       test_a_category_less_keep_candidate_silently_loses_its_detail`
+       characterizes the loss; nothing reported it. Measured: one such
+       Candidate alone in a day gives `Event Count: 1` and zero ids.
+
+    2. **BUG-11/27's silent half.** A summary carrying a newline and a
+       `- Event ID: VICTIM` line forges a structure line, and the forgery
+       does two things beyond the recorded ones: §38's guard then believes
+       VICTIM is already in the document, so a genuinely late VICTIM is
+       **never appended, on that run and every later one**, and
+       `_kept_but_not_rendered()` — the detector for exactly that loss —
+       reports clean, because the id it looks for is in the file. Measured,
+       one ordinary Candidate whose summary was `did work\n- Event ID: VICTIM`:
+
+           existing_event_ids(day)          {'EVT-1', 'VICTIM'}
+           select_late_candidates(day, ...) ()          <- never appended
+           _kept_but_not_rendered(...)      ()          <- reports clean
+           - Event Count: 1                             <- and two ids
+
+       The last line is the one thing the forgery cannot fake, because the
+       renderer wrote it from the candidate list rather than from the text.
+
+    3. An item block deleted by hand (docs/06 §57 permits the edit) without
+       correcting the count.
+
+    Reported in **both** directions, unlike the Monthly sibling. There the
+    excluded direction (`claimed < rendered`) is a hand edit that ADDED an
+    item, which is not a loss. Here the same inequality is the forgery in (2)
+    — the file carries an id the run never produced — and it is the more
+    expensive of the two, so silencing it to avoid an occasional hand-edit
+    report would be the wrong way round.
+
+    Escaping the renderer is BUG-11/27's decision and is not taken here; this
+    only counts, which C31 already established as the part that needs no
+    decision.
+
+    Threaded on the same `_READ_WORKERS` idiom as its Monthly sibling and for
+    the same measured reason — the cost is the file OPEN. This is the first
+    check that reads EVERY Daily file (`_kept_but_not_rendered()` reads only
+    the days that have stored Candidates), so it was measured before being
+    accepted, warm, five items per day:
+
+          365 days   31 ms      2,920 days (8 years)   231 ms
+
+    and split, at 2,920 days: 150 ms reading, 50 ms parsing. The read
+    dominates, which is why the parse is left precise.
+
+    A two-tier fast path — count `- Event ID:` lines cheaply, run
+    `existing_event_ids()` only for files that already look wrong — was
+    rejected for the reason the Monthly sibling rejects its own: the cheap
+    count and the precise one disagree in both directions (a duplicated id
+    makes the set smaller, a summary-shaped line makes the scan larger), so
+    the fast path can agree with `Event Count` on a file the precise pass
+    would report. It would buy ~50 ms at a scale eight years away by
+    reopening the silencing direction this check exists to close.
+    """
+    if not daily_dir.is_dir():
+        return ()
+    paths = [
+        path
+        for path in sorted(daily_dir.glob("*.md"))
+        if not is_incomplete_write(path.name)
+    ]
+    if not paths:
+        return ()
+
+    def _read(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+
+    with ThreadPoolExecutor(max_workers=_READ_WORKERS) as pool:
+        texts = list(pool.map(_read, paths))
+
+    mismatched: list[tuple[str, int, int]] = []
+    for path, text in zip(paths, texts):
+        if text is None:
+            continue
+        claimed = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(_EVENT_COUNT_LINE_PREFIX):
+                try:
+                    claimed = int(stripped[len(_EVENT_COUNT_LINE_PREFIX):].strip())
+                except ValueError:
+                    claimed = None
+                break
+        if claimed is None:
+            # A file whose metadata line is missing or unparseable is skipped
+            # rather than guessed at: this reports a disagreement between two
+            # numbers, and one number it could not read is not a
+            # disagreement. Same rule as the Monthly sibling.
+            continue
+        carried = len(existing_event_ids(text))
+        if claimed != carried:
+            mismatched.append((path.stem, claimed, carried))
+    return tuple(mismatched)
 
 
 _CONSOLIDATED_ITEMS_LINE_PREFIX = "- Consolidated Items: "
@@ -1150,6 +1675,170 @@ def _monthly_counts_more_than_it_shows(monthly_dir: Path) -> tuple[tuple[str, in
         if claimed is not None and claimed > rendered:
             mismatched.append((path.stem, claimed, rendered))
     return tuple(mismatched)
+
+
+def _rendered_event_ids(markdown: str) -> set[str]:
+    """The `- Event ID:` values a rendered document actually files.
+
+    Shared by the Monthly reader below and written the way its sibling
+    `_monthly_counts_more_than_it_shows()` counts them, for the reason that
+    function measured: an item's summary is rendered raw as its block's
+    first bullet, so a summary reading `Event ID: X` is byte-identical to a
+    real label line. `summary_line_indices()` is what tells the two apart,
+    and using anything else here would be a second opinion about a
+    distinction this file has already had to get right twice.
+    """
+    lines = markdown.splitlines()
+    summaries = summary_line_indices(lines)
+    found: set[str] = set()
+    for index, line in enumerate(lines):
+        if index in summaries:
+            continue
+        stripped = line.strip()
+        if stripped.startswith(_EVENT_ID_LINE_PREFIX):
+            found.add(stripped[len(_EVENT_ID_LINE_PREFIX):].strip())
+    return found
+
+
+def _monthly_lags_its_daily_source(
+    daily_dir: Path, monthly_dir: Path, dirty_months: tuple[str, ...] = ()
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Event IDs a month's Daily files carry that its Monthly does not.
+
+    `(key, event_ids)` per month, for consolidated months only.
+
+    The third link in a chain whose first two were already watched, and the
+    only one that crosses files:
+
+        Daily files (the source)   ->  Consolidated Items (what the run saw)
+                                   ->  rendered items (what got written)
+
+    `_monthly_counts_more_than_it_shows()` compares the second against the
+    third, inside one file. Nothing compared the first against anything, and
+    docs/09 §12-13 makes that the comparison that matters: Monthly is derived
+    **wholly** from the Daily files, so a Daily item that is not in its
+    month's Monthly is Company History that exists in one official record and
+    not the other.
+
+    **Measured, and it needs no corruption — only an edit two specs allow.**
+    docs/06 §57 and docs/11 §71 both permit the COO to edit a Daily History
+    by hand. With July consolidated on 08-03 and one item added to
+    `2026-07-30.md` afterwards:
+
+        run 08-04   exit 0   Monthly has it: False
+        run 08-05   exit 0   Monthly has it: False
+        ATTENTION            nothing naming it
+
+    and nothing ever revisits that month: `pending_months()` starts *after*
+    `last_successful_monthly_close`, and the only thing that reopens a closed
+    month is `mark_month_dirty()`, which `app/runner.py` calls for the dates
+    a **Late Event** changed — not for a date a person changed. The Late
+    Event path is therefore already correct and deliberately left alone here;
+    what has no route back is the hand edit.
+
+    The remedy is exact, which is why this is worth reporting rather than
+    only recording: Monthly is a derived artifact, so `mark_month_dirty()`
+    plus one run rebuilds it — the same sentence
+    `_holes_in_the_monthly_sequence()` already earns.
+
+    **Not a second opinion.** The Daily side is read with
+    `monthly.parser.read_daily_document()` — the parser Monthly itself
+    consolidates with — so "an item" means exactly what it means there, and
+    a *set* of event_ids is §59's one-id-one-entry rule by construction. The
+    Monthly side is its own `- Event ID:` lines with `summary_line_indices()`
+    applied, the same way the sibling check reads them.
+
+    One direction only, and it is the safe one. A summary shaped like
+    `- Event ID: X` on the Monthly side can only make that set *larger*, so
+    it can hide a finding, never invent one — the same asymmetry the sibling
+    check reasons about, pointing the same way. The reverse direction
+    (Monthly carries an id no Daily has) is not reported: that is a hand-edited
+    Monthly, which is the direction the sibling already declines for.
+
+    **Cost, measured rather than reasoned about.** Parsing every Daily file
+    is 28.9 ms per year and 258 ms per decade on this machine — the same
+    order as `_daily_counts_more_than_it_shows()`, which already reads them
+    all. It is not paid on a healthy tree: a Monthly can only fall behind its
+    source if a Daily file changed *after* it was written, so a month whose
+    Daily files are all older than its Monthly is skipped on the strength of
+    one `st_mtime` each, all of them from one directory read. Measured:
+
+        healthy (nothing examined)  1 year  1.4 ms   10 years  14.1 ms
+        every month examined, warm  1 year 24.5 ms   10 years 251.6 ms
+
+    mtime is a **prefilter** here and never the verdict
+    — every month it lets through is decided by reading the files — which is
+    the distinction `backup/working_copy._content_differs()` draws when it
+    refuses mtime for a decision. A restore that rewrites every mtime costs
+    one full pass and reports nothing.
+
+    Months listed in `dirty_months` are skipped: the next run rebuilds them,
+    and an alert that the next run clears is the kind this file keeps warning
+    about.
+    """
+    daily_dir = Path(daily_dir)
+    monthly_dir = Path(monthly_dir)
+    if not daily_dir.is_dir() or not monthly_dir.is_dir():
+        return ()
+
+    dirty = set(dirty_months)
+    days_by_month: dict[str, list[date]] = {}
+    for day in _daily_dates(daily_dir):
+        days_by_month.setdefault(f"{day.year:04d}-{day.month:02d}", []).append(day)
+
+    # One directory read for every mtime, not one `stat()` per day. Same
+    # reason `_daily_dates()` above stopped using `glob() + is_file()`: on
+    # Windows `DirEntry.stat()` answers from the listing that was already
+    # fetched, and the per-file form is what costs. Measured over ten years
+    # of Daily History, healthy tree: 63.6 ms -> 14.1 ms. Which names count as
+    # a day is still `_daily_dates()`' answer — this only carries times.
+    mtimes: dict[str, float] = {}
+    try:
+        for entry in os.scandir(daily_dir):
+            try:
+                mtimes[entry.name] = entry.stat().st_mtime
+            except OSError:
+                continue
+    except OSError:
+        return ()
+
+    findings: list[tuple[str, tuple[str, ...]]] = []
+    for key, days in sorted(days_by_month.items()):
+        if key in dirty:
+            continue
+        monthly_path = monthly_dir / f"{key}.md"
+        try:
+            if not monthly_path.is_file():
+                continue
+            monthly_mtime = monthly_path.stat().st_mtime
+        except OSError:
+            continue
+
+        # The prefilter: nothing can have fallen behind a Monthly that is
+        # newer than every Daily file it was built from.
+        if not any(
+            mtimes.get(f"{day.isoformat()}.md", 0.0) > monthly_mtime for day in days
+        ):
+            continue
+
+        try:
+            monthly_text = monthly_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        monthly_ids = _rendered_event_ids(monthly_text)
+
+        source_ids: set[str] = set()
+        for day in days:
+            try:
+                document = read_daily_document(daily_dir / f"{day.isoformat()}.md", day)
+            except Exception:  # noqa: BLE001 — an unreadable Daily has its own reporters
+                continue
+            source_ids.update(item.event_id for item in document.items)
+
+        missing = tuple(sorted(source_ids - monthly_ids))
+        if missing:
+            findings.append((key, missing))
+    return tuple(findings)
 
 
 def _source_note(*breakdowns) -> str:
@@ -1397,13 +2086,35 @@ def _print_history(now: datetime) -> list[str]:
     # `backup.working_copy` excludes it from backup scope: counting it would
     # report history this project does not have, and for `monthly_files` the
     # `stem` of one would be displayed as if it were a month.
+    #
+    # `is_file()` on top of that, and it is the same rule every other reader
+    # of these two directories already applies — `_daily_dates()` excludes a
+    # directory ("it exists, and it is not a day of Company History"),
+    # `_holes_in_the_monthly_sequence()` calls `entry.is_file()`, and
+    # `backup.working_copy._relative_files()` takes regular files only. These
+    # two counts were the last readers without it, which
+    # `_misnamed_scope_directories()`'s docstring already named in passing
+    # ("including this view's own `daily 파일` count, which uses `glob()`").
+    #
+    # Measured with `2026-08-01.md` replaced by a directory: this line said
+    # `daily 파일 : 5` for four days of Company History, one line above
+    # `daily state 정합성 : CONSISTENT` — a count that disagreed with the
+    # detector printed beneath it, in the direction that hides a loss.
     daily_count = (
-        sum(1 for p in daily_dir.glob("*.md") if not is_incomplete_write(p.name))
+        sum(
+            1
+            for p in daily_dir.glob("*.md")
+            if not is_incomplete_write(p.name) and p.is_file()
+        )
         if daily_dir.is_dir()
         else 0
     )
     monthly_files = (
-        sorted(p.stem for p in monthly_dir.glob("*.md") if not is_incomplete_write(p.name))
+        sorted(
+            p.stem
+            for p in monthly_dir.glob("*.md")
+            if not is_incomplete_write(p.name) and p.is_file()
+        )
         if monthly_dir.is_dir()
         else []
     )
@@ -1515,6 +2226,25 @@ def _print_history(now: datetime) -> list[str]:
             f"`added_event_ids=('EVT-S','EVT-N')`으로 병합됐다). 지난 날짜라면 "
             f"그런 Event가 오지 않는 것이 보통이므로 사람이 확인해야 "
             f"한다{running}"
+        )
+    # C33 §3: the reviewer wrote it, Company History never got it.
+    #
+    # Placed beside E-17's check because they are the same question one
+    # level apart — that one asks whether the Candidate reached the Daily
+    # file, this asks whether the Candidate's *content* did. The running
+    # caveat is shared for the same reason: a Runner between step 5 and step
+    # 6 has not rendered the day yet.
+    unrendered_review = _reviewed_but_not_rendered(keep_candidates, daily_dir)
+    if unrendered_review:
+        print(f"  검토 미반영         : {len(unrendered_review)}")
+        attention.append(
+            f"사람이 입력한 Decision Context {len(unrendered_review)}건이 Company "
+            f"History에 반영되지 않았다: {', '.join(unrendered_review[:5])}"
+            f"{' 외' if len(unrendered_review) > 5 else ''} — Daily 파일은 이미 "
+            f"렌더링됐고, Late Event 병합은 **새 Event**만 대상이라 어떤 실행도 "
+            f"이 내용을 넣지 않는다. 내용 자체는 "
+            f"runtime/history_candidates/keep/에 남아 있으니 유실은 아니지만, "
+            f"Company History에는 없다(BACKLOG C33 §3)"
         )
     if review_waiting:
         attention.append(
@@ -1694,6 +2424,28 @@ def _print_history(now: datetime) -> list[str]:
             f"모양이다. {where}"
         )
 
+    # The days the check above cannot bound — see
+    # `_history_gone_from_local_master()`. A missing *prefix* moves the range
+    # instead of leaving a hole in it, so the earliest days are the ones no
+    # Company History indicator can see going.
+    gone = _history_gone_from_local_master(
+        local_master, RUNTIME_DIR / "backup_working_copy"
+    )
+    if gone:
+        print(f"  Master에서 사라짐   : {len(gone)}")
+        attention.append(
+            f"Backup Working Copy에는 있고 Local Master에는 없는 Company History "
+            f"{len(gone)}건: {', '.join(one_line(name) for name in gone[:5])}"
+            + (" 외" if len(gone) > 5 else "")
+            + " — 그 파일들은 백업에 도달했었고 지금 이 머신에 없다. Working Copy는 "
+            "한 방향으로만 쓰이고 삭제를 반영하지 않으므로 아직 거기에 남아 있다. "
+            "Backup은 이 상태에서 add/commit/push를 전부 중단하므로(docs/08 §31) "
+            "**복구하기 전까지 이후 History도 원격에 가지 않는다**. Daily 시퀀스 "
+            "구멍 검사는 파일이 있는 범위만 보므로 사라진 것이 가장 이른 날짜들이면 "
+            "아무것도 보고하지 않고, 그 날짜 이름의 **디렉터리**가 대신 서 있는 "
+            "경우도 같다"
+        )
+
     # A Daily Close pointer dated in the future — a silent, permanent stop
     # that every other indicator reports as perfect health.
     #
@@ -1832,7 +2584,7 @@ def _print_history(now: datetime) -> list[str]:
             # `event_id` arrives from another Desktop and a newline inside one
             # forges a whole line of this block. The `!` prefix and the fixed
             # indentation are exactly what a forged line would imitate.
-            print(f"                        ! {one_line(orphan.event_id)} "
+            print(f"                        ! {_authored(orphan.event_id)} "
                   f"[{orphan.decision.value}]")
         # `find_orphaned_events()` is a pure function and knows nothing about
         # the lock, but the pipeline it inspects has a window where a
@@ -1849,14 +2601,55 @@ def _print_history(now: datetime) -> list[str]:
         running = " (Runner 실행 중 — 완료 후 재확인 권장)" if is_locked(_runner_lock_path()) else ""
         attention.append(
             f"수집됐지만 History에 들어가지 못한 Event {len(reconciliation.orphaned)}건: "
-            f"{', '.join(o.event_id for o in reconciliation.orphaned[:5])}"
+            f"{', '.join(_authored(o.event_id) for o in reconciliation.orphaned[:5])}"
             f"{' 외' if len(reconciliation.orphaned) > 5 else ''} — 재실행으로 "
             f"복구되지 않는다(BACKLOG A-20). 사람이 확인해야 한다" + running
         )
     if reconciliation.unreadable:
+        # Naming the files, which this line did not. `UnreadableEvent`
+        # carries `event_path` precisely so a person can go and open it, and
+        # that field had no reader anywhere (C32 §20's sweep). Every sibling
+        # ATTENTION line in this view names up to five items; this one said
+        # "N건" and left the operator to find them.
+        #
+        # The *filename*, not an `event_id` — the file is the thing that
+        # could not be parsed, so there is no id to quote. `one_line()` all
+        # the same: `main()`'s sink applies it to the whole message, and a
+        # name assembled here should not depend on that staying true.
+        names = ", ".join(
+            one_line(item.event_path.name) for item in reconciliation.unreadable[:5]
+        )
         attention.append(
-            f"processed에 읽을 수 없는 Event {len(reconciliation.unreadable)}건 — "
+            f"processed에 읽을 수 없는 Event {len(reconciliation.unreadable)}건: "
+            f"{names}{' 외' if len(reconciliation.unreadable) > 5 else ''} — "
             f"History 반영 여부를 판단할 수 없다"
+        )
+
+    # Secret-shaped content *inside an Event*, which no gate in this project
+    # looks at. See `_secret_shaped_event_content()` for the measurement: the
+    # Agent refuses a Signal carrying one, and an Event that arrived from
+    # another Desktop is never scanned at all, so the string reaches Company
+    # History and the backup remote intact.
+    #
+    # Everything printed is redacted, including the ids -- `event_id` and
+    # `project_id` are among the fields scanned, so quoting one raw is exactly
+    # how this report would become the second copy of a leaked credential.
+    secret_events = _secret_shaped_event_content(RUNTIME_DIR / "events" / "processed")
+    if secret_events:
+        named = ", ".join(
+            f"{_authored(event_id)}({_authored(source)}, {fields})"
+            for event_id, source, _name, fields in secret_events[:5]
+        )
+        attention.append(
+            f"Event 내용에 Secret 형태의 문자열 {len(secret_events)}건: {named}"
+            f"{' 외' if len(secret_events) > 5 else ''} — 이 Desktop의 Agent는 "
+            f"Signal을 그 자리에서 거부하지만(`find_secret_material()`), 다른 "
+            f"Desktop에서 온 Event나 손으로 쓴 파일은 `validate_event()`만 거치고 "
+            f"그것은 내용을 읽지 않는다. 실측: Daily History에 그대로 쓰이고 "
+            f"backup 원격까지 push된다(`scan_for_secrets()`는 이름만 본다). "
+            f"해당 자격증명을 **교체**해야 한다 — 파일을 고쳐도 원격 history에는 "
+            f"남는다. 거부로 바꾸면 그 Event가 `rejected/`로 가서 Company "
+            f"History에서 사라지므로 결정이 필요하다(BACKLOG)"
         )
 
     # Secret names the gate's own list holds but its comparison misses.
@@ -1998,6 +2791,55 @@ def _print_history(now: datetime) -> list[str]:
                 f"원격에 잘린 내용이 들어간다. 지워도 안전하다"
             )
 
+    # A Daily whose own two numbers disagree — the Daily counterpart of the
+    # Monthly check above, which existed while this one did not.
+    daily_mismatch = _daily_counts_more_than_it_shows(daily_dir)
+    if daily_mismatch:
+        for key, claimed, carried in daily_mismatch:
+            print(f"  Daily 항목 불일치   : {key} (Event Count {claimed} / 기록된 id {carried})")
+        attention.append(
+            f"Daily History의 자기 숫자가 어긋난 날 {len(daily_mismatch)}건: "
+            + ", ".join(
+                f"{key}({claimed}→{carried})" for key, claimed, carried in daily_mismatch[:5]
+            )
+            + (" 외" if len(daily_mismatch) > 5 else "")
+            + " — `- Event Count:`는 그날 렌더러가 받은 Candidate 수이고 뒤의 수는 "
+            "파일이 실제로 들고 있는 Event ID 수다. **적게 들고 있으면** 그 Event가 "
+            "Company History에 없다는 뜻이다(Category가 네 값 밖이면 어느 Section에도 "
+            "들어가지 않는다 — 해당 Candidate의 `category`를 확인한다). **많이 들고 "
+            "있으면** 어떤 Event의 `summary`/`project_id`/`event_id`에 개행이 들어가 "
+            "`- Event ID:` 줄을 위조한 것이다(BACKLOG BUG-11/27) — 그 경우 그 id로 "
+            "**나중에 도착하는 진짜 Event가 영원히 추가되지 않고**, 그 손실은 이 줄 "
+            "말고는 어디에도 보고되지 않는다. 손으로 항목 블록을 지운 경우도 앞쪽에 "
+            "해당한다(docs/06 §57)"
+        )
+
+    # A Monthly that has fallen behind the Daily files it is derived from —
+    # the link the two checks around it cannot see, because both compare a
+    # document with itself.
+    lagging = _monthly_lags_its_daily_source(
+        daily_dir, monthly_dir, dirty_months=tuple(state.dirty_months)
+    )
+    if lagging:
+        for key, event_ids in lagging:
+            print(f"  Monthly 원본 미반영 : {key} ({len(event_ids)}건)")
+        attention.append(
+            f"Daily에는 있는데 그 달 Monthly에는 없는 Event {sum(len(i) for _k, i in lagging)}건: "
+            + ", ".join(
+                f"{key}({', '.join(_authored(e) for e in event_ids[:3])}"
+                + (" 외" if len(event_ids) > 3 else "")
+                + ")"
+                for key, event_ids in lagging[:3]
+            )
+            + (" 외" if len(lagging) > 3 else "")
+            + " — Monthly는 Daily에서 **전부** 파생된다(docs/09 §12-13). 그 달이 "
+            "통합된 뒤에 Daily가 바뀌면(docs/06 §57 / docs/11 §71이 허용하는 손편집) "
+            "**어떤 실행도 그 달을 다시 만들지 않는다** — `pending_months()`는 마지막 "
+            "통합 **다음** 달부터 시작하고, 닫힌 달을 다시 여는 것은 Late Event가 "
+            "바꾼 날짜에 대한 `mark_month_dirty()`뿐이다. 복구는 정확하다: 그 달을 "
+            "dirty로 표시하고 한 번 실행하면 Monthly가 자기 원본과 다시 같아진다"
+        )
+
     # A Monthly that counted an item it did not write down.
     shortfall = _monthly_counts_more_than_it_shows(monthly_dir)
     if shortfall:
@@ -2107,6 +2949,258 @@ def _print_history(now: datetime) -> list[str]:
     return attention
 
 
+def _notion_retry_queue_path() -> Path:
+    """`runtime/state/notion_retry_queue.json`, derived per call.
+
+    Not `notion.retry_queue.DEFAULT_QUEUE_PATH`: that constant is frozen at
+    import from the *package's* project root, so redirecting `RUNTIME_DIR` —
+    the single knob every test and probe uses to isolate this view — would
+    leave this one block reading the developer's live queue while every
+    other block read the fixture. That is C31 §10's trap verbatim, and
+    `_agent_dir()` above carries the full reasoning.
+    """
+    return RUNTIME_DIR / "state" / "notion_retry_queue.json"
+
+
+def _dashboard_pending_path() -> Path:
+    """`runtime/state/dashboard_pending.json`, derived per call — see above."""
+    return RUNTIME_DIR / "state" / "dashboard_pending.json"
+
+
+def _queue_age_days(added_at: str, now: datetime) -> float | None:
+    """Whole-ish days since `added_at`, or None if it cannot be read.
+
+    `added_at` is read back out of a JSON file that `load_queue()`
+    shape-checks but never validates as a timestamp, so the naive/aware
+    guard is the same one `_print_last_run()` applies to `summary.started_at`
+    for the same reason: a hand-edited or restored state file can carry an
+    offset-less timestamp, and comparing it to an aware `now` raises
+    TypeError.
+    """
+    try:
+        added = datetime.fromisoformat(added_at)
+    except (TypeError, ValueError):
+        return None
+    reference = now
+    if added.tzinfo is None:
+        reference = reference.replace(tzinfo=None)
+    elif reference.tzinfo is None:
+        reference = reference.astimezone()
+    return (reference - added).total_seconds() / 86400
+
+
+def _print_notion(now: datetime) -> list[str]:
+    """The two Notion queues — and the two fields they write that nothing read.
+
+    `RetryQueueEntry` records `added_at` and `attempt_count` on every upsert,
+    and `PendingDashboardRecord` records the same pair. Grepping the whole
+    repository for a *consumer* of either finds none: they are written by the
+    queue modules, round-tripped through JSON, and read by no log line, no
+    status view and no test outside the queue modules' own. That is BUG-39's
+    shape — a value computed and discarded — in the one place where it costs
+    the most.
+
+    What it costs: BUG-13 established that `NOTION_RETRY_REQUIRED` covers
+    both "Notion was briefly down" and "Notion will refuse this forever", and
+    fixed the *reason string* so the log could tell them apart. The queue's
+    own two fields answer the other half of the same question — how long has
+    this been stuck, and how many times has it been tried — and reached
+    nobody.
+
+    The Run Manifest's `queued=` metric is not a substitute, three ways over:
+    it is the *last run's* count, it appears only when `notion_sync` is a
+    non-SUCCESS component, and it cannot see a queued entry whose
+    `to_event()` fails — `app/runner.py` counts that one as
+    `notion_unreadable` and leaves it in the queue, where it stays forever
+    while every counter reports zero queued.
+
+    Read-only and never fatal, like every other block here: a damaged queue
+    file is reported (docs/10 §46 — the program never deletes it).
+    """
+    attention: list[str] = []
+    print("NOTION — Retry Queue")
+    print("-" * 60)
+
+    try:
+        entries = load_notion_retry_queue(_notion_retry_queue_path())
+    except RetryQueueError as exc:
+        print(f"  손상된 Retry Queue: {one_line(exc)}")
+        attention.append(
+            f"Notion Retry Queue 파일을 읽을 수 없다 ({_notion_retry_queue_path()}) — "
+            f"Runner는 이 파일을 읽지 못하면 4단계에서 실패한다. 사람이 확인해야 한다"
+        )
+        entries = []
+
+    print(f"  대기 중 Event       : {len(entries)}")
+    if entries:
+        ages = [(_queue_age_days(e.added_at, now), e) for e in entries]
+        datable = [(age, e) for age, e in ages if age is not None]
+        undatable = len(ages) - len(datable)
+        attempts = max(e.attempt_count for e in entries)
+        print(f"  최대 재시도 횟수    : {attempts}")
+        if datable:
+            oldest_age, oldest = max(datable, key=lambda pair: pair[0])
+            print(
+                f"  가장 오래된 항목    : {one_line(oldest.added_at)} "
+                f"({oldest_age:.1f}일, event {_authored(oldest.event_id)})"
+            )
+            if oldest_age >= SILENT_AFTER_DAYS:
+                # `SILENT_AFTER_DAYS` reused rather than a new threshold
+                # invented — the same choice `_print_last_run()` made, and
+                # for a compatible reason. An entry that has survived that
+                # many days has survived many scheduled runs, so it is not
+                # the outage the queue exists to ride out.
+                attention.append(
+                    f"Notion Retry Queue에 {oldest_age:.1f}일째 남아 있는 Event가 있다 "
+                    f"({_authored(oldest.event_id)}, 재시도 {oldest.attempt_count}회) — "
+                    f"일시적 장애라면 이미 빠져나갔을 시간이다. Notion이 영구히 "
+                    f"거부하는 요청일 수 있으니 notion_sync.log의 REASON을 확인해야 "
+                    f"한다(BACKLOG BUG-13)"
+                )
+        if undatable:
+            # A `added_at` this cannot parse is skipped rather than guessed
+            # at, and said out loud — the same treatment `_print_last_run()`
+            # gives an unparseable `started_at`.
+            print(f"  (added_at을 읽을 수 없는 항목 {undatable}건)")
+
+    try:
+        pending_records = load_dashboard_pending(_dashboard_pending_path())
+    except DashboardPendingError as exc:
+        print(f"  손상된 Dashboard 대기열: {one_line(exc)}")
+        attention.append(
+            f"Dashboard pending 파일을 읽을 수 없다 ({_dashboard_pending_path()}) — "
+            f"`drain_pending()`은 이것을 '비었음'으로 취급하므로 밀린 기록은 "
+            f"영원히 재시도되지 않는다. 사람이 확인해야 한다"
+        )
+        pending_records = []
+
+    print(f"  Dashboard 밀린 기록 : {len(pending_records)}")
+    if pending_records:
+        print(
+            f"  최대 재시도 횟수    : "
+            f"{max(r.attempt_count for r in pending_records)}"
+        )
+        # `PendingDashboardRecord.queued_at` had no reader either — the same
+        # sweep, the same shape, and reporting the retry queue's age while
+        # ignoring this one would have left the asymmetry inside the block
+        # that was just added to remove it. Age matters more here than for
+        # the Event queue: a Dashboard record Notion permanently refuses (a
+        # Select value it will not accept, say) comes back every run with
+        # nothing but `attempt_count` climbing, which is exactly what
+        # `DrainPendingResult.last_reason` was added for.
+        ages = [
+            (age, record)
+            for age, record in (
+                (_queue_age_days(r.queued_at, now), r) for r in pending_records
+            )
+            if age is not None
+        ]
+        if ages:
+            oldest_age, oldest = max(ages, key=lambda pair: pair[0])
+            print(
+                f"  가장 오래된 기록    : {one_line(oldest.queued_at)} "
+                f"({oldest_age:.1f}일, run {one_line(oldest.run_id)})"
+            )
+            if oldest_age >= SILENT_AFTER_DAYS:
+                attention.append(
+                    f"Dashboard 기록 하나가 {oldest_age:.1f}일째 Notion에 반영되지 "
+                    f"못하고 있다 (run {one_line(oldest.run_id)}, 재시도 "
+                    f"{oldest.attempt_count}회) — notion_sync.log의 "
+                    f"`DASHBOARD DRAIN_PENDING ... REASON`을 확인해야 한다. "
+                    # The single most likely REASON, and the one that used to
+                    # have no exit: OPS_RUNS grew from 13 columns to 17 across
+                    # C32/C33, and a database created before a widening gets
+                    # a 400 on every run forever. Pointing at the fix from the
+                    # line the operator actually reads is the whole point —
+                    # the reason was already legible, the way out was not.
+                    f"열이 모자란 Database가 흔한 원인이며 그 경우 "
+                    f"docs/13 §3-⑧-4가 고치는 명령이다"
+                )
+
+    attention.extend(_same_instant_skips_from_the_last_run())
+    return attention
+
+
+def _same_instant_skips_from_the_last_run() -> list[str]:
+    """E-23's divergence, taken out of the Run Manifest where it was already
+    written and read by nobody.
+
+    C40 made the count exist: `app/runner.py` recognises a same-instant skip
+    by the note `notion/sync.py` attaches (never by re-deriving the
+    comparison, which is why the two answers cannot drift) and records it as
+    the `notion_sync` component's `same_instant_skips` metric, absent on a
+    run where it did not happen.
+
+    Nothing then read it. `_print_last_run()` prints a component's metrics
+    only when the component FAILED — deliberately, so the block stays short —
+    and a skip is not a failure: docs/04 §35 calls it "적용하지 않았다", the
+    Runner records `recorder.ok()`, the run exits 0. So the number went to
+    disk on every affected run and no view has ever shown it.
+
+    **What it means, measured rather than restated.** Two Events of the same
+    project at the same instant — the *normal* case, because a Signal with no
+    timestamp of its own gets that date's midnight for every Signal of that
+    day (docs/06 §12) — driven through the real `ExecutionPlanSync`:
+
+        E1 STARTED  IN_PROGRESS   -> NOTION_CREATED
+        E2 BLOCKED  BLOCKED       -> NOTION_SKIPPED_OLD_EVENT
+
+        Notion row   Status IN_PROGRESS   Blocker (none)
+        on disk      Status BLOCKED       Blocker "budget"
+
+    E-23 records this as losing "Notion 쪽 Current State의 **최신성**" — the
+    View being one Event behind. That is not the whole of it: the row can
+    show the *opposite of the risk state*, a blocked project reported as
+    healthy, and for anyone reading Notion as a Control Tower that is the one
+    number that must not be wrong.
+
+    The skip changes nothing on disk, which is the half that makes this
+    reportable at all: the CONTROL TOWER block above reads the same Events
+    and shows that project as BLOCKED, so the two blocks of this view
+    disagree in public rather than the divergence living only in Notion.
+    (Whether the second Event also reaches *Company History* is a different
+    rule — the History Filter's — and E-23's own measurement uses KEEP
+    Events, where it does.)
+
+    Per run, and it clears by itself: the next run's manifest carries no such
+    metric, and C43 measured that one further Event for that project restores
+    the row completely. So this is a line about *this* run, not a standing
+    alarm — and the action it names is the mitigation AGENT.md §3 already
+    documents, giving that day's Signals an explicit `timestamp`.
+
+    The decision that would remove the divergence is E-23's and is not taken
+    here: all three candidate fixes change a spec.
+    """
+    try:
+        summary = read_summary(DEFAULT_RUN_SUMMARY_PATH)
+    except (RunSummaryError, OSError, ValueError):
+        # The manifest's own reader already reports an unreadable manifest in
+        # LAST RUN; a second line for the same file would be a second opinion.
+        return []
+    if summary is None:
+        return []
+    component = summary.component("notion_sync")
+    if component is None or not isinstance(component.metrics, Mapping):
+        return []
+    skipped = component.metrics.get("same_instant_skips")
+    if not isinstance(skipped, int) or skipped <= 0:
+        return []
+    print(
+        f"  같은 instant 미반영 : {skipped} (마지막 실행)"
+    )
+    return [
+        f"마지막 실행에서 Event {skipped}건이 Notion 프로젝트 행에 반영되지 않았다 "
+        "— 같은 프로젝트·같은 instant의 두 번째 Event이기 때문이다(docs/04 §29-30의 "
+        "\"동시\" 규칙, BACKLOG E-23). **어긋난 것은 Notion 쪽 행뿐이다** — 이 "
+        "건너뜀은 디스크의 무엇도 바꾸지 않는다. 그리고 그 행은 한 Event 뒤처진 "
+        "정도가 아니라 **상태 자체가 다를 수 있다**(실측: 두 번째 Event가 BLOCKED "
+        "였을 때 Notion 행은 IN_PROGRESS에 Blocker 없음 — 위 CONTROL TOWER 블록은 "
+        "같은 Project를 BLOCKED로 보여준다). 그 프로젝트에 Event가 하나 더 도착하면 "
+        "행이 따라잡는다. 반복된다면 그 날짜 Signal에 `timestamp`를 명시하면 이 "
+        "경로를 타지 않는다(AGENT.md §3)"
+    ]
+
+
 def _agent_lock_path() -> Path:
     """The Agent's own lock — NOT the Runner's.
 
@@ -2172,25 +3266,81 @@ def _print_agent(now: datetime) -> list[str]:
         delivery = find_undelivered_events(
             sent_dir=agent_dir / "sent", sync_folder=Path(sync_folder)
         )
+        # Three outcomes, not two. `is_clean` now also covers records this
+        # scan could not read, and "UNDELIVERED" would be the wrong word for
+        # those — it claims a delivery verdict the scan explicitly does not
+        # have. Same distinction `_print_history()` already draws between
+        # `reconciliation.orphaned` and `reconciliation.unreadable`.
+        if delivery.undelivered:
+            verdict = "UNDELIVERED"
+        elif delivery.unreadable_records:
+            verdict = "UNKNOWN"
+        else:
+            verdict = "OK"
         print(
-            f"  전달 정합성         : "
-            f"{'OK' if delivery.is_clean else 'UNDELIVERED'} "
-            f"(확인 {delivery.checked}건, 이미 수거됨 {delivery.absent}건)"
+            f"  전달 정합성         : {verdict} "
+            f"(확인 {delivery.checked}건, 이미 수거됨 {delivery.absent}건"
+            + (
+                f", 읽을 수 없음 {len(delivery.unreadable_records)}건"
+                if delivery.unreadable_records
+                else ""
+            )
+            + ")"
         )
         for item in delivery.undelivered[:5]:
             # Same rule, same origin: this `event_id` is read back out of a
             # file in `sent/` and is not constrained to one line.
-            print(f"                        ! {one_line(item.event_id)} [{item.problem}]")
+            print(f"                        ! {_authored(item.event_id)} [{item.problem}]")
         if delivery.undelivered:
             delivery_attention.append(
                 f"전송 완료로 기록됐지만 sync 폴더에 도착하지 않은 Event "
                 f"{len(delivery.undelivered)}건: "
-                f"{', '.join(i.event_id for i in delivery.undelivered[:5])} — "
+                f"{', '.join(_authored(i.event_id) for i in delivery.undelivered[:5])} — "
                 f"자동 재전송되지 않는다(BACKLOG E-9). 사람이 확인해야 한다"
+            )
+        # The sibling of the `reconciliation.unreadable` line in
+        # `_print_history()`, and it did not exist. A damaged file in
+        # `sent/` was dropped by `find_undelivered_events()` without a
+        # count — so that Event's delivery went unchecked and this section
+        # printed OK. `event_id` cannot be quoted here for the obvious
+        # reason: it is what could not be read. The filename can, and it is
+        # what a person has to open.
+        if delivery.unreadable_records:
+            delivery_attention.append(
+                f"읽을 수 없는 전송 기록 {len(delivery.unreadable_records)}건 "
+                f"(runtime/agent/sent/): "
+                f"{', '.join(r.sent_record.name for r in delivery.unreadable_records[:5])}"
+                f"{' 외' if len(delivery.unreadable_records) > 5 else ''} — 해당 "
+                f"Event가 sync 폴더에 도착했는지 판단할 수 없다. 사람이 확인해야 한다"
             )
     else:
         print("  전달 정합성         : 확인 불가 (COMPANY_OPS_AGENT_SYNC_FOLDER 미설정)")
-    if snapshot.pending_dates and _agent_start_date() is None:
+    # Unconditional on the count, because the count is exactly what is
+    # meaningless without it — and the previous condition made this line
+    # unreachable.
+    #
+    # `read_status()` computes `pending_dates` ONLY when `agent_start_date`
+    # is supplied ("since a first-ever run has no other way to know where
+    # counting starts (docs/07 §50: never guessed)"), and this block passes
+    # it `_agent_start_date()`. So `snapshot.pending_dates` non-empty already
+    # implies the variable is set, and `and _agent_start_date() is None` made
+    # the whole condition a contradiction.
+    #
+    # What that cost is the thing this line exists to prevent. A Desktop with
+    # the variable unset printed
+    #
+    #     미수집 날짜         : 0
+    #
+    # which is byte-identical to a Desktop that is fully caught up — the
+    # absence of a measurement reading as a healthy measurement, on the
+    # machine that PRODUCES Company History. Measured, with the variable
+    # unset and `last_successful_collection_date` five days back: `0`, and
+    # nothing else.
+    #
+    # `_print_history()`'s sibling for `COMPANY_OPS_HISTORY_START_DATE` has
+    # always been written the right way round (`if history_start is None:`),
+    # which is the shape copied here.
+    if _agent_start_date() is None:
         print("  (COMPANY_OPS_AGENT_START_DATE 미설정 — 미수집 날짜는 계산되지 않음)")
 
     # The same two lock conditions `_print_last_run()` reports for the
@@ -2241,6 +3391,264 @@ def _print_agent(now: datetime) -> list[str]:
                 )
 
     return list(snapshot.needs_attention(now)) + delivery_attention + lock_attention
+
+
+def _event_day(iso: str | None) -> date | None:
+    """The date part of an Event timestamp, or None if it cannot be read."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _company_history_older_than_the_evidence(daily_dir: Path, earliest_event) -> date | None:
+    """The earliest day Company History records work for that the Control
+    Tower's evidence cannot cover, or None.
+
+    **Why this can happen at all, and why it is not a bug to fix here.**
+    `runtime/events/processed/` is Execution Evidence (docs/14 §2) and Backup
+    scope is `daily/` and `monthly/` only (docs/08 §26). So a machine restored
+    from the remote gets its whole Company History back and **none of its
+    Events** — and the Control Tower, which reads that directory and nothing
+    else, then answers `Event 0건 / 움직인 Project 0 / 모든 Team 활동 없음`.
+
+    Measured on a restored-shaped tree, 18 days of Daily History with work in
+    them: exactly that, with nothing on screen distinguishing it from a
+    company that did nothing. B-6's retention decision produces the same
+    shape deliberately.
+
+    So this is a **qualifier, not an alert**. There is no action that brings
+    the Events back, and a standing alarm nobody can clear is the thing this
+    file keeps removing. What the caller does with it is add "the numbers
+    below only cover what evidence is left" — the same treatment as an
+    unreadable file.
+
+    The comparison is against the earliest Daily that **carries work**, not
+    the earliest Daily file: `generate_daily_history()` writes a file for an
+    empty day too (docs/09 §72), so a `history_start_date` earlier than the
+    first Event is ordinary and must not read as missing evidence. Ids are
+    read with `_rendered_event_ids()` — the same reader the Monthly checks
+    use, so "an item" means one thing.
+
+    Cheap by construction: it stops at the first Daily that has work, which
+    on any tree is at most a few reads.
+    """
+    for day in _daily_dates(daily_dir):
+        if earliest_event is not None and day >= earliest_event:
+            return None
+        try:
+            text = (daily_dir / f"{day.isoformat()}.md").read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        if _rendered_event_ids(text):
+            return day
+    return None
+
+
+def _print_control_tower(now: datetime) -> list[str]:
+    """CONTROL TOWER — the business layer, which no view had.
+
+    Every other block in this file is operational: is the pipeline healthy,
+    is each Desktop reporting, did the last run succeed. None of them answers
+    what a Control Tower is for — which projects are moving, which have
+    stopped, which are blocked and on what, which team is silent, what
+    completed. `controltower/rollup.py` derives all of that from the Events
+    already in `runtime/events/processed/`, and this prints it.
+
+    **Numbers here are traceable by construction.** Every rollup carries the
+    `event_id` and the file it was counted from, and the blocker lines quote
+    both — "왜 이 숫자가 나오는가"는 파일 하나를 여는 것으로 끝난다.
+
+    What raises ATTENTION, and what deliberately does not:
+
+        열린 Blocker    yes. docs/02 makes a `BLOCKED` Event carry a
+                        human-written `blocker`, and nothing in the pipeline
+                        ever clears it — only a RESUMED / ISSUE_RESOLVED /
+                        COMPLETED Event from a person does. That is exactly
+                        this section's admission rule ("사람이 지금 할 일이
+                        있는 것"), and it clears the moment the team reports.
+                        No threshold is invented: an open blocker is open.
+        조용한 Team     **no.** `source` -> `role` is 1:1 (docs/02 §8), so a
+                        silent team is the silent Desktop the COMPANY block
+                        already reports. Two lines for one fact is the second
+                        opinion this project keeps removing; the count is
+                        printed here and the alert stays there.
+        읽을 수 없는 파일  **no.** The HISTORY block's Candidate 정합성 line
+                        already names them. Printed here only as the reason
+                        the numbers below are short of the truth.
+    """
+    rollup = build_company_rollup(
+        processed_dir=RUNTIME_DIR / "events" / "processed", now=now
+    )
+    attention: list[str] = []
+
+    print("CONTROL TOWER — Company / Team / Project")
+    print("-" * 60)
+
+    if rollup.unreadable:
+        # Not an alert of its own — see the docstring. Said here because it
+        # is the one thing that makes every number below a lower bound.
+        print(
+            f"  집계 대상           : Event {rollup.events_read}건 (전체 기간, "
+            f"읽지 못한 파일 {len(rollup.unreadable)}건 — 아래 숫자는 그만큼 적다)"
+        )
+    else:
+        print(f"  집계 대상           : Event {rollup.events_read}건 (전체 기간)")
+
+    # Company History can outlive the evidence the Control Tower reads — see
+    # `_company_history_older_than_the_evidence()`. Said as a qualifier on the
+    # numbers rather than as an alert: nothing brings those Events back.
+    earliest_event = min(
+        (
+            parsed
+            for parsed in (
+                _event_day(project.first_seen) for project in rollup.projects
+            )
+            if parsed is not None
+        ),
+        default=None,
+    )
+    older = _company_history_older_than_the_evidence(
+        RUNTIME_DIR / "local_master" / "daily", earliest_event
+    )
+    if older is not None:
+        print(
+            f"  증거 범위 밖        : Company History는 {older.isoformat()}부터 일을 "
+            f"기록하는데 이 계층이 읽는 Event는 "
+            + (
+                "하나도 남아 있지 않다"
+                if earliest_event is None
+                else f"{earliest_event.isoformat()}부터다"
+            )
+            + " — 위 숫자는 그 뒤만 덮는다 (`processed/`는 Backup 범위가 아니다, "
+            "docs/08 §26)"
+        )
+
+    completed = [p for p in rollup.projects if p.is_complete]
+    print(
+        f"  움직인 Project      : {len(rollup.projects)}"
+        + (f" (완료 {len(completed)})" if completed else "")
+    )
+
+    def _value(key: str) -> int:
+        metric = rollup.metric(key)
+        return metric.value if metric is not None else 0
+
+    print(
+        f"  Milestone/Decision/Issue: {_value('milestones_completed')} / "
+        f"{_value('decisions_approved')} / {_value('issues_resolved')}"
+    )
+    print(f"  열려 있는 Blocker   : {_value('open_blockers')}")
+
+    # No `if rollup.teams:` guard, and none below for Desktops: both folds
+    # seed every entry in docs/02 §8's table and return it silent rather than
+    # absent. That is the point of them -- "물어봤고 없다" and "묻지 않았다"
+    # are different sentences, and only the first is true here. Branch
+    # coverage found the guards; they had no other side to take.
+    print("  Team")
+    for team in rollup.teams:
+        silent = "" if team.has_activity else "   (이 기간 활동 없음)"
+        blocked = (
+            f"  막힌 Project {len(team.blocked_projects)}"
+            if team.blocked_projects
+            else ""
+        )
+        print(
+            f"    {one_line(team.display_name):<14} Event {team.event_count:<4}"
+            f"Project {len(team.projects)}{blocked}{silent}"
+        )
+
+    # The layer under Team, and the reason both are here: `source` -> `role`
+    # is 1:1 while every Event obeys docs/02 §8, so Team and Desktop are the
+    # same partition — right up to the moment an Event says otherwise, which
+    # is when having only one of them hides it.
+    print("  Desktop")
+    for desktop in rollup.desktops:
+        silent = desktop.days_silent(now)
+        when = (
+            f"마지막 {one_line(desktop.last_seen)}"
+            + (f" ({silent}일 전)" if silent else "")
+            if desktop.last_seen
+            else "이 기간 Event 없음"
+        )
+        bad = f"  ! role 어긋남 {len(desktop.mismatched)}" if desktop.mismatched else ""
+        print(
+            f"    {one_line(desktop.source):<12}{one_line(desktop.display_name):<14}"
+            f"Event {desktop.event_count:<4}Project {len(desktop.projects):<3}{when}{bad}"
+        )
+
+    if rollup.projects:
+        print("  Project")
+        # Blocked first, then by how long they have been quiet: the two
+        # questions an operator actually opens this block with.
+        def _order(project):
+            idle = project.days_since_last_event(now)
+            return (0 if project.is_blocked else 1, -(idle if idle is not None else 0))
+
+        shown = sorted(rollup.projects, key=_order)[:_CONTROL_TOWER_PROJECT_LINES]
+        for project in shown:
+            marker = "!" if project.is_blocked else " "
+            teams = "/".join(
+                one_line(ROLE_DISPLAY_NAMES.get(role, role)) for role in project.teams
+            )
+            if project.is_blocked:
+                days = project.days_blocked(now)
+                state = "BLOCKED" + (f" {days}일째" if days is not None else "")
+            elif project.is_complete:
+                state = f"완료 {one_line(project.completed_at)}"
+            else:
+                idle = project.days_since_last_event(now)
+                # The project's own last reported `status`, not a derived
+                # word: "created and never moved" (NOT_STARTED) and "in
+                # flight" (IN_PROGRESS) are different facts and only the
+                # Event says which.
+                state = f"{one_line(project.status)} 마지막 {one_line(project.last_seen)}" + (
+                    f" ({idle}일 전)" if idle else ""
+                )
+            print(
+                f"    {marker} {_authored(project.project_id):<20} {teams:<26}"
+                f"Event {project.event_count:<4}{state}"
+            )
+        if len(rollup.projects) > len(shown):
+            print(f"      외 {len(rollup.projects) - len(shown)}건")
+
+    for risk in rollup.risks:
+        days = risk.days_open(now)
+        age = f"{days}일째 " if days is not None else ""
+        attention.append(
+            f"{age}막혀 있는 Project: {_authored(risk.project_id)} "
+            f"[{one_line(ROLE_DISPLAY_NAMES.get(risk.team, risk.team))}] — "
+            f"{_authored(risk.blocker)} "
+            f"(증거 {_authored(risk.evidence.describe())}) — "
+            "Blocker는 파이프라인이 스스로 지우지 않는다. 그 팀이 RESUMED / "
+            "ISSUE_RESOLVED / COMPLETED를 보고할 때까지 열려 있다"
+        )
+
+    for mismatch in rollup.mismatches:
+        attention.append(
+            f"Desktop과 role이 어긋난 Event: {_authored(mismatch.event_id)} — "
+            f"{one_line(mismatch.source)}에서 왔는데 role은 "
+            f"{one_line(mismatch.claimed_role)}이라고 말한다(docs/02 §8은 그 Desktop을 "
+            f"{one_line(mismatch.expected_role)}로 정한다). 증거 "
+            f"{_authored(mismatch.evidence.describe())}. **이 Event의 작업은 위 Team "
+            f"집계와 Desktop 집계에서 서로 다른 곳으로 간다** — Notion PROJECTS 행도 "
+            f"Owner와 Source가 서로 다른 Desktop을 가리킨다. `validate_event()`는 두 "
+            f"필드를 각각만 검사하고 짝은 검사하지 않으므로 손으로 쓴 Event나 복원된 "
+            f"파일이 이 모양이 될 수 있다. 거부하지 않는 이유와 필요한 결정은 BACKLOG"
+        )
+
+    # The layers this system has no source for, said out loud. An empty panel
+    # reads as "아무 일도 없다"; this says "물어볼 곳이 없다", which is a
+    # different sentence and the true one.
+    print(
+        "  (원천 없음          : "
+        + ", ".join(UNSOURCED_LAYERS)
+        + " — Event Schema에도 Company Repository에도 이 계층이 없다. "
+        "BACKLOG 참조)"
+    )
+    return attention
 
 
 def _print_last_run(now: datetime | None = None) -> list[str]:
@@ -2326,6 +3734,42 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     # manifest is a DR path, not an exotic one.
     print(f"  실행 시각   : {one_line(summary.started_at)}")
 
+    # How long that run took. `RunSummary.finished_at` is written on every
+    # exit path — `run_once()` sets it in the same `finally` that writes the
+    # manifest — and was read by nothing at all: not this view, not
+    # `run_company_ops.py`, not a test. A field computed and discarded
+    # (BUG-39's shape), found by a sweep of every dataclass field with no
+    # production reader outside its own module (C32 §20).
+    #
+    # It is worth a line because the pipeline's cost is not constant: the
+    # Backup step shells out to git with a 300 s timeout, `desktop_activity`
+    # reads every file in `processed/` (which grows without bound), and the
+    # Notion steps wait on a network. A run that used to take four seconds
+    # and now takes four minutes is the earliest signal any of those is
+    # degrading, and until now the two timestamps that say so were both on
+    # disk and neither was ever subtracted.
+    #
+    # Resolution is one second, because `runsummary.now_iso()` formats with
+    # `timespec="seconds"` — so an idle run reads `0.0s`. That is the true
+    # answer at this resolution and the useful signal is the other end of
+    # the scale (seconds becoming minutes); widening the manifest's
+    # timestamp format to gain sub-second precision would be a schema
+    # change for a number nobody needs.
+    #
+    # Unparseable or out-of-order values are skipped rather than guessed at,
+    # exactly like the age check below: a restored manifest can carry either.
+    try:
+        finished = datetime.fromisoformat(summary.finished_at)
+        began = datetime.fromisoformat(summary.started_at)
+    except (TypeError, ValueError):
+        finished = began = None
+    if finished is not None and began is not None and (
+        (finished.tzinfo is None) == (began.tzinfo is None)
+    ):
+        elapsed = (finished - began).total_seconds()
+        if elapsed >= 0:
+            print(f"  소요 시간   : {elapsed:.1f}s")
+
     # How long ago that was — the question this line never answered.
     #
     # The AGENT section has had "agent has not run for N day(s)" since it was
@@ -2397,13 +3841,55 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
         # persisted file rendered to a terminal, and the rule that nothing
         # read back from disk can forge a line should not depend on today's
         # metric list staying the way it is.
-        if component.metrics:
+        #
+        # That last sentence is about the *keys*, and the guard used to be on
+        # the values only. `read_summary()` validates the three enums and
+        # nothing else — `metrics` comes back as `c.get("metrics", {})`, so
+        # both halves of every pair are whatever the JSON holds. A restored
+        # or hand-edited manifest is a DR path, and a forged line here sits
+        # inside the LAST RUN block indented exactly like a real metric row.
+        #
+        # And the sentence above is about the PAIRS. `metrics` itself is
+        # `c.get("metrics", {})`, so it can also be not-a-mapping at all —
+        # the one shape `.items()` cannot survive. Measured (C44), a manifest
+        # whose `metrics` was a string:
+        #
+        #     AttributeError: 'str' object has no attribute 'items'
+        #     -> out of `_print_last_run()`, out of `main()`
+        #     -> the operator gets a traceback instead of ANY status
+        #
+        # That breaks this file's own contract twice over: it "must still
+        # produce an answer when part of the evidence is damaged", and
+        # docs/10 §46 names a damaged state file as something to REPORT, not
+        # something to die on. It is a DR path — a restored or hand-edited
+        # manifest — which is exactly when this view is read.
+        #
+        # Reported rather than skipped, for §46's reason: the rest of the
+        # manifest still renders (which step failed, how badly), and the
+        # damage gets a line of its own instead of disappearing.
+        metrics = component.metrics if isinstance(component.metrics, Mapping) else None
+        if metrics:
             rendered = " ".join(
-                f"{key}={one_line(value)}" for key, value in sorted(component.metrics.items())
+                f"{one_line(key)}={one_line(value)}"
+                for key, value in sorted(metrics.items())
             )
             print(f"      {rendered}")
+        elif component.metrics:
+            kind = type(component.metrics).__name__
+            print(f"      metrics 읽을 수 없음 (JSON 객체가 아님: {kind})")
+            attention.append(
+                f"Run Manifest의 `{one_line(component.name)}` 단계 metrics가 손상됐다 "
+                f"(JSON 객체가 아니라 {kind}) — 그 단계의 숫자는 읽을 수 없다. "
+                f"나머지 Manifest는 그대로 유효하다. 복구된 파일이거나 손으로 편집된 "
+                f"파일일 수 있다(docs/10 §46)"
+            )
         if component.artifact_refs:
-            print(f"      evidence: {', '.join(component.artifact_refs)}")
+            # Same origin, same rule — `artifact_refs` is `tuple(c.get(...))`
+            # with no validation either.
+            print(
+                "      evidence: "
+                + ", ".join(one_line(ref) for ref in component.artifact_refs)
+            )
 
     # Steps that never started. This loop only ever walked the components
     # that ARE in the manifest, so a run that aborted in Backup — taking
@@ -2446,7 +3932,21 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     return attention
 
 
-def main() -> int:
+def main(argv: Sequence[str] = ()) -> int:
+    refusal = unexpected_arguments(
+        argv,
+        tool="ops_status.py",
+        configured_by=(
+            "COMPANY_OPS_RUNTIME_DIR",
+            "COMPANY_OPS_HISTORY_START_DATE",
+            "COMPANY_OPS_AGENT_SYNC_FOLDER",
+            "COMPANY_OPS_AGENT_START_DATE",
+        ),
+    )
+    if refusal is not None:
+        print(f"[FAILED] {refusal}", file=sys.stderr)
+        return CONFIG_ERROR_EXIT
+
     now = datetime.now().astimezone()
     print(f"DOJOONPASS Company Ops — Status @ {now.isoformat(timespec='seconds')}")
     print()
@@ -2455,7 +3955,11 @@ def main() -> int:
     print()
     attention.extend(_print_history(now))
     print()
+    attention.extend(_print_control_tower(now))
+    print()
     attention.extend(_print_last_run(now))
+    print()
+    attention.extend(_print_notion(now))
     print()
     attention.extend(_print_agent(now))
     print()
@@ -2496,17 +4000,34 @@ def main() -> int:
         # human has to go and find.
         #
         # `redact()` is deliberately NOT applied here, unlike in
-        # `append_line()`. Every ATTENTION message is built from filenames,
-        # ids and counts — never from a file's *contents* — and the two that
-        # carry an exception message carry a state-file parse error, whose
-        # text is positional ("Expecting ',' delimiter: line 3 column 5") and
-        # quotes nothing. Over-redacting a path an operator has to act on
-        # would cost more than it protects. If a message ever starts carrying
-        # a response body, it needs `redact()` too — see
-        # `run_company_ops.py::_print_result()`, where one already does.
+        # `append_line()`. Almost every ATTENTION message is built from
+        # filenames, ids and counts — never from a file's *contents* — and the
+        # two that carry an exception message carry a state-file parse error,
+        # whose text is positional ("Expecting ',' delimiter: line 3 column 5")
+        # and quotes nothing. Over-redacting a path an operator has to act on
+        # would cost more than it protects.
+        #
+        # The exceptions are handled where they are produced rather than
+        # here, and there is more than one: `_print_control_tower()`'s blocker
+        # line quotes a `blocker` string a person typed on another Desktop,
+        # which is Event *content* and can carry anything — "waiting for
+        # NOTION_API_TOKEN=… to be rotated" is a plausible thing to write.
+        #
+        # C47 corrected the sentence above it. "never from a file's contents"
+        # rested on ids being machine-made, and they are not: `event_id` and
+        # `project_id` are plain strings a Desktop sets for itself and
+        # `validate_event()` only type-checks. Measured — an Event named after
+        # the token it was about printed that token into this block and into
+        # the log a scheduled run redirects to disk. Every site that prints an
+        # Event-authored identifier now goes through `_authored()`.
+        #
+        # The sink itself stays un-redacted, which is still right: a path is
+        # still a path, and a message that carries authored text redacts at
+        # the place it is produced — exactly as
+        # `run_company_ops.py::_print_result()` does for `failure.reason`.
         print(f"  ! {one_line(item)}")
     return 3
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv))

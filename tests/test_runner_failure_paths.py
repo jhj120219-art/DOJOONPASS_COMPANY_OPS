@@ -69,7 +69,13 @@ from notion import (  # noqa: E402
 from notion.retry_queue import RetryQueueError  # noqa: E402
 from notion.retry_queue import save_queue as save_retry_queue  # noqa: E402
 from notion.sync import SyncResult, SyncStatus  # noqa: E402
-from runsummary import ComponentStatus, read_summary  # noqa: E402
+from runsummary import (  # noqa: E402
+    ComponentStatus,
+    OverallStatus,
+    Retryability,
+    Severity,
+    read_summary,
+)
 from scheduler.state import SchedulerStateError  # noqa: E402
 from reporter import Reporter  # noqa: E402
 
@@ -1036,6 +1042,51 @@ class RetryQueueBatchSaveDurabilityTests(RunnerFailurePathTestCase):
         original exception with the save's."""
         self._run_with_failure_at_and_failing_save(nth=3)
 
+    def test_the_masked_save_failure_still_leaves_a_trace(self):
+        """C40. Not masking the original exception is right; vanishing is not.
+
+        The swallowing branch is chosen precisely because raising there would
+        replace a real failure with a bookkeeping one — and it wrote nothing
+        at all, so the two facts an operator has to act on differently were
+        collapsed into one:
+
+            the step aborted            reported as STEP_ABORTED, and the
+                                        next run resumes
+            the queue write also failed the retries this run computed are
+                                        NOT on disk, so the next run does
+                                        not know to retry them
+
+        Only the first was visible. A log line is added; control flow is
+        unchanged — the original exception still escapes, which the sibling
+        test above pins.
+        """
+        self._run_with_failure_at_and_failing_save(nth=3)
+
+        log = self.notion_sync_log_path.read_text(encoding="utf-8")
+        self.assertIn("RETRY_QUEUE_SAVE_FAILED", log)
+        self.assertIn("save ALSO fails", log)
+
+    def test_the_unmasked_save_failure_is_logged_before_it_is_raised(self):
+        """The other branch writes the same line. It raises as well, so the
+        run is not silent either way — but the log is what survives into the
+        next run, and the exception is not."""
+        for i in range(2):
+            self._write_event(event_id=f"BATCHSAVELOG-{i:03d}")
+
+        def failing_save(path, entries):
+            raise OSError("simulated disk failure during save_retry_queue")
+
+        runner_module.save_retry_queue = failing_save
+        self.addCleanup(
+            lambda: setattr(runner_module, "save_retry_queue", save_retry_queue)
+        )
+
+        with self.assertRaises(OSError):
+            self._run(notion_sync=self._failing_sync())
+
+        log = self.notion_sync_log_path.read_text(encoding="utf-8")
+        self.assertIn("RETRY_QUEUE_SAVE_FAILED", log)
+
     def _run_with_failure_at_and_failing_save(self, nth):
         for i in range(4):
             self._write_event(event_id=f"BATCHSAVEFAIL2-{i:03d}")
@@ -1066,10 +1117,285 @@ class RetryQueueBatchSaveDurabilityTests(RunnerFailurePathTestCase):
             self._run(notion_sync=self._failing_sync())
 
 
-class NotionLastUpdatedParsingTests(unittest.TestCase):
-    """BUG-29 (NOT FIXED — the fix is a decision about what to trust).
+    def test_a_log_write_that_also_fails_does_not_replace_the_real_error(self):
+        """The innermost of the three failures, and the only one never run.
 
-    CHARACTERIZATION: asserts today's behaviour, including the crash.
+        The `RETRY_QUEUE_SAVE_FAILED` line added in C40 is written from inside
+        the `except` that caught the save failure, and it is wrapped in its own
+        `except Exception: pass`. The comment states why — "로그도 못 쓰는
+        상황이라면 원래 예외를 가리는 것이 훨씬 나쁘다" — and a branch-coverage
+        pass showed those lines had never executed, so the sentence described
+        untested code.
+
+        The arrangement is not exotic: the condition that stops
+        `save_retry_queue()` from writing `runtime/state/` (a full disk, a
+        revoked ACL, a directory replaced by a file) is usually the same one
+        that stops `notion_sync.log` from being appended to, so the two fail
+        together far more often than either fails alone.
+
+        What must survive: the ORIGINAL exception, unchanged. Not the save's,
+        not the logger's.
+        """
+        for i in range(2):
+            self._write_event(event_id=f"BATCHLOGFAIL-{i:03d}")
+
+        def failing_save(path, entries):
+            raise OSError("save fails")
+
+        def failing_log(path, message):
+            # Only the one line under test. A blanket failure would abort the
+            # run at its very first log write and prove nothing about this
+            # `except`.
+            if message.startswith("RETRY_QUEUE_SAVE_FAILED"):
+                raise OSError("the log is unwritable too")
+            return original_log(path, message)
+
+        original_log = runner_module._append_log_line
+        runner_module.save_retry_queue = failing_save
+        runner_module._append_log_line = failing_log
+        self.addCleanup(lambda: setattr(runner_module, "save_retry_queue", save_retry_queue))
+        self.addCleanup(lambda: setattr(runner_module, "_append_log_line", original_log))
+
+        with self.assertRaises(OSError) as caught:
+            self._run(notion_sync=self._failing_sync())
+
+        # The save's failure, raised because nothing else was propagating —
+        # not the logger's, which is best effort.
+        self.assertIn("save fails", str(caught.exception))
+
+    def test_a_log_write_that_also_fails_does_not_mask_a_propagating_error(self):
+        """Same innermost failure, reached with an ORIGINAL exception already
+        in flight. Three failures deep, and the first one still wins."""
+        for i in range(4):
+            self._write_event(event_id=f"BATCHLOGFAIL2-{i:03d}")
+
+        original_upsert = runner_module.retry_queue_upsert
+        calls = {"n": 0}
+
+        def counting_upsert(entries, event, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise ValueError("ORIGINAL injected failure inside the Notion step")
+            return original_upsert(entries, event, **kwargs)
+
+        def failing_save(path, entries):
+            raise OSError("save fails")
+
+        def failing_log(path, message):
+            # Only the one line under test. A blanket failure would abort the
+            # run at its very first log write and prove nothing about this
+            # `except`.
+            if message.startswith("RETRY_QUEUE_SAVE_FAILED"):
+                raise OSError("the log is unwritable too")
+            return original_log(path, message)
+
+        original_log = runner_module._append_log_line
+        runner_module.retry_queue_upsert = counting_upsert
+        runner_module.save_retry_queue = failing_save
+        runner_module._append_log_line = failing_log
+        self.addCleanup(lambda: setattr(runner_module, "retry_queue_upsert", original_upsert))
+        self.addCleanup(lambda: setattr(runner_module, "save_retry_queue", save_retry_queue))
+        self.addCleanup(lambda: setattr(runner_module, "_append_log_line", original_log))
+
+        with self.assertRaises(ValueError) as caught:
+            self._run(notion_sync=self._failing_sync())
+
+        self.assertIn("ORIGINAL injected failure", str(caught.exception))
+
+
+class OneBatchIsAppliedOldestFirstTests(RunnerFailurePathTestCase):
+    """C47: within ONE run, the Notion row depended on filename order.
+
+    Step 4b synced in `collector_summary.files` order, which is the
+    Collector's `sorted(glob("*.json"))` — filename order. An `event_id` is
+    `uuid5(namespace, "<Desktop>|<date>|<Signal filename>")`, so that order
+    has no relation to when the work happened, while docs/04 §29-30's Late
+    Event guard refuses any Event not newer than the row's `Last Updated`.
+
+    Measured, two Events of one project an hour apart in the same batch:
+
+        file order == time order   BLOCKED then DECISION_APPROVED
+                                   -> row shows the blocker
+        file order reversed        DECISION_APPROVED then BLOCKED
+                                   -> NOTION_SKIPPED_OLD_EVENT, and the row
+                                      shows NO blocker at all
+
+    Neither Event is late in any operational sense. Which of the two outcomes
+    an operator got was a coin flip on a uuid — and the losing outcome is a
+    blocked project reported as healthy, which is the one number a Control
+    Tower must not get wrong.
+
+    Sorting the batch changes the final state only when the older Event
+    carries state the newer one does not touch, and there the sorted answer
+    is the fold's answer. Distinct from E-23: those Events share an instant
+    and the guard's "동시" rule is doing what its spec says. Here the
+    timestamps differ and the *input order* was arbitrary.
+    """
+
+    PROJECT = "SEARCH"
+
+    def _two_events(self, blocked_id, decision_id):
+        """A BLOCKED at 09:00 and a DECISION_APPROVED at 10:00, whose
+        filenames sort in whichever order the ids imply."""
+        self._write_event(
+            event_id=blocked_id, project_id=self.PROJECT, event_type="BLOCKED",
+            status="BLOCKED", blocker="vendor key", summary="blocked",
+            timestamp="2026-08-01T09:00:00+09:00", milestone=None,
+        )
+        self._write_event(
+            event_id=decision_id, project_id=self.PROJECT,
+            event_type="DECISION_APPROVED", status="IN_PROGRESS",
+            summary="decided", timestamp="2026-08-01T10:00:00+09:00",
+            milestone=None,
+        )
+
+    def _row(self, transport):
+        pages = [
+            page for page in transport._pages.values()
+            if "Project ID" in page.get("properties", {})
+        ]
+        self.assertEqual(len(pages), 1)
+        return pages[0]["properties"]
+
+    def _blocker(self, properties):
+        items = (properties.get("Blocker") or {}).get("rich_text") or []
+        return "".join(item["text"]["content"] for item in items) or None
+
+    def _sync(self):
+        from notion import ExecutionPlanSync, InMemoryNotionTransport, NotionClient
+
+        transport = InMemoryNotionTransport()
+        return transport, ExecutionPlanSync(
+            client=NotionClient(transport=transport, database_id="DB")
+        )
+
+    def test_filename_order_matching_time_order_keeps_the_blocker(self):
+        """The half that always worked — the control."""
+        self._two_events("A-BLOCKED", "B-DECISION")
+        transport, sync = self._sync()
+
+        self._run(notion_sync=sync)
+
+        self.assertEqual(self._blocker(self._row(transport)), "vendor key")
+
+    def test_filename_order_reversing_time_order_keeps_it_too(self):
+        """The half that did not. Same two Events, ids swapped so the
+        Collector hands them over newest-first."""
+        self._two_events("Z-BLOCKED", "A-DECISION")
+        transport, sync = self._sync()
+
+        self._run(notion_sync=sync)
+
+        self.assertEqual(self._blocker(self._row(transport)), "vendor key")
+
+    def test_the_row_ends_where_the_fold_over_the_same_events_ends(self):
+        """Stated as the property rather than as two cases: whatever the file
+        order, the row equals the Control Tower's fold — the same invariant
+        `TheRowIsExactlyTheFoldOverWhatReachedItTests` holds for sequences."""
+        from controltower import build_company_rollup
+
+        for blocked_id, decision_id in (
+            ("A-BLOCKED", "B-DECISION"),
+            ("Z-BLOCKED", "A-DECISION"),
+        ):
+            with self.subTest(order=(blocked_id, decision_id)):
+                self.setUp()
+                self._two_events(blocked_id, decision_id)
+                transport, sync = self._sync()
+
+                self._run(notion_sync=sync)
+
+                folded = build_company_rollup(
+                    processed_dir=self.processed_dir,
+                    now=datetime(2026, 8, 2, 12, 0).astimezone(),
+                ).project(self.PROJECT)
+                self.assertEqual(
+                    self._blocker(self._row(transport)), folded.open_blocker
+                )
+
+    def test_nothing_is_skipped_when_the_batch_is_ordered(self):
+        """The skip count is the visible consequence: sorting removes skips
+        that were never about lateness."""
+        from notion import SyncStatus
+
+        self._two_events("Z-BLOCKED", "A-DECISION")
+        transport, sync = self._sync()
+
+        results = self._run(notion_sync=sync)[4]
+
+        self.assertEqual(
+            [r.status for r in results],
+            [SyncStatus.NOTION_CREATED, SyncStatus.NOTION_UPDATED],
+        )
+
+    def test_a_genuinely_older_event_is_still_refused_next_run(self):
+        """The guard itself is untouched — and the cost of that is worth
+        writing down, because sorting the batch does not pay it.
+
+        An Event that arrives in a LATER run than the one that already moved
+        the row is still refused. That is docs/04 §29-30's whole purpose. But
+        when the refused Event is the one carrying the blocker, the row keeps
+        a state that says the project is fine while the fold over the same
+        Events says it is blocked — and unlike the batch case there is no
+        ordering to fix, because the two Events genuinely arrived in
+        different runs.
+
+        Reachable without anything unusual: a Desktop that was switched off
+        sends yesterday's `BLOCKED` after today's `DECISION_APPROVED` has
+        already synced (docs/07 §58 makes an off Desktop normal).
+
+        Pinned as a **characterization**: closing it means changing what the
+        guard does, which is E-23's own open decision. What compensates today
+        is that the CONTROL TOWER block reads the fold off disk, so the
+        operator is still told — locally — that the project is blocked.
+        """
+        from controltower import build_company_rollup
+        from notion import SyncStatus
+
+        transport, sync = self._sync()
+        self._write_event(
+            event_id="NEWER", project_id=self.PROJECT, event_type="DECISION_APPROVED",
+            status="IN_PROGRESS", summary="today",
+            timestamp="2026-08-01T10:00:00+09:00", milestone=None,
+        )
+        self._run(notion_sync=sync)
+
+        self._write_event(
+            event_id="LATE", project_id=self.PROJECT, event_type="BLOCKED",
+            status="BLOCKED", blocker="arrived late", summary="older",
+            timestamp="2026-08-01T09:00:00+09:00", milestone=None,
+        )
+        results = self._run(
+            now=datetime(2026, 8, 3, 12, 0).astimezone(), notion_sync=sync
+        )[4]
+
+        self.assertEqual(
+            [r.status for r in results], [SyncStatus.NOTION_SKIPPED_OLD_EVENT]
+        )
+        self.assertIsNone(self._blocker(self._row(transport)))
+
+        # ...and the divergence, stated rather than left implicit.
+        folded = build_company_rollup(
+            processed_dir=self.processed_dir,
+            now=datetime(2026, 8, 3, 12, 0).astimezone(),
+        ).project(self.PROJECT)
+        self.assertEqual(folded.open_blocker, "arrived late")
+
+    def test_the_sort_key_is_the_one_the_rollup_uses(self):
+        """One rule, one place: a second ordering rule here and in the fold is
+        exactly how the two answers drift apart again."""
+        import inspect
+
+        from controltower import event_instant_key
+
+        source = inspect.getsource(runner_module.run_once)
+
+        self.assertIn("event_instant_key", source)
+        self.assertTrue(callable(event_instant_key))
+
+
+class NotionLastUpdatedParsingTests(unittest.TestCase):
+    """BUG-29 — FIXED in C32 §7. Was CHARACTERIZATION, now GUARANTEE.
 
     docs/04 sections 29-30's Late Event guard compares the incoming Event's
     timestamp against the page's current `Last Updated`:
@@ -1085,21 +1411,34 @@ class NotionLastUpdatedParsingTests(unittest.TestCase):
     comparing naive with aware raises TypeError. An empty string raises
     ValueError from fromisoformat itself.
 
-    Neither is caught: `sync()` only handles NotionAPIError. The exception
-    escapes into app/runner.py, whose broad `except Exception` turns it into
-    NOTION_FAILED and queues the Event. The Notion page still holds the same
-    unparseable value, so the next run raises again — the Event is queued
+    Neither was caught: `sync()` only handles NotionAPIError. The exception
+    escaped into app/runner.py, whose broad `except Exception` turned it into
+    NOTION_FAILED and queued the Event. The Notion page still held the same
+    unparseable value, so the next run raised again — the Event was queued
     forever with attempt_count climbing and nothing capping it, which is the
     BUG-13/BUG-14 loop reached through a human's edit rather than an
-    oversized payload.
+    oversized payload. One human setting a date in the Notion UI wedged that
+    project's sync permanently, and the only visible symptom was a retry
+    queue entry.
 
-    One human setting a date in the Notion UI therefore wedges that project's
-    sync permanently, and the only visible symptom is a retry queue entry.
+    **Why it stopped needing a decision.** What this was recorded as blocked
+    on — "what to trust" — turned out to be already settled *in this same
+    function*, one branch up: `current_last_updated is None` (a cleared date)
+    already means "cannot compare, proceed". A value that cannot be parsed is
+    the same epistemic state, and giving it the same answer invents no
+    policy. Proceeding is also the only self-healing option — the update
+    writes a well-formed `Last Updated`, so the guard is back on for the next
+    Event, whereas refusing would leave the cell, and the wedge, exactly as
+    it was.
 
-    The §62 duplicate guard runs FIRST and returns before the comparison, so a
-    re-arriving Event with a matching Last Event ID is unaffected — the damage
-    is confined to genuinely new Events for that project. That asymmetry is
-    asserted below so a fix cannot quietly change it.
+    What was *not* decided here, and stays out: reading "2026-08-05" as
+    midnight in the Event's own offset. That would move the Late Event
+    boundary by up to a day in a direction nobody chose. Unknown is reported
+    as unknown, on `SyncResult.error`, and reaches notion_sync.log.
+
+    The §62 duplicate guard runs FIRST and returns before the comparison, so
+    a re-arriving Event with a matching Last Event ID was unaffected even
+    before the fix. That asymmetry is still asserted below.
     """
 
     def _event(self, event_id="LATE-1", timestamp="2026-08-06T10:00:00+09:00"):
@@ -1131,6 +1470,18 @@ class NotionLastUpdatedParsingTests(unittest.TestCase):
         }
 
         class PageTransport(InMemoryNotionTransport):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                # Register the page so `update_page()` can actually apply to
+                # it. Without this the row was findable but not writable, so
+                # every UPDATE ended as a 404 -> NOTION_RETRY_REQUIRED and
+                # the class could only ever observe the *pre*-update part of
+                # `_update()`. That was enough while this file only asserted
+                # "does it raise"; it is not enough to see what the sync
+                # reports once it stops raising.
+                self._pages[page["id"]] = page
+                self._page_database[page["id"]] = "DB-1"
+
             def query_database(self, database_id, payload=None, **kwargs):
                 return {"results": [page]}
 
@@ -1147,32 +1498,60 @@ class NotionLastUpdatedParsingTests(unittest.TestCase):
         result = self._sync_against(None).sync(self._event())
         self.assertIsNotNone(result.status)
 
-    def test_a_date_only_last_updated_raises_out_of_sync(self):
+    def test_a_date_only_last_updated_no_longer_escapes_sync(self):
         """What Notion's date picker writes when no time is chosen."""
-        with self.assertRaises(TypeError):
-            self._sync_against("2026-08-05").sync(self._event())
+        result = self._sync_against("2026-08-05").sync(self._event())
 
-    def test_an_offset_less_timestamp_raises_out_of_sync(self):
-        with self.assertRaises(TypeError):
-            self._sync_against("2026-08-05T10:00:00").sync(self._event())
+        self.assertIsNotNone(result.status)
 
-    def test_an_empty_last_updated_raises_out_of_sync(self):
-        with self.assertRaises(ValueError):
-            self._sync_against("").sync(self._event())
+    def test_an_offset_less_timestamp_no_longer_escapes_sync(self):
+        result = self._sync_against("2026-08-05T10:00:00").sync(self._event())
+
+        self.assertIsNotNone(result.status)
+
+    def test_an_empty_last_updated_no_longer_escapes_sync(self):
+        result = self._sync_against("").sync(self._event())
+
+        self.assertIsNotNone(result.status)
+
+    def test_none_of_the_three_is_classified_as_a_permanent_failure(self):
+        """The symptom BUG-29 was actually about. `NOTION_FAILED` carries
+        retryability UNKNOWN and parks the Event in the retry queue, where
+        nothing about a stored date changes by retrying."""
+        for stored in ("2026-08-05", "2026-08-05T10:00:00", ""):
+            with self.subTest(last_updated=stored):
+                result = self._sync_against(stored).sync(self._event())
+                self.assertIsNot(result.status, SyncStatus.NOTION_FAILED)
+
+    def test_the_skipped_guard_is_reported_on_the_result(self):
+        """Proceeding without the Late Event guard is a real weakening for
+        that one Event, so it cannot be silent."""
+        result = self._sync_against("2026-08-05").sync(self._event())
+
+        self.assertIsNotNone(result.error)
+        self.assertIn("Late Event guard skipped", result.error)
 
     def test_the_duplicate_guard_short_circuits_before_the_comparison(self):
-        """§62 runs first, so a re-arriving Event survives a broken page."""
+        """§62 runs first, so a re-arriving Event survives a broken page.
+        True before the fix and after it — pinned either way."""
         result = self._sync_against("2026-08-05", last_event_id="LATE-1").sync(
             self._event("LATE-1")
         )
         self.assertIs(result.status, SyncStatus.NOTION_SKIPPED_OLD_EVENT)
 
-    def test_sync_only_guards_against_notion_api_errors(self):
-        """The structural cause: nothing else is caught around the compare."""
+    def test_the_guard_is_a_parse_check_not_a_swallowed_exception(self):
+        """The structural half. `_update()` still catches only
+        NotionAPIError — the fix is a comparability *test* before the
+        comparison, not a wider `except` around it. Those two look alike from
+        the outside and are not: an `except (TypeError, ValueError)` here
+        would also hide a genuine defect in the comparison itself.
+        """
         source = inspect.getsource(ExecutionPlanSync._update)
+
         self.assertIn("except NotionAPIError", source)
         self.assertNotIn("except (TypeError", source)
         self.assertNotIn("except ValueError", source)
+        self.assertIn("_as_comparable_timestamp", source)
 
 
 class IntakeClockSkewTests(unittest.TestCase):
@@ -1635,6 +2014,191 @@ class BackupLogPersistenceTests(unittest.TestCase):
         self.assertNotIn("backup_entry.to_json", entrypoint)
 
 
+class AnUnusableCandidateNamesItselfTests(unittest.TestCase):
+    """C44. A hand-edited Candidate stopped Company History and said nothing
+    useful about why.
+
+    docs/11 §71 explicitly permits the COO to edit files under
+    `runtime/history_candidates/` by hand. `HistoryCandidate.from_dict()`
+    reads whatever the file says and type-checks nothing, so a wrong-typed
+    field survived the read and killed the Markdown renderer three steps
+    later.
+
+    Measured through the real Runner, one edited KEEP Candidate beside one
+    ordinary one — the pipeline result and what the operator was told:
+
+        summary=12345     daily FAILED, 0 Daily files, exit 2, permanently
+        reason            "sequence item 2: expected str instance, int found"
+        ops_status        "Candidate 정합성 : OK"
+
+    The Scheduler builds the KEEP index once per batch, so one file stops
+    **every** date — the same blast radius A-7 / BUG-38 record — and the file
+    stays in `keep/`, so the next run dies identically.
+
+    Nothing about *whether* a run fails changed. What changed is that the
+    failure names the file and the field, and that
+    `ops_status._read_keep_candidates()` now uses the same predicate, so the
+    status view stops calling such a Candidate readable.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.keep = self.root / "keep"
+        self.review = self.root / "review"
+        self.keep.mkdir(parents=True)
+        self.review.mkdir()
+        self.repo = FileHistoryRepository(keep_dir=self.keep, review_dir=self.review)
+
+    GOOD = {
+        "history_id": "HIST-OK",
+        "event_id": "OK-1",
+        "timestamp": "2026-08-05T10:00:00+09:00",
+        "category": "MILESTONE",
+        "project_id": "SEARCH_FRONTEND",
+        "role": "COO",
+        "summary": "healthy candidate",
+        "evidence": [],
+        "filter_result": "KEEP",
+    }
+
+    def _write(self, name, **overrides):
+        data = dict(self.GOOD)
+        data["history_id"] = f"HIST-{name}"
+        data["event_id"] = name
+        drop = overrides.pop("__drop__", None)
+        data.update(overrides)
+        if drop:
+            data.pop(drop, None)
+        (self.keep / f"HIST-{name}.json").write_text(
+            json.dumps(data), encoding="utf-8"
+        )
+
+    BLOCKING = {
+        "summary=int": {"summary": 12345},
+        "summary=dict": {"summary": {"t": "x"}},
+        "project_id=int": {"project_id": 7},
+        "timestamp=int": {"timestamp": 5},
+        "history_id=int": {"history_id": 9},
+        "event_id=list": {"event_id": ["a"]},
+        "missing summary": {"__drop__": "summary"},
+        "missing filter_result": {"__drop__": "filter_result"},
+        "bad filter_result": {"filter_result": "NOPE"},
+    }
+
+    def test_a_healthy_candidate_is_still_read(self):
+        self._write("OK-1")
+
+        self.assertEqual(len(self.repo.list(decision=HistoryDecision.KEEP)), 1)
+
+    def test_every_blocking_shape_names_the_file_and_the_reason(self):
+        from history.file_repository import HistoryCandidateError
+
+        for label, override in self.BLOCKING.items():
+            with self.subTest(case=label):
+                self.setUp()
+                self._write("BAD", **dict(override))
+
+                with self.assertRaises(HistoryCandidateError) as caught:
+                    self.repo.list(decision=HistoryDecision.KEEP)
+
+                message = str(caught.exception)
+                self.assertIn("HIST-BAD.json", message)
+                self.assertIsInstance(caught.exception, ValueError)
+                self.assertTrue(caught.exception.errors, message)
+
+    def test_a_file_that_is_not_utf_8_names_itself(self):
+        """The read itself can fail, and it did so before as a bare
+        `UnicodeDecodeError` from inside `pathlib`. Same shape as
+        `monthly.parser.read_daily_document`'s `ValueError` catch, and for
+        the same reason: a Daily-side codec message with no filename in it
+        was the exact complaint that fix answered."""
+        from history.file_repository import HistoryCandidateError
+
+        (self.keep / "HIST-BINARY.json").write_bytes(b"\xff\xfe not utf-8")
+
+        with self.assertRaises(HistoryCandidateError) as caught:
+            self.repo.list(decision=HistoryDecision.KEEP)
+
+        self.assertIn("HIST-BINARY.json", str(caught.exception))
+        self.assertIn("could not read file", str(caught.exception))
+
+    def test_a_json_document_that_is_not_an_object_names_itself(self):
+        """Valid JSON, wrong shape — a list or a bare string parses fine and
+        then fails on `.get()`. Every other loader in this repository checks
+        the container before the fields (`scheduler`, `collector`, `monthly`,
+        `agent` state all do); this one now does too."""
+        from history.file_repository import HistoryCandidateError
+
+        for label, text in (("list", "[1, 2]"), ("string", '"nope"')):
+            with self.subTest(shape=label):
+                self.setUp()
+                (self.keep / "HIST-SHAPE.json").write_text(text, encoding="utf-8")
+
+                with self.assertRaises(HistoryCandidateError) as caught:
+                    self.repo.list(decision=HistoryDecision.KEEP)
+
+                self.assertIn("HIST-SHAPE.json", str(caught.exception))
+                self.assertIn("JSON object", str(caught.exception))
+
+    def test_get_names_it_too(self):
+        """`get()` and `list()` read the same files; a message that only one
+        of them carries is a message an operator meets by accident."""
+        from history.file_repository import HistoryCandidateError
+
+        self._write("BAD", summary=12345)
+
+        with self.assertRaises(HistoryCandidateError) as caught:
+            self.repo.get("HIST-BAD")
+
+        self.assertIn("HIST-BAD.json", str(caught.exception))
+        self.assertIn("summary", str(caught.exception))
+
+    def test_the_healthy_neighbour_is_still_lost(self):
+        """The severity is NOT reduced — per-file tolerance is still the
+        undecided question (A-7 / BUG-38). Asserted so the improvement is not
+        mistaken for a fix."""
+        from history.file_repository import HistoryCandidateError
+
+        self._write("OK-1")
+        self._write("BAD", summary=12345)
+
+        with self.assertRaises(HistoryCandidateError):
+            self.repo.list(decision=HistoryDecision.KEEP)
+
+    def test_the_shapes_the_renderer_survives_are_deliberately_allowed(self):
+        """The line this draws, stated as a test.
+
+        Refusing these would turn a survivable corruption into a stopped
+        pipeline — the exact harm the named error exists to reduce. Each is
+        covered elsewhere: `category` by
+        `ops_status._daily_counts_more_than_it_shows()` (C43), `evidence` by
+        `test_from_dict_is_inconsistently_strict_about_evidence` and BACKLOG.
+        """
+        for label, override in (
+            ("role=int", {"role": 5}),
+            ("category=int", {"category": 9}),
+            ("evidence=str", {"evidence": "ab"}),
+            ("decision_context=int", {"decision_context": 3}),
+        ):
+            with self.subTest(case=label):
+                self.setUp()
+                self._write("SOFT", **dict(override))
+
+                self.assertEqual(len(self.repo.list(decision=HistoryDecision.KEEP)), 1)
+
+    def test_the_predicate_is_shared_with_the_status_view(self):
+        """One authority, two consumers (C28's rule). If `ops_status` grew its
+        own copy the two would answer differently about the same file, which
+        is how a run dies on a Candidate the status view called healthy."""
+        repo = Path(__file__).resolve().parents[1]
+        source = (repo / "ops_status.py").read_text(encoding="utf-8")
+
+        self.assertIn("from history.result import candidate_errors", source)
+        self.assertIn("if candidate_errors(data):", source)
+
+
 class CorruptCandidateFileTests(unittest.TestCase):
     """BUG-38 (NOT FIXED): one unreadable candidate file blocks the whole day.
 
@@ -1698,22 +2262,41 @@ class CorruptCandidateFileTests(unittest.TestCase):
         self.assertIn("OK-1", body)
 
     def test_one_corrupt_file_breaks_listing_entirely(self):
+        """Still true, and it now says WHICH file (C44).
+
+        The characterized defect is unchanged — no per-file tolerance, the
+        whole listing dies. What changed is that the exception carries the
+        path instead of being a bare `JSONDecodeError` from somewhere inside
+        `json`. `HistoryCandidateError` subclasses `ValueError`, which is what
+        `json.JSONDecodeError` was, so every caller that already caught
+        `ValueError` still does.
+        """
+        from history.file_repository import HistoryCandidateError
+
         self._save_healthy()
         (self.keep / "HIST-BROKEN.json").write_text("{ not json", encoding="utf-8")
 
-        with self.assertRaises(json.JSONDecodeError):
+        with self.assertRaises(HistoryCandidateError) as caught:
             self.repo.list(decision=HistoryDecision.KEEP)
+
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertIn("HIST-BROKEN.json", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, json.JSONDecodeError)
 
     def test_one_corrupt_file_blocks_the_whole_days_history(self):
         """The healthy candidate is lost too — that is the severity."""
+        from history.file_repository import HistoryCandidateError
+
         self._save_healthy()
         (self.keep / "HIST-BROKEN.json").write_text("{ not json", encoding="utf-8")
 
-        with self.assertRaises(json.JSONDecodeError):
+        with self.assertRaises(HistoryCandidateError) as caught:
             generate_daily_history(
                 self.repo, date(2026, 8, 5), output_dir=self.root / "daily"
             )
         self.assertFalse((self.root / "daily" / "2026-08-05.md").exists())
+        # The severity is unchanged; what an operator is told is not.
+        self.assertIn("HIST-BROKEN.json", str(caught.exception))
 
     def test_from_dict_is_inconsistently_strict_about_evidence(self):
         base = {
@@ -3546,19 +4129,37 @@ class BackupJunctionTraversalTests(unittest.TestCase):
 
         self.assertTrue(_is_in_scope(str(Path("daily") / "linked" / "secret.md")))
 
-    def test_the_scan_follows_links_by_default(self):
-        """The structural cause, for JUNCTIONS specifically: `is_file()`
-        alone follows a junction, and `_relative_files()` now guards with
-        `is_symlink()` (added this Sprint for the unrelated file-symlink
-        bug above) -- which measured `False` for a junction, so that guard
-        provides no protection here. `test_a_junction_pulls_outside_content_into_the_scan`
-        is the direct behavioural proof; this test pins the source-level
-        reason it still happens.
-        """
-        source = inspect.getsource(sys.modules["backup.working_copy"]._relative_files)
+    def test_neither_link_guard_the_walk_applies_stops_a_junction(self):
+        """The structural cause, for JUNCTIONS specifically — asserted by
+        measuring the two predicates rather than by reading the source.
 
-        self.assertIn("path.is_file()", source)
-        self.assertNotIn("follow_symlinks=False", source)
+        This used to grep `_relative_files()` for `path.is_file()` and for
+        the *absence* of `follow_symlinks=False`. Both were true of the
+        `rglob` walk and neither is true of the `os.scandir` walk that
+        replaced it in C45 — and yet junction traversal is exactly as
+        unfixed as before, which is the whole point of this class. A source
+        string that moves when the behaviour does not was measuring the
+        wrong thing.
+
+        The two guards the walk actually applies, measured on a real
+        junction:
+
+            entry.is_symlink()              False   (NTFS reparse point,
+                                                     not a POSIX symlink)
+            entry.is_dir(follow_symlinks=False)  True   (so it is descended)
+
+        So neither the link refusal nor the no-follow flag has anything to
+        reject, and `test_a_junction_pulls_outside_content_into_the_scan`
+        above is the end-to-end consequence.
+        """
+        self._make_junction(self.master / "daily" / "linked", self.outside)
+
+        entries = {e.name: e for e in os.scandir(self.master / "daily")}
+        junction = entries["linked"]
+
+        self.assertFalse(junction.is_symlink())
+        self.assertTrue(junction.is_dir(follow_symlinks=False))
+        self.assertTrue(os.path.isjunction(junction.path))
 
     def test_no_walk_setting_would_have_prevented_the_descent(self):
         """Re-measured: `os.walk(followlinks=False)` — the obvious "just turn
@@ -4506,10 +5107,6 @@ class DashboardStepDiagnosticsTests(RunnerFailurePathTestCase):
         self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ConsumedEventWithoutCandidateTests(RunnerFailurePathTestCase):
     """BUG-20's loss mechanism, reachable with NO concurrency (NOT FIXED).
 
@@ -5336,13 +5933,24 @@ class RecursionErrorIsUnparseableTests(unittest.TestCase):
         boundary is a position rather than an oversight, and so this test
         fails the day that decision is taken.
         """
+        from history.file_repository import HistoryCandidateError
+
         keep = self.root / "keep"
         self._deep_file(keep)
 
-        with self.assertRaises(RecursionError):
+        with self.assertRaises(HistoryCandidateError) as caught:
             FileHistoryRepository(
                 keep_dir=keep, review_dir=self.root / "review"
             ).list(decision=HistoryDecision.KEEP)
+
+        # Still raises — the per-file tolerance decision is still not taken.
+        # What changed (C44) is that `RecursionError` no longer escapes as a
+        # `RuntimeError` that `except ValueError` cannot see, which is the
+        # same conversion `agent.signals.parse_signal()` and
+        # `transport.intake._is_parseable_json()` already make, and for the
+        # reason both of them state.
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertIsInstance(caught.exception.__cause__, RecursionError)
 
     def test_the_signal_parser_already_handled_it(self):
         """The precedent the four fixes follow, pinned so it cannot regress
@@ -5911,3 +6519,698 @@ class DeletedHistoryReachesTheManifestTests(RunnerFailurePathTestCase):
 
         self.assertEqual(backup["status"], "SUCCESS")
         self.assertEqual(backup["metrics"].get("deleted_files", 0), 0)
+
+
+class MonthlyUnconsolidatedReachesTheLogTests(RunnerFailurePathTestCase):
+    """The last hop of a data-loss signal, executed rather than re-written.
+
+    `monthly/parser.py` loses a whole section when one Event's `project_id`
+    carries a `##` heading — measured in `test_monthly_history.py`: three
+    Events, two of them innocent, all dropped, and `MONTHLY_GENERATED`
+    reported. Escaping that is docs/06's rendering contract, so the loss
+    stays; `MonthlyResult.unconsolidated_days` was added so it can at least
+    be seen, and `app/runner.py` writes it to `daily_late_update.log` —
+    the file AGENT.md §6a sends an operator to for "돌긴 돌았는데 뭔가
+    안 됐다".
+
+    **That last line had no test that ran it.** A stdlib line-coverage pass
+    over the whole suite (C40) showed `app/runner.py:1204-1210` never
+    executing, and the reason is visible in the test that claims it:
+    `test_the_runner_writes_it_to_the_log_operators_are_told_to_read` calls
+    `monthly.run_once()` and then **re-implements the Runner's logging in the
+    test body**, with a sibling
+    (`test_the_runner_really_contains_that_call`) checking the two strings
+    appear in `inspect.getsource(run_once)`. Its own docstring says why:
+    "The half the test above cannot prove by construction."
+
+    So the pair would have passed with the Runner's condition inverted, with
+    the message written to the wrong path, or with `_bounded()` truncating
+    it into nothing. This drives `app.runner.run_once()` and reads the real
+    log file, so the production line is the thing under test.
+    """
+
+    BROKEN_PROJECT = "P\n\n## Metadata\n\n- x"
+    WORK_DAY = date(2026, 8, 5)
+    RUN_AT = datetime(2026, 9, 2, 11, 0)
+
+    def _candidate(self, event_id, project_id):
+        return HistoryCandidate(
+            history_id=f"HIST-{event_id}",
+            event_id=event_id,
+            timestamp=f"{self.WORK_DAY.isoformat()}T10:00:00+09:00",
+            category="MILESTONE",
+            project_id=project_id,
+            role="COO",
+            summary=f"summary for {event_id}",
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _store(self, *candidates):
+        repository = FileHistoryRepository(
+            keep_dir=self.keep_dir, review_dir=self.review_dir
+        )
+        for item in candidates:
+            repository.save(item)
+
+    def _late_update_log(self):
+        path = self.notion_sync_log_path.parent / "daily_late_update.log"
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+    def test_the_runner_itself_writes_the_line(self):
+        self._store(
+            self._candidate("EVT-BROKEN-RUNNER", self.BROKEN_PROJECT),
+            self._candidate("EVT-INNOCENT-RUNNER", "SEARCH_FRONTEND"),
+        )
+
+        # September, so the Scheduler closes every day of August and the
+        # Monthly step consolidates the finished month in the same run.
+        self._run(now=self.RUN_AT.astimezone())
+
+        log = self._late_update_log()
+        self.assertIn("MONTHLY_UNCONSOLIDATED 2026-08", log)
+        self.assertIn(self.WORK_DAY.isoformat(), log)
+
+    def test_the_month_still_reports_itself_generated(self):
+        """Why the extra line has to exist at all: the success line is not
+        wrong, it just cannot carry this. `item_count` counts what arrived,
+        so a dropped item leaves no trace in it."""
+        self._store(
+            self._candidate("EVT-BROKEN-PAIR", self.BROKEN_PROJECT),
+            self._candidate("EVT-INNOCENT-PAIR", "SEARCH_FRONTEND"),
+        )
+
+        self._run(now=self.RUN_AT.astimezone())
+
+        log = self._late_update_log()
+        self.assertIn("MONTHLY_GENERATED 2026-08", log)
+        self.assertIn("MONTHLY_UNCONSOLIDATED 2026-08", log)
+
+    def test_a_healthy_month_writes_no_such_line(self):
+        """The other side of the condition. Without this, a Runner that
+        logged unconditionally would pass the test above and put a standing
+        data-loss warning on every ordinary month."""
+        self._store(self._candidate("EVT-HEALTHY-RUNNER", "SEARCH_FRONTEND"))
+
+        self._run(now=self.RUN_AT.astimezone())
+
+        log = self._late_update_log()
+        self.assertIn("MONTHLY_GENERATED 2026-08", log)
+        self.assertNotIn("MONTHLY_UNCONSOLIDATED", log)
+
+    def test_the_run_is_not_reported_as_failed(self):
+        """The severity, pinned where it is decided. Monthly is DEGRADED
+        severity and this is not even a Monthly failure — the month was
+        generated. The signal is a log line precisely because the run did
+        not break; turning it into a failure here would cry wolf on a
+        rendering defect docs/06 has already accepted."""
+        self._store(
+            self._candidate("EVT-BROKEN-SEV", self.BROKEN_PROJECT),
+            self._candidate("EVT-INNOCENT-SEV", "SEARCH_FRONTEND"),
+        )
+
+        result = self._run(now=self.RUN_AT.astimezone())
+
+        monthly = result.summary.component("monthly")
+        self.assertEqual(monthly.status, ComponentStatus.SUCCESS)
+
+
+class BackupPendingReachesTheManifestTests(RunnerFailurePathTestCase):
+    """The classification the live deployment is sitting in right now — and
+    the branch that looks like it produces it but cannot.
+
+    `app/runner.py` has **two** places that say BACKUP_PENDING:
+
+        the `except GitOperationError` handler    classifies, then re-raises
+        `if backup_entry.final_status is PENDING` the returned-entry branch
+
+    A line-coverage pass over the whole suite (C41) showed the second one
+    never executing, and reading `backup/runner.py` explains why: every
+    `BackupLogEntry` it *returns* carries SUCCESS, NOT_REQUIRED or FAILED.
+    `BackupStatus.PENDING` is only ever written to `state.backup_status`
+    immediately before a `raise`. So the returned-entry branch is
+    unreachable today — the same shape as BACKLOG E-16's
+    `recorder.skipped(C_DASHBOARD)`.
+
+    It is not dead code to delete: it becomes the live path the day BUG-4 /
+    A-18 is decided the other way and `run_once()` absorbs the Backup
+    exception. What it is today is a second, plausible-looking explanation
+    for a classification produced somewhere else — and it carries two
+    metrics the reachable path does not.
+
+    **Measured, driving the real Runner against a diverged remote:**
+
+        raised            GitOperationError (BUG-4: not absorbed)
+        manifest backup   FAILED / BACKUP_PENDING / DEGRADED / RETRYABLE
+        metrics           {}                    <- BUG-39's two are absent
+        overall           DEGRADED / exit 3
+        recorded steps    8 of 9 (dashboard never starts)
+        backup_state.json BACKUP_PENDING
+        Company History   on disk
+
+    Nothing here asserts that the metrics *should* be present: filling them
+    on the exception path needs a commit hash that neither the exception nor
+    the state file carries at that moment, which is plumbing, not a fix.
+    Recorded in BACKLOG instead. What these tests pin is that the account an
+    operator reads is the one measured above, so a change to either producer
+    is visible.
+    """
+
+    def _diverge_the_remote(self):
+        """Push an unrelated commit from a second clone, so the Runner's
+        push is rejected as non-fast-forward — docs/08 §19's transient case,
+        not a credential failure."""
+        other = self.root / "other_clone"
+        self._run_git(["clone", str(self.bare_remote_dir), str(other)], cwd=self.root)
+        self._run_git(["config", "user.email", "other@example.invalid"], cwd=other)
+        self._run_git(["config", "user.name", "Other Desktop"], cwd=other)
+        (other / "divergence.md").write_text("from elsewhere", encoding="utf-8")
+        self._run_git(["add", "-A"], cwd=other)
+        self._run_git(["commit", "-m", "diverge"], cwd=other)
+        self._run_git(["push", "origin", "main"], cwd=other)
+
+    def _run_into_a_rejected_push(self, event_id="BACKUP-PENDING-001"):
+        self._diverge_the_remote()
+        self._write_event(event_id=event_id)
+        with self.assertRaises(GitOperationError):
+            self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+        return read_summary(self.run_summary_path)
+
+    def test_a_rejected_push_is_degraded_not_failed(self):
+        summary = self._run_into_a_rejected_push()
+
+        backup = summary.component("backup")
+        self.assertEqual(backup.status, ComponentStatus.FAILED)
+        self.assertEqual(backup.failure.classification, "BACKUP_PENDING")
+        self.assertEqual(backup.failure.severity, Severity.DEGRADED)
+        self.assertEqual(backup.failure.retryability, Retryability.RETRYABLE)
+
+    def test_the_run_exits_three_rather_than_two(self):
+        """The whole point of the distinction, read where Task Scheduler
+        reads it: 3 means the next run retries, 2 means a person must act."""
+        summary = self._run_into_a_rejected_push(event_id="BACKUP-PENDING-002")
+
+        self.assertEqual(summary.overall_status, OverallStatus.DEGRADED)
+        self.assertEqual(summary.exit_code, 3)
+
+    def test_the_manifest_carries_no_commit_metrics_on_this_path(self):
+        """Characterization, not a wish. BUG-39 put `commit_hash` and
+        `changed_files` on the *returned-entry* branch, which never runs, so
+        the manifest for a real pending push says which classification it is
+        and not which commit is waiting."""
+        summary = self._run_into_a_rejected_push(event_id="BACKUP-PENDING-003")
+
+        self.assertEqual(dict(summary.component("backup").metrics), {})
+
+    def test_the_run_stops_there_and_says_so(self):
+        """BUG-4's consequence, pinned where an operator meets it: the steps
+        after Backup never start, and the manifest shows their absence
+        rather than reporting them as fine."""
+        summary = self._run_into_a_rejected_push(event_id="BACKUP-PENDING-004")
+
+        recorded = [c.name for c in summary.components]
+        self.assertIn("backup", recorded)
+        self.assertNotIn("dashboard", recorded)
+
+    def test_company_history_is_on_disk_even_though_the_push_failed(self):
+        """README RULE 9 at the seam: a rejected push must not cost the
+        History it was carrying. That is why this is DEGRADED at all."""
+        self._run_into_a_rejected_push(event_id="BACKUP-PENDING-005")
+
+        daily = self.local_master_dir / "daily" / "2026-08-01.md"
+        self.assertTrue(daily.is_file())
+        self.assertIn("BACKUP-PENDING-005", daily.read_text(encoding="utf-8"))
+
+    def test_the_state_file_and_the_manifest_agree(self):
+        """Two records of one failure, written by different modules. Them
+        disagreeing is the shape C37 spent a Sprint removing elsewhere."""
+        summary = self._run_into_a_rejected_push(event_id="BACKUP-PENDING-006")
+
+        state = json.loads(self.backup_state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["backup_status"], "BACKUP_PENDING")
+        self.assertEqual(
+            summary.component("backup").failure.classification, "BACKUP_PENDING"
+        )
+
+    def test_a_healthy_push_is_not_reported_as_pending(self):
+        """The other side of the branch, so a Runner that classified every
+        run as PENDING would fail here rather than look correct above."""
+        self._write_event(event_id="BACKUP-HEALTHY-001")
+
+        result = self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        backup = result.summary.component("backup")
+        self.assertEqual(backup.status, ComponentStatus.SUCCESS)
+        self.assertEqual(result.summary.exit_code, 0)
+
+    def test_a_returned_backup_entry_never_carries_pending(self):
+        """The premise the whole class rests on, checked against the source
+        that decides it rather than assumed. `backup/runner.py` assigns
+        `final_status` for the entries it returns; PENDING is not among
+        them, which is exactly why the runner's returned-entry branch cannot
+        fire. If this ever changes, that branch becomes live and the
+        measurements above need re-taking.
+        """
+        import re
+
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "backup" / "runner.py"
+        ).read_text(encoding="utf-8")
+
+        returned = set(re.findall(r"final_status = BackupStatus\.(\w+)", source))
+
+        self.assertEqual(returned, {"FAILED", "SUCCESS", "NOT_REQUIRED"})
+        # And PENDING really is in the file — on the state-then-raise paths,
+        # so this test cannot pass merely because the name vanished.
+        self.assertIn("BackupStatus.PENDING", source)
+
+
+class AbortBeforeTheLateUpdateStrandsACandidateTests(RunnerFailurePathTestCase):
+    """E-17b — CHARACTERIZATION. A second way into E-17's state, and the
+    quieter one.
+
+    E-17 records one cause: `update_daily_history()` runs and fails, which
+    the manifest reports as `late_update` / `LATE_EVENT_MERGE_FAILED` /
+    PERMANENT — loud, listed in ATTENTION, exit 3. Found by fault injection
+    (`os.replace` failing at an arbitrary commit point across 60 randomized
+    multi-run trials), there is another: **the run never reaches step 6.5 at
+    all.**
+
+    Step 5 writes the Candidate. Step 6 (Daily Catch-up) is between it and
+    step 6.5, and not every failure there returns a `SchedulerRunResult` —
+    `scheduler/state.save_state()` raising an OSError propagates straight out
+    of `scheduler.run_once()`, which is one of the shapes BUG-3 already
+    records. The run then aborts with the Candidate on disk and the merge
+    never attempted.
+
+    The difference that matters is what an operator is told. Measured, with
+    `2026-08-01.md` already closed and a late Event for that date:
+
+        run 2  daily FAILED STEP_ABORTED, exit 2
+               late_update component ABSENT from the manifest
+               daily_late_update.log ABSENT
+        run 3  every step SUCCESS, exit 0
+        run 4  every step SUCCESS, exit 0
+        Daily 2026-08-01.md still does not carry the Event
+
+    So the Run Contract's own signals say "step 6 failed, then two runs
+    succeeded" — which reads as resolved. `daily_late_update.log`, the sink
+    AGENT.md §6a sends an operator to, does not exist, because the step that
+    writes it never began. The one thing that still tells the truth is
+    `ops_status._kept_but_not_rendered()`, and it lives in a different
+    command.
+
+    The retry itself stays SKIP for E-17's own reasons (it needs either a
+    persisted failed-date set or a Candidate-vs-Daily reconciliation pass —
+    a mechanism, not a value). What is pinned here is the shape and, above
+    all, that the detector covers *this* entry path too: that coverage was an
+    accident of how the detector is written, and nothing held it.
+    """
+
+    def _stored_candidates(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_e17b", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        candidates, _unreadable = module._read_keep_candidates(self.keep_dir)
+        return module, candidates
+
+    def _daily(self, day="2026-08-01"):
+        return (self.local_master_dir / "daily" / f"{day}.md").read_text(encoding="utf-8")
+
+    def _abort_inside_the_daily_step(self):
+        """Make `scheduler.run_once()` raise once, after step 5 has written
+        its Candidate. `save_state()` rather than `generate_daily_history()`
+        on purpose: the latter is inside the Scheduler's own try/except and
+        comes back as a FAILED *result*, which lets the run continue into
+        step 6.5. This one does not."""
+        import scheduler.scheduler as scheduler_module
+
+        original = scheduler_module.save_state
+        calls = {"n": 0}
+
+        def failing_save(path, state):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(5, "injected: scheduler state save failed")
+            return original(path, state)
+
+        scheduler_module.save_state = failing_save
+        self.addCleanup(lambda: setattr(scheduler_module, "save_state", original))
+
+    def _manifest(self):
+        summary = read_summary(self.run_summary_path)
+        return summary, {c.name: c for c in summary.components}
+
+    def _arrange(self):
+        """Run 1 closes 08-01; run 2 brings a late Event and aborts in step 6."""
+        self._write_event(event_id="EVT-EARLY", timestamp="2026-08-01T10:00:00+09:00")
+        self._run(now=datetime(2026, 8, 4, 11, 0).astimezone())
+        self.assertIn("- Event ID: EVT-EARLY", self._daily())
+
+        self._write_event(event_id="EVT-LATE", timestamp="2026-08-01T11:00:00+09:00")
+        self._abort_inside_the_daily_step()
+        with self.assertRaises(OSError):
+            self._run(now=datetime(2026, 8, 6, 11, 0).astimezone())
+
+    def test_the_aborted_run_never_begins_the_late_update_step(self):
+        self._arrange()
+
+        summary, by_name = self._manifest()
+
+        self.assertEqual(by_name["daily"].failure.classification, "STEP_ABORTED")
+        self.assertNotIn(
+            "late_update",
+            by_name,
+            "the manifest carries no late_update component — the step never began",
+        )
+        self.assertEqual(summary.exit_code, 2)
+
+    def test_the_daily_domain_log_says_nothing_about_the_stranded_event(self):
+        """`daily_late_update.log` is where every Daily-domain failure
+        collects (SCHEDULER_FAILED, LATE_UPDATE_FAILED, MONTHLY_*). It is not
+        written here, because the step that writes it never ran."""
+        self._arrange()
+
+        log_path = self.notion_sync_log_path.parent / "daily_late_update.log"
+
+        self.assertFalse(log_path.is_file(), log_path.read_text(encoding="utf-8") if log_path.is_file() else "")
+
+    def test_the_candidate_is_durable_and_the_daily_file_does_not_carry_it(self):
+        self._arrange()
+
+        self.assertTrue((self.keep_dir / "HIST-EVT-LATE.json").is_file())
+        self.assertNotIn("- Event ID: EVT-LATE", self._daily())
+
+    def test_two_clean_runs_report_success_and_change_nothing(self):
+        """The part that makes it quiet. Step 6.5's target dates are the ones
+        *this* run collected, so a run with nothing new never looks at
+        2026-08-01 again — and reports a clean bill of health while doing so.
+        """
+        self._arrange()
+
+        for day in (7, 8):
+            self._run(now=datetime(2026, 8, day, 11, 0).astimezone())
+            summary, by_name = self._manifest()
+            with self.subTest(run=day):
+                self.assertEqual(summary.exit_code, 0)
+                self.assertEqual(by_name["late_update"].status, ComponentStatus.SUCCESS)
+
+        self.assertNotIn("- Event ID: EVT-LATE", self._daily())
+
+    def test_the_loss_still_reaches_the_operator_through_the_status_view(self):
+        """The one signal that survives all of the above, and the reason this
+        is characterization rather than a P0: a different command still names
+        the Event and its date."""
+        self._arrange()
+        for day in (7, 8):
+            self._run(now=datetime(2026, 8, day, 11, 0).astimezone())
+
+        module, candidates = self._stored_candidates()
+
+        self.assertEqual(
+            module._kept_but_not_rendered(candidates, self.local_master_dir / "daily"),
+            ("EVT-LATE (2026-08-01)",),
+        )
+
+    def test_a_later_event_on_the_same_date_still_carries_it_in(self):
+        """E-17's only automatic recovery path, reached from this entry too:
+        one more Event on 2026-08-01 puts that date back in `kept_dates`, and
+        `select_late_candidates()` looks at the whole date rather than at the
+        new arrival, so the stranded one goes in beside it."""
+        self._arrange()
+        self._write_event(event_id="EVT-COMPANION", timestamp="2026-08-01T12:00:00+09:00")
+
+        self._run(now=datetime(2026, 8, 7, 11, 0).astimezone())
+
+        text = self._daily()
+        self.assertIn("- Event ID: EVT-LATE", text)
+        self.assertIn("- Event ID: EVT-COMPANION", text)
+
+        module, candidates = self._stored_candidates()
+        self.assertEqual(
+            module._kept_but_not_rendered(candidates, self.local_master_dir / "daily"), ()
+        )
+
+
+class AnAbortedStepRecordsWhatAbortedItTests(RunnerFailurePathTestCase):
+    """`STEP_ABORTED` said *which* step died and never *why*.
+
+    C34 added the attribution because an unattributed abort read as a
+    success. The `reason` stayed a constant string, so the manifest — the one
+    artifact docs/14 §3 sends an operator to — carried no fact about the
+    failure itself.
+
+    The gap is widest exactly where it costs most: the aborts that repeat.
+    Measured with a corrupted `collector_state.json`, which docs/10 §46 names
+    as a thing to expect (a truncated write, a partial restore, a hand edit):
+
+        collector  FAILED  STEP_ABORTED
+        reason     "the run aborted inside this step"
+
+    `PersistentSeenEventStore._load()` raises a `CollectorStateError` naming
+    the file *and* the parse position, and that sentence lived only in the
+    scheduled task's console output. Every following run dies identically, so
+    Company History stops advancing while the manifest says nothing anyone
+    can act on.
+
+    Read out of `sys.exc_info()` in the `finally` rather than by adding an
+    `except`: what propagates must not change, and the run's own exception is
+    still what escapes (`test_the_exception_still_escapes_unchanged`).
+    """
+
+    def _corrupt_the_collector_state(self):
+        self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+        self.collector_state_path.write_bytes(b'{"processed_event_ids": [1,')
+
+    def test_the_reason_names_the_file_and_the_error(self):
+        self._write_event(event_id="ABORT-1")
+        self._corrupt_the_collector_state()
+
+        with self.assertRaises(Exception):
+            self._run(now=datetime(2026, 8, 3, 12, 0).astimezone())
+
+        summary = read_summary(self.run_summary_path)
+        failure = summary.component("collector").failure
+        self.assertEqual(failure.classification, "STEP_ABORTED")
+        self.assertIn("CollectorStateError", failure.reason)
+        self.assertIn("collector_state.json", failure.reason)
+
+    def test_the_constant_prefix_is_kept(self):
+        """The sentence readers already had stays the head of the line — the
+        cause is appended to it, not swapped for it."""
+        self._write_event(event_id="ABORT-2")
+        self._corrupt_the_collector_state()
+
+        with self.assertRaises(Exception):
+            self._run(now=datetime(2026, 8, 3, 12, 0).astimezone())
+
+        reason = read_summary(self.run_summary_path).component("collector").failure.reason
+        self.assertTrue(
+            reason.startswith("the run aborted inside this step"), reason
+        )
+
+    def _abort_the_daily_step_with(self, message):
+        import scheduler.scheduler as scheduler_module
+
+        original = scheduler_module.save_state
+
+        def failing_save(path, state):
+            raise RuntimeError(message)
+
+        scheduler_module.save_state = failing_save
+        self.addCleanup(lambda: setattr(scheduler_module, "save_state", original))
+
+    def test_a_credential_in_the_exception_does_not_reach_the_manifest(self):
+        """An aborting exception can carry a remote response body — the very
+        case `oplog.append_line()` redacts for, and `notion/transport.py`
+        already anticipates a proxy echoing request headers back. The manifest
+        is a file on disk that is committed nowhere but read by two
+        entrypoints, so the redaction happens at the write point."""
+        self._write_event(event_id="ABORT-3")
+        token = "ntn_" + "A" * 40
+        self._abort_the_daily_step_with(f"502 from a proxy: Authorization: Bearer {token}")
+
+        with self.assertRaises(RuntimeError):
+            self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        reason = read_summary(self.run_summary_path).component("daily").failure.reason
+        self.assertNotIn(token, reason)
+        self.assertIn("[REDACTED]", reason)
+
+    def test_a_very_long_exception_is_bounded(self):
+        """Same bound every other error string in this file gets. A manifest
+        is a summary; an unbounded message would make one component's failure
+        longer than the whole rest of the document."""
+        self._write_event(event_id="ABORT-4")
+        self._abort_the_daily_step_with("x" * 5000)
+
+        with self.assertRaises(RuntimeError):
+            self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        reason = read_summary(self.run_summary_path).component("daily").failure.reason
+        self.assertLess(len(reason), 1000, len(reason))
+
+    def test_a_newline_in_the_exception_cannot_forge_a_report_line(self):
+        """`run_company_ops.py` prints this value inside its failure block,
+        one indented line per component."""
+        self._write_event(event_id="ABORT-5")
+        self._abort_the_daily_step_with(
+            "first line" + chr(10) + "  [collector] LOOKS_LIKE_A_ROW (severity=INFO)"
+        )
+
+        with self.assertRaises(RuntimeError):
+            self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        reason = read_summary(self.run_summary_path).component("daily").failure.reason
+        self.assertNotIn(chr(10), reason)
+
+    def test_the_exception_still_escapes_unchanged(self):
+        """The `finally` reports; it does not catch. A run that aborted must
+        keep aborting, with its own exception."""
+        self._write_event(event_id="ABORT-6")
+        self._abort_the_daily_step_with("the original failure")
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        self.assertIn("the original failure", str(caught.exception))
+
+    def test_a_run_that_finishes_records_no_aborted_step(self):
+        """The control: nothing about this touches the ordinary path."""
+        self._write_event(event_id="ABORT-7")
+
+        self._run(now=datetime(2026, 8, 2, 12, 0).astimezone())
+
+        summary = read_summary(self.run_summary_path)
+        self.assertEqual(
+            [c.name for c in summary.components
+             if c.failure and c.failure.classification == "STEP_ABORTED"],
+            [],
+        )
+
+
+class MonthlyConsolidationFailureReachesTheManifestTests(RunnerFailurePathTestCase):
+    """A corrupt Daily file inside a finished month, driven through the real
+    Runner.
+
+    `app/runner.py` treats the two non-success Monthly outcomes differently:
+
+        MONTHLY_PENDING  docs/09 §10 declining a month with a Daily hole, on
+                         purpose. Logged, not a failure — the next run builds
+                         it once Catch-up fills the gap.
+        MONTHLY_FAILED   recorded as a component failure
+                         (`MONTHLY_CONSOLIDATION_FAILED`, DEGRADED).
+
+    A line-coverage pass over the whole suite (C41) showed the PENDING half
+    exercised and the FAILED half not: nothing had ever driven
+    `monthly_run_once()` into returning MONTHLY_FAILED through the Runner.
+    The only covered producer of that classification was the
+    `except Exception` fallback below it, which is a different thing — that
+    one is for an exception escaping the Monthly module, this one is the
+    module reporting failure normally.
+
+    The stimulus is the one docs/10 §46 says to expect: a file on disk that
+    can no longer be read. `consolidate_month()` catches
+    `(DailyParseError, OSError, ValueError)`, and an undecodable byte
+    sequence raises `UnicodeDecodeError`, which is a `ValueError`.
+    """
+
+    UNDECODABLE = b"\xff\xfe\x00 not utf-8 \xff"
+    WORK_DAY = date(2026, 8, 5)
+
+    def _candidate(self, event_id):
+        return HistoryCandidate(
+            history_id=f"HIST-{event_id}",
+            event_id=event_id,
+            timestamp=f"{self.WORK_DAY.isoformat()}T10:00:00+09:00",
+            category="MILESTONE",
+            project_id="SEARCH_FRONTEND",
+            role="COO",
+            summary=f"summary for {event_id}",
+            evidence=(),
+            filter_result=HistoryDecision.KEEP,
+        )
+
+    def _a_finished_month_with_one_unreadable_day(self):
+        FileHistoryRepository(
+            keep_dir=self.keep_dir, review_dir=self.review_dir
+        ).save(self._candidate("EVT-MONTHLY-FAIL"))
+
+        # Close August without consolidating it: the month is not over yet.
+        self._run(now=datetime(2026, 8, 31, 23, 0).astimezone())
+        daily = self.local_master_dir / "daily" / self.WORK_DAY.isoformat()
+        target = daily.with_suffix(".md")
+        self.assertTrue(target.is_file(), "precondition: the day was rendered")
+        target.write_bytes(self.UNDECODABLE)
+        return target
+
+    def test_the_component_is_recorded_as_failed(self):
+        self._a_finished_month_with_one_unreadable_day()
+
+        result = self._run(now=datetime(2026, 9, 2, 11, 0).astimezone())
+
+        monthly = result.summary.component("monthly")
+        self.assertEqual(monthly.status, ComponentStatus.FAILED)
+        self.assertEqual(monthly.failure.classification, "MONTHLY_CONSOLIDATION_FAILED")
+        self.assertEqual(monthly.failure.retryability, Retryability.RETRYABLE)
+
+    def test_the_run_is_degraded_not_failed(self):
+        """docs/14 §5 puts `monthly` at DEGRADED severity — it projects
+        Company History rather than recording it, and the Daily files it
+        could not read are still on disk."""
+        self._a_finished_month_with_one_unreadable_day()
+
+        result = self._run(now=datetime(2026, 9, 2, 11, 0).astimezone())
+
+        self.assertEqual(result.summary.overall_status, OverallStatus.DEGRADED)
+        self.assertEqual(result.summary.exit_code, 3)
+
+    def test_the_later_steps_still_run(self):
+        """§74: a Monthly failure must not stop the Runtime. Backup is the
+        one that matters — Company History still reaches the remote."""
+        self._a_finished_month_with_one_unreadable_day()
+
+        result = self._run(now=datetime(2026, 9, 2, 11, 0).astimezone())
+
+        from app.runner import PIPELINE_COMPONENTS
+
+        recorded = [c.name for c in result.summary.components]
+        self.assertEqual(recorded, list(PIPELINE_COMPONENTS))
+        self.assertEqual(
+            result.summary.component("backup").status, ComponentStatus.SUCCESS
+        )
+
+    def test_the_reason_names_something_actionable(self):
+        """A failure whose `reason` is empty sends an operator to the log
+        with nothing to look for — the same gap C31 closed for Backup."""
+        self._a_finished_month_with_one_unreadable_day()
+
+        result = self._run(now=datetime(2026, 9, 2, 11, 0).astimezone())
+
+        reason = result.summary.component("monthly").failure.reason
+        self.assertTrue(reason)
+        log = (self.notion_sync_log_path.parent / "daily_late_update.log").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("MONTHLY_FAILED", log)
+
+    def test_a_readable_month_is_not_reported_as_failed(self):
+        """The other side, so a Runner that failed every month would fail
+        here rather than look correct above."""
+        FileHistoryRepository(
+            keep_dir=self.keep_dir, review_dir=self.review_dir
+        ).save(self._candidate("EVT-MONTHLY-OK"))
+        self._run(now=datetime(2026, 8, 31, 23, 0).astimezone())
+
+        result = self._run(now=datetime(2026, 9, 2, 11, 0).astimezone())
+
+        self.assertEqual(
+            result.summary.component("monthly").status, ComponentStatus.SUCCESS
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -65,8 +65,10 @@ def safe_event_filename(event_id: str) -> str:
     must never collide on one filename.
 
     Kept byte-for-byte identical to `transport.onedrive.safe_event_filename()`
-    and in step with `history.file_repository.safe_candidate_filename()`;
-    tests assert the two copies agree.
+    and in step with `history.file_repository.safe_candidate_filename()`.
+    `DuplicatedRulesStayInStepTests` compares the two copies over a shared
+    corpus of adversarial ids — it did not exist until C38, so for several
+    Sprints this sentence promised a check that nothing performed.
     """
     sanitized = _UNSAFE_FILENAME_CHARS.sub("_", event_id).strip("._")
     if sanitized == event_id and len(event_id) <= _MAX_FILENAME_STEM:
@@ -100,6 +102,43 @@ def write_event_json(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(event.to_json())
+            # Durability, not only atomicity — the canonical statement of it
+            # for this project's fourteen atomic writers, which the others
+            # point back at.
+            #
+            # `mkstemp` + `os.replace` buys *atomicity*: a reader never sees a
+            # half-written file, because the name only ever points at a
+            # complete one. It does not buy *durability*. Without this flush
+            # the bytes live in the OS page cache while `os.replace()` is a
+            # metadata operation NTFS journals, so the two can reach the disk
+            # in either order. The order that hurts is rename-first: after a
+            # power cut the file is there, under its real name, the right
+            # size, and its contents are whatever was on those blocks —
+            # usually zeros.
+            #
+            # That is not a hypothetical class of event for this repository.
+            # `INCOMPLETE_WRITE_PREFIX` above already reasons about "a write
+            # the process never returned from — power loss, SIGKILL, a
+            # container stop", and follows the *staging* file through every
+            # reader. This is the other half of the same accident, and it is
+            # the worse half: a leftover `.tmp-…json` is at least visibly not
+            # an artifact, while a zero-filled `2026-08-05.md` is a day of
+            # Company History that every reader, detector and backup accepts
+            # as the record. `_holes_in_the_daily_sequence()` looks for a
+            # missing file, not an empty one, and Backup would commit and
+            # push it.
+            #
+            # Cost, measured on this machine (200 writes of a small JSON
+            # payload, local disk): 0.43 ms -> 1.12 ms per write. A run writes
+            # on the order of tens of files, so this is tens of milliseconds
+            # against a step already dominated by git.
+            #
+            # File only, not the directory. `os.fsync()` on a directory
+            # handle is not supported on Windows (this project's target OS),
+            # and the half that is portable is the half that matters here:
+            # the data is on disk before any name points at it.
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_path, final_path)
     except BaseException:
         try:
