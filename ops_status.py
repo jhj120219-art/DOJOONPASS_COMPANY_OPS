@@ -126,9 +126,15 @@ from oplog import SECRET_RE  # noqa: E402
 
 # The business layer of the view. `controltower` writes nothing and reads the
 # same `processed/` directory this file already reads twice — see
-# `_print_control_tower()`.
-from controltower import UNSOURCED_LAYERS, build_company_rollup  # noqa: E402
-from controltower import read_events  # noqa: E402
+# `_print_control_tower()`, which renders from `build_dashboard()`'s model so
+# that the screen and any projection of it are one arrangement of one fold.
+from controltower import (  # noqa: E402
+    UNSOURCED_LAYERS,
+    build_company_rollup,
+    build_dashboard,
+    read_events,
+    unsourced_layer_coverage,
+)
 from notion.properties import ROLE_DISPLAY_NAMES  # noqa: E402
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 from scheduler.lock import (  # noqa: E402
@@ -2631,6 +2637,29 @@ def _print_history(now: datetime) -> list[str]:
     # another Desktop is never scanned at all, so the string reaches Company
     # History and the backup remote intact.
     #
+    # C49 added the third destination, and it is the one an operator's
+    # rotation checklist is most likely to miss because it is not a file:
+    # **the Notion PROJECTS row**. `ExecutionPlanSync` writes the Event's own
+    # text into it, unmodified. Measured, one Event of each shape through the
+    # real sync:
+    #
+    #     event_id     -> `Last Event ID`      leaks
+    #     project_id   -> `Project ID` + Title leaks
+    #     milestone    -> `Current Milestone`  leaks
+    #     blocker      -> `Blocker`            leaks
+    #     summary      -> (no property)        does not
+    #
+    # Four of the five fields scanned above. Notion is a third party with its
+    # own retention and its own copy, and "고쳐도 원격 history에는 남는다"
+    # was true of exactly one of the two remotes this text reaches.
+    #
+    # Said conditionally, because this tool cannot know whether the run that
+    # accepted the Event had Notion configured — it reads `processed/`, and a
+    # deployment without a token is supported (docs/04). The sentence names
+    # the destination and the condition; deciding to redact on the way out
+    # would be the pipeline rewriting a person's own words, which docs/06 §57
+    # is about (BACKLOG).
+    #
     # Everything printed is redacted, including the ids -- `event_id` and
     # `project_id` are among the fields scanned, so quoting one raw is exactly
     # how this report would become the second copy of a leaked credential.
@@ -2647,9 +2676,13 @@ def _print_history(now: datetime) -> list[str]:
             f"Desktop에서 온 Event나 손으로 쓴 파일은 `validate_event()`만 거치고 "
             f"그것은 내용을 읽지 않는다. 실측: Daily History에 그대로 쓰이고 "
             f"backup 원격까지 push된다(`scan_for_secrets()`는 이름만 본다). "
-            f"해당 자격증명을 **교체**해야 한다 — 파일을 고쳐도 원격 history에는 "
-            f"남는다. 거부로 바꾸면 그 Event가 `rejected/`로 가서 Company "
-            f"History에서 사라지므로 결정이 필요하다(BACKLOG)"
+            f"**Notion Sync가 설정된 배포에서는 PROJECTS 행에도 그대로 들어간다** "
+            f"— event_id/project_id/milestone/blocker 네 필드가 그대로 쓰인다"
+            f"(summary는 Property가 없어 가지 않는다). "
+            f"해당 자격증명을 **교체**해야 한다 — 파일을 고쳐도 원격 history와 "
+            f"Notion Workspace에는 남는다. 거부로 바꾸면 그 Event가 "
+            f"`rejected/`로 가서 Company History에서 사라지므로 결정이 "
+            f"필요하다(BACKLOG)"
         )
 
     # Secret names the gate's own list holds but its comparison misses.
@@ -3457,6 +3490,17 @@ def _print_control_tower(now: datetime) -> list[str]:
     completed. `controltower/rollup.py` derives all of that from the Events
     already in `runtime/events/processed/`, and this prints it.
 
+    **Through the Dashboard Model, not around it.** `controltower/dashboard.py`
+    arranges that rollup into the panels a Control Tower has, and this block
+    renders those panels. The alternative — reaching into the rollup field by
+    field here — is what it used to do, and it left "what the Control Tower
+    shows" existing only as terminal output: a Notion projection of the same
+    view would have had to derive it a second time from the same rollup, and
+    two derivations of one view is how a screen and a projection start
+    disagreeing about the same day. The KPI counts are the one thing still
+    read off the rollup (`rollup.metric()`), and a test holds the panel's
+    value for every key to that same number.
+
     **Numbers here are traceable by construction.** Every rollup carries the
     `event_id` and the file it was counted from, and the blocker lines quote
     both — "왜 이 숫자가 나오는가"는 파일 하나를 여는 것으로 끝난다.
@@ -3482,59 +3526,79 @@ def _print_control_tower(now: datetime) -> list[str]:
     rollup = build_company_rollup(
         processed_dir=RUNTIME_DIR / "events" / "processed", now=now
     )
+    # Rendered from the Dashboard Model rather than from the rollup directly.
+    # The screen and any projection of this block (a Notion Control Tower
+    # above all) then read the *same* arrangement of the same facts, so
+    # "what is on the screen" and "what leaves the machine" cannot drift into
+    # two derivations -- which is the one failure a second consumer of a
+    # rollup reliably produces.
+    model = build_dashboard(rollup, now=now)
     attention: list[str] = []
+
+    def _rows(key: str):
+        panel = model.panel(key)
+        return panel.rows if panel is not None else ()
 
     print("CONTROL TOWER — Company / Team / Project")
     print("-" * 60)
 
-    if rollup.unreadable:
+    if model.unreadable:
         # Not an alert of its own — see the docstring. Said here because it
         # is the one thing that makes every number below a lower bound.
         print(
-            f"  집계 대상           : Event {rollup.events_read}건 (전체 기간, "
-            f"읽지 못한 파일 {len(rollup.unreadable)}건 — 아래 숫자는 그만큼 적다)"
+            f"  집계 대상           : Event {model.events_read}건 (전체 기간, "
+            f"읽지 못한 파일 {len(model.unreadable)}건 — 아래 숫자는 그만큼 적다)"
         )
     else:
-        print(f"  집계 대상           : Event {rollup.events_read}건 (전체 기간)")
+        print(f"  집계 대상           : Event {model.events_read}건 (전체 기간)")
+
+    project_rows = _rows("PROJECTS")
 
     # Company History can outlive the evidence the Control Tower reads — see
     # `_company_history_older_than_the_evidence()`. Said as a qualifier on the
     # numbers rather than as an alert: nothing brings those Events back.
-    earliest_event = min(
-        (
-            parsed
-            for parsed in (
-                _event_day(project.first_seen) for project in rollup.projects
-            )
-            if parsed is not None
-        ),
-        default=None,
-    )
+    #
+    # The evidence range comes off the model (`coverage`), the Company History
+    # side is read here, and the answer goes **back into the model** rather
+    # than only onto the screen. That is the same rule the rest of this block
+    # follows: a projection of this Control Tower needs the qualifier as much
+    # as the terminal does, and deriving it twice is how the two would start
+    # disagreeing about which days are covered.
+    earliest_event = _event_day(model.coverage.evidence_from)
     older = _company_history_older_than_the_evidence(
         RUNTIME_DIR / "local_master" / "daily", earliest_event
     )
-    if older is not None:
+    model = model.with_history_coverage(older)
+    if model.coverage.history_uncovered_from is not None:
         print(
-            f"  증거 범위 밖        : Company History는 {older.isoformat()}부터 일을 "
+            f"  증거 범위 밖        : Company History는 "
+            f"{model.coverage.history_uncovered_from}부터 일을 "
             f"기록하는데 이 계층이 읽는 Event는 "
             + (
                 "하나도 남아 있지 않다"
-                if earliest_event is None
-                else f"{earliest_event.isoformat()}부터다"
+                if model.coverage.evidence_from is None
+                else f"{model.coverage.evidence_from}부터다"
             )
             + " — 위 숫자는 그 뒤만 덮는다 (`processed/`는 Backup 범위가 아니다, "
             "docs/08 §26)"
         )
 
-    completed = [p for p in rollup.projects if p.is_complete]
-    print(
-        f"  움직인 Project      : {len(rollup.projects)}"
-        + (f" (완료 {len(completed)})" if completed else "")
-    )
-
     def _value(key: str) -> int:
+        # Read off the rollup rather than out of the model's METRICS panel,
+        # and the two are the same number by construction — `_metrics_panel()`
+        # is built from `rollup.metrics` and nothing else.
+        # `TheScreenAndThePayloadCarryTheSameFactsTests` asserts that equality
+        # for every key, which is a stronger statement than "both call the
+        # same accessor": it would still fail if the panel started deriving
+        # its own.
         metric = rollup.metric(key)
         return metric.value if metric is not None else 0
+
+    completed = _value("projects_completed")
+    print(
+        f"  움직인 Project      : {len(project_rows)}"
+        + (f" (완료 {completed})" if completed else "")
+    )
 
     print(
         f"  Milestone/Decision/Issue: {_value('milestones_completed')} / "
@@ -3542,22 +3606,20 @@ def _print_control_tower(now: datetime) -> list[str]:
     )
     print(f"  열려 있는 Blocker   : {_value('open_blockers')}")
 
-    # No `if rollup.teams:` guard, and none below for Desktops: both folds
-    # seed every entry in docs/02 §8's table and return it silent rather than
-    # absent. That is the point of them -- "물어봤고 없다" and "묻지 않았다"
+    # No `if rows:` guard, and none below for Desktops: both folds seed every
+    # entry in docs/02 §8's table and return it silent rather than absent.
+    # That is the point of them -- "물어봤고 없다" and "묻지 않았다"
     # are different sentences, and only the first is true here. Branch
     # coverage found the guards; they had no other side to take.
     print("  Team")
-    for team in rollup.teams:
-        silent = "" if team.has_activity else "   (이 기간 활동 없음)"
-        blocked = (
-            f"  막힌 Project {len(team.blocked_projects)}"
-            if team.blocked_projects
-            else ""
-        )
+    for row in _rows("TEAMS"):
+        values = row.values
+        silent = "" if values["has_activity"] else "   (이 기간 활동 없음)"
+        blocked_count = values["blocked_project_count"]
+        blocked = f"  막힌 Project {blocked_count}" if blocked_count else ""
         print(
-            f"    {one_line(team.display_name):<14} Event {team.event_count:<4}"
-            f"Project {len(team.projects)}{blocked}{silent}"
+            f"    {one_line(values['display_name']):<14} Event {values['events']:<4}"
+            f"Project {len(values['projects'])}{blocked}{silent}"
         )
 
     # The layer under Team, and the reason both are here: `source` -> `role`
@@ -3565,86 +3627,97 @@ def _print_control_tower(now: datetime) -> list[str]:
     # same partition — right up to the moment an Event says otherwise, which
     # is when having only one of them hides it.
     print("  Desktop")
-    for desktop in rollup.desktops:
-        silent = desktop.days_silent(now)
+    for row in _rows("DESKTOPS"):
+        values = row.values
+        silent = values["days_silent"]
         when = (
-            f"마지막 {one_line(desktop.last_seen)}"
+            f"마지막 {one_line(values['last_seen'])}"
             + (f" ({silent}일 전)" if silent else "")
-            if desktop.last_seen
+            if values["last_seen"]
             else "이 기간 Event 없음"
         )
-        bad = f"  ! role 어긋남 {len(desktop.mismatched)}" if desktop.mismatched else ""
+        mismatches = values["role_mismatches"]
+        bad = f"  ! role 어긋남 {mismatches}" if mismatches else ""
         print(
-            f"    {one_line(desktop.source):<12}{one_line(desktop.display_name):<14}"
-            f"Event {desktop.event_count:<4}Project {len(desktop.projects):<3}{when}{bad}"
+            f"    {one_line(values['source']):<12}{one_line(values['display_name']):<14}"
+            f"Event {values['events']:<4}Project {len(values['projects']):<3}{when}{bad}"
         )
 
-    if rollup.projects:
+    if project_rows:
         print("  Project")
-        # Blocked first, then by how long they have been quiet: the two
-        # questions an operator actually opens this block with.
-        def _order(project):
-            idle = project.days_since_last_event(now)
-            return (0 if project.is_blocked else 1, -(idle if idle is not None else 0))
-
-        shown = sorted(rollup.projects, key=_order)[:_CONTROL_TOWER_PROJECT_LINES]
-        for project in shown:
-            marker = "!" if project.is_blocked else " "
+        # The model already ordered these: blocked first, then by how long
+        # they have been quiet — the two questions an operator actually opens
+        # this block with. Ordering it here as well would be the second
+        # derivation this refactor exists to remove.
+        shown = project_rows[:_CONTROL_TOWER_PROJECT_LINES]
+        for row in shown:
+            values = row.values
+            state_key = values["state"]
+            marker = "!" if state_key == "BLOCKED" else " "
             teams = "/".join(
-                one_line(ROLE_DISPLAY_NAMES.get(role, role)) for role in project.teams
+                one_line(ROLE_DISPLAY_NAMES.get(role, role)) for role in values["teams"]
             )
-            if project.is_blocked:
-                days = project.days_blocked(now)
+            if state_key == "BLOCKED":
+                days = values["days_blocked"]
                 state = "BLOCKED" + (f" {days}일째" if days is not None else "")
-            elif project.is_complete:
-                state = f"완료 {one_line(project.completed_at)}"
+            elif state_key == "COMPLETE":
+                state = f"완료 {one_line(values['completed_at'])}"
             else:
-                idle = project.days_since_last_event(now)
+                idle = values["days_idle"]
                 # The project's own last reported `status`, not a derived
                 # word: "created and never moved" (NOT_STARTED) and "in
                 # flight" (IN_PROGRESS) are different facts and only the
                 # Event says which.
-                state = f"{one_line(project.status)} 마지막 {one_line(project.last_seen)}" + (
-                    f" ({idle}일 전)" if idle else ""
+                state = (
+                    f"{one_line(values['status'])} 마지막 {one_line(values['last_seen'])}"
+                    + (f" ({idle}일 전)" if idle else "")
                 )
             print(
-                f"    {marker} {_authored(project.project_id):<20} {teams:<26}"
-                f"Event {project.event_count:<4}{state}"
+                f"    {marker} {_authored(values['project_id']):<20} {teams:<26}"
+                f"Event {values['events']:<4}{state}"
             )
-        if len(rollup.projects) > len(shown):
-            print(f"      외 {len(rollup.projects) - len(shown)}건")
+        if len(project_rows) > len(shown):
+            print(f"      외 {len(project_rows) - len(shown)}건")
 
-    for risk in rollup.risks:
-        days = risk.days_open(now)
-        age = f"{days}일째 " if days is not None else ""
-        attention.append(
-            f"{age}막혀 있는 Project: {_authored(risk.project_id)} "
-            f"[{one_line(ROLE_DISPLAY_NAMES.get(risk.team, risk.team))}] — "
-            f"{_authored(risk.blocker)} "
-            f"(증거 {_authored(risk.evidence.describe())}) — "
-            "Blocker는 파이프라인이 스스로 지우지 않는다. 그 팀이 RESUMED / "
-            "ISSUE_RESOLVED / COMPLETED를 보고할 때까지 열려 있다"
-        )
-
-    for mismatch in rollup.mismatches:
-        attention.append(
-            f"Desktop과 role이 어긋난 Event: {_authored(mismatch.event_id)} — "
-            f"{one_line(mismatch.source)}에서 왔는데 role은 "
-            f"{one_line(mismatch.claimed_role)}이라고 말한다(docs/02 §8은 그 Desktop을 "
-            f"{one_line(mismatch.expected_role)}로 정한다). 증거 "
-            f"{_authored(mismatch.evidence.describe())}. **이 Event의 작업은 위 Team "
-            f"집계와 Desktop 집계에서 서로 다른 곳으로 간다** — Notion PROJECTS 행도 "
-            f"Owner와 Source가 서로 다른 Desktop을 가리킨다. `validate_event()`는 두 "
-            f"필드를 각각만 검사하고 짝은 검사하지 않으므로 손으로 쓴 Event나 복원된 "
-            f"파일이 이 모양이 될 수 있다. 거부하지 않는 이유와 필요한 결정은 BACKLOG"
-        )
+    for row in _rows("RISKS"):
+        values = row.values
+        if values["kind"] == "OPEN_BLOCKER":
+            days = values["days_open"]
+            age = f"{days}일째 " if days is not None else ""
+            attention.append(
+                f"{age}막혀 있는 Project: {_authored(values['project_id'])} "
+                f"[{one_line(ROLE_DISPLAY_NAMES.get(values['team'], values['team']))}] — "
+                f"{_authored(values['blocker'])} "
+                f"(증거 {_authored(row.evidence[0].describe())}) — "
+                "Blocker는 파이프라인이 스스로 지우지 않는다. 그 팀이 RESUMED / "
+                "ISSUE_RESOLVED / COMPLETED를 보고할 때까지 열려 있다"
+            )
+        else:
+            attention.append(
+                f"Desktop과 role이 어긋난 Event: {_authored(values['event_id'])} — "
+                f"{one_line(values['source'])}에서 왔는데 role은 "
+                f"{one_line(values['claimed_role'])}이라고 말한다(docs/02 §8은 그 Desktop을 "
+                f"{one_line(values['expected_role'])}로 정한다). 증거 "
+                f"{_authored(row.evidence[0].describe())}. **이 Event의 작업은 위 Team "
+                f"집계와 Desktop 집계에서 서로 다른 곳으로 간다** — Notion PROJECTS 행도 "
+                f"Owner와 Source가 서로 다른 Desktop을 가리킨다. `validate_event()`는 두 "
+                f"필드를 각각만 검사하고 짝은 검사하지 않으므로 손으로 쓴 Event나 복원된 "
+                f"파일이 이 모양이 될 수 있다. 거부하지 않는 이유와 필요한 결정은 BACKLOG"
+            )
 
     # The layers this system has no source for, said out loud. An empty panel
     # reads as "아무 일도 없다"; this says "물어볼 곳이 없다", which is a
-    # different sentence and the true one.
+    # different sentence and the true one. Which layers those are comes from
+    # the model's own panels rather than from the constant alone, so a layer
+    # that gained a source and lost its panel entry stops being announced
+    # here too instead of being announced forever.
     print(
         "  (원천 없음          : "
-        + ", ".join(UNSOURCED_LAYERS)
+        + ", ".join(
+            layer
+            for layer in UNSOURCED_LAYERS
+            if layer in unsourced_layer_coverage(model)
+        )
         + " — Event Schema에도 Company Repository에도 이 계층이 없다. "
         "BACKLOG 참조)"
     )
@@ -3936,8 +4009,12 @@ def main(argv: Sequence[str] = ()) -> int:
     refusal = unexpected_arguments(
         argv,
         tool="ops_status.py",
+        # `COMPANY_OPS_RUNTIME_DIR` used to head this list and nothing has
+        # ever read it — `RUNTIME_DIR` is a constant here, deliberately (see
+        # `_agent_dir()`'s note on why it is derived per call rather than
+        # made a knob). Naming it was worse than naming nothing: the message
+        # exists to give an operator "the name of the knob that does exist".
         configured_by=(
-            "COMPANY_OPS_RUNTIME_DIR",
             "COMPANY_OPS_HISTORY_START_DATE",
             "COMPANY_OPS_AGENT_SYNC_FOLDER",
             "COMPANY_OPS_AGENT_START_DATE",

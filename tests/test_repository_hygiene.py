@@ -516,6 +516,106 @@ class EnvironmentContractTests(unittest.TestCase):
             with self.subTest(variable=name):
                 self.assertIn(name, read)
 
+    # ------------------------------------------------------------------
+    # The third direction, added in C48: what the tools *tell an operator*
+    # to set.
+
+    def _advertised_variables(self) -> dict[str, set[str]]:
+        """`name -> entrypoints` for every `configured_by` name.
+
+        `cli.unexpected_arguments()` prints these when a tool is given an
+        argument it does not take, and its own docstring says why: "this
+        takes no arguments" leaves an operator with nowhere to go, and the
+        next thing they need is **the name of the knob that does exist".
+        A name in that list is therefore an instruction, and an instruction
+        that names a variable nothing reads is worse than silence — the
+        operator sets it, nothing changes, and the tool never says so.
+
+        Measured before this test existed (C48). Three of the seven names
+        across the four entrypoints did not exist:
+
+            COMPANY_OPS_NOTION_API_TOKEN     init_notion, run_company_ops
+            COMPANY_OPS_NOTION_PROJECTS_DB   init_notion, run_company_ops
+            COMPANY_OPS_RUNTIME_DIR          ops_status, run_company_ops
+
+        The first two are misspellings of `NOTION_API_TOKEN` /
+        `NOTION_PROJECTS_DATABASE_ID`, which the same two files name
+        correctly in their own module docstrings. The third is not a knob at
+        all: `RUNTIME_DIR` is a constant in both files, deliberately.
+
+        `init_notion.py`, whose entire job is Notion configuration, listed
+        only the two wrong ones — so an operator who followed its message
+        exactly got the same `NotionConfigError` they were trying to fix.
+        """
+        import ast
+
+        advertised: dict[str, set[str]] = {}
+        for name in self.ENTRYPOINTS:
+            path = REPO_ROOT / name
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if called != "unexpected_arguments":
+                    continue
+                for keyword in node.keywords:
+                    if keyword.arg != "configured_by":
+                        continue
+                    for element in ast.walk(keyword.value):
+                        if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                            advertised.setdefault(element.value, set()).add(name)
+        return advertised
+
+    def test_the_advertised_scan_finds_every_entrypoints_list(self):
+        """Guard against the AST walk above matching nothing and turning the
+        two checks below into no-ops."""
+        advertised = self._advertised_variables()
+
+        self.assertTrue(advertised)
+        covered = {tool for tools in advertised.values() for tool in tools}
+        self.assertEqual(covered, set(self.ENTRYPOINTS))
+
+    def test_every_variable_a_tool_advertises_is_one_something_reads(self):
+        read = self._read_variables()
+        for name, tools in sorted(self._advertised_variables().items()):
+            with self.subTest(variable=name):
+                self.assertIn(
+                    name,
+                    read,
+                    f"{sorted(tools)} tell an operator to set {name}, "
+                    "and nothing in this repository reads it",
+                )
+
+    def test_every_variable_a_tool_advertises_is_in_the_template(self):
+        """The message ends with 'AGENT.md를 보세요', and the variables
+        themselves are documented in `.env.example` (which AGENT.md §2.3
+        points at). A name in neither leaves the operator with a string and
+        no way to look it up."""
+        declared = self._declared_variables()
+        for name, tools in sorted(self._advertised_variables().items()):
+            with self.subTest(variable=name):
+                self.assertIn(
+                    name,
+                    declared,
+                    f"{sorted(tools)} advertise {name}, which is not in .env.example",
+                )
+
+    def test_each_entrypoint_advertises_the_variables_it_needs(self):
+        """Specific enough to fail on the exact regression that was found:
+        the two Notion tools have to name the two Notion variables."""
+        advertised = self._advertised_variables()
+
+        for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID"):
+            with self.subTest(variable=name):
+                self.assertEqual(
+                    advertised.get(name),
+                    {"init_notion.py", "run_company_ops.py"},
+                )
+        self.assertIn("run_company_ops.py", advertised["COMPANY_OPS_HISTORY_START_DATE"])
+        self.assertIn("run_agent.py", advertised["COMPANY_OPS_PROFILE"])
+
     def test_no_entrypoint_silently_loads_a_dotenv_file(self):
         """`.env.example` states that nothing auto-loads it. If that ever
         changes, the template's own instructions become wrong."""
@@ -849,6 +949,20 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         "report_and_send",                # the outbox gives durability
         "enqueue",                        # retry_queue's one-shot API; the
         "dequeue",                        # Runner uses the batch API (B안)
+        # --- waiting on a credentialled sink, not on a decision -----------
+        "to_payload",                     # C48: `DashboardModel.to_payload()`
+                                          # is the Control Tower's hand-off
+                                          # contract for a Notion projection,
+                                          # and the Workspace it would write
+                                          # to needs credentials this
+                                          # repository does not have (A-8).
+                                          # Distinct from the four above: no
+                                          # decision is outstanding and the
+                                          # shape is fixed by tests against
+                                          # the very model `ops_status.py`
+                                          # renders, so the screen and the
+                                          # payload cannot drift while it
+                                          # waits.
         # --- convenience accessors nothing needed yet ---------------------
         # `component` left this list in C46: `ops_status._same_instant_skips_
         # from_the_last_run()` needs one named component's metrics out of the
@@ -1947,23 +2061,55 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
         set instead. A stale name there sends them to a variable nothing
         looks at, which is worse than saying nothing.
 
-        So the names are checked against the ones the source actually
-        mentions, rather than against a list restated in this test.
+        **This test was written in C47 and could not catch the thing it was
+        for.** Two mistakes, both found in C48:
+
+        1. It matched only `COMPANY_OPS_*`. The two Notion tools name
+           `NOTION_API_TOKEN` / `NOTION_PROJECTS_DATABASE_ID`, so most of
+           what the messages say was outside the scan entirely.
+        2. `known` was "every `COMPANY_OPS_*` string that appears anywhere in
+           the source" — and the `configured_by` tuple **is** source. A
+           made-up name satisfied the check by being written down in the
+           very list under test. `COMPANY_OPS_NOTION_API_TOKEN`,
+           `COMPANY_OPS_NOTION_PROJECTS_DB` and `COMPANY_OPS_RUNTIME_DIR`
+           passed here for a full Sprint.
+
+        So `known` is now the set of names something actually **reads** —
+        an `os.environ.get()` / `source.get()` call or a `*_ENV_VAR`
+        constant — which is the property the message claims.
+        `EnvironmentContractTests` checks the same relation statically; this
+        one drives the real processes, so it also catches a message built
+        somewhere other than `configured_by`.
         """
+        patterns = (
+            r'os\.environ(?:\.get)?\(?\[?\s*["\']([A-Z_][A-Z0-9_]*)["\']',
+            r'source\.get\(\s*["\']([A-Z_][A-Z0-9_]*)["\']',
+            r'^[A-Z_]*ENV_VAR\s*=\s*["\']([A-Z_][A-Z0-9_]*)["\']',
+        )
         known = set()
         for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py")):
-            known.update(
-                re.findall(r"COMPANY_OPS_[A-Z_]+", path.read_text(encoding="utf-8"))
-            )
-        self.assertIn("COMPANY_OPS_PROFILE", known)  # the scan itself works
+            if "__pycache__" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for pattern in patterns:
+                known.update(re.findall(pattern, text, re.M))
+        # The scan itself works — one variable read each way.
+        self.assertIn("COMPANY_OPS_PROFILE", known)      # via a *_ENV_VAR constant
+        self.assertIn("NOTION_API_TOKEN", known)         # via `source.get()`
 
         for name in self.ENTRYPOINTS:
             with self.subTest(entrypoint=name):
                 message = self._run(name, "--dry-run").stderr
-                named = set(re.findall(r"COMPANY_OPS_[A-Z_]+", message))
+                named = set(
+                    re.findall(r"(?:COMPANY_OPS|NOTION)_[A-Z0-9_]+", message)
+                )
 
                 self.assertTrue(named, f"{name} names no variable at all")
-                self.assertEqual(named - known, set())
+                self.assertEqual(
+                    named - known,
+                    set(),
+                    f"{name} tells an operator to set a variable nothing reads",
+                )
 
     def test_the_rule_lives_in_one_place(self):
         """Four copies of "reject unknown arguments" is four chances for one

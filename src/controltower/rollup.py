@@ -139,7 +139,25 @@ class ProjectRollup:
     open_blocker: str | None = None
     open_blocker_since: str | None = None
     open_blocker_evidence: EvidenceRef | None = None
+    # The `role` of the Event that opened the blocker, which is not the same
+    # thing as "a team that has touched this project". A project several
+    # teams work on has several entries in `teams`, and the one that reported
+    # BLOCKED is the one that can report RESUMED — docs/02 requires the
+    # `blocker` text from a person, and the pipeline never clears it by
+    # itself. `Risk.team` used to be `teams[-1]`, i.e. whichever team logged
+    # the most recent Event of any kind, so a DECISION_APPROVED from another
+    # team silently moved the blocker's owner. Measured: PAY blocked by
+    # CTO_BACKEND, one later CMO Event, ATTENTION named CMO.
+    open_blocker_team: str | None = None
     completed_at: str | None = None
+    # The Event that wrote §25's Completed Date, not simply the last Event of
+    # a completed project. `projects_completed`'s evidence used to be
+    # `open_blocker_evidence or evidence[-1]`, which named a blocker for a
+    # completion and otherwise named whatever happened last — measured, a
+    # project COMPLETED on the 5th with a DECISION_APPROVED on the 9th cited
+    # the 9th. A traceability field that names the wrong file is worse than
+    # none, because it is checked and believed.
+    completed_evidence: EvidenceRef | None = None
     milestones: tuple[str, ...] = ()
     evidence: tuple[EvidenceRef, ...] = ()
 
@@ -561,7 +579,9 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
                 "blocker": None,
                 "blocker_since": None,
                 "blocker_ref": None,
+                "blocker_team": None,
                 "completed_at": None,
+                "completed_ref": None,
                 "milestones": [],
                 "evidence": [],
             }
@@ -578,8 +598,14 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
             bucket["blocker"] = value
             bucket["blocker_since"] = event.timestamp if value else None
             bucket["blocker_ref"] = _ref(event, name) if value else None
+            # `role`, not `source`: this answers "which team has to report
+            # RESUMED", and the Team layer is keyed by role. When the two
+            # disagree the Event is already a `PairMismatch` and the Desktop
+            # layer says so — one fact, one place to see it named wrong.
+            bucket["blocker_team"] = event.role if value else None
         if _completes(event):
             bucket["completed_at"] = event.timestamp
+            bucket["completed_ref"] = _ref(event, name)
         if event.event_type == "MILESTONE_COMPLETED" and event.milestone:
             if event.milestone not in bucket["milestones"]:
                 bucket["milestones"].append(event.milestone)
@@ -595,7 +621,9 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
             open_blocker=state[key]["blocker"],
             open_blocker_since=state[key]["blocker_since"],
             open_blocker_evidence=state[key]["blocker_ref"],
+            open_blocker_team=state[key]["blocker_team"],
             completed_at=state[key]["completed_at"],
+            completed_evidence=state[key]["completed_ref"],
             milestones=tuple(state[key]["milestones"]),
             evidence=tuple(state[key]["evidence"]),
         )
@@ -742,7 +770,7 @@ def _roll_risks(projects: Sequence[ProjectRollup]) -> tuple[Risk, ...]:
         risks.append(
             Risk(
                 project_id=project.project_id,
-                team=project.teams[-1] if project.teams else "",
+                team=project.open_blocker_team or "",
                 blocker=project.open_blocker or "",
                 since=project.open_blocker_since or "",
                 evidence=project.open_blocker_evidence,
@@ -801,7 +829,7 @@ def _roll_metrics(
             value=len(completed),
             source="docs/04 §25가 Completed Date를 쓰게 하는 Event(COMPLETED)",
             evidence=tuple(
-                p.open_blocker_evidence or p.evidence[-1] for p in completed if p.evidence
+                p.completed_evidence for p in completed if p.completed_evidence
             ),
         ),
         Metric(

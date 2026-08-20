@@ -23,6 +23,10 @@ What this pins that a unit test cannot:
     the OPS_RUNS row's numbers equal the rollup's
     the PROJECTS row's blocker equals the rollup's blocker
     a re-run adds no row and no duplicate
+    the Dashboard Model, the payload and the Notion row are one arrangement
+        of one fold (C48) — the chain the request states as
+        Desktop -> Company Ops -> Control Tower -> Dashboard Model ->
+        Notion Payload
 """
 
 import json
@@ -41,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent import run_once as agent_run_once  # noqa: E402
 from app.runner import run_once as runner_run_once  # noqa: E402
-from controltower import build_company_rollup  # noqa: E402
+from controltower import build_company_rollup, build_dashboard  # noqa: E402
 from notion import (  # noqa: E402
     ExecutionPlanSync,
     InMemoryNotionTransport,
@@ -107,6 +111,147 @@ def _prop(properties, name):
     return None
 
 
+class TheProjectsRowOwnerIsTheCreatorNotTheBlockerTests(unittest.TestCase):
+    """CHARACTERIZATION (C48): on a project two Desktops touch, the Notion
+    PROJECTS row attributes the blocker to the team that **created** the
+    project.
+
+    `build_update_properties()` deliberately omits `Owner` and `Source` —
+    its own docstring says docs/04 §9-12 describe them as creation-time
+    information and give no basis for overwriting them on every update. So
+    the row keeps the first Event's role and Desktop forever, while
+    `Blocker` is rewritten by whichever team reports one.
+
+    Measured, two Events, real `ExecutionPlanSync`:
+
+        E1  PAY  CMO / DESKTOP_2          STARTED
+        E2  PAY  CTO_BACKEND / DESKTOP_1  BLOCKED "vendor key missing"
+
+        PROJECTS row   Owner=CMO  Source=DESKTOP_2  Blocker="vendor key missing"
+        Control Tower  risk.team=CTO_BACKEND        (C48's fix)
+
+    So a Notion view that groups blocked projects by `Owner` routes this
+    blocker to the CMO, and the Control Tower on the same evidence routes it
+    to CTO Backend. **Only one of them can be right and it is not the row.**
+
+    Not fixed here, and the reason is that both fixes are spec decisions:
+    overwriting `Owner` on update contradicts the paragraph quoted above,
+    and a separate `Blocker Owner` property widens the PROJECTS schema,
+    which docs/04 fixes. BACKLOG carries the decision. Until then
+    `docs/13` §3-⑨ tells an operator not to build that view, and this test
+    stops the behaviour changing without anyone noticing.
+
+    Single-Desktop projects are unaffected: `Owner` is then the only team
+    there is, which is why every earlier Sprint's fixtures agreed.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.processed = Path(tmp.name) / "processed"
+        self.processed.mkdir(parents=True)
+        self.transport = InMemoryNotionTransport()
+        self.client = NotionClient(transport=self.transport, database_id="DB")
+
+    def _event(self, event_id, role, source, event_type, status, day, **extra):
+        from events import create_event
+
+        event = create_event(
+            source=source,
+            role=role,
+            project_id="PAY",
+            event_type=event_type,
+            status=status,
+            summary=f"summary for {event_id}",
+            history_candidate=True,
+            event_id=event_id,
+            timestamp=f"2026-08-{day:02d}T09:00:00+09:00",
+            **extra,
+        )
+        (self.processed / f"{event_id}.json").write_text(
+            event.to_json(), encoding="utf-8"
+        )
+        return event
+
+    def _sync_both(self):
+        sync = ExecutionPlanSync(client=self.client)
+        for event in (
+            self._event("E1", "CMO", "DESKTOP_2", "STARTED", "IN_PROGRESS", 5),
+            self._event(
+                "E2", "CTO_BACKEND", "DESKTOP_1", "BLOCKED", "BLOCKED", 6,
+                blocker="vendor key missing",
+            ),
+        ):
+            sync.sync(event)
+        return [
+            page
+            for page in self.transport._pages.values()
+            if "Project ID" in page.get("properties", {})
+        ][0]["properties"]
+
+    def test_the_row_keeps_the_creating_teams_owner(self):
+        properties = self._sync_both()
+
+        self.assertEqual(_prop(properties, "Owner"), "CMO")
+        self.assertEqual(_prop(properties, "Source"), "DESKTOP_2")
+
+    def test_the_row_still_carries_the_other_teams_blocker(self):
+        properties = self._sync_both()
+
+        self.assertEqual(_prop(properties, "Blocker"), "vendor key missing")
+        self.assertEqual(_prop(properties, "Status"), "BLOCKED")
+
+    def test_the_control_tower_names_the_team_that_reported_it(self):
+        self._sync_both()
+
+        rollup = build_company_rollup(
+            processed_dir=self.processed,
+            now=datetime(2026, 8, 19, 9, 0, tzinfo=KST),
+        )
+
+        self.assertEqual([risk.team for risk in rollup.risks], ["CTO_BACKEND"])
+
+    def test_the_two_disagree_and_that_is_the_finding(self):
+        """Stated as one assertion so the day they agree, this fails and the
+        characterization has to be rewritten as a fix."""
+        properties = self._sync_both()
+        rollup = build_company_rollup(
+            processed_dir=self.processed,
+            now=datetime(2026, 8, 19, 9, 0, tzinfo=KST),
+        )
+        from notion.properties import ROLE_DISPLAY_NAMES
+
+        self.assertNotEqual(
+            _prop(properties, "Owner"),
+            ROLE_DISPLAY_NAMES[rollup.risks[0].team],
+        )
+
+    def test_a_single_desktop_project_has_no_disagreement(self):
+        sync = ExecutionPlanSync(client=self.client)
+        for event in (
+            self._event("S1", "CMO", "DESKTOP_2", "STARTED", "IN_PROGRESS", 5),
+            self._event(
+                "S2", "CMO", "DESKTOP_2", "BLOCKED", "BLOCKED", 6, blocker="budget",
+            ),
+        ):
+            sync.sync(event)
+        properties = [
+            page
+            for page in self.transport._pages.values()
+            if "Project ID" in page.get("properties", {})
+        ][0]["properties"]
+        rollup = build_company_rollup(
+            processed_dir=self.processed,
+            now=datetime(2026, 8, 19, 9, 0, tzinfo=KST),
+        )
+        from notion.properties import ROLE_DISPLAY_NAMES
+
+        self.assertEqual(
+            _prop(properties, "Owner"),
+            ROLE_DISPLAY_NAMES[rollup.risks[0].team],
+        )
+
+
 class ThreeDesktopsReachNotionTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -139,12 +284,18 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
         self._git(["push", "-u", "origin", "main"], self.working_copy)
 
     # ---------------------------------------------------------------- steps
-    def _run_the_agents(self, signals=None):
-        """One real Agent run per Desktop, into one shared sync folder."""
+    def _run_the_agents(self, signals=None, *, day=DAY, now=NOW_AGENT):
+        """One real Agent run per Desktop, into one shared sync folder.
+
+        `day` / `now` are parameters so a test can deliver a **second**
+        batch on a later date and watch the per-run and all-time numbers
+        diverge in the one way they are allowed to — see
+        `test_each_runs_row_counts_only_its_own_events`.
+        """
         results = {}
         for desktop, entries in (signals or SIGNALS).items():
             agent_dir = self.root / desktop / "agent"
-            day_dir = agent_dir / "signals" / DAY.isoformat()
+            day_dir = agent_dir / "signals" / day.isoformat()
             day_dir.mkdir(parents=True, exist_ok=True)
             for name, payload in entries:
                 (day_dir / name).write_text(
@@ -163,7 +314,7 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
                 state_path=agent_dir / "state" / "agent_state.json",
                 lock_path=agent_dir / "locks" / "agent.lock",
                 log_path=agent_dir / "logs" / "agent.log",
-                now=NOW_AGENT,
+                now=now,
             )
         self._age_the_sync_folder()
         return results
@@ -292,6 +443,119 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
         self.assertEqual(_prop(properties, "Accepted"), rollup.events_read)
         self.assertEqual(_prop(properties, "Overall"), "OK")
 
+    def test_the_dashboard_model_is_the_same_fold_the_row_was_built_from(self):
+        """C48: the chain's last two links, checked against real data.
+
+        `record_run()` writes `Desktops Reporting` out of the Runner's own
+        rollup over this run's Events; the Dashboard Model arranges the
+        rollup read back off disk. On a single run those are the same Events,
+        so the two have to agree — and they are computed by completely
+        different code paths, which is what makes the agreement worth
+        asserting rather than assuming.
+        """
+        self._run_the_agents()
+        self._run_the_runner()
+
+        model = build_dashboard(self._rollup(), now=NOW_RUNNER)
+        properties = self._rows("Run ID")[0]["properties"]
+
+        reporting = {
+            row.key: row.values["events"]
+            for row in model.panel("DESKTOPS").rows
+            if row.values["events"]
+        }
+        self.assertEqual(
+            _prop(properties, "Desktops Reporting"),
+            " ".join(f"{source}:{count}" for source, count in sorted(reporting.items())),
+        )
+        self.assertEqual(
+            _prop(properties, "Role Mismatches"),
+            sum(row.values["role_mismatches"] for row in model.panel("DESKTOPS").rows),
+        )
+        self.assertEqual(
+            _prop(properties, "Accepted"),
+            sum(row.values["events"] for row in model.panel("DESKTOPS").rows),
+        )
+
+    def test_the_payload_carries_every_desktops_work_exactly_once(self):
+        """The serialised form, not just the objects. `to_payload()` is what
+        a credentialled projection would send, so the counting property has
+        to survive serialisation too."""
+        self._run_the_agents()
+        self._run_the_runner()
+
+        payload = build_dashboard(self._rollup(), now=NOW_RUNNER).to_payload()
+        panels = {panel["key"]: panel for panel in payload["panels"]}
+
+        for key in ("DESKTOPS", "TEAMS", "PROJECTS"):
+            with self.subTest(panel=key):
+                self.assertEqual(
+                    sum(row["values"]["events"] for row in panels[key]["rows"]),
+                    payload["events_read"],
+                )
+        self.assertEqual(
+            sorted(
+                row["key"] for row in panels["DESKTOPS"]["rows"] if row["values"]["events"]
+            ),
+            ["DESKTOP_1", "DESKTOP_2", "DESKTOP_4"],
+        )
+
+    def test_the_payload_names_the_blocked_project_and_the_team_that_blocked_it(self):
+        self._run_the_agents()
+        self._run_the_runner()
+
+        payload = build_dashboard(self._rollup(), now=NOW_RUNNER).to_payload()
+        risks = [
+            row
+            for panel in payload["panels"]
+            if panel["key"] == "RISKS"
+            for row in panel["rows"]
+        ]
+
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["values"]["project_id"], "SEARCH_BACKEND")
+        self.assertEqual(risks[0]["values"]["team"], "CTO_BACKEND")
+        self.assertEqual(risks[0]["values"]["kind"], "OPEN_BLOCKER")
+        # Traceable to a file that is really there — the whole reason every
+        # row carries evidence.
+        self.assertTrue(
+            (
+                self.runtime / "events" / "processed" / risks[0]["evidence"][0]["path"]
+            ).is_file()
+        )
+
+    def test_a_second_run_changes_no_number_in_the_payload(self):
+        """The duplicate-collection property, stated at the payload level."""
+        self._run_the_agents()
+        self._run_the_runner()
+        first = build_dashboard(self._rollup(), now=NOW_RUNNER).to_payload()
+
+        self._run_the_runner(now=NOW_RUNNER + timedelta(hours=1))
+        second = build_dashboard(self._rollup(), now=NOW_RUNNER).to_payload()
+
+        self.assertEqual(first, second)
+
+    def test_an_empty_run_produces_a_payload_that_says_so(self):
+        """Every panel present, every Desktop present, nothing invented — and
+        the two unsourced panels still saying they have no source."""
+        self._run_the_runner()
+
+        payload = build_dashboard(self._rollup(), now=NOW_RUNNER).to_payload()
+        panels = {panel["key"]: panel for panel in payload["panels"]}
+
+        self.assertEqual(payload["events_read"], 0)
+        self.assertEqual(panels["PROJECTS"]["rows"], [])
+        self.assertEqual(panels["PROJECTS"]["status"], "SOURCED")
+        self.assertEqual(len(panels["DESKTOPS"]["rows"]), 4)
+        self.assertEqual(
+            sorted(
+                layer
+                for panel in payload["panels"]
+                for layer in panel["unsourced_layers"]
+            ),
+            ["COMPANY_GOAL", "SPRINT", "TASK", "TEAM_GOAL"],
+        )
+
     def test_the_projects_rows_agree_with_the_rollup(self):
         self._run_the_agents()
         self._run_the_runner()
@@ -340,6 +604,60 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
             [p.event_count for p in rollup_after.projects],
             [p.event_count for p in rollup_before.projects],
         )
+
+    def test_each_runs_row_counts_only_its_own_events(self):
+        """The one way the row and the model are allowed to disagree, pinned.
+
+        `Accepted` on an `OPS_RUNS` row is **this run's** Events; the
+        Dashboard Model over `processed/` is **every** Event ever collected.
+        On a first run those coincide, which is what
+        `test_the_dashboard_model_is_the_same_fold_the_row_was_built_from`
+        checks — and a single-run test cannot tell the two definitions apart.
+
+        So this delivers a second batch on a later date and asserts the
+        stronger property: **the rows partition the evidence.** Every Event
+        is counted by exactly one row, none twice and none lost. A future
+        change that made the row all-time (or that double-counted a
+        re-collected Event) fails here rather than looking right.
+        """
+        second_day = DAY + timedelta(days=1)
+        self._run_the_agents()
+        self._run_the_runner()
+        first_accepted = _prop(self._rows("Run ID")[0]["properties"], "Accepted")
+
+        self._run_the_agents(
+            signals={
+                "DESKTOP_2": [
+                    ("second-campaign.json", {
+                        "project_id": "BRAND_CAMPAIGN",
+                        "event_type": "MILESTONE_COMPLETED",
+                        "status": "IN_PROGRESS",
+                        "summary": "9월 캠페인 초안",
+                        "milestone": "Draft",
+                        "history_candidate": True,
+                    }),
+                ],
+            },
+            day=second_day,
+            now=NOW_AGENT + timedelta(days=1),
+        )
+        self._run_the_runner(now=NOW_RUNNER + timedelta(days=1))
+
+        rows = self._rows("Run ID")
+        self.assertEqual(len(rows), 2, "the second run must write its own row")
+        accepted = [_prop(row["properties"], "Accepted") for row in rows]
+        model = build_dashboard(self._rollup(), now=NOW_RUNNER + timedelta(days=1))
+
+        # Partition: the rows sum to the whole, and the second row is not the
+        # whole.
+        self.assertEqual(sum(accepted), model.events_read)
+        self.assertIn(first_accepted, accepted)
+        self.assertLess(max(accepted), model.events_read)
+        # ...and the new Event landed under the Desktop that sent it.
+        desktops = {
+            row.key: row.values["events"] for row in model.panel("DESKTOPS").rows
+        }
+        self.assertEqual(desktops["DESKTOP_2"], 2)
 
     def test_re_running_the_agents_delivers_nothing_new(self):
         """`event_id` is derived deterministically from Desktop+date+filename,
@@ -487,6 +805,101 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
         self.assertEqual(_prop(row, "Desktops Reporting"), "")
         self.assertEqual(_prop(row, "Role Mismatches"), 0)
         self.assertEqual(_prop(row, "Accepted"), 0)
+
+    def test_the_coverage_says_the_numbers_cover_everything(self):
+        """C49: after a clean run the Control Tower's evidence covers every
+        day Company History records, and `coverage` says so."""
+        self._run_the_agents()
+        self._run_the_runner()
+
+        model = build_dashboard(self._rollup(), now=NOW_RUNNER)
+        older = self._history_older_than_the_evidence(model)
+        model = model.with_history_coverage(older)
+
+        self.assertEqual(model.coverage.evidence_from, DAY.isoformat())
+        self.assertEqual(model.coverage.evidence_to, DAY.isoformat())
+        self.assertEqual(model.coverage.unreadable, 0)
+        self.assertIsNone(model.coverage.history_uncovered_from)
+        self.assertTrue(model.coverage.complete)
+
+    def test_a_restored_machine_says_its_evidence_is_gone(self):
+        """The case `Coverage` exists for, driven through the real pipeline.
+
+        `runtime/events/processed/` is Execution Evidence and Backup scope is
+        `daily/` + `monthly/` only (docs/08 §26), so a machine restored from
+        the remote has its whole Company History and none of its Events. Every
+        panel then reports zero — truthfully — about a company that did work,
+        and only `coverage` can tell that apart from a quiet week.
+        """
+        self._run_the_agents()
+        self._run_the_runner()
+        wrote = sorted(
+            path.name for path in (self.local_master / "daily").glob("*.md")
+        )
+        self.assertTrue(wrote, "the run must have written Company History")
+
+        # The restore: History comes back, Events do not.
+        for path in (self.runtime / "events" / "processed").glob("*.json"):
+            path.unlink()
+
+        model = build_dashboard(self._rollup(), now=NOW_RUNNER)
+        older = self._history_older_than_the_evidence(model)
+        model = model.with_history_coverage(older)
+
+        self.assertEqual(model.events_read, 0)
+        self.assertEqual(model.panel("PROJECTS").rows, ())
+        self.assertEqual(len(model.panel("DESKTOPS").rows), 4)
+        self.assertIsNone(model.coverage.evidence_from)
+        self.assertEqual(model.coverage.history_uncovered_from, DAY.isoformat())
+        self.assertFalse(model.coverage.complete)
+        # ...and it survives serialisation, because that is the form a
+        # projection would carry it in.
+        self.assertEqual(
+            model.to_payload()["coverage"]["history_uncovered_from"],
+            DAY.isoformat(),
+        )
+
+    def test_the_screen_says_the_same_thing_after_that_restore(self):
+        """One derivation: `ops_status.py` hands its answer back into the
+        model and prints it from there."""
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        import ops_status
+
+        self._run_the_agents()
+        self._run_the_runner()
+        for path in (self.runtime / "events" / "processed").glob("*.json"):
+            path.unlink()
+
+        buffer = io.StringIO()
+        with mock.patch.object(ops_status, "RUNTIME_DIR", self.runtime):
+            with redirect_stdout(buffer):
+                attention = ops_status._print_control_tower(NOW_RUNNER)
+        printed = buffer.getvalue()
+
+        self.assertIn("증거 범위 밖", printed)
+        self.assertIn(DAY.isoformat(), printed)
+        self.assertIn("하나도 남아 있지 않다", printed)
+        # A qualifier, never an alarm: nothing brings those Events back.
+        self.assertEqual(attention, [])
+
+    def _history_older_than_the_evidence(self, model):
+        """The Company History side of `coverage`, read the way the real view
+        reads it — `ops_status.py`'s own function, not a copy."""
+        from datetime import datetime as datetime_type
+
+        import ops_status
+
+        earliest = (
+            datetime_type.fromisoformat(model.coverage.evidence_from).date()
+            if model.coverage.evidence_from
+            else None
+        )
+        return ops_status._company_history_older_than_the_evidence(
+            self.local_master / "daily", earliest
+        )
 
     def test_the_run_manifest_and_the_dashboard_agree(self):
         self._run_the_agents()

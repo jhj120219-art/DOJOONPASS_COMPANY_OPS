@@ -737,6 +737,61 @@ class RejectedSignalTests(AgentTestCase):
         self.assertEqual(pending(self.outbox_dir), ())
         self.assertNotIn(secret, self.log_path.read_text(encoding="utf-8"))
 
+    def test_a_rejection_that_cannot_be_moved_is_noisy_not_lossy(self):
+        """C49: `_reject_signal()`'s `except OSError` had never been executed.
+
+        Its docstring states the contract — "If the move fails the Signal
+        simply stays where it is — it will be re-judged (and re-rejected)
+        next run, which is noisy but never lossy." Nothing checked either
+        half. The condition is ordinary on Windows: a scanner or a sync
+        client holding the file open makes `os.replace` raise, and this runs
+        on Signals a person wrote by hand seconds earlier.
+
+        What must not happen is the failure escaping: this is called from the
+        per-date loop, so a raise here would stall **every** date behind one
+        unmovable file — the precise outcome the rejection path exists to
+        prevent.
+        """
+        import os
+
+        self.write_signal(date(2026, 8, 8), "good")
+        (self.signals_dir / "2026-08-08" / "bad.json").write_text("{oops", encoding="utf-8")
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            raise OSError(32, "signal held open by another process")
+
+        os.replace = failing_replace
+        self.addCleanup(setattr, os, "replace", real_replace)
+
+        transport = RecordingTransport()
+        result = self.run_agent(transport, now=datetime(2026, 8, 9, 9, 0))
+
+        # Reported as rejected all the same — the date is not stalled.
+        self.assertEqual(result.dates[0].rejected_signals, ("bad.json",))
+        # ...and nothing was lost: the Signal is still where a human left it.
+        self.assertTrue((self.signals_dir / "2026-08-08" / "bad.json").exists())
+
+    def test_an_already_rejected_name_is_not_overwritten(self):
+        """The other branch beside it: a second Signal of the same name must
+        not replace the copy a human still has to look at."""
+        (self.rejected_dir / "2026-08-08").mkdir(parents=True, exist_ok=True)
+        (self.rejected_dir / "2026-08-08" / "bad.json").write_text(
+            "the first one", encoding="utf-8"
+        )
+        (self.signals_dir / "2026-08-08").mkdir(parents=True, exist_ok=True)
+        (self.signals_dir / "2026-08-08" / "bad.json").write_text(
+            "{oops", encoding="utf-8"
+        )
+
+        self.run_agent(RecordingTransport(), now=datetime(2026, 8, 9, 9, 0))
+
+        self.assertEqual(
+            (self.rejected_dir / "2026-08-08" / "bad.json").read_text(encoding="utf-8"),
+            "the first one",
+        )
+
     def test_one_bad_signal_does_not_stall_the_good_ones(self):
         self.write_signal(date(2026, 8, 8), "good")
         (self.signals_dir / "2026-08-08" / "bad.json").write_text("{oops", encoding="utf-8")

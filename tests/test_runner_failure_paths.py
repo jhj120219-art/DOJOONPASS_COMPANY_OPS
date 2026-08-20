@@ -4315,6 +4315,80 @@ class NotionErrorBodyTests(unittest.TestCase):
         self.assertIn("Notion API returned 400: Bad Request", str(caught.exception))
         self.assertIn("Status is expected to be status", str(caught.exception))
 
+    def test_a_body_that_cannot_be_read_still_leaves_a_usable_error(self):
+        """C49: found by branch coverage — `_error_detail()`'s own `except`
+        had never been executed.
+
+        Its docstring makes a promise: "reading it must never turn one
+        failure into two". That promise is the whole reason a best-effort
+        read is acceptable here, and nothing was checking it. The condition
+        is ordinary rather than exotic — a connection dropped mid-response, a
+        proxy that closes the socket after the headers — and it arrives
+        exactly when Notion is already failing.
+        """
+        import urllib.error
+        import urllib.request
+
+        class Unreadable:
+            """A response whose body cannot be read.
+
+            `close()` is here because `HTTPError` owns the file object and
+            closes it during teardown; without it the stub produces a
+            `PytestUnraisableExceptionWarning` that has nothing to do with
+            what is being tested.
+            """
+
+            def read(self, *args, **kwargs):
+                raise OSError("connection reset while reading the body")
+
+            def close(self):
+                return None
+
+        real_urlopen = urllib.request.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url, 500, "Internal Server Error", {}, Unreadable()
+            )
+
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+        from notion.transport import NotionAPIError
+
+        with self.assertRaises(NotionAPIError) as caught:
+            self._transport()._request("POST", "/pages", {"x": 1})
+
+        # One failure, not two — and the caller still gets what it had.
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertIn("Notion API returned 500", str(caught.exception))
+        # No dangling separator from a detail that never materialised.
+        self.assertNotIn("|", str(caught.exception))
+
+    def test_an_empty_body_adds_nothing(self):
+        """The other early return beside it: a response with no body at all
+        must not produce a bare ` | ` suffix."""
+        import io
+        import urllib.error
+        import urllib.request
+
+        real_urlopen = urllib.request.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"   ")
+            )
+
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+        from notion.transport import NotionAPIError
+
+        with self.assertRaises(NotionAPIError) as caught:
+            self._transport()._request("POST", "/pages", {"x": 1})
+
+        self.assertNotIn("|", str(caught.exception))
+
     def test_the_status_code_is_preserved(self):
         """What IS kept — enough to classify, not enough to diagnose."""
         from notion.transport import NotionAPIError
@@ -5040,6 +5114,72 @@ class DashboardStepDiagnosticsTests(RunnerFailurePathTestCase):
         self.assertIn("RuntimeError", joined)
         self.assertIn("dashboard blew up", joined)
         self.assertIn("run_id=RUN-DASHLOG-2", joined)
+
+    def test_a_broken_control_tower_projection_does_not_reach_the_history(self):
+        """C49: where the Control Tower projection is computed matters.
+
+        `Desktops Reporting` / `Role Mismatches` are derived from a rollup of
+        this run's Events and a Dashboard Model built over it. C48 computed
+        the rollup at step 5, immediately after History Filter — i.e. with
+        three CRITICAL steps still ahead of it (Daily, Monthly, Backup) and
+        nothing catching an exception. Both calls are pure transforms over
+        Events that already parsed, so the placement was safe by argument;
+        C49 moved it inside the Dashboard step so it is safe by construction,
+        which is what CEO Decision ④ actually asks for — "Dashboard 기록
+        실패는 Runtime을 절대 중단시키면 안 된다."
+
+        Driven rather than reasoned: the projection is made to raise, and the
+        run must still write Company History and reach a successful Backup.
+        """
+        import app.runner as runner_module
+
+        original = runner_module.ops_runs_fields
+
+        def exploding(*args, **kwargs):
+            raise RuntimeError("control tower projection blew up")
+
+        runner_module.ops_runs_fields = exploding
+        self.addCleanup(setattr, runner_module, "ops_runs_fields", original)
+
+        self._write_event(event_id="FAILPATH-CTPROJ-001")
+        result = self._run(dashboard_client=self._client(), run_id="RUN-CTPROJ-1")
+
+        # The run survived, and the CRITICAL steps behind the Dashboard did
+        # their work.
+        self.assertIsNotNone(result)
+        self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+        self.assertTrue(
+            list(self.local_master_dir.glob("daily/*.md")),
+            "Company History was not written",
+        )
+
+        # ...and the failure is recorded rather than swallowed.
+        joined = chr(10).join(self._dashboard_log_lines())
+        self.assertIn("FAILED (unexpected)", joined)
+        self.assertIn("control tower projection blew up", joined)
+        self.assertIn("run_id=RUN-CTPROJ-1", joined)
+
+    def test_the_projection_is_not_computed_without_a_dashboard(self):
+        """The other half of the placement: an install with no Dashboard
+        configured — a supported deployment shape (docs/04) — does not pay
+        for a projection nothing will read, and cannot be broken by one."""
+        import app.runner as runner_module
+
+        original = runner_module.ops_runs_fields
+        calls = []
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        runner_module.ops_runs_fields = counting
+        self.addCleanup(setattr, runner_module, "ops_runs_fields", original)
+
+        self._write_event(event_id="FAILPATH-CTPROJ-002")
+        result = self._run(dashboard_client=None, run_id="RUN-CTPROJ-2")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(calls, [])
 
     def test_a_pending_backlog_is_reported_instead_of_growing_unseen(self):
         """drain_pending() already returned (recorded, still_pending); the

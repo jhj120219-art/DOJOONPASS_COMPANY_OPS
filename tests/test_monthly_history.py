@@ -434,6 +434,55 @@ class ParserTests(unittest.TestCase):
         )
 
 
+class CoverageWithNothingExpectedTests(unittest.TestCase):
+    """C49: found by branch coverage — `DailyCoverage.description`'s
+    empty-month branch had never been executed.
+
+    Reachable, and in the one situation this line exists to be read in: a
+    month entirely before `history_start_date` expects no days at all. The
+    rest of the method indexes `expected_dates[0]` and `[-1]`, so without
+    this branch the Metadata line — the sentence §37 requires every Monthly
+    to carry — would raise `IndexError` while rendering.
+
+    `is_complete` is True for such a month (no missing dates), which is the
+    right answer and also the one that makes the failure most surprising:
+    everything reports healthy right up to the line that formats it.
+    """
+
+    def _coverage(self, **kwargs):
+        from monthly.coverage import DailyCoverage
+
+        return DailyCoverage(year=2026, month=7, **kwargs)
+
+    def test_a_month_expecting_nothing_still_has_a_metadata_line(self):
+        coverage = self._coverage()
+
+        self.assertEqual(coverage.description, "COMPLETE (0 days expected)")
+
+    def test_it_is_complete_rather_than_incomplete(self):
+        """No expected day is missing, so the verdict is COMPLETE — and the
+        line has to say so without a date range to show."""
+        coverage = self._coverage()
+
+        self.assertTrue(coverage.is_complete)
+        self.assertEqual(coverage.status, "COMPLETE")
+
+    def test_an_ordinary_month_still_shows_its_span(self):
+        """The other side, so the empty branch cannot pass by always
+        firing."""
+        from datetime import date as date_type
+
+        coverage = self._coverage(
+            expected_dates=(date_type(2026, 7, 1), date_type(2026, 7, 2)),
+            present_dates=(date_type(2026, 7, 1),),
+            missing_dates=(date_type(2026, 7, 2),),
+        )
+
+        self.assertIn("2026-07-01 ~ 2026-07-02", coverage.description)
+        self.assertIn("1/2 days", coverage.description)
+        self.assertTrue(coverage.description.startswith("INCOMPLETE"))
+
+
 class CoverageTests(MonthlyTestCase):
     """docs/09 §10, §38-39, §85."""
 
@@ -1064,6 +1113,29 @@ class MockTestLateEventAndDirty(MonthlyTestCase):
         marked = mark_month_dirty(self.state_path, date(2026, 8, 20))
 
         self.assertTrue(marked)
+        self.assertEqual(load_state(self.state_path).dirty_months, ["2026-08"])
+
+    def test_marking_an_already_dirty_month_writes_nothing(self):
+        """C49: found by branch coverage — `mark_month_dirty()`'s
+        already-dirty return had never been executed.
+
+        A month is marked dirty once per Late Event, and several late Events
+        for the same month in one run is ordinary (a Desktop that was off for
+        a week delivers them together). `mark_dirty()` returns False for a
+        key it already holds precisely so the caller can skip the save, and
+        the caller does — but nothing checked that it does, so a regression
+        would have turned every late Event into a state write.
+        """
+        self._close_august_then_add_a_late_event()
+        self.assertTrue(mark_month_dirty(self.state_path, date(2026, 8, 20)))
+        before = self.state_path.read_text(encoding="utf-8")
+        stamp = self.state_path.stat().st_mtime_ns
+
+        marked = mark_month_dirty(self.state_path, date(2026, 8, 21))
+
+        self.assertFalse(marked, "the second mark reported new information")
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), before)
+        self.assertEqual(self.state_path.stat().st_mtime_ns, stamp)
         self.assertEqual(load_state(self.state_path).dirty_months, ["2026-08"])
 
     def test_the_next_run_rebuilds_a_dirty_month(self):

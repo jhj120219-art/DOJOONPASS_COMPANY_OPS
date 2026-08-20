@@ -7,7 +7,116 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-08-19 (C47 — **Desktop → Control Tower → Notion Sprint.**
+마지막 갱신: 2026-08-20 (C49 — **하나의 Model, 두 소비자.** C48이 화면을 Dashboard Model로
+옮겼다면 이번 기준은 **"Notion으로 나가는 것도 같은 모델에서 나온다"**였다.
+(1) **Notion 행이 아직 갈라져 있었다** — C48이 count는 하나로 만들었지만 `Desktops Reporting`의
+**표현**은 여전히 `app/runner.py`가 rollup에서 조립했다. 화면은 Model, 행은 rollup. 둘을 맞춰
+두는 것이 사후 비교 테스트 하나뿐이었다. `src/controltower/projection.py` 신설 —
+`ops_runs_fields(model)`가 그 두 열을 만들고 Runner는 부르기만 한다.
+(2) **rich_text 상한이 없었다** — `Desktops Reporting`은 `events.SOURCES`와 함께 자라라고
+rich_text 하나로 둔 열인데(C47), Notion의 2,000자 한도를 넘으면 행 전체가 400으로 거절된다.
+`RICH_TEXT_LIMIT` + **보이는** 절단(`…`).
+(3) **Coverage — "무엇에 대해"가 모델에 없었다** — 복원된 머신은 Company History는 전부,
+Event는 하나도 갖지 않는다. 그 상태에서 일곱 패널은 전부 0을 보고하고 **그것은 사실이다**.
+지금까지 그 단서는 `ops_status.py`가 계산해 화면에만 찍는 한 줄이었고, projection은 다시
+파생해야 했다. `Coverage`(`evidence_from`/`to`, `unreadable`, `history_uncovered_from`,
+`complete`)를 모델에 넣고 화면이 답을 **모델로 되돌려준다**(`with_history_coverage()`).
+(4) **새 게이트가 즉시 자기 값을 했다** — C48 마지막에 넣은 테스트 클래스 인용 게이트가
+`projection.py`가 아직 없는 테스트 두 개를 인용한 것을 잡았고, fresh run은 BACKLOG 산문 속
+placeholder 하나도 잡았다.
+(5) `contracted_columns()`를 만들었다가 **지웠다** — 호출자가 테스트뿐이었다.
+(6) ATTENTION 불변식을 property로 고정 — 이 블록이 찍는 ATTENTION 줄은 **RISKS 패널의 행
+개수와 정확히 같다**(무작위 40 seed).
+(7) **Dashboard 전용 계산이 CRITICAL 단계 앞에 서 있었다** — C48이 5단계 직후에 둔 rollup은
+Daily/Monthly/Backup보다 앞이고 감싸는 `except`가 없었다. Dashboard 단계 안으로 옮겼다.
+Dashboard 미설정 배포는 이제 아예 계산하지 않는다.
+(8) **`days_silent`만으로 stale View를 만들면 가장 걱정스러운 Desktop을 빠뜨린다** — 한 번도
+보고한 적 없는 Desktop은 값이 `null`이다. COMPANY 블록은 이미 `None`을 포함하는데, 그 규칙이
+문서에 없었다. `docs/13` §3-⑨-1에 조건을 적고 테스트로 고정했다.
+(9) **실행된 적 없는 분기 여섯 곳** — `src/notion/`에 분기 커버리지를 걸어 전부 도달 가능한
+방어였음을 확인하고 덮었다(빈 `Last Event ID`, update 실패, Title 없는 schema, 빈 report,
+제목 없는 Page, 읽을 수 없는 오류 본문). 97% → 99%.
+(10) **Notion으로 나가는 요청의 모양을 자격증명 없이 고정했다** — `RealNotionTransport`의 여섯
+메서드는 스위트가 한 번도 실행한 적이 없었다. verb/경로/body/헤더/timeout, 그리고 timeout·OSError
+변환까지. double의 두 번째 거짓말(타입 미검사)도 `_TypeEnforcingTransport`로 국소 보완.
+(8b) **Secret 보고가 세 번째 목적지를 말하지 않았다** — C47이 만든 줄은 Daily History와 backup
+원격을 대고 멈춘다. 실측: 훑는 다섯 필드 중 **넷**이 Notion PROJECTS 행에 그대로 들어간다.
+제3자이고 파일이 아니어서 교체 체크리스트에서 가장 빠지기 쉬운 사본이다. 보고를 고쳤다
+(동작을 고치는 것은 §12의 결정).
+(11) **원자적 쓰기 게이트의 명단이 트리보다 뒤처져 있었다** — 손으로 유지된 일곱 개, 실제
+열세 개. `agent/state.py`와 `monthly/state.py`는 **어느 게이트에도 없었다.** 명단을 훑기로
+바꾸고, cleanup 존재 여부까지 검사한다. 그리고 관용구의 **안쪽** `except OSError`는 열세 곳
+어디에서도 실행된 적이 없었다 — cleanup 실패가 원래 실패를 가리지 않는지 고정했다(보고형
+writer 둘에서 특히 중요하다).
+(11b) 남은 미실행 분기를 **분류해 기록**했다 — 추상/플랫폼/권한/도달불가 넷으로 나뉘며,
+다음 Sprint가 같은 조사를 반복하지 않는다.
+테스트 2938 → 3051(신규 113건), 실패 0. `src/controltower/` 100%, `src/notion/` 99%,
+`src/` 전체 **99%**(직전 98%).
+
+이전 갱신: 2026-08-20 (C48 — **Dashboard Model Sprint.** C47이 "Desktop의 실제 데이터가
+Notion까지 도달한다"를 세웠다면 이번 기준은 **"그 데이터가 하나의 모델로 정리돼, 화면과 나가는
+payload가 같은 것임을 증명할 수 있다"**였다.
+(1) **rollup이 Blocker를 엉뚱한 팀에 붙이고 있었다** — `Risk.team`이 `project.teams[-1]`,
+즉 "가장 최근에 아무 Event나 남긴 팀"이었다. 실측: PAY를 CTO_BACKEND가 BLOCKED로 막고
+CMO가 DECISION_APPROVED 하나를 남기면 ATTENTION이 **CMO에게** "그 팀이 RESUMED를 보고할
+때까지"라고 말한다. Blocker를 연 Event의 `role`로 고쳤다(`open_blocker_team`).
+(2) **완료 지표가 완료가 아닌 파일을 증거로 대고 있었다** — `projects_completed`의 evidence가
+`open_blocker_evidence or evidence[-1]`이었다. 완료 count에 blocker 파일을 우선하고, 아니면
+그 Project가 마지막으로 한 일을 댄다. 실측: 5일 COMPLETED / 9일 DECISION_APPROVED인
+Project가 9일 파일을 댔다. `completed_evidence`를 fold에 넣었다.
+(3) **`src/controltower/dashboard.py` 신설 — 요청된 5개 패널의 데이터 모델.** rollup과 화면
+사이에 아무것도 없었고, 그래서 "Control Tower가 무엇을 보여주는가"는 터미널 출력으로만
+존재했다. 7패널(`COMPANY_GOALS`/`METRICS`/`TEAMS`/`PROJECTS`/`SPRINTS`/`DESKTOPS`/`RISKS`),
+`PanelStatus.UNSOURCED`가 1급 값이며 `UNSOURCED_LAYERS` 4개를 정확히 한 패널씩 나눠 갖는다
+(테스트가 강제). **`ops_status.py`의 CONTROL TOWER 블록이 이 모델로 렌더링한다** — 실 runtime
+출력 byte 단위 동일 확인.
+(4) **payload가 자기 row key를 안 가렸다** — 처음 설계는 `AUTHORED_KEYS` 허용목록이었고,
+테스트가 즉시 깼다: PROJECTS 행의 `key`가 `project_id`라서 secret 모양 Project 이름이 옆
+칸은 가려진 채 key로 나갔다. **가릴 것의 목록이 아니라 안 가려도 되는 것의 목록**으로
+뒤집었다(`_UNAUTHORED_KEYS` — 전부 `validate_event()`가 고정 집합으로 묶는 값이다).
+(5) **CANCELLED가 ACTIVE로 나갔다** — docs/04 §26은 CANCELLED에 property를 주지 않으므로
+접을 사실이 없고, 화면은 `status`를 직접 찍어 안 보였지만 `state`를 읽는 projection에는
+취소된 Project가 진행 중으로 보였다.
+(6) **Runner가 `_roll_desktops()`를 손으로 한 번 더 구현하고 있었다** — docs/02 §8 짝 검사
+사본까지. `build_company_rollup(events=...)` seam으로 바꿔 하나의 fold가 화면과 OPS_RUNS 행
+둘 다를 만든다.
+(7) **PROJECTS 행의 `Owner`는 만든 팀이지 막은 팀이 아니다** (특성화, SKIP §5). 두 팀이 쓰는
+Project에서 Notion 행과 Control Tower가 서로 다른 팀을 가리킨다 — 실측. 고치려면 스키마 결정이
+필요해 `docs/13` §3-⑨에 "Blocked를 Owner로 group by 하지 말 것"으로 적고 테스트로 고정했다.
+(8) 문서: `docs/13` §3-⑨ **Control Tower View 구성** — PROJECTS/OPS_RUNS 위에 얹을 View,
+만들 수 없는 View와 그 이유, ⑨-4 경고. 새 Database도 새 Property도 만들지 않는다.
+(9) **payload가 작업량에 비례해 자랐다** — docs/14 §3이 Run Manifest에 대해 이미 정리한 규칙을
+내 새 코드가 깼다. Event 하나가 네 행(metric/project/team/desktop)에 증거로 실려, 6,000건에서
+**2.0 MB / 382 ms**. 상한을 두되 `evidence_count`는 진짜 총계로 남긴다 — 55 KB / 6.6 ms.
+(10) **네 entrypoint가 존재하지 않는 환경변수를 설정하라고 안내하고 있었다** — C47이 `--help`
+자리에 넣은 refusal 메시지의 일곱 이름 중 **셋이 존재하지 않는다**. `init_notion.py`는
+**틀린 둘만** 댔다. C47이 같이 넣은 테스트는 `configured_by` 목록 자신을 근거로 삼고 있어
+잡을 수 없었다. 이름을 고치고, 읽는 자리와 대조하는 게이트를 정적·프로세스 두 겹으로 넣었다.
+(11) **AGENT.md §2.2가 C13이 틀렸다고 적은 측정을 아직 그대로 싣고 있었다** — 정정(§2b)은
+36줄 아래에 있었다. Desktop 4의 환경변수를 다루는 절이 없어 refusal 메시지가 가리키는 문서에
+그 변수들이 없다는 문제도 같이 고쳤다(§2.3 신설).
+(12) **무작위 체인 property 하네스** — Desktop 1/2/3/4 → rollup → Dashboard Model → payload를
+무작위 Event 열로 흘려 8개 불변식을 250 seed(subtest 2,000건) 검증, 문제 0. 저장소에는
+40 seed(28초)로 남긴다. 고정하는 것: Desktop 간 혼입 없음, 세 파티션 전부 `events_read`와 일치,
+**파일 이름 순서 무관**(이름만 역순으로 바꿔 payload 동일), state가 fold와 일치, 완료마다 완료
+Event가 증거, RISKS = 열린 Blocker + mismatch, 어떤 authored 필드로 들어온 secret도 payload에
+없음, 나이가 음수인 값 없음.
+(13) **Cross-run partition** — `OPS_RUNS` 행의 `Accepted`는 per-run이고 Dashboard Model은
+전체 기간이다. 첫 실행에서는 두 값이 같아 단일 실행 테스트로는 두 정의를 구분할 수 없다.
+다음 날짜의 두 번째 배치를 실제로 흘려 **행들이 증거를 분할한다**를 고정했다 —
+합 = `events_read`, 어느 한 행도 전체가 아님.
+(14) **validator가 거절한 값을 그대로 되돌려주고 있었다** — `unreadable`의 `reason`은
+`invalid source: '…'`처럼 **거절한 값을 인용한다.** 처음 판단("파일명과 예외 메시지는 authored
+텍스트가 아니다")이 §4와 같은 종류로 틀렸다. `processed/`에 손으로 쓴 파일 하나로 credential이
+payload에 **두 번** 들어갔다(파일명 + 이유). 둘 다 가리고 `bounded()`도 걸었다.
+(15) **src/의 테스트 클래스 인용에 게이트가 없었다** — 이 저장소는 주석을 "그리고 …Tests가
+그것을 검사한다"로 끝내는 일이 잦은데(가장 강한 형태의 근거다), 그 이름이 실제로 존재하는지
+보는 것은 **BACKLOG.md에 대해서만** 있었다(`BacklogEvidenceLinksResolveTests`). 이번 Sprint에만
+src/ 쪽에서 둘이 어긋났다(테스트 이름을 붙인 뒤 바꿨다). 나머지 절반을
+`TestClassCitationsResolveTests`가 덮는다 — 둘이 트리를 분할한다.
+테스트 2825 → 2938(신규 113건), 실패 0. `src/controltower/` 문/분기 커버리지 100%.
+
+이전 갱신: 2026-08-19 (C47 — **Desktop → Control Tower → Notion Sprint.**
 기준은 "코드가 있다"가 아니라 **"Desktop 1/2/4의 실제 데이터가 Notion까지 도달하고 올바르게
 표현된다"**였다.
 (1) **Desktop 계층이 없었고, 그 부재가 결함을 가리고 있었다.** C46의 rollup은 `source`를 버렸다.
@@ -1550,6 +1659,46 @@ C10이 여기를 건드리지 않은 이유: 어느 Database에 무엇을 쓸지
 **SKIP.** (스키마가 나중 Sprint를 위한 의도적 준비라면 그렇다고 적어 두는
 것만으로도 충분하다 — 지금은 아무 문서도 그 말을 하지 않는다.)
 
+### A-22. README §9가 `Dashboard`를 **V1 제외**로 적고 있다 (C48 신규, **문서 충돌**)
+
+README §13이 문서 우선순위를 `README → 00 → 01 → 개별 Spec`으로 고정한다. 그 README의
+§9 "V1 제외" 목록 첫 줄이 `Dashboard`다.
+
+그런데 이 저장소에는 **Operations Dashboard가 구현·배선·문서화돼 있다** —
+`notion/dashboard.record_run()`이 `OPS_RUNS` 행을 쓰고, `run_company_ops.py`가
+`dashboard_client`를 만들며(GAP-1 수정), `docs/13` §3-⑧이 운영자 절차를 담고, C47이
+열 둘을 더 넣었다. 근거로 인용되는 것은 **"CEO Decision ④"** 인데, 그 결정문 자체는
+이 저장소 안에 없고 코드 주석과 docs/13에만 등장한다.
+
+두 읽기가 가능하고, **고르는 것이 결정이다.**
+
+- (a) README §9의 `Dashboard`는 **BI/제품으로서의 Dashboard**를 뜻하고(같은 목록에
+  `Advanced BI`, `KPI Platform`, `Alert Platform`이 나란히 있다), `OPS_RUNS` 한 행은
+  그 범주가 아니다 → README는 그대로 두고 용어를 구분해 적어야 한다.
+- (b) 문자 그대로 충돌이다 → 최우선 문서가 V1에서 뺀 것을 만들어 둔 셈이고, README §9를
+  고쳐야 한다.
+
+**SKIP.** README는 우선순위 1번 문서이고, 이 항목을 어느 쪽으로 읽을지는 CEO Decision ④의
+범위를 아는 사람만 정할 수 있다. 코드나 docs/13을 이 판단 없이 되돌리는 것은 반대 방향의
+사고다. 결정에 필요한 것: CEO Decision ④의 원문 범위, 그리고 (a)라면 README §9에 쓸
+구분 문구.
+
+### A-23. README §4의 시스템 그림에 Desktop 4의 **보고자 역할**이 없다 (C48 신규, **문서**)
+
+§4의 그림은 `Desktop 1 / 2 / 3 ─ Reporter → Event Transport → Desktop 4`다. Desktop 4는
+수집자로만 그려져 있다.
+
+실제로는 넷 다 보고자다. docs/02 §8의 표가 `DESKTOP_4 → COO`를 포함하고,
+`reporter/profiles.PROFILES`가 그것을 그대로 담으며(그 파일의 주석이 "DESKTOP_4 was
+missing here even though docs/02 §8 lists it"이라고 적어 둔 수정이다), Control Tower의
+Desktop 계층·`desktop_activity`·이 저장소의 실 runtime 모두 DESKTOP_4의 Event를 갖고
+있다. 이번 Sprint의 요청문도 "Desktop 1 / Desktop 2 / Desktop 4"를 기준으로 삼는다.
+
+**SKIP.** §4는 README이고, 그림을 고치는 것은 최우선 문서의 아키텍처 서술을 바꾸는
+일이다. 다만 이것은 A-22와 달리 **해석의 여지가 없다** — 표(docs/02 §8)와 그림이 서로
+다른 수의 보고자를 말한다. 결정에 필요한 것: 그림에 Desktop 4의 Reporter 가지를 그릴지,
+아니면 "Desktop 4는 자기 Event도 만든다"는 한 줄을 덧붙일지.
+
 ### A-21. 네 Category 밖의 항목을 Monthly가 어떻게 다루는가 (C31 신규, **데이터 유실**)
 
 **발견한 사실.** `monthly/markdown.render_monthly_markdown()`은
@@ -1932,6 +2081,659 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C49. 하나의 Model, 두 소비자 — 그리고 "무엇에 대해"
+
+C48은 화면을 Dashboard Model 위로 옮겼다. 이번 질문은 그 다음이었다: **Notion으로 나가는
+것도 같은 모델에서 나오는가.** 답은 아니오였고, 그것을 고치는 과정에서 모델이 답할 수 없던
+질문이 하나 더 드러났다.
+
+---
+
+### 1. Notion 행이 아직 갈라져 있었다 (신규, 구조)
+
+C48은 Runner의 손수 계산(`events_by_source` 루프 + docs/02 §8 짝 검사 사본)을 없애고 하나의
+`build_company_rollup()` fold로 바꿨다. **count는 하나가 됐지만 표현은 아니었다:**
+
+    rollup ─┬─> Dashboard Model ──> 화면
+            └─> (Runner가 직접 조립) ──> OPS_RUNS 행
+
+`" ".join(f"{d.source}:{d.event_count}" ...)`가 파이프라인 숫자 여덟 개 사이에 끼어 있었고,
+정렬 규칙·조용한 Desktop을 빼는 이유·그 이유가 패널과 반대인 까닭이 전부 그 자리의 주석에만
+있었다. 둘을 맞춰 두는 것은 **사후 비교 테스트 하나**였다 — C48이 직접 쓴 것.
+
+**`src/controltower/projection.py` 신설.** `ops_runs_fields(model)`가 두 열을 만들고 Runner는
+부른다. 이제:
+
+    rollup ──> Dashboard Model ─┬─> 화면
+                                └─> ops_runs_fields() ──> OPS_RUNS 행
+
+"행이 모델과 같다"가 **검사로 얻는 성질이 아니라 구성으로 얻는 성질**이 됐다.
+
+`OPS_RUNS_CONTROL_TOWER_COLUMNS`가 keyword→열 이름 표를 들고, `ContractedColumnsExistTests`가
+그것을 `DASHBOARD_DATABASES[OPS_RUNS]`·`record_run()`의 시그니처 양쪽과 대조한다. 열을 하나
+더 파생하면서 스키마에 넣지 않으면 **첫 실 운영 실행의 HTTP 400이 아니라 테스트가** 실패한다.
+
+`role_mismatches`를 DESKTOPS 패널에서 세는 것도 명시적 선택이다(RISKS도 같은 Event를 들고
+있다). DESKTOPS는 **보낸 기계**로 세고 그것이 이 열이 말하는 분할이다.
+`TheTwoPanelsAgreeAboutMismatchesTests`가 두 패널을 같은 수에 묶어, 선택이 조용한 차이가 되지
+않게 한다.
+
+---
+
+### 2. rich_text 상한이 없었다 (신규, **Notion 계약**)
+
+`Desktops Reporting`이 Desktop당 열이 아니라 rich_text **하나**인 이유는 C47이 적어 뒀다 —
+`events.SOURCES`는 자랄 수 있는 스키마 값이고, 열을 늘리면 매번 Database 마이그레이션이다.
+그런데 자라는 쪽에 한도가 없었다: Notion의 rich_text 한 항목은 2,000자이고, 넘으면
+**행 전체가 400으로 거절된다**(그 실행의 기록은 `dashboard_pending.json`에 쌓이고 이유가 남는다
+— 안전하지만 빠져나올 길이 없다, ⑧-4가 적은 바로 그 모양).
+
+`RICH_TEXT_LIMIT = 2000`, 그리고 절단은 **보인다** — `…`로 끝난다. 조용한 절단은 "네 Desktop이
+보고했다"를 짧은 문장이 아니라 **거짓 문장**으로 만든다. 잃는 것도 없다: 같은 수가 DESKTOPS
+패널과 Run Manifest에 있다.
+
+---
+
+### 3. Coverage — 모델이 "무엇에 대해"를 답할 수 없었다 (신규, **복구**)
+
+패널은 "무슨 일이 있었나"를 답한다. 답하지 않던 것은 **"무엇에 대해"**다.
+
+`runtime/events/processed/`는 Execution Evidence(docs/14 §2)이고 Backup 범위는
+`daily/`·`monthly/`뿐이다(docs/08 §26). 그래서 원격에서 복원한 머신은 Company History를 전부
+되찾고 **Event는 하나도** 되찾지 못한다. 그 상태에서 일곱 패널은 전부 0을 보고하며 —
+**그것은 사실이다.** 조용한 한 주와 구분되지 않을 뿐이다.
+
+지금까지 그 구분은 `ops_status.py`가 계산해 **화면에만** 찍는 한 줄이었다. Notion projection은
+같은 것을 다시 파생해야 했고, 그것이 C48·C49가 계속 닫아 온 갈래다.
+
+`Coverage`를 모델에 넣었다:
+
+    evidence_from / evidence_to    이 숫자들이 덮는 Event 날짜 범위
+    unreadable                     디렉터리에 있으나 쓸 수 없었던 파일 수
+    history_uncovered_from         일은 기록됐는데 증거가 없는 가장 이른 날
+    complete                       위 둘이 모두 비어 있는가
+
+`history_uncovered_from`만 **바깥에서 온다** — Company History는 `local_master/daily/`에 있고
+이 모듈은 그 디렉터리를 읽지 않으며 읽기 시작해서도 안 된다(rollup을 받아 재배열할 뿐이다).
+`with_history_coverage()`가 그 값을 받아 **새 모델**을 돌려준다(frozen 유지).
+`ops_status.py`는 이제 자기가 구한 답을 모델로 되돌려주고 **모델에서 찍는다** — 하나의 파생.
+
+E2E로 실제 파이프라인에서 확인했다: 정상 실행 뒤 `complete=True`, `processed/`를 비운 뒤
+(=복원 모양) `history_uncovered_from`이 그 날짜를 말하고 `complete=False`, 화면도 같은 문장,
+그리고 **ATTENTION은 비어 있다**(단서지 경보가 아니다).
+
+---
+
+### 4. 새 게이트가 같은 Sprint 안에서 두 번 발화했다 (기록)
+
+C48 마지막에 넣은 `TestClassCitationsResolveTests`가 `projection.py`의 주석이 인용한 테스트
+클래스 둘이 아직 없다고 즉시 실패했다(쓸 예정이었고, 이름을 먼저 적었다).
+
+그리고 **fresh 전체 실행**이 하나 더 잡았다 — C48이 BACKLOG 산문에 예시로 적은 가짜
+클래스 이름 하나를 기존 `BacklogEvidenceLinksResolveTests`가 인용으로 읽었다. 게이트가
+옳았다: `…Tests`로 끝나는 이름은 이 저장소에서 **인용**이며 예시로 쓸 수 있는 단어가
+아니다. 산문 쪽을 고쳤다(이 문단도 그래서 이름을 대지 않는다).
+
+두 게이트가 트리를 분할한다 — BACKLOG는 기존 것, `src/`·루트 entrypoint·AGENT.md·README는
+새 것.
+
+---
+
+### 5. 만들었다가 지운 것 (기록)
+
+`contracted_columns()` — 스키마에서 두 항목을 읽어 돌려주는 접근자. 호출자가 **테스트뿐**이었고,
+그것이 `DeadCapabilityInventoryTests`가 잡는 모양이다. 이 모듈이 다른 곳에 지는 빚은
+`OPS_RUNS_CONTROL_TOWER_COLUMNS` 하나이고, 스키마는 `notion/dashboard.py`의 것이며, 둘 다
+필요한 독자는 각각에게 한 번씩 물으면 된다.
+
+---
+
+### 6. ATTENTION 불변식을 property로 고정했다 (기록)
+
+이 블록이 찍는 ATTENTION 줄은 **RISKS 패널의 행 개수와 정확히 같다** — 무작위 Event 열
+40 seed로 고정했다. 임계값이 생기거나, 조용한 팀·읽을 수 없는 파일이 슬그머니 경보가 되거나,
+반대로 열린 Blocker가 조용해지면 이 테스트가 실패한다. 그런 드리프트는 한 줄씩 도착한다.
+
+Coverage 쪽도 property로 덮었다: 증거 범위가 실제 Event 날짜의 최소·최대와 같은가,
+`complete`가 정확히 "unreadable 0 + 미덮인 History 없음"인가.
+
+---
+
+### 7. Dashboard 전용 계산이 CRITICAL 단계 **앞**에 서 있었다 (신규, 배치)
+
+§1을 붙이고 나서 그 코드가 **어디에** 있는지를 봤다. C48이 넣은
+`build_company_rollup(events=run_events, ...)`은 5단계(History Filter) 직후에 있었다 — 즉
+Daily / Monthly / Backup **세 CRITICAL 단계보다 앞**이고, 그 자리를 감싸는 `except`는 없다.
+
+두 호출 모두 이미 파싱된 Event에 대한 순수 변환이라 실제로 던질 일은 없다. 하지만 그것은
+**논증으로 얻은 안전**이고, CEO Decision ④이 요구하는 것은 그것이 아니다 — "Dashboard 기록
+실패는 Runtime을 절대 중단시키면 안 된다."
+
+Dashboard 단계의 `try` 안으로 옮겼다. 두 가지가 따라온다:
+
+- 던져도 그 실행의 Company History와 Backup은 무사하고, 실패는 `notion_sync.log`의
+  `DASHBOARD FAILED (unexpected)`로 남는다 — 주입해서 확인했다.
+- **Dashboard 미설정 배포(docs/04가 지원하는 형태)는 아예 계산하지 않는다.** 읽지 않을 값을
+  만들지 않고, 그것 때문에 깨질 수도 없다. 이것도 테스트가 고정한다.
+
+실측(한 실행에 Event 5,000건): rollup 24 ms, 모델 0.3 ms, projection 0.009 ms — 옮긴 이유는
+비용이 아니라 배치다.
+
+---
+
+### 8. Secret 보고가 **세 번째 목적지**를 말하지 않았다 (신규, **Security**)
+
+C47 §11-12가 만든 ATTENTION 줄은 Event 내용의 secret이 어디로 가는지를 이렇게 적는다 —
+"Daily History에 그대로 쓰이고 backup 원격까지 push된다. 해당 자격증명을 **교체**해야 한다 —
+파일을 고쳐도 원격 history에는 남는다."
+
+**목적지가 하나 더 있다.** 실 `ExecutionPlanSync`로 측정:
+
+    event_id     -> `Last Event ID`       샌다
+    project_id   -> `Project ID` + Title  샌다
+    milestone    -> `Current Milestone`   샌다
+    blocker      -> `Blocker`             샌다
+    summary      -> (Property 없음)       가지 않는다
+
+같은 줄이 훑는 다섯 필드 중 **넷**이 Notion PROJECTS 행에 그대로 들어간다. Notion은 자체 보존
+정책을 가진 제3자이고, **파일이 아니어서** 운영자의 교체 체크리스트에서 가장 빠지기 쉬운 사본이다.
+"파일을 고쳐도 원격 history에는 남는다"는 두 원격 중 **하나**에 대해서만 참이었다.
+
+**보고를 고쳤지, 동작을 고치지 않았다.** 나가는 길에 가리는 것은 파이프라인이 사람이 쓴 문장을
+고쳐 쓰는 것이고 docs/06 §57이 그 얘기다 — C47 §15가 남긴 결정 그대로다. 줄은 이제 조건과 함께
+Notion을 이름 댄다("Notion Sync가 설정된 배포에서는"): 이 도구는 `processed/`를 읽을 뿐이고
+그 Event를 받은 실행에 Notion이 설정돼 있었는지 알 수 없으며, 토큰 없는 배포는 지원되는
+형태다(docs/04).
+
+**결정에 필요한 것** — C47 §15의 (a)/(b)/(c)에 하나 더 붙는다: 거부도 통과도 아닌 네 번째 안,
+**Notion 쪽으로 나갈 때만 가리는 것**. Company History의 문장은 손대지 않으므로 §57과 충돌하지
+않지만, 그때 Notion 행과 Company History가 서로 다른 문장을 갖게 되고 docs/14 §1이 Notion을
+"View"로 고정한 의미를 바꾼다. **SKIP.**
+
+---
+
+### 9. 실행된 적 없는 분기를 전수로 훑었다 — Notion 쪽에서만 여섯 (신규, **테스트**)
+
+`src/notion/`에 분기 커버리지를 걸고 "한 번도 실행되지 않은 방어"를 전부 열었다. 여섯 곳이
+나왔고, **전부 도달 가능**했다 — 추상 메서드 본문이나 플랫폼 분기가 아니라 실제 조건이다.
+
+| 어디 | 조건 | 왜 중요한가 |
+|---|---|---|
+| `properties._extract_rich_text()` ×2 | `Last Event ID`가 없거나 비어 있는 행 | docs/04 §43은 사람이 이 DB에 쓰는 것을 허용한다. 이 함수가 `""`를 답하면 **event_id가 빈 Event**(`EmptyEventIdIsStillAnEventIdTests`가 유효하다고 고정한 것)가 §62 중복 가드에 걸려 적용되지 않은 채 skip된다. §29-30 시각 가드는 이걸 못 잡는다 |
+| `sync._update()`의 `except NotionAPIError` | update 실패 | create 실패는 덮여 있었고 **update는 아니었다.** 대부분의 sync가 update다. docs/04 §38이 요구하는 `NOTION_RETRY_REQUIRED`가 실제로 나오는지 아무도 확인하지 않았다 |
+| `bootstrap._has_title_property()` + `_bootstrap_title_property()` | Title이 없는 schema | "이론상 발생하지 않음"이라고 적힌 방어. 방어는 **동작할 때만** 방어다 |
+| `bootstrap.format_report()` | 빈 결과 | `max()`가 빈 시퀀스에서 `ValueError`를 낸다 — 그 early return이 유일한 방벽이다 |
+| `dashboard._page_title()` | 제목 없는 Page | Notion에서 흔하고, 호스트 후보로 **유효하다.** 빈 문자열로 나열되면 렌더링 오류처럼 읽힌다 |
+| `transport._error_detail()`의 `except` | 본문을 읽다 끊긴 응답 | docstring의 약속이 "하나의 실패를 둘로 만들지 않는다"인데 아무도 확인하지 않았다 |
+
+전부 테스트로 덮었다. `src/notion/` 97% → **99%**(남은 것은 추상 메서드 본문 6줄뿐).
+
+---
+
+### 10. Notion으로 **실제로 나가는 요청의 모양**을 자격증명 없이 고정했다 (신규, **Release**)
+
+`RealNotionTransport`의 여섯 메서드는 한 줄짜리이고 스위트가 **하나도 실행한 적이 없었다.**
+verb 하나, 경로 하나, body 모양 하나 — live Workspace가 404/405로 답하기 전까지 보이지 않는
+종류의 코드다. `DashboardSchemaMappingTests`는 *property*를 고정하지만, 그것을 나르는 *요청*은
+아무도 고정하지 않았다.
+
+`urllib.request.urlopen`을 가로채 `Request`를 잡아 검사한다 — 네트워크도 자격증명도 필요 없다:
+GET `/databases/{id}`, POST `/databases/{id}/query`, POST `/pages`(+`parent.database_id`),
+PATCH `/pages/{id}`(스키마가 아니라 값), PATCH `/databases/{id}`(값이 아니라 스키마),
+POST `/databases`(+`parent.type=page_id` — Notion은 workspace 루트에 DB를 못 만든다), 그리고
+모든 요청의 `Notion-Version`/`Authorization` 헤더와 설정된 timeout.
+
+같은 방식으로 `_request()`의 두 변환도 덮었다 — read timeout(urllib이 `URLError`로 **감싸지
+않는다**)과 그 밖의 `OSError`가 `NotionAPIError`가 되는지. 이 변환이 없으면
+`ExecutionPlanSync`/`bootstrap`/`dashboard`가 잡지 않는 타입이 새어 나가고, Runner에서 그것은
+"재시도하는 단계"가 아니라 "죽는 단계"다.
+
+**그리고 double의 두 번째 거짓말을 고쳤다.** `_SchemaEnforcingTransport`는 없는 열을 거부하지만
+**타입은 보지 않았다** — `number` 열에 `rich_text`를 써도 통과한다. `TestDoubleFidelityTests`가
+"wrong property type accepted"로 이미 기록해 둔 발산이고, C36이 그 때문에 존재한다.
+`_TypeEnforcingTransport`로 실제 `record_run()` 한 번을 **전체 OPS_RUNS 스키마**에 대해 흘려
+본다. 이것이 중요한 이유: `record_run()`은 절대 raise하지 않으므로, 값 모양이 틀리면 행은
+`dashboard_pending.json`에 쌓여 **매 실행 똑같이 실패하며** 재시도된다.
+
+`TestDoubleFidelityTests`의 특성화는 그대로 둔다(평범한 double은 여전히 관대하다) — 두 완화가
+**국소 subclass**라는 것과, 그것이 실제 연결을 대체하지 않는다는 문장을 함께 적었다.
+
+---
+
+### 11. 원자적 쓰기 게이트의 명단이 **트리보다 뒤처져 있었다** (신규, **테스트/내구성**)
+
+`test_every_state_writer_uses_the_same_atomic_idiom`은 이 저장소의 구조 게이트 중 하나다.
+자기 docstring이 목적을 이렇게 적는다 — "a future writer that skips tempfile+os.replace would
+silently lose the no-torn-file property."
+
+**명단이 손으로 유지되고 있었고, 일곱 개였다.** `tempfile.mkstemp`로 훑으면 **열세 개**다.
+
+그리고 `agent/state.py`와 `monthly/state.py`는 **어느 명단에도 없었다** —
+구조 게이트에도, `AtomicWriteFailureCleanupTests`에도,
+`CompanyHistoryWritersCleanUpTooTests`에도. 관용구는 갖고 있는데 그것을 아는 게이트가 없었다.
+이 테스트가 막으려던 실패가 반대편에서 도착한 것이다: 관용구를 **빠뜨린** 새 writer가 조용히
+통과하는 것을 막으려 썼는데, 관용구를 **가진** 새 writer도 똑같이 조용했다.
+
+**명단을 없앴다.** 이제 `src/`를 훑고, 찾은 것마다 `os.replace`와
+`except BaseException: os.remove(tmp_path)` 둘 다를 요구한다(후자는 새 검사다 — staging은 하면서
+cleanup을 빠뜨린 writer는 이전 게이트가 볼 수 없었다). 훑기가 아무것도 못 잡는 경우를 막는
+guard-the-guard도 붙였다.
+
+### 11b. 그리고 관용구의 **안쪽 절반**은 한 번도 실행된 적이 없었다
+
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:      <- 여기
+            pass
+        raise
+
+바깥은 덮여 있었다(`os.replace`를 깨서 주입). **안쪽은 어디에서도 실행된 적이 없다** — cleanup
+자신이 실패한 적이 한 번도 없었다.
+
+이것도 이 프로젝트의 대상 OS에서는 별개 시나리오가 아니다. 목적지를 붙잡고 있는 무언가가
+`os.replace`에 WinError 5를 내고, **같은 핸들이** staging 파일에도 WinError 32를 낸다. 둘은
+독립적으로 오는 것보다 **함께** 오는 쪽이 흔하다.
+
+걸린 성질은 "호출자가 어느 예외를 보는가"다. `pass`가 사라지면 writer는 "state를 못 썼다"가
+아니라 **"임시 파일을 못 지웠다"**를 보고한다 — 문제 대신 문제의 뒷정리에 대한 메시지다. 실패를
+분류하는 모든 호출자(`app/runner.py`의 recorder, `SyncResult`, `TransportError`)가 엉뚱한 쪽을
+분류하게 된다.
+
+Company History writer 셋에서는 더 나쁘다. 그중 둘은 **던지지 않고 보고한다** —
+`update_daily_history()`는 `LateUpdateOutcome.FAILED`의 `error` 문자열을,
+`consolidate_month()`는 실패한 `MonthlyResult`를 돌려주고, 그 문자열이 Run Manifest와
+`daily_late_update.log`와 `ops_status.py`에 도달한다. Daily Close를 잃은 원인을 찾는 운영자가
+"임시 파일을 못 지웠다"를 이유로 받게 된다.
+
+`os.remove`까지 깨는 클래스 둘을 붙여 열세 writer 전부에 대해 고정했다 — 원래 오류가
+전파/보고되고, cleanup의 오류가 그것을 가리지 않고, 이름이 붙은 산출물은 여전히 생기지 않는다.
+
+부수 관찰: staging 이름이 `.tmp-f70hq44g.md`처럼 **확장자를 유지**하므로 `glob("*.md")`에 잡힌다.
+이 프로젝트의 모든 reader는 `.tmp-` 접두사를 배제하지만(`controltower.read_events()`, Monthly
+parser, Collector), 테스트를 쓰면서 그것을 잊으면 잔여물이 "유령 날짜"로 보인다 — 실제로 이
+테스트의 첫 판이 그렇게 실패했다.
+
+커버리지: `agent/state.py`·`monthly/state.py`·`daily/generator.py` 100%,
+`monthly/generator.py` 99%, `src/` 전체 98%.
+
+---
+
+### 11c. 남은 미실행 분기를 **분류해 두었다** (기록)
+
+`src/` 전체 문·분기 커버리지 **99%**. 남은 55줄/27분기는 다음 넷 중 하나이며, 다음 Sprint가
+같은 조사를 다시 하지 않도록 여기에 적는다.
+
+| 종류 | 어디 | 왜 남는가 |
+|---|---|---|
+| 추상 메서드 본문 | `history/repository.py`, `history/review.py`, `collector/seen_store.py`, `transport/interface.py`, `notion/transport.py`의 6줄 | `raise NotImplementedError` — 구현이 아니라 계약이다 |
+| 플랫폼 분기 | `scheduler/lock.py` 67·100-108 | POSIX `os.kill` 경로. 이 머신은 Windows이고 `tasklist` 쪽을 쓴다 |
+| 권한 필요 | `backup/working_copy.py` 13줄 | symlink/junction 거부 분기. `SeCreateSymbolicLinkPrivilege`가 없다(B-2와 같은 조건) |
+| 도달 불가(문서화됨) | `app/runner.py` 1390·1627 등 | `BACKUP_PENDING`처럼 "도달 불가"가 전제와 함께 테스트로 고정돼 있다 |
+
+이번 Sprint에 **닫은 것**: `agent/agent.py`·`agent/state.py`·`backup/state.py`·
+`daily/generator.py`·`monthly/generator.py`·`monthly/state.py`·`monthly/coverage.py`·
+`notion/properties.py`·`notion/sync.py`·`notion/dashboard.py`·`notion/bootstrap.py`·
+`notion/retry_queue.py`·`notion/dashboard_pending.py`·`reporter/local_output.py`·
+`collector/state.py`·`scheduler/state.py`·`history/file_repository.py`·`transport/intake.py`
+— 전부 100%.
+
+**남은 셋은 여전히 실제 조건이다**(추상/플랫폼/권한이 아니다):
+`agent/delivery.py` 213(빈 record 목록), `agent/outbox.py` 122(이름 경합 흡수),
+`agent/status.py` 78-79(naive/aware 정규화), `app/desktop_activity.py` 133-134·414·519,
+`backup/git_ops.py` 226(porcelain 빈 줄), `daily/role_summary.py` 98(호출자 없는 모듈, A-3),
+`review_cli.py` 178-180·184. 전부 값싸게 덮을 수 있고 이번에 시간이 아니라 우선순위로 남겼다.
+
+---
+
+### 12. 남는 결정 (SKIP, 조건 명시)
+
+C48 §9 그대로이며 바뀐 것은 없다. 덧붙는 것 하나:
+
+**Coverage를 Notion 어디에 둘 것인가.** 값은 이제 payload에 있고 `docs/13` §3-⑨-4가 "패널 옆
+텍스트 블록"을 권한다. 그것을 `OPS_RUNS`의 열로 만들지(= per-run 행에 standing fact를 하나 더
+얹는 결정, `Notion Queued`의 선례가 있다), 아니면 Workspace에서 사람이 배치할지는 View 구성
+결정이고 자격증명이 필요하다(A-8).
+
+---
+
+## C48. Dashboard Model — 화면과 payload가 같은 것임을 증명할 수 있게
+
+C47은 Desktop의 실제 데이터가 Notion 행까지 닿는 것을 흘려서 확인했다. 남은 질문은
+다른 것이었다: **그 데이터를 "전사 Control Tower"로 보여줄 때, 화면에 있는 것과
+밖으로 나가는 것이 같은 것이라고 무엇이 보장하는가.** 이번 Sprint의 기준은 그
+보장을 코드 구조로 만드는 것이었고, 그 과정에서 rollup 자체의 결함 셋이 나왔다.
+
+---
+
+### 1. Blocker가 엉뚱한 팀에 붙어 있었다 (신규, **오귀속**)
+
+`_roll_risks()`가 `Risk.team`을 `project.teams[-1]`로 정했다. `ProjectRollup.teams`는
+그 Project를 **건드린 모든 role**을 first-seen 순으로 담는 목록이므로, `[-1]`은
+"가장 최근에 처음 등장한 팀"이다. 두 팀이 함께 쓰는 Project에서 다른 팀의 Event
+하나가 Blocker의 주인을 옮긴다. 실측:
+
+    E1  PAY  CTO_BACKEND  BLOCKED            blocker="vendor key missing"
+    E2  PAY  CMO          DECISION_APPROVED
+    -> Risk.team == "CMO"
+
+그리고 `ops_status.py`는 그 이름을 ATTENTION 문장 안에 찍는다 — "…**[CMO]** — vendor
+key missing — Blocker는 파이프라인이 스스로 지우지 않는다. **그 팀이** RESUMED /
+ISSUE_RESOLVED / COMPLETED를 보고할 때까지 열려 있다". 막고 있지 않은 팀에게 풀라고
+말하고 있었다.
+
+**고침:** Blocker를 연 Event의 `role`을 fold가 함께 들고 다닌다
+(`ProjectRollup.open_blocker_team`). `role`이지 `source`가 아닌 이유는 이 값이
+답하는 질문이 "어느 팀이 RESUMED를 보고해야 하는가"이고 Team 계층의 키가 `role`이기
+때문이다. 둘이 어긋난 Event는 이미 `PairMismatch`이고 Desktop 계층이 그것을 따로
+말한다.
+
+`TeamRollup.blocked_projects`는 **바꾸지 않았다** — 막힌 Project를 함께 쓰는 팀은
+막힌 Project를 갖고 있는 것이 맞다. 두 사실은 다르고 둘 다 참이다.
+
+---
+
+### 2. 완료 지표가 완료가 아닌 파일을 증거로 대고 있었다 (신규, **추적성**)
+
+`projects_completed` metric의 evidence가 이랬다:
+
+    evidence=tuple(p.open_blocker_evidence or p.evidence[-1] for p in completed ...)
+
+**완료 count가 blocker 파일을 우선한다.** 그리고 blocker가 없으면 그 Project가
+마지막으로 한 일 아무거나를 댄다. 실측:
+
+    C1  SEARCH  COMPLETED           5일
+    C2  SEARCH  DECISION_APPROVED   9일
+    -> evidence = C2
+
+    D1  OPSX  COMPLETED  5일
+    D2  OPSX  BLOCKED    9일  blocker="reopened for audit"
+    -> evidence = D2  (blocker 파일이 완료의 증거로)
+
+이 모듈의 docstring이 스스로 적어 둔 문장이 "왜 열린 Blocker가 3인가는 이름이 적힌
+파일 셋을 여는 것으로 끝난다"이다. 이름이 적혔는데 그 파일이 이유가 아니면 없느니만
+못하다 — 한 번 열어 보고 상관없다는 것을 알면 그 다음부터 열지 않는다.
+
+**고침:** §25의 Completed Date를 쓴 Event를 fold가 기록한다
+(`ProjectRollup.completed_evidence`).
+
+---
+
+### 3. `src/controltower/dashboard.py` — 요청된 패널의 데이터 모델 (신규)
+
+rollup과 `ops_status.py` 사이에 아무 층도 없었다. 렌더러가 `CompanyRollup`을 필드
+단위로 헤집어 문장을 조립했으므로 **"Control Tower가 무엇을 보여주는가"는 터미널
+출력으로만 존재**했고, 같은 것을 원하는 두 번째 소비자(Notion projection)는 rollup에서
+다시 파생할 수밖에 없었다. 하나의 view를 두 번 파생하는 것이 화면과 projection이 같은
+날에 대해 다른 말을 하기 시작하는 방식이다.
+
+패널은 요청의 다섯 개 그대로다.
+
+| 요청 | 패널 | 상태 |
+|---|---|---|
+| ① COMPANY GOALS | `COMPANY_GOALS` | **UNSOURCED** |
+| ① KPI | `METRICS` | SOURCED (target 없음 — target은 Goal이다) |
+| ② TEAM DASHBOARD | `TEAMS` | SOURCED (`current_sprint`는 항상 null) |
+| ③ PROJECT | `PROJECTS` | SOURCED (`sprint`는 항상 null) |
+| ③ SPRINT / Backlog | `SPRINTS` | **UNSOURCED** |
+| ④ DESKTOP | `DESKTOPS` | SOURCED |
+| ⑤ RISK / BLOCKER | `RISKS` | SOURCED (열린 Blocker + role 어긋남) |
+
+**`PanelStatus.UNSOURCED`가 1급 값인 이유.** 빈 패널과 원천 없는 패널은 모델이 둘을
+구분하지 못하면 똑같이 그려지고, 뜻은 정반대다 — "아무 일도 없었다" 대 "물어볼 곳이
+없다". `UNSOURCED_LAYERS` 4개가 정확히 한 패널씩에 귀속되며, 그 성질을 테스트가
+모델에게 물어서 검사한다(어느 패널이 어느 계층을 갖는지 테스트가 알지 않는다).
+계층 하나가 원천을 얻으면 그 테스트가 **실패해서** 옮기라고 알린다.
+
+**`ops_status.py`의 CONTROL TOWER 블록이 이 모델로 렌더링한다.** 실 runtime에서
+변경 전/후 전체 출력 byte 단위 동일. KPI 숫자만 `rollup.metric()`에서 읽고, 그 둘이
+같은 수임을 metric key 전부에 대해 테스트가 대조한다 — "같은 접근자를 부른다"보다
+강한 문장이다.
+
+④/⑤의 **운영 쪽 절반은 일부러 여기 없다.** Agent 상태 / Runner 상태 / Last Run /
+Backup / Delivery / Recovery / Notion Sync는 전부 이미 `OPS_RUNS` 행에 있고
+(`Generated Days`, `Backup Status`, `Notion Queued`, `Failed Steps`,
+`Desktops Reporting`, …), 여기에 다시 적는 것은 한 실행에 대한 두 번째 의견이다.
+`dashboard.py`의 docstring이 그 대응표를 들고 있다.
+
+---
+
+### 4. payload가 자기 row key를 안 가렸다 (신규, **Security**, 내 코드)
+
+처음 설계는 `AUTHORED_KEYS` — "가릴 필드의 목록"이었다. 테스트가 즉시 깼다:
+
+    project_id = "PROJ-ntn_AAAA…"
+    payload  values.project_id = "PROJ-[REDACTED]"      가려짐
+             key               = "PROJ-ntn_AAAA…"      **안 가려짐**
+
+`DashboardRow.key`는 PROJECTS 패널에서 `project_id` 그 자체다. 허용목록은 **완전해야만**
+동작하고, 나중에 붙는 열마다 잊을 기회가 생긴다.
+
+**뒤집었다.** `_UNAUTHORED_KEYS` — 가리지 **않아도** 되는 것의 짧은 목록이고, 거기
+들어간 이름은 전부 `validate_event()`가 고정 집합(`SOURCES`/`ROLES`/`STATUSES`)으로
+묶거나 이 모듈이 스스로 고른 단어다. 테스트가 두 방향을 다 잡는다: 목록의 이름이 실제
+열인지, 그리고 그 열의 값이 정말 고정 집합 안에 있는지.
+
+같은 검사가 열 이름 충돌 하나도 잡았다 — `source`가 DESKTOPS에서는
+`events.SOURCES` 값이고 METRICS에서는 자유 텍스트 출처 문장이었다. `_out()`이 열
+**이름만**으로 판단하므로 한 이름이 두 뜻을 가지면 예외목록이 곧 구멍이다. METRICS 쪽을
+`derived_from`으로 바꿨다.
+
+`EvidenceRef.path`도 가린다: 수집된 파일 이름이 Event 이름에서 오므로 secret 모양
+`event_id`는 secret 모양 파일명이다. 모델 자신은 **verbatim으로 둔다** — 파일을 찾는
+데 쓰는 값을 파이프라인이 고쳐 쓰면 증거가 증거가 아니게 된다. 가리는 곳은 기계를
+떠나는 지점 하나뿐이다.
+
+---
+
+### 5. CANCELLED가 ACTIVE로 나갔다 (신규, 내 코드)
+
+`_project_state()`가 접힌 사실(blocker / Completed Date)만 봤다. docs/04 §26은
+CANCELLED에 property를 **주지 않으므로** 접을 사실이 없고, 취소는 `status`에만 남는다.
+화면은 `status`를 직접 찍기 때문에 보이지 않았지만, `state`를 읽는 projection에는
+취소된 Project가 진행 중으로 보인다. `PROJECT_STATES`를
+`BLOCKED / COMPLETE / CANCELLED / ACTIVE`로 고정하고 테스트를 붙였다.
+
+---
+
+### 4b. validator가 **거절한 값**을 payload로 되돌려주고 있었다 (신규, **Security**, 내 코드)
+
+§4를 고친 뒤에도 `to_payload()`에 한 곳이 남아 있었고, 남긴 이유가 §4와 **똑같은 모양의
+추론**이었다 — 주석에 이렇게 적어 두었다: "파일 이름은 디스크에서, 이유는 예외에서 오며,
+**둘 다 authored Event 텍스트가 아니다**." 둘 다 틀렸다.
+
+    file    Event 파일은 Event 이름을 따서 지어진다(`safe_event_filename()`).
+            secret 모양 `event_id`는 곧 secret 모양 파일명이다.
+    reason  `validate_event()`는 **거절한 값을 메시지에 인용한다** —
+            `invalid source: '…'`, `timestamp is not valid ISO-8601: '…'`.
+
+실측. `processed/`에 JSON이지만 Event가 아닌 파일 하나(`source`가 credential 모양):
+
+    unreadable: [{'file': 'ntn_AAAA….json',
+                  'reason': "invalid source: 'ntn_AAAA…'"}]
+
+같은 credential이 payload에 **두 번** 들어갔다. `ops_status.py`는 개수만 찍으므로 화면에는
+없었고, 나가는 바이트에만 있었다.
+
+도달 경로는 손상이 아니다: docs/11이 `incoming/`에 손으로 쓰는 것을 허용하고, 부분 복원은
+남은 것을 그대로 남기며, `read_events()`의 docstring 자체가 Collector가 받아들인 staging
+residue를 적어 둔다. 그리고 이 필드가 채워지는 상황은 **운영자가 상태를 들여다보는 바로 그
+상황**이다.
+
+둘 다 `redact(one_line(...))`, 이유에는 `bounded()`도 걸었다 — `read_events()`가
+`except Exception`이라 텍스트가 무엇이든 될 수 있고, 무한히 커질 수 있는 보고서는 디스크를
+채운다(`oplog.bounded()`의 논거 그대로).
+
+**교훈이 §4와 같다.** "이 필드는 사용자 입력이 아니다"라는 추론은 이 저장소에서 이미 두 번
+틀렸다(C47의 "id는 내용이 아니다", 그리고 이번의 두 번). 그래서 남긴 규칙은 목록이 아니라
+방향이다 — payload에서 가리지 **않는** 것만 열거하고, 그 목록에 넣으려면 `validate_event()`가
+고정 집합으로 묶는다는 근거가 있어야 한다.
+
+---
+
+### 5b. payload가 작업량에 비례해 자랐다 (신규, **성능**, 내 코드)
+
+docs/14 §3이 Run Manifest에 대해 이미 정리해 둔 규칙이다 — "Manifest는 Event 1건당 줄을
+쓰지 않는다 … 작업량에 비례해 커지는 것은 로그이며, 그러면 Manifest일 수 없다." 새
+payload가 정확히 그것을 깼다. Event 하나는 **네 행**에 증거로 실린다(자기 metric, 자기
+Project, 자기 Team, 자기 Desktop). 실측 6,000건:
+
+    to_payload()   382.4 ms   2.0 MB
+    build_dashboard  0.2 ms            (모델 자체는 재배열일 뿐이다)
+
+둘 다 상한 없이 자란다. 이것이 Notion으로 나갈 바로 그 바이트다.
+
+**고침:** `EVIDENCE_IN_PAYLOAD = 5`. 행마다 앞의 다섯 개만 싣고, `evidence_count`는
+**진짜 총계**를, `evidence_truncated`가 잘렸는지를 말한다 — 조용한 절단은 "전부 덮었다"로
+읽히므로 하지 않는다. 모델 자신은 전부 들고 있다(이 기계 위의 독자에게는 다 있다).
+
+    to_payload()     6.6 ms   55 KB
+
+Blocker나 role 어긋남처럼 **증거가 곧 이유인** 행은 원래 ref 하나짜리라 상한에 닿지 않는다.
+
+---
+
+### 6. Runner가 `_roll_desktops()`를 손으로 한 번 더 구현하고 있었다 (정리)
+
+C47이 `Desktops Reporting` / `Role Mismatches`를 넣으면서 step 5 루프 안에서 직접
+셌다 — docs/02 §8 짝 검사의 **두 번째 사본**을 포함해서. 값은 맞았지만 "Dashboard 행이
+rollup과 일치한다"가 검사로 얻는 성질이지 구조로 얻는 성질이 아니었다.
+
+`build_company_rollup(events=...)` seam으로 바꿨다(이미 있던 seam이고, 파일을 다시 열지
+않는다). 이제 하나의 fold가 화면과 OPS_RUNS 행 둘 다를 만든다. per-run 행이므로 조용한
+Desktop은 `DESKTOP_3:0`이 아니라 빠진다 — 상태 뷰는 "활동 없음"과 "세지 않음"을 구분해야
+하지만, 이 실행에 아무것도 보내지 않은 Desktop은 이 실행에 보고하지 않은 것이다.
+
+---
+
+### 7. PROJECTS 행의 `Owner`는 **만든 팀**이지 막은 팀이 아니다 (신규, 특성화 — SKIP은 §9)
+
+§1을 고치고 나서 같은 질문을 Notion 쪽에 했다. `build_update_properties()`는
+`Owner`/`Source`를 **일부러 빼고**(docstring: docs/04 §9-12는 생성 시점 정보로만 설명하며
+매 Update마다 덮어쓸 근거가 spec에 없다), `Blocker`는 보고한 팀이 매번 덮어쓴다. 실측,
+실 `ExecutionPlanSync`:
+
+    E1  PAY  CMO / DESKTOP_2          STARTED
+    E2  PAY  CTO_BACKEND / DESKTOP_1  BLOCKED "vendor key missing"
+
+    PROJECTS 행   Owner=CMO  Source=DESKTOP_2  Blocker="vendor key missing"
+    Control Tower risk.team=CTO_BACKEND
+
+"Blocked를 Owner로 group by"하는 Notion View는 이 Blocker를 CMO에게 보낸다. 둘 중
+하나만 맞고, 맞는 쪽은 행이 아니다. 단일 Desktop Project에는 문제가 없다 — 그래서 이제껏
+모든 fixture가 일치했다.
+
+고치는 두 길이 **둘 다 명세 결정**이라(§9) 특성화 테스트로 고정하고 `docs/13` §3-⑨에
+경고를 적었다.
+
+---
+
+### 8. 문서 — `docs/13` §3-⑨ Control Tower View 구성 (신규)
+
+Database를 만드는 절이 아니다. **이미 있는 PROJECTS / OPS_RUNS 위에 View를 얹는 절**이며
+새 Database도 새 Property도 만들지 않는다. 담은 것:
+
+- PROJECTS 위의 View 5종(Board by Status / Timeline by Last Updated / Board by Owner /
+  Table by Source / Filter Blocker is not empty)과 각 View가 어느 패널에 대응하는지
+- OPS_RUNS 열이 요청의 어느 항목을 답하는지 대응표, 그리고 **행의 연속성을 완전성으로
+  읽지 말 것**(Dashboard 단계 앞에서 멈춘 실행은 행을 남기지 않는다)
+- 만들 수 **없는** View와 그 이유 — Goal / Sprint / Backlog 칸반은 원천이 없다
+- ⑨-4 경고 — Blocked를 `Owner`로 묶지 않는다(§7)
+
+패널 목록 자체는 문서에 옮겨 적지 않고 코드에서 뽑는 명령을 실었다(⑧이 열 목록에 대해
+하는 것과 같은 이유: 정본이 둘이면 어긋난다). 그 명령은 실행해서 확인했다.
+
+---
+
+### 10. 네 entrypoint가 **존재하지 않는 환경변수**를 설정하라고 안내하고 있었다 (신규, C47 회귀)
+
+C47 §13이 `--dry-run`이 운영 실행이던 것을 고치면서 `cli.unexpected_arguments()`를 넣었다.
+그 메시지의 존재 이유는 자기 docstring에 적혀 있다 — "'이 도구는 인자를 받지 않는다'는
+운영자를 갈 곳 없이 만든다. 다음으로 필요한 것은 **실제로 있는 knob의 이름**이다."
+
+실측(네 도구를 실제로 실행):
+
+    init_notion.py       COMPANY_OPS_NOTION_API_TOKEN, COMPANY_OPS_NOTION_PROJECTS_DB
+    run_company_ops.py   COMPANY_OPS_HISTORY_START_DATE, COMPANY_OPS_NOTION_API_TOKEN,
+                         COMPANY_OPS_NOTION_PROJECTS_DB, COMPANY_OPS_RUNTIME_DIR
+    ops_status.py        COMPANY_OPS_RUNTIME_DIR, COMPANY_OPS_HISTORY_START_DATE, …
+    run_agent.py         (셋 다 실재)
+
+일곱 이름 중 **셋이 존재하지 않는다.**
+
+- `COMPANY_OPS_NOTION_API_TOKEN` / `COMPANY_OPS_NOTION_PROJECTS_DB` — 진짜 이름은
+  `NOTION_API_TOKEN` / `NOTION_PROJECTS_DATABASE_ID`이고, **같은 파일의 module docstring이
+  그 둘을 올바로 적고 있다.** 메시지가 자기가 들어 있는 파일과 모순이었다.
+- `COMPANY_OPS_RUNTIME_DIR` — knob이 아니다. 두 파일 모두 `RUNTIME_DIR`이 상수이고,
+  `run_company_ops.py`에는 그것을 rebind하는 것이 위험해서 넣어 둔 가드가 바로 아래 있다.
+
+`init_notion.py`는 **Notion 설정이 전부인 도구**인데 틀린 둘만 댔다. 메시지를 그대로 따른
+운영자는 고치려던 `NotionConfigError`를 다시 만난다. 그리고 메시지는 "AGENT.md를 보세요"로
+끝나는데, AGENT.md에는 그 이름이 하나도 없었다(§11).
+
+**C47이 같이 넣은 테스트는 이것을 잡을 수 없었다.** 두 가지가 겹쳤다:
+
+1. `COMPANY_OPS_*`만 훑었다 — Notion 도구가 말하는 이름 대부분이 스캔 밖이었다.
+2. `known`이 "소스 어디든 나타나는 `COMPANY_OPS_*` 문자열 전부"였는데, **`configured_by`
+   목록 자체가 소스다.** 지어낸 이름이 *검사 대상 목록에 적혀 있다는 이유로* 검사를 통과했다.
+
+게이트를 두 겹으로 다시 세웠다. 정적(`EnvironmentContractTests`) — `configured_by`의 모든
+이름이 실제 **읽는 자리**(`os.environ.get` / `source.get` / `*_ENV_VAR`)를 갖고 `.env.example`에
+있는가. 프로세스(`AnEntrypointRefusesArgumentsItCannotHonourTests`) — 네 도구를 정말 실행해
+찍힌 이름을 같은 집합과 대조한다. 되돌려 보고 발화도 확인했다.
+
+---
+
+### 11. AGENT.md가 **틀렸다고 이미 기록된 측정**을 아직 싣고 있었다 (신규, 문서)
+
+§2.2: "관리자 권한이 필요할 수 있다 … 개발 머신에서 실측: **빈 Task조차 거부됐다**."
+§2b(36줄 아래): "**이전 안내는 필요하다고 했는데 틀렸다** — 실제 원인은 `-User` 누락이었고
+(C13에서 수정) 비관리자 세션에서 전 과정을 확인했다."
+
+두 문장이 같은 문서에 있고, **틀린 쪽이 먼저다.** §2.2에서 읽기를 멈춘 운영자는 관리자
+권한을 찾으러 간다. BACKLOG B-1이 이 사건에서 뽑은 교훈이 그대로 재현된 셈이다 —
+"'불가능함이 확인됐다'로 기록된 측정은 근거보다 오래 살아남는다."
+
+§2.2를 정정으로 바꾸고 §2b를 가리키게 했다.
+
+같은 절에서 두 번째 구멍: **AGENT.md에 Desktop 4의 환경변수를 다루는 절이 없었다.**
+§2.1은 Agent의 셋만 적고 "`NOTION_API_TOKEN` 등은 Desktop 4의 Runner만 사용한다"로
+끝난다. 그런데 `run_company_ops.py` / `init_notion.py` / `ops_status.py`의 refusal 메시지는
+전부 "사용법은 AGENT.md를 보세요"로 끝난다 — 이름을 받아 든 운영자가 안내받은 문서에서
+그 이름을 찾을 수 없었다. §2.3을 신설해 넷을 적고 정본(`.env.example`)과 Workspace 구축
+절차(docs/13)를 가리킨다.
+
+---
+
+### 9. 남는 결정 (SKIP, 조건 명시)
+
+**PROJECTS 행이 Blocker의 주인을 말할 것인가** (§7). 두 길이 있고 둘 다 명세 결정이다.
+- (a) `Owner`를 매 Update마다 덮어쓴다 — `build_update_properties()`의 docstring이
+  "spec에 근거가 없다"고 적어 둔 바로 그 일이다. 게다가 `Owner`의 뜻이 "만든 팀"에서
+  "마지막으로 손댄 팀"으로 바뀌는 것이라, 이미 그 열을 보고 만든 View가 있다면 조용히
+  뜻이 달라진다.
+- (b) `Blocker Owner` Property를 새로 만든다 — PROJECTS 스키마 변경이고 docs/04가
+  고정한다. 기존 행에는 값이 없으므로 backfill 여부도 결정해야 한다.
+- 결정에 필요한 것: `Owner`의 정의(생성자인가 최근 담당인가), 그리고 (b)라면 backfill
+  정책. 그때까지 팀별 Blocker는 `ops_status.py`의 CONTROL TOWER 블록이 유일하게 옳다.
+
+**`DashboardModel.to_payload()`의 sink** (A-8에 붙는다). payload는 완성돼 있고 화면이
+쓰는 바로 그 모델의 직렬화이지만, 그것을 받을 곳은 자격증명이 필요한 Workspace다.
+**결정이 남은 것이 아니라 자격증명이 남은 것**이며, 그 구분을 `DeadCapabilityInventoryTests`
+항목에 그대로 적었다. 연결할 때 필요한 것은 전송뿐이다 — 모델·payload·계약·View 설계·
+테스트·문서는 이번에 끝냈다.
+
+**Notion에 Control Tower 전용 표면을 만들 것인가.** docs/14 §1이 Operational Projection을
+`PROJECTS / OPS_RUNS` 둘로 고정한다. 패널 7개를 그 둘 위의 View로 얹는 것은 계약 안이고
+(§8), 세 번째 Database나 블록 Page를 만드는 것은 계약을 넓히는 일이라 명세 결정이다.
+이번 Sprint는 계약 안에 머물렀다.
+
+**Goal / Team Goal / Sprint / Task의 원천** — C46 §15, C47 §15 그대로. 바뀐 것은 하나:
+이제 모델이 그 부재를 데이터로 들고 있고(`UNSOURCED_LAYERS` → 패널), 원천이 생기면
+테스트가 실패해서 알린다. 결정 자체는 그대로 남는다.
 
 ---
 

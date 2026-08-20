@@ -68,10 +68,12 @@ powershell -ExecutionPolicy Bypass -File .\install_agent_task.ps1 `
 > 위 형태는 **그 PowerShell 프로세스에만** 적용되고 시스템 정책은 바꾸지 않는다.
 > `Set-ExecutionPolicy`로 머신 전체를 바꿀 이유는 없다.
 >
-> **관리자 권한이 필요할 수 있다.** 머신에 따라 `Register-ScheduledTask`가
-> 비관리자 세션을 거부한다(개발 머신에서 실측: 빈 Task조차 거부됐다).
-> 거부되면 스크립트가 원인과 조치를 알려주니 그대로 따르면 된다 — 그 경우
-> PowerShell을 관리자로 실행해 다시 돌린다. 재실행은 안전하다(`-Force`).
+> **관리자 권한은 필요 없다.** 여기 있던 "필요할 수 있다 — 빈 Task조차
+> 거부됐다"는 측정은 **틀렸다.** 실제 원인은 이 스크립트의 트리거에 `-User`가
+> 빠져 있던 것이고(C13에서 수정), 거부되는 것은 machine-wide 트리거뿐이다.
+> 같은 비관리자 세션에서 등록 → 실행 → Event 전달 → 수집까지 확인했다.
+> 자세한 것은 §2b. 거부되면 스크립트가 판별 절차를 알려준다 —
+> **elevation은 마지막 후보다.** 재실행은 안전하다(`-Force`).
 
 등록되는 것: `DOJOONPASS_COMPANY_OPS_AGENT_<DESKTOP_ID>`, **At log on**
 트리거, 2분 지연(docs/07 §54), `MultipleInstances=IgnoreNew`(§55).
@@ -82,6 +84,31 @@ Catch-up으로 복구한다. 켜질 때마다 1회 실행되어 마지막 성공
 
 `-DailyAt "11:00"`을 주면 자정을 넘겨 계속 켜져 있는 머신용 일일 트리거가
 추가된다. 이것은 안전장치가 아니라 편의 기능이다 — 안전장치는 Catch-up이다.
+
+---
+
+### 2.3 Desktop 4 (Runner)의 환경변수
+
+§2.1의 셋은 **Agent**의 것이다. Desktop 4에서 도는 Runner와 상태 도구는 다른 것을
+읽는다:
+
+```
+COMPANY_OPS_HISTORY_START_DATE=2026-08-01   # run_company_ops.py (필수)
+NOTION_API_TOKEN=                           # 없으면 Notion Sync를 건너뛴다 (실패가 아니다)
+NOTION_PROJECTS_DATABASE_ID=
+NOTION_OPS_RUNS_DATABASE_ID=                # 없으면 Operations Dashboard만 건너뛴다
+```
+
+**정본은 `.env.example`이다** — 각 변수가 무엇을 하고 누가 읽는지 거기에 적혀 있고,
+`tests/test_repository_hygiene.py`가 코드와 양방향으로 대조한다. Notion Workspace를
+처음 세우는 절차는 `docs/13_NOTION_ENVIRONMENT_SETUP.md`다.
+
+`.env`는 **자동으로 읽히지 않는다.** 셸에서 export하거나 실행 스크립트가 직접
+읽어야 한다(`.env.example` 머리말).
+
+인자를 붙여 실행하면 각 도구가 **자기가 읽는 변수의 이름**을 알려주고 종료한다
+(exit 1). 그 목록도 위와 같은 대조를 받는다 — C48 이전에는 일곱 이름 중 셋이
+존재하지 않는 변수였다.
 
 ---
 

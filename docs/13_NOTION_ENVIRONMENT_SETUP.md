@@ -159,7 +159,7 @@ readiness = READY                  이 Page 밑에 만들 수 있다
    중간에 실패하면 `DashboardBootstrapPartialError`가 **그때까지 만들어진 id를 메시지에 담아** 올라온다. 그 id들은 Workspace에 실제로 존재하므로 기록해 두고, 재시도는 `only=`에 **남은 이름만** 넘긴다.
 3. **`NOTION_OPS_RUNS_DATABASE_ID` 설정** — 위에서 얻은 id. §2.1대로 entrypoint가 실제로 보게 해야 한다.
 
-`OPS_RUNS`의 Property 정의는 `src/notion/dashboard.py`의 `DASHBOARD_DATABASES["OPS_RUNS"]`가 정본이다. 손으로 만들 때는 이름과 타입을 그대로 맞춘다 — 열이 많아 옮겨 적기보다 **출력해서 보고 만드는 편이 안전하다.** 이 문서에 목록을 복사하지 않는 이유도 같다(정본이 둘이 되면 어긋난다). 개수도 적지 않는다: C31 13열 → C32 15열 → C33 17열 → C37 18열 → C42 20열로 실제로 자라 왔고, 문서에 박아 둔 숫자는 그때마다 조용히 틀렸다:
+`OPS_RUNS`의 Property 정의는 `src/notion/dashboard.py`의 `DASHBOARD_DATABASES["OPS_RUNS"]`가 정본이다. 손으로 만들 때는 이름과 타입을 그대로 맞춘다 — 열이 많아 옮겨 적기보다 **출력해서 보고 만드는 편이 안전하다.** 이 문서에 목록을 복사하지 않는 이유도 같다(정본이 둘이 되면 어긋난다). 개수도 적지 않는다: C31 13열 → C32 15열 → C33 17열 → C37 18열 → C42 20열 → C47 22열로 실제로 자라 왔고, 문서에 박아 둔 숫자는 그때마다 조용히 틀렸다 — **이 줄 자신도 C47 뒤로 한 Sprint 동안 틀려 있었다**(C48에서 발견). 이제 `OpsRunsColumnHistoryIsCurrentTests`가 이 줄의 마지막 숫자를 스키마와 대조한다:
 
 ```powershell
 python -c "import sys; sys.path.insert(0,'src'); from notion.dashboard import DASHBOARD_DATABASES, OPS_RUNS; [print(f'{n:<20} {next(iter(t))}') for n, t in DASHBOARD_DATABASES[OPS_RUNS].items()]"
@@ -169,7 +169,7 @@ Notion UI에서의 타입 대응: `title`=Title, `date`=Date, `number`=Number, `
 
 #### ⑧-4 이미 만든 Database에 열이 모자랄 때
 
-위 400은 손으로 만들다 빠뜨렸을 때만 나오는 게 아니다. **`OPS_RUNS` 스키마는 자라 왔다** — C31까지 13열, C32에서 15열(`Transport Blocked`, `Notion Skipped`), C33에서 17열(`Notion Unreadable`, `Notion Queued`), C37에서 18열(`Failed Steps`), C42에서 20열(`Reused Days`, `Deleted Files`). ⑧-2를 C31 시점에 실행해 둔 Database는 지금 코드가 쓰는 열을 갖고 있지 않고, 그 상태에서는 **모든 실행이 400으로 거절된다.** 실패는 안전하지만(위 문단대로 큐에 쌓이고 이유가 남는다) 빠져나올 길이 없었다.
+위 400은 손으로 만들다 빠뜨렸을 때만 나오는 게 아니다. **`OPS_RUNS` 스키마는 자라 왔다** — C31까지 13열, C32에서 15열(`Transport Blocked`, `Notion Skipped`), C33에서 17열(`Notion Unreadable`, `Notion Queued`), C37에서 18열(`Failed Steps`), C42에서 20열(`Reused Days`, `Deleted Files`), C47에서 22열(`Desktops Reporting`, `Role Mismatches`). ⑧-2를 C31 시점에 실행해 둔 Database는 지금 코드가 쓰는 열을 갖고 있지 않고, 그 상태에서는 **모든 실행이 400으로 거절된다.** 실패는 안전하지만(위 문단대로 큐에 쌓이고 이유가 남는다) 빠져나올 길이 없었다.
 
 `bootstrap_dashboard_properties(client)`가 그 길이다. **없는 Property만 추가하고 기존 Property는 정의째 그대로 둔다**(옵션을 설정해 둔 Select도 안전하다). Title이 Notion 기본값 `Name`이면 `Run ID`로 rename한다 — Notion API는 두 번째 Title을 만들 수 없어서 rename이 유일한 방법이고, `notion.bootstrap`이 PROJECTS에 대해 이미 하던 예외를 그대로 쓴다.
 
@@ -192,6 +192,137 @@ print(format_report(bootstrap_dashboard_properties(client)))
 `bootstrap_dashboard_databases()`는 다섯 개(`OPS_RUNS`/`OPS_BACKUP`/`OPS_NOTION_SYNC`/`OPS_RISK`/`OPS_READINESS`)의 스키마를 갖고 있지만, **인자 없이 부르면 `OPS_RUNS` 하나만 만든다.** `docs/14_RUN_CONTRACT.md` §1이 Operational Projection을 "Notion (PROJECTS / OPS_RUNS)"로 고정하고 있고, 나머지 넷은 그 모델에 없으며 어떤 코드도 쓰지 않기 때문이다(BACKLOG A-16 / C33 §2).
 
 넷을 굳이 만들려면 `only=[...]`로 **명시적으로** 요청해야 한다. 만들면 영구히 비어 있고, 이 모듈에는 삭제 경로가 없다(의도된 설계) — Notion UI에서 직접 지워야 한다.
+
+---
+
+### ⑨ Control Tower View 구성 (선택)
+
+Database를 만드는 절차가 아니다. **이미 있는 두 Database(PROJECTS / OPS_RUNS) 위에
+View를 얹는 절차**이며, 새 Database도 새 Property도 만들지 않는다 —
+`docs/14_RUN_CONTRACT.md` §1이 Operational Projection을 그 둘로 고정하고,
+Goal·Sprint·Task는 이 시스템에 원천이 없다(§⑨-3).
+
+무엇을 보여줄지는 코드가 이미 정해 두었다. `src/controltower/dashboard.py`의
+`build_dashboard()`가 만드는 **Dashboard Model**이 정본이고, 같은 모델을
+`ops_status.py`의 CONTROL TOWER 블록이 화면에 그린다. 아래 View는 그 모델의 패널을
+Notion 쪽 재료로 옮긴 것이며, 화면과 어긋나면 어긋난 쪽이 틀린 것이다.
+
+패널 목록과 각 패널이 무엇에서 파생되는지는 코드에서 직접 뽑는다(여기에 옮겨 적으면
+정본이 둘이 된다 — ⑧과 같은 이유):
+
+```powershell
+python -c @'
+import sys
+from datetime import datetime
+sys.path.insert(0, "src")
+from controltower import build_company_rollup, build_dashboard
+model = build_dashboard(build_company_rollup(now=datetime.now().astimezone()),
+                        now=datetime.now().astimezone())
+for panel in model.panels:
+    print(f"{panel.key:<15} {panel.status.value:<10} {panel.title}")
+    print(f"                {panel.source or panel.note}")
+'@
+```
+
+#### ⑨-1 PROJECTS Database 위의 View
+
+| Dashboard Model 패널 | Notion View | 만드는 법 |
+|---|---|---|
+| `PROJECTS` (③) | Board | Group by **Status** |
+| `PROJECTS` (③) | Timeline / Calendar | Date = **Last Updated**, 완료는 **Completed Date** |
+| `TEAMS` (②) | Board | Group by **Owner** — 단, ⑨-5의 경고를 먼저 읽는다 |
+| `DESKTOPS` (④) | Table | Group by **Source** — 같은 경고가 적용된다 |
+| `RISKS` (⑤, 열린 Blocker) | Table | Filter **Blocker is not empty** |
+
+> **stale View를 `days_silent`만으로 만들지 않는다.** `days_silent`는 그 Desktop의 가장 최근
+> Event로부터의 날 수이고, **한 번도 보고한 적 없는 Desktop에는 값이 없다**(null). 그래서
+> `days_silent >= 3` 필터는 가장 걱정스러운 경우를 **빠뜨린다.** 조건은
+> `has_activity = false` **또는** `days_silent >= N`이다 — `ops_status.py`의 COMPANY 블록이
+> 쓰는 규칙과 같다(`silent_for()`는 `None`을 포함한다). 임계값 자체(N)는 Control Tower가
+> 정하지 않는다: 이 계층은 숫자만 싣고, 경보는 COMPANY 블록이 `SILENT_AFTER_DAYS`로 낸다.
+
+`Blocker`는 사람이 쓴 텍스트이고 파이프라인은 그것을 **스스로 지우지 않는다**
+(그 팀의 RESUMED / ISSUE_RESOLVED / COMPLETED만 지운다). 따라서
+"Blocker is not empty" View는 Control Tower의 열린 Blocker 목록과 같은 집합이다.
+
+#### ⑨-2 OPS_RUNS Database 위의 View
+
+| 요청 항목 | 열 |
+|---|---|
+| Desktop / Agent / Runner (④) | `Desktops Reporting`, `Role Mismatches`, `Run At` |
+| Delivery | `Transport Moved`, `Transport Blocked` |
+| Daily / History | `Generated Days`, `Reused Days`, `Accepted`, `Duplicate`, `Rejected` |
+| Backup / Recovery | `Backup Status`, `Deleted Files`, `Reused Days` |
+| Notion Sync | `Notion Synced` / `Skipped` / `Retried` / `Unreadable` / `Queued` |
+| 실패 (⑤) | `Failed Steps`, `Overall` |
+
+이 중 **Control Tower가 파생하는 두 열**(`Desktops Reporting`, `Role Mismatches`)은
+`src/controltower/projection.py`의 `OPS_RUNS_CONTROL_TOWER_COLUMNS`가 정본이다. 나머지 열은
+파이프라인 각 단계가 스스로 센 값이고, 이 둘만 Dashboard Model에서 나온다 — 그래서 화면의
+DESKTOPS 패널과 이 행은 **같은 fold의 같은 배열**이며 서로 다를 수 없다.
+
+한 행이 실행 1회다. **행의 연속성을 완전성으로 읽으면 안 된다** — Dashboard 단계
+앞에서 멈춘 실행은 행을 남기지 않는다(`runtime/runs/last_run.json`은 모든 종료
+경로에 쓰인다). docs/14 §1이 Notion을 View로 못 박은 이유가 이것이다.
+
+#### ⑨-3 만들 수 없는 View, 그리고 왜인지
+
+| 요청 | 상태 |
+|---|---|
+| 전사 목표 / 목표별 진행률 / KPI target | **원천 없음** (`COMPANY_GOAL`, `TEAM_GOAL`) |
+| 현재 Sprint / Sprint Board / Backlog 칸반 | **원천 없음** (`SPRINT`, `TASK`) |
+
+Event Schema에도 Company Repository에도 이 계층이 없다. Notion에 적어 넣고 권위로
+삼는 것은 docs/14 §1을 정면으로 깨는 일이므로, 원천을 Company Repository 산출물로
+둘지 Event Schema 필드로 둘지가 먼저 정해져야 한다(BACKLOG). 그때까지 이 패널들은
+**빈 View가 아니라 "원천 없음"으로** 남긴다 — 빈 View는 "아무 일도 없었다"로 읽히고,
+그것은 사실이 아니다.
+
+KPI 자체는 `METRICS` 패널에 있고 target만 없다. target은 Goal이기 때문이다.
+
+#### ⑨-4 반드시 함께 보여야 하는 것 — Coverage
+
+Control Tower의 모든 숫자에는 **"무엇에 대해"**가 붙는다. `processed/`는 Execution
+Evidence이고 Backup 범위는 `daily/`·`monthly/`뿐이므로(docs/08 §26), 원격에서 복원한 머신은
+**Company History는 전부, Event는 하나도** 갖지 않는다. 그 상태에서 일곱 패널은 전부 0을
+보고하며 그것은 **사실이다** — 다만 조용한 한 주와 구분되지 않는다.
+
+`DashboardModel.coverage`가 그 구분이다.
+
+| 필드 | 뜻 |
+|---|---|
+| `evidence_from` / `evidence_to` | 이 숫자들이 덮는 Event 날짜 범위 |
+| `unreadable` | 디렉터리에 있으나 쓸 수 없었던 파일 수 |
+| `history_uncovered_from` | Company History가 일을 기록하는데 증거가 없는 가장 이른 날 |
+| `complete` | 위 둘이 모두 비어 있는가 |
+
+**경보가 아니라 단서다** — 그 Event를 되돌리는 조치는 없고, 지울 수 없는 경보는 이 프로젝트가
+계속 없애 온 것이다. Notion View를 만들 때는 이 값을 **패널 옆 텍스트 블록**으로 두고, 숫자가
+0인 화면을 그것 없이 보여주지 않는다. `ops_status.py`의 CONTROL TOWER 블록이 같은 값을
+`증거 범위 밖 :` 줄로 찍는다.
+
+#### ⑨-5 경고 — Blocked를 `Owner`로 묶지 않는다
+
+PROJECTS 행의 `Owner`/`Source`는 **그 Project를 처음 만든 Event**의 값이고, 이후
+Update가 덮어쓰지 않는다(`build_update_properties()`의 docstring이 근거를 적어 둔다).
+`Blocker`는 반대로 보고한 팀이 매번 덮어쓴다. 그래서 두 팀이 함께 쓰는 Project에서는
+행 하나가 서로 다른 두 팀을 가리킬 수 있다. 실측:
+
+```
+E1  PAY  CMO / DESKTOP_2          STARTED
+E2  PAY  CTO_BACKEND / DESKTOP_1  BLOCKED "vendor key missing"
+
+PROJECTS 행   Owner=CMO  Source=DESKTOP_2  Blocker="vendor key missing"
+Control Tower risk.team=CTO_BACKEND
+```
+
+"Blocked를 Owner로 group by"한 View는 이 Blocker를 CMO에게 보낸다. 막고 있는 팀은
+CTO Backend다. **팀별 Blocker는 `ops_status.py`의 CONTROL TOWER 블록(과 같은 모델의 RISKS 패널)에서 본다** —
+거기서는 Blocker를 선언한 Event의 `role`로 귀속한다(C48). 행에 `Blocker Owner`를
+더하는 것은 PROJECTS 스키마 변경이고, `Owner`를 매 Update마다 덮어쓰는 것은 위
+docstring이 근거 없다고 적은 일이라, 둘 다 승인이 필요하다(BACKLOG).
+
+단일 Desktop Project에는 이 문제가 없다 — `Owner`가 곧 유일한 팀이다.
 
 ---
 

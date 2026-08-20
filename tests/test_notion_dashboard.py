@@ -320,6 +320,376 @@ def _page(page_id, title, parent_type):
     }
 
 
+class TheWireShapeOfEveryRequestTests(unittest.TestCase):
+    """C49: what `RealNotionTransport` actually sends, checked without a
+    network.
+
+    Found by branch coverage — the six methods below are one line each and
+    the suite had never executed any of them. That is exactly the code whose
+    mistakes are invisible until a live Workspace answers 404 or 405: a verb,
+    a path, and the shape of a body. `DashboardSchemaMappingTests` already
+    pins the *properties* a row carries; nothing pinned the request that
+    carries them.
+
+    Everything here is asserted against a captured `urllib.request.Request`,
+    so it needs no credentials — the last step the Dashboard is waiting on
+    (BACKLOG A-8) is a Workspace, and this removes one class of first-run
+    surprise from it.
+    """
+
+    def setUp(self):
+        import urllib.request
+
+        self.sent = []
+        real_urlopen = urllib.request.urlopen
+
+        class _Response:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def read(self_inner):
+                return b'{"ok": true}'
+
+        def fake_urlopen(request, timeout=None):
+            self.sent.append(request)
+            return _Response()
+
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+    def _transport(self):
+        return RealNotionTransport(api_token="ntn_" + "T" * 20, timeout=7.5)
+
+    def _last(self):
+        import json as json_module
+
+        request = self.sent[-1]
+        body = json_module.loads(request.data.decode("utf-8")) if request.data else None
+        return request.get_method(), request.full_url, body
+
+    def test_retrieve_database_is_a_get_on_the_database(self):
+        result = self._transport().retrieve_database("DB-1")
+        method, url, body = self._last()
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(method, "GET")
+        self.assertTrue(url.endswith("/databases/DB-1"), url)
+        self.assertIsNone(body)
+
+    def test_query_database_posts_the_filter_under_its_own_key(self):
+        self._transport().query_database("DB-1", {"property": "Project ID"})
+        method, url, body = self._last()
+
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/databases/DB-1/query"), url)
+        self.assertEqual(body, {"filter": {"property": "Project ID"}})
+
+    def test_create_page_names_the_database_as_the_parent(self):
+        """A page created without `parent.database_id` lands nowhere Notion
+        will let this integration find it again."""
+        self._transport().create_page("DB-1", {"Project ID": {"rich_text": []}})
+        method, url, body = self._last()
+
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/pages"), url)
+        self.assertEqual(body["parent"], {"database_id": "DB-1"})
+        self.assertEqual(body["properties"], {"Project ID": {"rich_text": []}})
+
+    def test_update_page_patches_only_properties(self):
+        """PATCH, not PUT: Notion merges the properties given and leaves the
+        rest of the page alone, which is what docs/04 §45's reserved
+        human-written fields depend on."""
+        self._transport().update_page("PAGE-1", {"Status": {"select": {"name": "OK"}}})
+        method, url, body = self._last()
+
+        self.assertEqual(method, "PATCH")
+        self.assertTrue(url.endswith("/pages/PAGE-1"), url)
+        self.assertEqual(body, {"properties": {"Status": {"select": {"name": "OK"}}}})
+
+    def test_update_database_patches_the_schema_not_a_row(self):
+        """The one call that changes a Database definition — `/databases/`,
+        never `/pages/`. Writing a schema to a page id is the mistake
+        `record_run()`'s docstring warns about from the other direction."""
+        self._transport().update_database("DB-1", {"Accepted": {"number": {}}})
+        method, url, body = self._last()
+
+        self.assertEqual(method, "PATCH")
+        self.assertTrue(url.endswith("/databases/DB-1"), url)
+        self.assertEqual(body, {"properties": {"Accepted": {"number": {}}}})
+
+    def test_create_database_puts_it_under_a_page(self):
+        """Notion cannot create a Database at the workspace root — the whole
+        reason `diagnose_dashboard_bootstrap()` hunts for a shared Page."""
+        self._transport().create_database(
+            "PAGE-1", "OPS_RUNS", {"Run ID": {"title": {}}}
+        )
+        method, url, body = self._last()
+
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/databases"), url)
+        self.assertEqual(body["parent"], {"type": "page_id", "page_id": "PAGE-1"})
+        self.assertEqual(
+            body["title"], [{"type": "text", "text": {"content": "OPS_RUNS"}}]
+        )
+        self.assertEqual(body["properties"], {"Run ID": {"title": {}}})
+
+    def test_every_request_carries_the_version_and_the_token(self):
+        """Notion rejects a request with no `Notion-Version`, and the header
+        is the only place the token ever travels.
+
+        The version is read from the module rather than restated: pinning the
+        string here would make an intentional upgrade fail as though it were
+        a mistake, while the property that matters — the header is sent at
+        all — holds either way."""
+        from notion.transport import NOTION_API_VERSION
+
+        self._transport().retrieve_database("DB-1")
+        request = self.sent[-1]
+
+        self.assertEqual(request.get_header("Notion-version"), NOTION_API_VERSION)
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertTrue(request.get_header("Authorization").startswith("Bearer ntn_"))
+
+    def test_the_configured_timeout_is_the_one_used(self):
+        """A default that silently replaced the configured value would make
+        every deployment's timeout a surprise."""
+        import urllib.request
+
+        seen = []
+        real_urlopen = urllib.request.urlopen
+
+        class _Response:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def read(self_inner):
+                return b"{}"
+
+        def capturing(request, timeout=None):
+            seen.append(timeout)
+            return _Response()
+
+        urllib.request.urlopen = capturing
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+        self._transport().retrieve_database("DB-1")
+
+        self.assertEqual(seen, [7.5])
+
+
+class NetworkFailuresBecomeNotionApiErrorsTests(unittest.TestCase):
+    """The two conversions `_request()` documents and nothing exercised.
+
+    Its contract is "network problems become `NotionAPIError`", and every
+    caller — `ExecutionPlanSync`, `bootstrap`, `dashboard` — catches only
+    that type. A failure that escapes as something else does not become
+    `NOTION_RETRY_REQUIRED`; it propagates, and on the Runner that is a step
+    that dies rather than a step that retries.
+    """
+
+    def _raising(self, exc):
+        import urllib.request
+
+        real_urlopen = urllib.request.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            raise exc
+
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+        return RealNotionTransport(api_token="ntn_" + "T" * 20, timeout=3.0)
+
+    def test_a_read_timeout_becomes_a_notion_api_error(self):
+        """urllib does NOT wrap a read timeout in URLError — it escapes as a
+        bare `TimeoutError`, which is why this branch exists at all."""
+        from notion.transport import NotionAPIError
+
+        transport = self._raising(TimeoutError("timed out"))
+
+        with self.assertRaises(NotionAPIError) as caught:
+            transport.retrieve_database("DB-1")
+
+        self.assertIn("timed out after 3.0s", str(caught.exception))
+        self.assertIsNone(caught.exception.status_code)
+
+    def test_any_other_socket_failure_becomes_one_too(self):
+        from notion.transport import NotionAPIError
+
+        transport = self._raising(OSError("network is unreachable"))
+
+        with self.assertRaises(NotionAPIError) as caught:
+            transport.retrieve_database("DB-1")
+
+        self.assertIn("network is unreachable", str(caught.exception))
+
+    def test_neither_message_carries_the_token(self):
+        """The security property every path here has to keep."""
+        from notion.transport import NotionAPIError
+
+        for exc in (TimeoutError("t"), OSError("o")):
+            transport = self._raising(exc)
+            with self.subTest(exc=type(exc).__name__):
+                with self.assertRaises(NotionAPIError) as caught:
+                    transport.retrieve_database("DB-1")
+                self.assertNotIn("ntn_", str(caught.exception))
+
+
+class ATransportThatCannotSearchInheritsThatAnswerTests(unittest.TestCase):
+    """C49: `NotionTransport.search_pages()`'s own body had never run.
+
+    It is deliberately **not** an abstractmethod — its docstring says so —
+    precisely so that a transport with no reason to implement workspace
+    search inherits "I cannot search" instead of failing to instantiate. The
+    diagnosis then reports UNKNOWN rather than treating it as an error.
+
+    Every double in this suite overrides it, including the one that tests the
+    unavailable case (it raises its own `NotImplementedError`). So the
+    default the design depends on was never exercised by anything, and a
+    change to it — dropping the message, raising a different type — would
+    have gone unnoticed.
+    """
+
+    class _Minimal(NotionTransport):
+        """Only the abstract methods, the way a real third-party double
+        would be written."""
+
+        def retrieve_database(self, database_id):
+            return {"parent": {"type": "workspace"}, "properties": {}}
+
+        def query_database(self, database_id, filter_):
+            return {"results": []}
+
+        def create_page(self, database_id, properties):
+            return {"id": "page-1"}
+
+        def update_page(self, page_id, properties):
+            return {"id": page_id}
+
+        def update_database(self, database_id, properties):
+            return {"id": database_id}
+
+        def create_database(self, parent_page_id, title, properties):
+            return {"id": "db-1"}
+
+    def test_the_inherited_default_refuses_rather_than_returning_nothing(self):
+        """An empty list would say "no shared pages", which is a different —
+        and wrong — answer from "I could not look"."""
+        with self.assertRaises(NotImplementedError) as caught:
+            self._Minimal().search_pages()
+
+        self.assertIn("cannot search", str(caught.exception))
+
+    def test_the_diagnosis_reports_it_as_unavailable_not_as_a_failure(self):
+        client = NotionClient(transport=self._Minimal(), database_id="projects-db")
+
+        diagnosis = diagnose_dashboard_bootstrap(client)
+
+        self.assertFalse(diagnosis.search_available)
+        self.assertEqual(diagnosis.hostable_pages, ())
+        self.assertEqual(diagnosis.readiness, BootstrapReadiness.NEEDS_SHARED_PAGE)
+        self.assertIn("NOTION_OPS_RUNS_DATABASE_ID", diagnosis.required_action)
+
+
+class AnUntitledPageIsStillListedTests(unittest.TestCase):
+    """C49: found by branch coverage — `_page_title()`'s fallback had never
+    been executed.
+
+    `diagnose_dashboard_bootstrap()` lists the Pages an operator can host the
+    OPS_* databases under, and identifies each by its title. An untitled page
+    is ordinary in Notion — a page created and not yet named has an empty
+    title — and it is still a perfectly valid parent.
+
+    Without the fallback the entry would be identified by an empty string,
+    which in a list of candidates reads as a rendering fault rather than as a
+    page. The `id` is what the operator actually passes to
+    `bootstrap_dashboard_databases()`, so nothing is lost by the page having
+    no name; what matters is that it is **listed** rather than dropped or
+    blank.
+    """
+
+    def test_a_page_with_no_title_property_is_named_untitled(self):
+        from notion.dashboard import _page_title
+
+        self.assertEqual(_page_title({"properties": {}}), "(untitled)")
+
+    def test_a_page_with_an_empty_title_is_named_untitled(self):
+        from notion.dashboard import _page_title
+
+        self.assertEqual(
+            _page_title({"properties": {"Name": {"type": "title", "title": []}}}),
+            "(untitled)",
+        )
+
+    def test_a_title_whose_runs_are_all_empty_is_named_untitled(self):
+        """Notion stores one item per formatting run; every one of them can
+        be empty without the property being absent."""
+        from notion.dashboard import _page_title
+
+        self.assertEqual(
+            _page_title(
+                {
+                    "properties": {
+                        "Name": {
+                            "type": "title",
+                            "title": [{"plain_text": ""}, {"plain_text": ""}],
+                        }
+                    }
+                }
+            ),
+            "(untitled)",
+        )
+
+    def test_a_named_page_keeps_its_name(self):
+        """The other side, so the fallback cannot pass by always firing."""
+        from notion.dashboard import _page_title
+
+        self.assertEqual(
+            _page_title(
+                {
+                    "properties": {
+                        "Name": {"type": "title", "title": [{"plain_text": "Company Ops"}]}
+                    }
+                }
+            ),
+            "Company Ops",
+        )
+
+    def test_the_title_is_found_past_other_properties(self):
+        """A page carries whatever properties its database gave it, in
+        whatever order Notion returns them — the title is not first, and the
+        scan has to keep going rather than answer on the first entry."""
+        from notion.dashboard import _page_title
+
+        self.assertEqual(
+            _page_title(
+                {
+                    "properties": {
+                        "Status": {"type": "select", "select": {"name": "Live"}},
+                        "Notes": {"type": "rich_text", "rich_text": []},
+                        "Name": {"type": "title", "title": [{"plain_text": "Company Ops"}]},
+                    }
+                }
+            ),
+            "Company Ops",
+        )
+
+    def test_a_page_whose_only_properties_are_not_titles_is_untitled(self):
+        from notion.dashboard import _page_title
+
+        self.assertEqual(
+            _page_title(
+                {"properties": {"Status": {"type": "select"}, "Notes": {"type": "rich_text"}}}
+            ),
+            "(untitled)",
+        )
+
+
 class BootstrapDiagnosisTests(unittest.TestCase):
     """P0: decide from the *real* workspace shape whether bootstrap can run."""
 
@@ -2318,6 +2688,169 @@ class _SchemaEnforcingTransport(InMemoryNotionTransport):
                 raise NotionAPIError(
                     f"{name} is not a property that exists", status_code=400
                 )
+
+
+class _TypeEnforcingTransport(_SchemaEnforcingTransport):
+    """The **second** behaviour of real Notion the doubles did not have.
+
+    `_SchemaEnforcingTransport` rejects a property the database does not
+    define. Notion also rejects one whose *value shape* does not match the
+    declared type — a `{"rich_text": [...]}` written into a `number` column
+    is a 400, and every double in this suite accepted it.
+
+    That is the failure mode `DashboardSchemaMappingTests` reasons about
+    ("A name or type mismatch ... would stay invisible until the day the
+    Dashboard is finally wired — and then every run would fail with an HTTP
+    400"). It checked the two dicts against each other; nothing drove a real
+    write through a double that would say no. This does.
+    """
+
+    def _reject_unknown(self, properties):
+        super()._reject_unknown(properties)
+        for name, value in properties.items():
+            declared = self._schema_properties[name].get("type")
+            if declared is None:
+                continue
+            written = next(iter(value), None)
+            if written != declared:
+                raise NotionAPIError(
+                    f"{name} is expected to be {declared}, got {written}",
+                    status_code=400,
+                )
+
+
+def _full_schema():
+    """`OPS_RUNS` exactly as `DASHBOARD_DATABASES` declares it, in
+    `retrieve_database` shape."""
+    return {
+        name: {"type": next(iter(payload)), next(iter(payload)): {}}
+        for name, payload in DASHBOARD_DATABASES[OPS_RUNS].items()
+    }
+
+
+class EveryValueMatchesItsColumnTypeTests(unittest.TestCase):
+    """C49: a real run, written through a double that enforces column types.
+
+    The Dashboard is waiting on a Workspace, not on code (BACKLOG A-8), so
+    the useful thing to remove before that day is a class of first-run
+    surprise. A wrong value shape is the one that costs most: `record_run()`
+    never raises, so the row is queued to `dashboard_pending.json` and
+    retried — failing identically — on every subsequent run.
+    """
+
+    def _client(self):
+        return NotionClient(
+            transport=_TypeEnforcingTransport(initial_properties=_full_schema()),
+            database_id="OPS-RUNS-DB",
+        )
+
+    def _record(self, client, **overrides):
+        kwargs = dict(
+            run_id="RUN-C49",
+            run_at=datetime(2026, 8, 20, 9, 0, 0),
+            intake_summary=_FakeIntake(moved=("a.json",)),
+            collector_summary=_FakeCollector(accepted=2),
+            scheduler_result=_FakeScheduler(),
+            backup_entry=_FakeBackup(),
+            notion_sync_results=(_sync(SyncStatus.NOTION_CREATED),),
+            desktops_reporting="DESKTOP_1:2",
+            role_mismatches=1,
+            failed_steps=("monthly",),
+        )
+        kwargs.update(overrides)
+        return record_run(client, **kwargs)
+
+    def test_a_whole_run_is_accepted_by_a_type_enforcing_database(self):
+        result = self._record(self._client())
+
+        self.assertIs(result.outcome, DashboardOutcome.RECORDED)
+
+    def test_the_control_tower_columns_are_accepted_too(self):
+        """The two the Dashboard Model projects — one rich_text, one number.
+        Swapping them is the exact mistake this double now catches."""
+        from controltower import (
+            OPS_RUNS_CONTROL_TOWER_COLUMNS,
+            build_company_rollup,
+            build_dashboard,
+            ops_runs_fields,
+        )
+
+        fields = ops_runs_fields(
+            build_dashboard(
+                build_company_rollup(events=[], now=datetime(2026, 8, 20, 9, 0, 0)),
+                now=datetime(2026, 8, 20, 9, 0, 0),
+            )
+        )
+        result = self._record(self._client(), **fields)
+
+        self.assertIs(result.outcome, DashboardOutcome.RECORDED)
+        self.assertEqual(set(fields), set(OPS_RUNS_CONTROL_TOWER_COLUMNS))
+
+    def test_the_double_actually_rejects_a_mismatched_type(self):
+        """Guards the guard — a double that accepts everything would make
+        the two tests above meaningless."""
+        client = self._client()
+
+        with self.assertRaises(NotionAPIError) as caught:
+            client.create_project(
+                {"Role Mismatches": {"rich_text": [{"text": {"content": "1"}}]}}
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("expected to be number", str(caught.exception))
+
+    def test_it_still_rejects_an_unknown_column(self):
+        """The behaviour inherited from `_SchemaEnforcingTransport` must not
+        be lost by overriding its hook."""
+        client = self._client()
+
+        with self.assertRaises(NotionAPIError) as caught:
+            client.create_project({"No Such Column": {"number": 1}})
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("not a property that exists", str(caught.exception))
+
+    def test_every_declared_column_is_writable_with_its_own_builder(self):
+        """Each property `build_ops_run_properties()` emits, checked against
+        its declared type one at a time — so a failure names the column
+        rather than the whole row."""
+        from notion.dashboard import build_ops_run_properties
+
+        properties = build_ops_run_properties(
+            run_id="RUN-C49",
+            run_at=datetime(2026, 8, 20, 9, 0, 0).astimezone(),
+            transport_moved=1,
+            transport_blocked=0,
+            accepted=2,
+            duplicate=0,
+            rejected=0,
+            failed=0,
+            scheduler_status="COMPLETED",
+            generated_days=1,
+            reused_days=0,
+            backup_status="BACKUP_SUCCESS",
+            deleted_files=0,
+            notion_synced=2,
+            notion_skipped=0,
+            notion_retried=0,
+            notion_unreadable=0,
+            notion_queued=0,
+            # A sequence, not a string: `Failed Steps` is rich_text but the
+            # builder joins the names itself, and passing the rendered form
+            # would test the test rather than the builder. `Overall` is not a
+            # parameter at all — the builder derives the verdict from the
+            # numbers above (C37), which is the property that keeps the row
+            # from contradicting the run's own exit code.
+            failed_steps=("monthly",),
+            desktops_reporting="DESKTOP_1:2",
+            role_mismatches=1,
+        )
+        schema = _full_schema()
+
+        for name, value in sorted(properties.items()):
+            with self.subTest(column=name):
+                self.assertIn(name, schema)
+                self.assertEqual(next(iter(value)), schema[name]["type"])
 
 
 class DashboardMigrationClosesTheLoopTests(unittest.TestCase):

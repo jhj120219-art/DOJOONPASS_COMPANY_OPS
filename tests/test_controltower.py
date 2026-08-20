@@ -269,6 +269,135 @@ class TraceabilityTests(ControlTowerTestCase):
                 self.assertEqual(len(metric.evidence), metric.value, key)
 
 
+class TheRiskNamesTheTeamThatReportedItTests(ControlTowerTestCase):
+    """C48: `Risk.team` was "whichever team logged the newest Event".
+
+    `_roll_risks()` read `project.teams[-1]`, and `ProjectRollup.teams` is
+    *every* role that has touched the project, in first-seen order. So on a
+    project two teams share, one unrelated Event from the other team moved
+    the blocker's owner — measured:
+
+        E1  PAY  CTO_BACKEND  BLOCKED           blocker="vendor key missing"
+        E2  PAY  CMO          DECISION_APPROVED
+        -> Risk.team == "CMO"
+
+    and `ops_status.py` prints that name inside the ATTENTION line that tells
+    a team the blocker stays open "그 팀이 RESUMED / ISSUE_RESOLVED /
+    COMPLETED를 보고할 때까지". It was telling the wrong team.
+    """
+
+    def test_the_blocker_belongs_to_the_team_that_declared_it(self):
+        self.put("E1", "PAY", "CTO_BACKEND", "BLOCKED", "BLOCKED", 6, blocker="vendor key")
+        self.put("E2", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 8)
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.project("PAY").teams, ("CTO_BACKEND", "CMO"))
+        self.assertEqual([risk.team for risk in rollup.risks], ["CTO_BACKEND"])
+        self.assertEqual(rollup.project("PAY").open_blocker_team, "CTO_BACKEND")
+
+    def test_a_reblock_by_another_team_moves_the_owner(self):
+        """The owner follows the Event that is *currently* holding it open."""
+        self.put("E1", "PAY", "CTO_BACKEND", "BLOCKED", "BLOCKED", 6, blocker="vendor key")
+        self.put("E2", "PAY", "CTO_BACKEND", "RESUMED", "IN_PROGRESS", 8)
+        self.put("E3", "PAY", "CMO", "BLOCKED", "BLOCKED", 10, blocker="legal review")
+
+        rollup = self.rollup()
+
+        self.assertEqual([risk.team for risk in rollup.risks], ["CMO"])
+        self.assertEqual(rollup.risks[0].evidence.event_id, "E3")
+
+    def test_clearing_the_blocker_clears_its_owner(self):
+        self.put("E1", "PAY", "CTO_BACKEND", "BLOCKED", "BLOCKED", 6, blocker="vendor key")
+        self.put("E2", "PAY", "CTO_BACKEND", "RESUMED", "IN_PROGRESS", 8)
+
+        project = self.rollup().project("PAY")
+
+        self.assertIsNone(project.open_blocker_team)
+        self.assertEqual(self.rollup().risks, ())
+
+    def test_the_owner_reaches_attention(self):
+        self.put("E1", "PAY", "CTO_BACKEND", "BLOCKED", "BLOCKED", 6, blocker="vendor key")
+        self.put("E2", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 8)
+
+        rollup = self.rollup()
+        from notion.properties import ROLE_DISPLAY_NAMES
+
+        self.assertEqual(
+            ROLE_DISPLAY_NAMES.get(rollup.risks[0].team),
+            ROLE_DISPLAY_NAMES["CTO_BACKEND"],
+        )
+
+
+class CompletionEvidenceNamesTheCompletingEventTests(ControlTowerTestCase):
+    """C48: `projects_completed` cited the wrong file.
+
+    The metric's evidence was `p.open_blocker_evidence or p.evidence[-1]` —
+    an expression that, for a *completion* count, prefers the file that
+    declared a **blocker** and otherwise names whatever the project did last.
+    Measured:
+
+        C1  SEARCH  COMPLETED           on the 5th
+        C2  SEARCH  DECISION_APPROVED   on the 9th
+        -> evidence named C2
+
+    Traceability is this module's stated point ("open three named files"), and
+    a named file that is not the reason for the number is worse than no name:
+    it is checked once, found irrelevant, and then not checked again.
+    """
+
+    def test_the_completion_names_the_event_that_completed_it(self):
+        self.put("C1", "SEARCH", "CTO_BACKEND", "COMPLETED", "COMPLETED", 5)
+        self.put("C2", "SEARCH", "CTO_BACKEND", "DECISION_APPROVED", "IN_PROGRESS", 9)
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.project("SEARCH").completed_evidence.event_id, "C1")
+        self.assertEqual(
+            [ref.event_id for ref in rollup.metric("projects_completed").evidence],
+            ["C1"],
+        )
+
+    def test_a_blocker_opened_after_completion_is_not_the_completion(self):
+        self.put("D1", "OPSX", "COO", "COMPLETED", "COMPLETED", 5)
+        self.put("D2", "OPSX", "COO", "BLOCKED", "BLOCKED", 9, blocker="reopened for audit")
+
+        rollup = self.rollup()
+
+        self.assertEqual(
+            [ref.event_id for ref in rollup.metric("projects_completed").evidence],
+            ["D1"],
+        )
+        self.assertEqual([risk.evidence.event_id for risk in rollup.risks], ["D2"])
+
+    def test_a_project_that_never_completed_has_no_completion_evidence(self):
+        self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 5)
+
+        self.assertIsNone(self.rollup().project("SEARCH").completed_evidence)
+        self.assertEqual(self.rollup().metric("projects_completed").evidence, ())
+
+    def test_the_completion_evidence_is_a_file_that_exists(self):
+        self.put("C1", "SEARCH", "CTO_BACKEND", "COMPLETED", "COMPLETED", 5)
+
+        ref = self.rollup().project("SEARCH").completed_evidence
+
+        self.assertTrue((self.processed / ref.path).is_file())
+        self.assertEqual(ref.at, self.rollup().project("SEARCH").completed_at)
+
+    def test_every_counted_metric_still_carries_as_many_files_as_it_counts(self):
+        """The property the broken expression happened to satisfy, kept."""
+        self.put("C1", "SEARCH", "CTO_BACKEND", "COMPLETED", "COMPLETED", 5)
+        self.put("C2", "PAY", "CMO", "COMPLETED", "COMPLETED", 6)
+        self.put("C3", "OPSX", "COO", "BLOCKED", "BLOCKED", 7, blocker="waiting")
+
+        rollup = self.rollup()
+
+        for key in ("events", "projects_completed", "open_blockers"):
+            with self.subTest(metric=key):
+                metric = rollup.metric(key)
+                self.assertEqual(len(metric.evidence), metric.value, key)
+
+
 class NoInventedLayersTests(unittest.TestCase):
     """Goal / Team Goal / Sprint / Task have no source in this system.
 
@@ -796,6 +925,36 @@ class DesktopLayerTests(ControlTowerTestCase):
         self.assertEqual(
             ROLE_FOR_SOURCE, {p.source: p.role for p in PROFILES.values()}
         )
+
+    def test_the_presentation_order_is_the_one_it_claims_to_share(self):
+        """C48: `TEAM_ORDER`'s comment says it is "the same one
+        `daily/role_summary.ROLE_ORDER` uses and for the same reason", and it
+        is restated rather than imported because the layering table has no
+        `controltower -> daily` edge. A claim with nothing checking it is how
+        two copies drift; this is the check the comment implies.
+        """
+        from controltower.rollup import TEAM_ORDER
+        from daily import ROLE_ORDER
+
+        self.assertEqual(TEAM_ORDER, ROLE_ORDER)
+
+    def test_every_role_has_a_place_in_the_order(self):
+        """A role added to `events.ROLES` and not here still appears — the
+        fold appends the unknown ones, sorted, after the known ones — but it
+        appears in a different place than the rest of the project shows it.
+        Named so the addition is a decision rather than a surprise."""
+        from controltower.rollup import TEAM_ORDER
+
+        self.assertEqual(set(TEAM_ORDER), set(ROLES))
+
+    def test_every_desktop_has_a_place_in_the_order(self):
+        """The same for `source`. `reporter/profiles.py`'s own comment records
+        the time this went wrong in the other direction — "DESKTOP_4 was
+        missing here even though docs/02 §8 lists it as an allowed source"."""
+        from controltower.rollup import DESKTOP_ORDER
+        from events import SOURCES
+
+        self.assertEqual(set(DESKTOP_ORDER), set(SOURCES))
 
 
 class DesktopBlockTests(ControlTowerTestCase):

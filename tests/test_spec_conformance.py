@@ -566,6 +566,49 @@ class DashboardProductionWiringTests(unittest.TestCase):
         self.assertIn("database_id=config.ops_runs_database_id", entrypoint)
 
 
+class OpsRunsColumnHistoryIsCurrentTests(unittest.TestCase):
+    """docs/13 §3-⑧ writes down how the OPS_RUNS schema has grown, and the
+    paragraph's own point is that a number pinned in a document goes stale —
+    "문서에 박아 둔 숫자는 그때마다 조용히 틀렸다".
+
+    It then went stale itself. C47 added `Desktops Reporting` and
+    `Role Mismatches`, taking the schema to 22 columns; both lists still
+    ended at "C42 20열" a Sprint later (found in C48). An operator building
+    the Database by hand from that paragraph would have created a Database
+    two columns short — which is exactly the failure ⑧-4 exists to recover
+    from.
+
+    Checked as a property rather than a restated number: the **largest**
+    count the paragraph names must equal the schema's. A Sprint that adds a
+    column and extends the history passes; one that adds a column silently
+    does not.
+    """
+
+    DOC = REPO_ROOT / "docs" / "13_NOTION_ENVIRONMENT_SETUP.md"
+
+    def _counts_named(self):
+        text = self.DOC.read_text(encoding="utf-8")
+        return [int(value) for value in re.findall(r"(\d+)열", text)]
+
+    def test_the_paragraph_still_names_column_counts(self):
+        """Guard against the regex silently matching nothing."""
+        self.assertGreater(len(self._counts_named()), 4)
+
+    def test_the_largest_count_named_is_the_schemas_own(self):
+        from notion.dashboard import DASHBOARD_DATABASES, OPS_RUNS
+
+        self.assertEqual(
+            max(self._counts_named()), len(DASHBOARD_DATABASES[OPS_RUNS])
+        )
+
+    def test_the_columns_c47_added_are_named_in_the_history(self):
+        text = self.DOC.read_text(encoding="utf-8")
+
+        for column in ("Desktops Reporting", "Role Mismatches"):
+            with self.subTest(column=column):
+                self.assertIn(column, text)
+
+
 class DecisionAuthorityCharacterizationTests(unittest.TestCase):
     """docs/10 section 17: "COO recommends Beta Scope A" 를 "CEO approved Beta
     Scope A" 로 변환하면 FAIL이다. Recommendation과 Decision을 구분해야 한다.
@@ -2113,6 +2156,74 @@ class SpecCitationsPointSomewhereTests(unittest.TestCase):
             ],
             ["951"],
         )
+
+
+class TestClassCitationsResolveTests(unittest.TestCase):
+    """Every ``SomethingTests`` a source file names in backticks exists.
+
+    `BacklogEvidenceLinksResolveTests` already does this for `BACKLOG.md`,
+    and stops there. This is the other half of the tree — `src/`, the root
+    entrypoints, `AGENT.md` and `README.md` — and between them the two
+    partition every file that cites one. Production code here routinely ends
+    a comment by naming the test class that checks the claim, which is the
+    strongest form of justification the project uses because it names
+    something executable.
+
+    A name that does not resolve is worse than no citation: the reader goes
+    looking for the check that is supposed to make the claim safe, does not
+    find it, and cannot tell whether the check was renamed or never written.
+    Both happened in C48 — two comments were written naming test classes that
+    were then given different names before they landed.
+
+    Only names ending in `Tests` are checked, and only inside backticks: a
+    bare word in prose is not a citation, and this must not start reporting
+    ordinary sentences.
+    """
+
+    CITATION = re.compile(r"`([A-Z][A-Za-z0-9_]*Tests)`")
+
+    def _test_class_names(self):
+        names = set()
+        for path in sorted((REPO_ROOT / "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    names.add(node.name)
+        return names
+
+    def _citing_files(self):
+        files = [
+            path
+            for path in list((REPO_ROOT / "src").rglob("*.py"))
+            + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in path.parts
+        ]
+        for name in ("AGENT.md", "README.md"):
+            if (REPO_ROOT / name).is_file():
+                files.append(REPO_ROOT / name)
+        return files
+
+    def test_the_scan_finds_citations_at_all(self):
+        """Guard against the pattern silently matching nothing."""
+        found = sum(
+            len(self.CITATION.findall(path.read_text(encoding="utf-8")))
+            for path in self._citing_files()
+        )
+
+        self.assertGreater(found, 5)
+
+    def test_every_cited_test_class_exists(self):
+        known = self._test_class_names()
+        self.assertIn("SpecCitationsPointSomewhereTests", known)  # the scan works
+
+        for path in self._citing_files():
+            for name in self.CITATION.findall(path.read_text(encoding="utf-8")):
+                with self.subTest(file=path.name, cited=name):
+                    self.assertIn(
+                        name,
+                        known,
+                        f"{path.name} cites `{name}`, which no test file defines",
+                    )
 
 
 class BacklogIdCitationsResolveTests(unittest.TestCase):

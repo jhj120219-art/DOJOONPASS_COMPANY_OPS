@@ -8886,6 +8886,7 @@ class SameInstantSkipEndToEndTests(unittest.TestCase):
         import importlib.util
 
         from app.runner import run_once
+        from events import create_event
         from notion import ExecutionPlanSync, InMemoryNotionTransport, NotionClient
         from reporter import Reporter
 
@@ -8973,6 +8974,7 @@ class SameInstantSkipEndToEndTests(unittest.TestCase):
     def test_one_second_apart_takes_no_such_path(self):
         """The mitigation AGENT.md §3 documents, held to its promise."""
         from app.runner import run_once
+        from events import create_event
         from notion import ExecutionPlanSync, InMemoryNotionTransport, NotionClient
         from reporter import Reporter
 
@@ -11169,6 +11171,105 @@ class SecretShapedEventContentTests(unittest.TestCase):
             json.dumps(payload, ensure_ascii=False), encoding="utf-8"
         )
         return payload
+
+    def test_the_third_destination_is_notion_and_the_report_says_so(self):
+        """C49: the report named Company History and the backup remote, and
+        stopped there. Measured through the real `ExecutionPlanSync`, four of
+        the five scanned fields also reach the Notion PROJECTS row verbatim:
+
+            event_id     -> `Last Event ID`       leaks
+            project_id   -> `Project ID` + Title  leaks
+            milestone    -> `Current Milestone`   leaks
+            blocker      -> `Blocker`             leaks
+            summary      -> (no property)         does not
+
+        Notion is a third party with its own retention, and it is the copy an
+        operator's rotation checklist is most likely to miss because it is not
+        a file on their disk. Not fixed by redacting on the way out: that is
+        the pipeline rewriting a person's own words, which docs/06 §57 is
+        about, and the decision is in BACKLOG. Fixed by saying it.
+        """
+        from events import create_event
+        from notion import ExecutionPlanSync, InMemoryNotionTransport, NotionClient
+
+        secrets = {
+            field: "ntn_" + letter * 20
+            for field, letter in (
+                ("event_id", "A"),
+                ("project_id", "B"),
+                ("milestone", "C"),
+                ("summary", "D"),
+                ("blocker", "E"),
+            )
+        }
+        transport = InMemoryNotionTransport()
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=transport, database_id="PROJECTS")
+        )
+        for event_type, status, extra, day in (
+            ("BLOCKED", "BLOCKED", {"blocker": secrets["blocker"]}, 6),
+            (
+                "MILESTONE_COMPLETED",
+                "IN_PROGRESS",
+                {"milestone": secrets["milestone"]},
+                7,
+            ),
+        ):
+            sync.sync(
+                create_event(
+                    source="DESKTOP_1",
+                    role="CTO_BACKEND",
+                    project_id=secrets["project_id"],
+                    event_type=event_type,
+                    status=status,
+                    summary=secrets["summary"],
+                    history_candidate=True,
+                    event_id=secrets["event_id"] + event_type,
+                    timestamp=f"2026-08-0{day}T09:00:00+09:00",
+                    **extra,
+                )
+            )
+
+        written = str(transport._pages)
+        reached = {
+            field: token in written for field, token in secrets.items()
+        }
+
+        self.assertEqual(
+            reached,
+            {
+                "event_id": True,
+                "project_id": True,
+                "milestone": True,
+                "blocker": True,
+                "summary": False,
+            },
+        )
+
+    def test_the_attention_line_names_notion_as_a_destination(self):
+        """The report is the fix, so the report is what is pinned."""
+        from datetime import timezone
+
+        module = self._load_entrypoint()
+        processed = self._processed(module)
+        self._write(processed, "leak.json", summary=f"rotate {self.SECRET}")
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(
+                datetime(2026, 8, 19, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+            )
+        line = next(
+            item for item in attention if "Secret 형태의 문자열" in item
+        )
+
+        self.assertIn("Notion", line)
+        self.assertIn("PROJECTS", line)
+        # ...and it still names the two it already named.
+        self.assertIn("Daily History", line)
+        self.assertIn("backup", line)
+        # The secret itself is never quoted, here or anywhere else.
+        self.assertNotIn(self.SECRET, line)
 
     def test_a_clean_processed_directory_says_nothing(self):
         """The property that decides whether this line is usable at all: on a

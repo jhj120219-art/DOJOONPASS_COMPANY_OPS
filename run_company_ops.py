@@ -223,11 +223,20 @@ def main(argv: Sequence[str] = ()) -> int:
     refusal = unexpected_arguments(
         argv,
         tool="run_company_ops.py",
+        # The names this entrypoint actually reads — `os.environ.get()` here
+        # for the first, `NotionConfig.from_env()` for the rest. Three of the
+        # four it used to print did not exist: `COMPANY_OPS_NOTION_API_TOKEN`
+        # and `COMPANY_OPS_NOTION_PROJECTS_DB` are misspellings of the two
+        # this file's own module docstring names, and `COMPANY_OPS_RUNTIME_DIR`
+        # is not a knob at all — `RUNTIME_DIR` is a constant, and the guard
+        # below exists precisely because rebinding it is unsafe. So the
+        # message told an operator to set a variable that would be ignored,
+        # and pointed them at AGENT.md, which does not mention it either.
         configured_by=(
             "COMPANY_OPS_HISTORY_START_DATE",
-            "COMPANY_OPS_NOTION_API_TOKEN",
-            "COMPANY_OPS_NOTION_PROJECTS_DB",
-            "COMPANY_OPS_RUNTIME_DIR",
+            "NOTION_API_TOKEN",
+            "NOTION_PROJECTS_DATABASE_ID",
+            "NOTION_OPS_RUNS_DATABASE_ID",
         ),
     )
     if refusal is not None:

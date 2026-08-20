@@ -684,6 +684,56 @@ class LateEventGuardSurvivesAHumanEditedDateTests(unittest.TestCase):
         )
 
 
+class AFailedUpdateIsRetryRequiredNotLostTests(unittest.TestCase):
+    """C49: found by branch coverage — `_update()`'s `except NotionAPIError`
+    had never been executed.
+
+    The create path's failure was covered; the update path's was not, and
+    updates are the ordinary case — a project is created once and updated
+    every time it moves. docs/04 §38 is explicit that a Notion failure must
+    never delete or reject the Event, so what this branch returns decides
+    whether a moved project's Event is retried or silently dropped.
+    """
+
+    def _sync_with_failing_update(self):
+        sync, _client, transport = _make_sync()
+        _existing_row(
+            transport, last_updated={"start": "2026-08-01T10:00:00+09:00"}
+        )
+        transport.fail_next_method = "update_page"
+        event = _event(event_id="EVT-UPDATE-FAIL", timestamp="2026-08-17T10:00:00+09:00")
+        return sync.sync(event)
+
+    def test_the_event_is_marked_for_retry(self):
+        result = self._sync_with_failing_update()
+
+        self.assertEqual(result.status, SyncStatus.NOTION_RETRY_REQUIRED)
+
+    def test_the_result_still_names_the_event_and_project(self):
+        """The retry queue is keyed by these; a result that lost them would
+        queue nothing."""
+        result = self._sync_with_failing_update()
+
+        self.assertEqual(result.event_id, "EVT-UPDATE-FAIL")
+        self.assertEqual(result.project_id, "SEARCH_FRONTEND")
+        self.assertIsNotNone(result.page_id)
+
+    def test_the_reason_survives_for_the_log(self):
+        """Without it a permanent refusal and a network blip look identical
+        — the distinction BUG-13's REASON exists for."""
+        result = self._sync_with_failing_update()
+
+        self.assertTrue(result.error)
+        self.assertIn("simulated", result.error)
+
+    def test_nothing_raises_out_of_sync(self):
+        """docs/04 §38: a Notion failure must not stop the Runner."""
+        try:
+            self._sync_with_failing_update()
+        except Exception as exc:  # pragma: no cover - the assertion is the point
+            self.fail(f"sync() raised {exc!r}")
+
+
 class DuplicateGuardReadsWholeRichTextTests(unittest.TestCase):
     """C32 §8: §62's duplicate guard read only the first formatting run.
 
@@ -741,6 +791,64 @@ class DuplicateGuardReadsWholeRichTextTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, SyncStatus.NOTION_UPDATED)
+
+    def test_a_row_with_an_empty_last_event_id_is_unknown_not_empty(self):
+        """C49: found by branch coverage — `_extract_rich_text()`'s two
+        early returns had never been executed.
+
+        Both are reachable without corruption. docs/04 §43 says people write
+        in this database too, so a hand-created row can carry an empty
+        `Last Event ID`, and a Database created before that property existed
+        carries none at all.
+
+        The distinction matters because `event_id` is only type-checked —
+        `EmptyEventIdIsStillAnEventIdTests` pins that `""` is a valid one. If
+        the extractor answered `""` instead of `None`, an Event with an empty
+        id meeting a row with an empty cell would be **skipped as a
+        duplicate** having never been applied, and §29-30's timestamp guard
+        cannot catch it: the row here is deliberately older than the Event.
+        """
+        sync, _client, transport = _make_sync()
+        event = _event(event_id="", timestamp="2026-08-17T10:00:00+09:00")
+        _existing_row(
+            transport,
+            last_updated={"start": "2026-08-01T10:00:00+09:00"},
+            last_event_id_items=[],
+        )
+
+        result = sync.sync(event)
+
+        self.assertEqual(result.status, SyncStatus.NOTION_UPDATED)
+
+    def test_a_row_with_no_last_event_id_property_is_unknown_too(self):
+        """The other early return: the property is absent entirely."""
+        sync, _client, transport = _make_sync()
+        event = _event(event_id="", timestamp="2026-08-17T10:00:00+09:00")
+        transport.create_page(
+            "DB-1",
+            {
+                "Project ID": {"rich_text": [{"text": {"content": "SEARCH_FRONTEND"}}]},
+                "Last Updated": {"date": {"start": "2026-08-01T10:00:00+09:00"}},
+            },
+        )
+
+        result = sync.sync(event)
+
+        self.assertEqual(result.status, SyncStatus.NOTION_UPDATED)
+
+    def test_the_extractor_answers_none_rather_than_empty_string(self):
+        """Stated directly as well, because the two tests above would also
+        pass if the guard changed rather than the extractor."""
+        from notion.properties import extract_last_event_id
+
+        for row in (
+            {"properties": {}},
+            {"properties": {"Last Event ID": None}},
+            {"properties": {"Last Event ID": {"rich_text": []}}},
+            {"properties": {"Last Event ID": {}}},
+        ):
+            with self.subTest(row=row):
+                self.assertIsNone(extract_last_event_id(row))
 
 
 if __name__ == "__main__":

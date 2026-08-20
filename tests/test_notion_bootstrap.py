@@ -112,6 +112,111 @@ class BootstrapTitleRenameCollisionTests(unittest.TestCase):
         self.assertEqual(schema["Status"], {"select": {}})
 
 
+class SchemaWithNoTitleIsReportedNotCrashedIntoTests(unittest.TestCase):
+    """C49: found by branch coverage — three guards in this module had never
+    been executed.
+
+    Notion enforces exactly one Title property on every database, which is
+    why `_bootstrap_title_property()`'s own docstring calls the no-Title case
+    "이론상 발생하지 않음". It is still the case that decides what happens when
+    the schema this code reads back is *not* what Notion enforces — a partial
+    response, a hand-built payload, a stubbed client — and "defensive" is
+    only true if the defence works.
+
+    Measured before these tests existed: `_has_title_property()`'s
+    `return False, None` and the `if not title_exists:` branch above it were
+    dead in the suite, so nothing said whether the FAILED report they promise
+    is actually produced or whether the code raises on the way there.
+    """
+
+    def test_a_schema_with_no_title_property_is_recognised(self):
+        from notion.bootstrap import _has_title_property
+
+        found, name = _has_title_property(
+            {"Status": {"type": "select"}, "Notes": {"type": "rich_text"}}
+        )
+
+        self.assertFalse(found)
+        self.assertIsNone(name)
+
+    def test_a_schema_with_a_title_names_it(self):
+        """The other side, so the check above cannot pass by always failing."""
+        from notion.bootstrap import _has_title_property
+
+        found, name = _has_title_property(
+            {"Name": {"type": "title"}, "Status": {"type": "select"}}
+        )
+
+        self.assertTrue(found)
+        self.assertEqual(name, "Name")
+
+    def test_no_title_produces_a_failed_report_rather_than_an_exception(self):
+        """The promise the docstring makes: absorbed, classified, and the
+        reason said out loud — never a raise that would take a bootstrap run
+        down at the one step an operator cannot repeat safely."""
+        from notion.bootstrap import PropertyOutcome, _bootstrap_title_property
+
+        transport = InMemoryNotionTransport()
+        client = NotionClient(transport=transport, database_id="DB-1")
+
+        report = _bootstrap_title_property(
+            client, {"Status": {"type": "select"}}, title_property="Run ID"
+        )
+
+        self.assertEqual(report.name, "Run ID")
+        self.assertIs(report.outcome, PropertyOutcome.FAILED)
+        self.assertIn("no Title property", report.detail)
+
+    def test_nothing_was_written_to_the_database(self):
+        """A FAILED report must not have half-applied something first."""
+        from notion.bootstrap import _bootstrap_title_property
+
+        transport = InMemoryNotionTransport()
+        client = NotionClient(transport=transport, database_id="DB-1")
+        before = dict(transport.retrieve_database("DB-1").get("properties", {}))
+
+        _bootstrap_title_property(client, {"Status": {"type": "select"}})
+
+        self.assertEqual(
+            dict(transport.retrieve_database("DB-1").get("properties", {})), before
+        )
+
+
+class FormatReportHandlesAnEmptyResultTests(unittest.TestCase):
+    """The third never-executed guard. `format_report()` computes a column
+    width with `max()` over the reports, which raises `ValueError` on an
+    empty sequence — so the early return is not decoration, it is the only
+    thing standing between an empty result and a crash in the function whose
+    whole job is printing one."""
+
+    def test_an_empty_result_formats_to_nothing(self):
+        from notion.bootstrap import BootstrapResult, format_report
+
+        self.assertEqual(format_report(BootstrapResult(reports=())), "")
+
+    def test_a_non_empty_result_still_formats(self):
+        from notion.bootstrap import (
+            BootstrapResult,
+            PropertyBootstrapReport,
+            PropertyOutcome,
+            format_report,
+        )
+
+        text = format_report(
+            BootstrapResult(
+                reports=(
+                    PropertyBootstrapReport("Run ID", PropertyOutcome.EXISTS),
+                    PropertyBootstrapReport("Accepted", PropertyOutcome.CREATED),
+                )
+            )
+        )
+
+        self.assertIn("Run ID", text)
+        self.assertIn("EXISTS", text)
+        self.assertIn("Accepted", text)
+        self.assertIn("CREATED", text)
+
+
 class BootstrapTitleRenameFailureTests(unittest.TestCase):
     """작업 6, 시나리오 3: Rename 실패 시 Runtime 중단 없이 Error 반환."""
 

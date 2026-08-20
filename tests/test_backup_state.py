@@ -60,6 +60,52 @@ class CorruptedStateTests(BackupStateTestCase):
 
         self.assertEqual(self.state_path.read_text(encoding="utf-8"), "{not valid json")
 
+    def test_a_non_string_commit_hash_raises_the_typed_error(self):
+        """C49: found by branch coverage — this guard had never been executed.
+
+        `last_backup_commit` is read back and used as a git object name. A
+        JSON number or list there is not a hash, and letting it through would
+        push the type error down into `git_ops`, where it surfaces as a
+        subprocess failure whose message is about git rather than about a
+        corrupt state file.
+
+        Reachable the same way every other check in this function is: the
+        file is JSON a person or a half-finished write can shape freely, and
+        docs/10 §46 forbids repairing it silently.
+        """
+        self.state_path.parent.mkdir(parents=True)
+        for bad in (123, ["abc"], {"sha": "abc"}, True):
+            with self.subTest(value=bad):
+                self.state_path.write_text(
+                    json.dumps({"last_backup_commit": bad}), encoding="utf-8"
+                )
+
+                with self.assertRaises(BackupStateError) as caught:
+                    load_state(self.state_path)
+
+                self.assertIn("last_backup_commit", str(caught.exception))
+
+    def test_a_null_commit_hash_is_accepted(self):
+        """The other side: absent is the ordinary state before the first
+        successful backup, and must not be an error."""
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(
+            json.dumps({"last_backup_commit": None}), encoding="utf-8"
+        )
+
+        self.assertIsNone(load_state(self.state_path).last_backup_commit)
+
+    def test_the_bad_file_survives(self):
+        """docs/10 §46 again — the reader never repairs or deletes."""
+        self.state_path.parent.mkdir(parents=True)
+        raw = json.dumps({"last_backup_commit": 123})
+        self.state_path.write_text(raw, encoding="utf-8")
+
+        with self.assertRaises(BackupStateError):
+            load_state(self.state_path)
+
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), raw)
+
     def test_wrong_top_level_shape_raises_the_typed_error(self):
         self.state_path.parent.mkdir(parents=True)
         self.state_path.write_text(json.dumps("not an object"), encoding="utf-8")

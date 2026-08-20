@@ -264,6 +264,61 @@ class SerialisationTests(unittest.TestCase):
 
         write_summary(self.path, self.summary)  # must not raise
 
+    def test_it_still_does_not_raise_when_the_cleanup_also_fails(self):
+        """C49: the inner `except OSError` of the atomic idiom, here.
+
+        `write_summary()` is called from `run_once()`'s `finally` — it is the
+        one writer whose failure must never surface, because by the time it
+        runs the History is already written and the Backup already pushed.
+        The test above breaks the *write*; this breaks the write **and** the
+        removal of its staging file, which on Windows is the same cause
+        arriving twice (something holding both files open).
+
+        A raise escaping here would take down a run that had already
+        succeeded, which is exactly the inversion of README RULE 9 the
+        docstring above refuses.
+        """
+        import os
+
+        real_replace = os.replace
+        real_remove = os.remove
+
+        def failing_replace(src, dst):
+            raise OSError(5, "destination held open")
+
+        def failing_remove(path):
+            raise OSError(32, "temp file held open too")
+
+        os.replace = failing_replace
+        os.remove = failing_remove
+        self.addCleanup(setattr, os, "remove", real_remove)
+        self.addCleanup(setattr, os, "replace", real_replace)
+
+        write_summary(self.path, self.summary)  # must not raise
+
+        self.assertFalse(self.path.exists(), "a failed write left a manifest")
+
+    def test_a_failed_write_leaves_the_previous_manifest_alone(self):
+        """`ops_status.py` reads this file. A failed write that truncated the
+        last good manifest would replace "the previous run's result" with
+        "no result", which is a worse answer than a stale one."""
+        import os
+
+        write_summary(self.path, self.summary)
+        before = self.path.read_text(encoding="utf-8")
+
+        real_replace = os.replace
+
+        def failing_replace(src, dst):
+            raise OSError(5, "destination held open")
+
+        os.replace = failing_replace
+        self.addCleanup(setattr, os, "replace", real_replace)
+
+        write_summary(self.path, self.summary)  # must not raise
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
     def test_a_partially_written_file_is_never_observed(self):
         """Atomic replace, like every state writer here: `ops_status.py` may
         read this while a Runner is mid-write, and half a manifest would be

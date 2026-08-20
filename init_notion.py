@@ -95,7 +95,21 @@ def _safe_block(text: str) -> str:
 
 def main(argv: Sequence[str] = ()) -> int:
     refusal = unexpected_arguments(
-        argv, tool="init_notion.py", configured_by=("COMPANY_OPS_NOTION_API_TOKEN", "COMPANY_OPS_NOTION_PROJECTS_DB",)
+        argv,
+        tool="init_notion.py",
+        # The names `NotionConfig.from_env()` actually reads. They were
+        # `COMPANY_OPS_NOTION_API_TOKEN` / `COMPANY_OPS_NOTION_PROJECTS_DB`,
+        # which nothing has ever read — this file's own §13 docstring names
+        # the real two, four lines from here, and the message contradicted
+        # it. An operator who followed the message got the same
+        # `NotionConfigError` they were trying to fix.
+        # `EnvironmentContractTests` now checks the list
+        # against the read sites.
+        configured_by=(
+            "NOTION_API_TOKEN",
+            "NOTION_PROJECTS_DATABASE_ID",
+            "NOTION_OPS_RUNS_DATABASE_ID",
+        ),
     )
     if refusal is not None:
         print(f"[FAILED] {refusal}", file=sys.stderr)

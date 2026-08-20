@@ -67,6 +67,49 @@ class MovesStableValidFilesTests(IntakeTestCase):
 
 
 class NotStableTests(IntakeTestCase):
+    def test_a_file_whose_stat_fails_is_not_promoted(self):
+        """C49: found by branch coverage — `_is_stable()`'s `except OSError`
+        had never been executed.
+
+        The answer it gives is the safe one and that is the point: a file
+        this process cannot even stat is treated as **not stable**, so it
+        stays in `transport/` and is re-judged next run rather than being
+        promoted into `incoming/` on no evidence.
+
+        Ordinary on this project's transport. `transport/` is an OneDrive
+        folder (docs/11); a placeholder being hydrated, a file another
+        process holds, or one deleted between the listing and the check all
+        produce exactly this.
+        """
+        import os
+
+        path = self._write(self.transport_dir, "unstattable.json", '{"a": 1}')
+
+        real_stat = os.stat
+        blocked = str(path)
+
+        def failing_stat(target, *args, **kwargs):
+            # Only this one path, and only in `transport/`. A broader match
+            # also breaks the `incoming/` check below, which would make the
+            # test pass for the wrong reason.
+            if str(target) == blocked:
+                raise OSError(5, "cannot stat")
+            return real_stat(target, *args, **kwargs)
+
+        os.stat = failing_stat
+        self.addCleanup(setattr, os, "stat", real_stat)
+
+        summary = self._run()
+
+        # Restored before asserting: `Path.exists()` is itself an `os.stat`,
+        # so the assertion would otherwise raise the injected error instead
+        # of answering the question.
+        os.stat = real_stat
+
+        self.assertEqual(summary.moved, ())
+        self.assertTrue(path.exists(), "the file was moved on no evidence")
+        self.assertFalse((self.incoming_dir / path.name).exists())
+
     def test_recently_modified_file_is_not_moved(self):
         self._write(self.transport_dir, "TEST-FRESH-001.json", json.dumps({"a": 1}), age_seconds=0.0)
         summary = self._run(stable_after_seconds=5.0)

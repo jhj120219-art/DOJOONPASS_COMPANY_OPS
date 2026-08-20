@@ -69,7 +69,12 @@ from collector import (  # noqa: E402
 # docs/02 §8's Desktop->role table, one hop from `reporter/profiles.py`
 # where it lives. Used for exactly one number in the Dashboard row — see
 # `desktops_reporting` at step 9b — and never to decide anything.
-from controltower import ROLE_FOR_SOURCE, event_instant_key  # noqa: E402
+from controltower import (  # noqa: E402
+    build_company_rollup,
+    build_dashboard,
+    event_instant_key,
+    ops_runs_fields,
+)
 from daily import LateUpdateOutcome, update_daily_history  # noqa: E402
 from events import Event, EventValidationError  # noqa: E402
 from history import FileHistoryRepository, HistoryDecision, HistoryFilter  # noqa: E402
@@ -924,24 +929,24 @@ def run_once(
         # Invariant("아무것도 pending이 아니면 repository.list()를 호출하지 않는다",
         # tests/test_architecture_invariants.py)를 그대로 지킨다.
         kept_dates: set[date] = set()
-        # Where this run's Events came from, counted in the one loop that
-        # already reads every accepted Event of this run. Two facts the
-        # Dashboard row could not answer (C47): which Desktops contributed,
-        # and whether any Event claimed a `role` its Desktop does not own.
+        # Where this run's Events came from — two facts the Dashboard row
+        # could not answer before C47: which Desktops contributed, and
+        # whether any Event claimed a `role` its Desktop does not own.
         #
-        # Counted here rather than by re-reading `processed/`, which holds
+        # Collected here rather than by re-reading `processed/`, which holds
         # every Event this project ever collected — a per-run row must not be
-        # built from an all-time directory.
-        events_by_source: dict[str, int] = {}
-        role_mismatches = 0
+        # built from an all-time directory. The counting itself happens in
+        # `controltower.build_company_rollup()` after this loop (C48): the
+        # inline version was a second implementation of `_roll_desktops()`,
+        # including a second copy of docs/02 §8's pair check, and the
+        # Dashboard row is supposed to *be* the rollup rather than agree with
+        # it by inspection.
+        run_events: list[tuple[Event, str]] = []
         for processed_file in collector_summary.files:
             if processed_file.outcome is not RuntimeOutcome.ACCEPTED:
                 continue
             event = Event.from_json(processed_file.destination_path.read_text(encoding="utf-8"))
-            events_by_source[event.source] = events_by_source.get(event.source, 0) + 1
-            expected_role = ROLE_FOR_SOURCE.get(event.source)
-            if expected_role is not None and event.role != expected_role:
-                role_mismatches += 1
+            run_events.append((event, processed_file.destination_path.name))
             filter_result = history_filter.evaluate(event)
             repository.save(filter_result.candidate)
             if filter_result.decision is HistoryDecision.KEEP:
@@ -954,6 +959,7 @@ def run_once(
                 # 흐리게 만들 뿐 실제로 바뀌는 것은 없다.
                 kept_dates.add(datetime.fromisoformat(event.timestamp).date())
         recorder.ok(C_HISTORY_FILTER, kept_dates=len(kept_dates))
+
 
         # 6. Daily History — docs/07 §37 steps 7-8
         #    "Missing Daily Date 계산" + "Daily Catch-up"
@@ -1491,6 +1497,38 @@ def run_once(
                 # nothing.
                 resolved_run_id = resolved_manifest_run_id
 
+                # The Control Tower half of this row, derived here rather
+                # than back at step 5 — and the placement is the point.
+                #
+                # One derivation, two readers: `ops_status.py`'s CONTROL
+                # TOWER block and this row come from the same fold, and one
+                # *arrangement*, two readers — the Dashboard Model is what
+                # the screen renders and `ops_runs_fields()` projects the
+                # same model onto this row's columns. Formatting the string
+                # inline would be the fork C49 removed.
+                #
+                # It sits **inside this try** because it is Dashboard data
+                # and CEO Decision ④ fixes what that means: "Dashboard 기록
+                # 실패는 Runtime을 절대 중단시키면 안 된다." Computed at step
+                # 5 it would have been a Dashboard-only derivation standing
+                # in front of Daily History, Monthly and Backup — three
+                # CRITICAL steps — with nothing catching it. Both calls are
+                # pure transforms over Events that already parsed, so this
+                # is a placement argument rather than a suspicion; the
+                # difference is that the argument no longer has to hold.
+                #
+                # Also skipped entirely when no Dashboard is configured,
+                # which is the supported deployment shape (docs/04).
+                #
+                # Built over **this run's** Events, never over `processed/`:
+                # an all-time number on a per-run row is the mistake step
+                # 5's own comment warns about. Measured at 5,000 Events in
+                # one run: rollup 24 ms, model 0.3 ms, projection 0.009 ms.
+                run_rollup = build_company_rollup(events=run_events, now=now)
+                run_control_tower = ops_runs_fields(
+                    build_dashboard(run_rollup, now=now)
+                )
+
                 # 밀린 기록 먼저 재시도한다(Retry Queue와 동일한 "먼저 처리" 원칙).
                 drain_result = drain_pending(
                     resolved_dashboard_pending_path, dashboard_client
@@ -1532,15 +1570,15 @@ def run_once(
                     # does.
                     notion_unreadable=len(notion_unreadable),
                     notion_queued=notion_queue_depth,
-                    # Step 5 counted these while it was reading this run's
-                    # Events; sorted so the same run always renders the same
-                    # string and a diff between two rows means a difference
-                    # in the work, not in dict order.
-                    desktops_reporting=" ".join(
-                        f"{source}:{count}"
-                        for source, count in sorted(events_by_source.items())
-                    ),
-                    role_mismatches=role_mismatches,
+                    # Step 5's Dashboard Model, projected onto this row's
+                    # two Control Tower columns. Which Desktops reported and
+                    # how the string is ordered, why silent Desktops are
+                    # dropped here but present-and-empty on the panel, and
+                    # the rich_text bound all live in
+                    # `controltower/projection.py` — one place, read by both
+                    # this row and anything else that projects the model.
+                    desktops_reporting=run_control_tower["desktops_reporting"],
+                    role_mismatches=run_control_tower["role_mismatches"],
                     # The manifest's own verdict inputs, so the Dashboard
                     # row cannot contradict the exit code of the run that
                     # produced it (C37). Every step except this one has

@@ -882,24 +882,65 @@ class AtomicStateWriteInvariantTests(unittest.TestCase):
         )
         self.assertIn("os.O_CREAT | os.O_EXCL", lock_source)
 
+    def _atomic_writers(self):
+        """Every source under `src/` that stages through `tempfile.mkstemp`.
+
+        Swept rather than listed, and the sweep is the fix (C49). The list
+        was hard-coded with seven entries; the tree has **thirteen**, and
+        `agent/state.py` and `monthly/state.py` were in no list at all — they
+        had the idiom and no guard knew it. That is this test's own stated
+        failure mode arriving from the other side: it was written so "a
+        future writer that skips tempfile+os.replace" cannot pass unnoticed,
+        and a future writer that *has* it can be equally unnoticed when the
+        roster is maintained by hand.
+        """
+        return sorted(
+            path
+            for path in SRC.rglob("*.py")
+            if "__pycache__" not in str(path)
+            and "tempfile.mkstemp" in path.read_text(encoding="utf-8")
+        )
+
+    def test_the_sweep_finds_the_writers_we_know_exist(self):
+        """Guard against the sweep silently matching nothing, and against a
+        writer being deleted without anyone noticing."""
+        writers = self._atomic_writers()
+        # Paths, not basenames: four different packages each call their file
+        # `state.py`, and counting names would report eight for thirteen
+        # writers — which is exactly the kind of undercount this guard exists
+        # to prevent.
+        self.assertGreaterEqual(len(writers), 13)
+
+        relative = {path.relative_to(SRC).as_posix() for path in writers}
+        for known in (
+            "agent/state.py",
+            "monthly/state.py",
+            "notion/retry_queue.py",
+            "reporter/local_output.py",
+            "daily/generator.py",
+        ):
+            with self.subTest(module=known):
+                self.assertIn(known, relative)
+
     def test_every_state_writer_uses_the_same_atomic_idiom(self):
         """Structural guard: a future writer that skips tempfile+os.replace
         would silently lose the no-torn-file property."""
-        writers = {
-            "collector/state.py": "_save",
-            "scheduler/state.py": "save_state",
-            "backup/state.py": "save_state",
-            "notion/retry_queue.py": "save_queue",
-            "notion/dashboard_pending.py": "save_all",
-            "history/file_repository.py": "save",
-            "daily/generator.py": "generate_daily_history",
-        }
-        for module, function in writers.items():
-            with self.subTest(module=module):
-                source = (SRC / module).read_text(encoding="utf-8")
-                self.assertIn("tempfile.mkstemp", source)
+        for path in self._atomic_writers():
+            with self.subTest(module=path.relative_to(SRC).as_posix()):
+                source = path.read_text(encoding="utf-8")
                 self.assertIn("os.replace", source)
-                self.assertIn(f"def {function}", source)
+
+    def test_every_state_writer_cleans_up_after_a_failed_commit(self):
+        """The other half of the idiom, structurally. The behavioural proof is
+        `AtomicWriteFailureCleanupTests` and the two classes beside it; this
+        catches a new writer that stages and commits but drops the cleanup,
+        which those cannot see because they only drive writers they know
+        about."""
+        for path in self._atomic_writers():
+            with self.subTest(module=path.relative_to(SRC).as_posix()):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn("except BaseException:", source)
+                self.assertIn("os.remove(tmp_path)", source)
 
 
 class AtomicWriteFailureCleanupTests(unittest.TestCase):
@@ -964,10 +1005,14 @@ class AtomicWriteFailureCleanupTests(unittest.TestCase):
 
     def _writers(self):
         """(name, callable) for every atomic writer, each writing under self.root."""
+        from agent.state import AgentState
+        from agent.state import save_state as agent_save_state
         from backup.result import BackupStatus
         from backup.state import BackupState
         from backup.state import save_state as backup_save_state
         from collector.state import PersistentSeenEventStore
+        from monthly.state import MonthlyState
+        from monthly.state import save_state as monthly_save_state
         from history import FileHistoryRepository, HistoryCandidate, HistoryDecision
         from notion.dashboard_pending import save_pending
         from notion.retry_queue import RetryQueueEntry
@@ -1070,6 +1115,24 @@ class AtomicWriteFailureCleanupTests(unittest.TestCase):
                     sync_folder=d / "sync", outgoing_dir=d
                 ).send(event),
             ),
+            # C49: both use the same idiom and were in no behavioural class.
+            # Found by sweeping for `tempfile.mkstemp` instead of trusting the
+            # hand-kept roster above this method.
+            (
+                "agent/state.py::save_state",
+                self.root / "agent",
+                lambda d: agent_save_state(
+                    d / "agent_state.json",
+                    AgentState(desktop_id="DESKTOP_1"),
+                ),
+            ),
+            (
+                "monthly/state.py::save_state",
+                self.root / "monthly",
+                lambda d: monthly_save_state(
+                    d / "monthly_history_state.json", MonthlyState()
+                ),
+            ),
         ]
 
     def test_a_failed_commit_leaves_no_temp_file_behind(self):
@@ -1095,6 +1158,135 @@ class AtomicWriteFailureCleanupTests(unittest.TestCase):
 
                 written = [p.name for p in directory.rglob("*.json") if p.is_file()]
                 self.assertEqual(written, [], f"{name} left {written}")
+
+
+class ACleanupThatFailsDoesNotHideTheOriginalFailureTests(unittest.TestCase):
+    """C49: the inner half of the idiom, which nothing exercised.
+
+    Every atomic writer ends the same way::
+
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    `AtomicWriteFailureCleanupTests` proves the outer half — the commit fails,
+    the temp file goes, the error propagates. A coverage pass shows the
+    **inner** `except OSError` unexecuted in all of them: nothing has ever
+    made the cleanup itself fail.
+
+    That is not exotic either, and on this project's target OS it is the same
+    cause as the outer failure. `os.replace` raises WinError 5 when something
+    holds the destination open; the very same handle holding the *temp* file
+    makes `os.remove` raise WinError 32. So the two failures arrive together
+    far more often than independently.
+
+    The property at stake is which exception a caller sees. If the `pass` were
+    ever dropped, the writer would report "could not delete a temp file"
+    instead of "could not write the state" — a message about the cleanup of a
+    problem, in place of the problem. Every caller that classifies failures
+    (`app/runner.py`'s recorder, `SyncResult`, `TransportError`) would
+    classify the wrong one.
+
+    Borrows `AtomicWriteFailureCleanupTests._writers` as a plain function
+    rather than inheriting from it, so the two classes cannot drift about
+    what "every atomic writer" means while this one does **not** inherit the
+    parent's assertions — under a failing `os.remove` the temp file is
+    supposed to survive, which is the opposite of what the parent asserts.
+    """
+
+    MARKER = AtomicWriteFailureCleanupTests.MARKER
+    REMOVE_MARKER = "simulated: temp file held open too"
+    _writers = AtomicWriteFailureCleanupTests._writers
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+        real_replace = os.replace
+        real_remove = os.remove
+
+        def failing_replace(src, dst):
+            raise OSError(5, self.MARKER)
+
+        def failing_remove(path):
+            raise OSError(32, self.REMOVE_MARKER)
+
+        os.replace = failing_replace
+        os.remove = failing_remove
+        # Restored before the TemporaryDirectory is cleaned up: cleanups run
+        # last-registered-first, and `tmp.cleanup` needs a working `os.remove`.
+        self.addCleanup(setattr, os, "remove", real_remove)
+        self.addCleanup(setattr, os, "replace", real_replace)
+
+    def test_the_original_error_is_what_propagates(self):
+        for name, directory, write in self._writers():
+            with self.subTest(writer=name):
+                directory.mkdir(parents=True, exist_ok=True)
+                with self.assertRaises(Exception) as caught:  # noqa: B017
+                    write(directory)
+
+                message = str(caught.exception)
+                self.assertIn(self.MARKER, message, f"{name} lost the original error")
+                self.assertNotIn(
+                    self.REMOVE_MARKER,
+                    message,
+                    f"{name} reported the cleanup failure instead",
+                )
+
+    def test_no_writer_swallows_the_failure_entirely(self):
+        """The other way the `pass` could go wrong: swallowing the `raise`
+        as well would turn a failed write into a silent success."""
+        for name, directory, write in self._writers():
+            with self.subTest(writer=name):
+                directory.mkdir(parents=True, exist_ok=True)
+                with self.assertRaises(Exception):  # noqa: B017
+                    write(directory)
+
+    def test_the_destination_is_still_absent(self):
+        """A failed cleanup must not leave a half-written state file where
+        the next run will read it. The temp file survives — that is what a
+        failed `os.remove` means — but nothing ever points a real name at
+        it, which is the property `os.replace` was there to give."""
+        for name, directory, write in self._writers():
+            with self.subTest(writer=name):
+                directory.mkdir(parents=True, exist_ok=True)
+                with self.assertRaises(Exception):  # noqa: B017
+                    write(directory)
+
+                written = [
+                    p.name
+                    for p in directory.rglob("*.json")
+                    if p.is_file() and not p.name.startswith(".tmp-")
+                ]
+                self.assertEqual(written, [], f"{name} left {written}")
+
+    def test_the_temp_file_is_the_only_thing_left_behind(self):
+        """Stated so the leak is characterised rather than implied: when the
+        cleanup itself fails there is nothing more the writer can do, and the
+        residue is a `.tmp-` file that `ops_status.py`'s staging-residue
+        report already looks for."""
+        leaked = []
+        for name, directory, write in self._writers():
+            with self.subTest(writer=name):
+                directory.mkdir(parents=True, exist_ok=True)
+                with self.assertRaises(Exception):  # noqa: B017
+                    write(directory)
+
+                residue = [
+                    p.name
+                    for p in directory.rglob("*")
+                    if p.is_file() and p.name.startswith(".tmp-")
+                ]
+                leaked.append((name, len(residue)))
+
+        self.assertTrue(
+            all(count >= 1 for _name, count in leaked),
+            f"the injection did not reach every writer: {leaked}",
+        )
 
 
 class AtomicWritesReachTheDiskBeforeTheRenameTests(unittest.TestCase):
@@ -1384,6 +1576,22 @@ class TestDoubleFidelityTests(unittest.TestCase):
     exercises, and deciding how faithful it should be (full schema validation?
     just the documented limits?) is a design decision. This test at least
     makes the gap explicit rather than implicit.
+
+    Two of the six now have a **local** mitigation — a stricter subclass used
+    where the limit matters, rather than a change to the double everything
+    uses:
+
+        rich_text over 2000 chars   `StrictNotionTransport`
+                                    (test_runner_failure_paths.py, C13)
+        wrong property type         `_TypeEnforcingTransport`
+                                    (test_notion_dashboard.py, C49) — drives
+                                    a whole `record_run()` against the full
+                                    OPS_RUNS schema and rejects a value whose
+                                    shape does not match its declared column
+
+    The other four remain as characterised, and the honest reading below is
+    unchanged: these narrow the class of first-run surprise, they do not
+    replace the real connection.
     """
 
     def _double(self):
@@ -1463,6 +1671,33 @@ class TestDoubleFidelityTests(unittest.TestCase):
 
         self.assertIn("class StrictNotionTransport", transport_source)
         self.assertIn("MAX_TEXT = 2000", transport_source)
+
+    def test_a_type_enforcing_double_exists_for_the_other_one(self):
+        """C49's mitigation, recorded here for the same reason: an unused
+        stricter double is deleted, and then the divergence it covered comes
+        back silently."""
+        dashboard_source = (
+            REPO_ROOT / "tests" / "test_notion_dashboard.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("class _TypeEnforcingTransport", dashboard_source)
+        self.assertIn("expected to be", dashboard_source)
+
+    def test_the_plain_double_is_still_the_permissive_one(self):
+        """The mitigations are local subclasses, not a change to the double
+        every other Notion test uses — so the characterisation above stays
+        true and this is what says so."""
+        from notion.transport import InMemoryNotionTransport
+
+        transport = InMemoryNotionTransport(
+            initial_properties={"Role Mismatches": {"type": "number", "number": {}}}
+        )
+
+        page = transport.create_page(
+            "DB-1", {"Role Mismatches": {"rich_text": [{"text": {"content": "1"}}]}}
+        )
+
+        self.assertIn("id", page)
 
 
 class ExitCodeContractTests(unittest.TestCase):
@@ -3297,11 +3532,16 @@ class LayeringInvariantTests(unittest.TestCase):
         #   reporter  docs/02 §8's Desktop->role table, which lives in
         #             `profiles.PROFILES` and whose own comment says it "only
         #             pairs them the way the spec already does"
+        #   oplog     `dashboard.to_payload()` is the boundary where Event
+        #             text leaves this machine, and `redact`/`one_line` are
+        #             the two functions this project has for that. A leaf, so
+        #             it closes no cycle — the same edge `collector` and
+        #             `agent` already have and for the same reason.
         # It writes nothing and nothing writes to it, so it sits beside the
         # other derivations rather than under them. `reporter` is a writer
         # package, but the edge reaches `profiles.py` — pure vocabulary — and
         # `reporter` imports nothing from here, so the graph stays acyclic.
-        "controltower": {"events", "notion", "reporter"},
+        "controltower": {"events", "notion", "oplog", "reporter"},
         "app": None,  # composition root: unrestricted
     }
 
@@ -4053,6 +4293,180 @@ class CompanyHistoryWritersCleanUpTooTests(unittest.TestCase):
         staged.write_text("residue", encoding="utf-8")
 
         self.assertEqual(self._leftovers(self.daily_dir), [".tmp-leaked"])
+
+
+class CompanyHistoryReportsTheRealFailureNotTheCleanupsTests(
+    CompanyHistoryWritersCleanUpTooTests
+):
+    """C49: the inner `except OSError` of the Company History writers.
+
+    `CompanyHistoryWritersCleanUpTooTests` breaks `os.replace`; this breaks
+    `os.remove` on top of it, so the cleanup of a failed write fails too.
+    On Windows that is not a second scenario — it is the *same* one. Whatever
+    holds the destination open (WinError 5 on `os.replace`) commonly holds
+    the staging file too (WinError 32 on `os.remove`).
+
+    Which error survives matters more here than anywhere else in the idiom.
+    Two of these three writers **report instead of raising**:
+    `update_daily_history()` returns `LateUpdateOutcome.FAILED` with an
+    `error` string, and `consolidate_month()` returns a failed
+    `MonthlyResult` — and those strings are what reach the Run Manifest, the
+    `daily_late_update.log` and `ops_status.py`. If the cleanup's error
+    displaced the original, an operator investigating a lost Daily Close
+    would be handed "could not delete a temp file" as the reason.
+
+    Inherits the fixtures and re-states only the assertions that change: the
+    staging file now survives (nothing can remove it), and the reported
+    reason must still be the write's own.
+    """
+
+    REMOVE_MARKER = "simulated: temp file held open too"
+
+    def _break_remove(self):
+        real_remove = os.remove
+
+        def failing_remove(path):
+            raise OSError(32, self.REMOVE_MARKER)
+
+        os.remove = failing_remove
+        self.addCleanup(setattr, os, "remove", real_remove)
+
+    # The parent's three tests assert the staging file is gone, which cannot
+    # hold once `os.remove` fails. Replaced rather than inherited.
+    def test_generate_daily_history_reports_the_write_failure(self):
+        from daily.generator import generate_daily_history
+
+        self._break_replace()
+        self._break_remove()
+
+        with self.assertRaises(OSError) as caught:
+            generate_daily_history(
+                self.repository, date(2026, 8, 6), output_dir=self.daily_dir
+            )
+
+        self.assertIn(self.MARKER, str(caught.exception))
+        self.assertNotIn(self.REMOVE_MARKER, str(caught.exception))
+        # The staging file survives — nothing can remove it — and no *named*
+        # Daily file was created. `.tmp-` is excluded explicitly because the
+        # staging name keeps the `.md` suffix, so a bare `glob("*.md")` finds
+        # it: the residue looks like a Daily file to anything that does not
+        # know the prefix. Every reader in this project does
+        # (`controltower.read_events()`, the Monthly parser, the Collector),
+        # which is what makes the residue harmless rather than a phantom day.
+        self.assertTrue(self._leftovers(self.daily_dir))
+        self.assertEqual(
+            [
+                path.name
+                for path in self.daily_dir.glob("*.md")
+                if not path.name.startswith(".tmp-")
+            ],
+            [],
+        )
+
+    def test_update_daily_history_reports_the_write_failure(self):
+        from daily import LateUpdateOutcome
+        from daily.generator import generate_daily_history, update_daily_history
+
+        generate_daily_history(
+            self.repository, date(2026, 8, 6), output_dir=self.daily_dir
+        )
+        self._break_replace()
+        self._break_remove()
+
+        result = update_daily_history(
+            self.repository,
+            date(2026, 8, 6),
+            output_dir=self.daily_dir,
+            now=datetime(2026, 8, 7, 9, 0),
+            keep_candidates=[
+                HistoryCandidate(
+                    history_id="HIST-ATOMIC-LATE-2",
+                    event_id="ATOMIC-LATE-2",
+                    timestamp="2026-08-06T18:00:00+09:00",
+                    category="MILESTONE",
+                    project_id="PRJ-ATOMIC",
+                    role="COO",
+                    summary="late arrival",
+                    evidence=(),
+                    filter_result=HistoryDecision.KEEP,
+                )
+            ],
+        )
+
+        self.assertEqual(result.outcome, LateUpdateOutcome.FAILED)
+        self.assertIn(self.MARKER, result.error)
+        self.assertNotIn(self.REMOVE_MARKER, result.error)
+
+    def test_consolidate_month_reports_the_write_failure(self):
+        from daily.generator import generate_daily_history
+        from monthly.generator import consolidate_month
+
+        for day in range(1, 32):
+            generate_daily_history(
+                self.repository, date(2026, 8, day), output_dir=self.daily_dir
+            )
+        self._break_replace()
+        self._break_remove()
+
+        result = consolidate_month(
+            year=2026,
+            month=8,
+            daily_dir=self.daily_dir,
+            monthly_dir=self.monthly_dir,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 9, 1, 9, 0),
+        )
+
+        self.assertIsNotNone(result.error)
+        self.assertIn(self.MARKER, result.error)
+        self.assertNotIn(self.REMOVE_MARKER, result.error)
+
+    def test_the_month_file_is_still_not_created(self):
+        """A failed cleanup must not leave a *named* Monthly file — the
+        residue is a `.tmp-` file, and `ops_status.py`'s staging-residue
+        report is what finds those."""
+        from daily.generator import generate_daily_history
+        from monthly.generator import consolidate_month
+
+        for day in range(1, 32):
+            generate_daily_history(
+                self.repository, date(2026, 8, day), output_dir=self.daily_dir
+            )
+        self._break_replace()
+        self._break_remove()
+
+        consolidate_month(
+            year=2026,
+            month=8,
+            daily_dir=self.daily_dir,
+            monthly_dir=self.monthly_dir,
+            history_start_date=date(2026, 8, 1),
+            now=datetime(2026, 9, 1, 9, 0),
+        )
+
+        named = [
+            path.name
+            for path in self.monthly_dir.glob("*.md")
+            if not path.name.startswith(".tmp-")
+        ]
+        self.assertEqual(named, [])
+        self.assertTrue(self._leftovers(self.monthly_dir))
+
+    def test_the_probe_would_notice_a_leak(self):
+        """Inherited assertion no longer applies — under a failing
+        `os.remove` a leak is expected, so the parent's guard-the-guard is
+        replaced by its opposite: the residue must actually appear."""
+        from daily.generator import generate_daily_history
+
+        self._break_replace()
+        self._break_remove()
+
+        with self.assertRaises(OSError):
+            generate_daily_history(
+                self.repository, date(2026, 8, 6), output_dir=self.daily_dir
+            )
+
+        self.assertTrue(self._leftovers(self.daily_dir))
 
 
 class IncompleteWriteInvariantTests(unittest.TestCase):
