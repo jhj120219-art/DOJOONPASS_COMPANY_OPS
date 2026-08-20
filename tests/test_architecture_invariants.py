@@ -1544,54 +1544,49 @@ class TestDoubleFidelityTests(unittest.TestCase):
     """BUG-35: `InMemoryNotionTransport` is more permissive than the real API,
     which bounds how much any Notion test in this repository can prove.
 
-    CHARACTERIZATION: asserts the divergence that exists today.
+    CHARACTERIZATION of what is still divergent, and a GUARD on the one
+    divergence that has been closed.
 
     Interface parity is exact — both transports implement all seven methods of
     `NotionTransport` with identical signatures (asserted below). Behavioural
     parity is not. Of eight payloads the live Notion API rejects, the double
-    accepts six:
+    used to accept six. **Five, since C50:**
 
-        rich_text over 2000 chars        accepted   (real: 400)
         property name not in the schema  accepted   (real: 400)
         wrong property type              accepted   (real: 400)
         unknown database_id on query     accepted   (real: 404)
         empty properties on create       accepted   (real: 400, title required)
         select name = ""                 accepted   (real: 400)
 
+        rich_text over 2000 chars        REJECTED, 400   (C50 — see below)
         unknown page_id on update        rejected   (matches real 404)
         properties=None                  TypeError  (real: 400 — wrong kind)
 
-    This is why the audit had to build `StrictNotionTransport` in
-    test_runner_failure_paths.py to reproduce BUG-13 at all: against the plain
-    double, an oversized payload simply succeeds. It also explains how BUG-31
-    (bootstrap never checks property TYPE) and BUG-32 (no request pacing)
-    could exist with a green suite — the double never pushes back, so no test
-    could have caught either.
+    **Why that one moved onto the double itself.** The original note here
+    read "tightening the double changes what every existing Notion test
+    exercises", and that was the right worry for *schema* fidelity, which
+    needs a schema the double does not have. It was the wrong worry for a
+    fixed character count: no test in this repository writes a 2,000-character
+    property, so enforcing it changed nothing any test was doing — and the
+    laxness had a measured cost. `notion/properties.py` sent **four unbounded
+    authored fields** (`blocker`, `milestone`, `project_id`, `event_id`) to
+    the live API for the whole life of this project, and the suite could not
+    see it precisely because the double accepted them (C50 §4).
 
-    The honest reading: green Notion tests here demonstrate that OUR logic is
-    self-consistent, not that Notion will accept what we send. Only the real
-    connection can show that.
+    The local-subclass mitigation was tried first and did not hold: by C50
+    there were **three** copies of the same eight lines
+    (`StrictNotionTransport` here, plus two more added in the same Sprint),
+    each protecting one test file while every other Notion test stayed blind.
+    A rule that has to be opted into is a rule most callers do not have.
 
-    Not fixed: tightening the double changes what every existing Notion test
-    exercises, and deciding how faithful it should be (full schema validation?
-    just the documented limits?) is a design decision. This test at least
-    makes the gap explicit rather than implicit.
+    `_TypeEnforcingTransport` (test_notion_dashboard.py, C49) stays a local
+    subclass, and correctly: it validates against the OPS_RUNS *schema*, which
+    is a property of one database rather than of the API.
 
-    Two of the six now have a **local** mitigation — a stricter subclass used
-    where the limit matters, rather than a change to the double everything
-    uses:
-
-        rich_text over 2000 chars   `StrictNotionTransport`
-                                    (test_runner_failure_paths.py, C13)
-        wrong property type         `_TypeEnforcingTransport`
-                                    (test_notion_dashboard.py, C49) — drives
-                                    a whole `record_run()` against the full
-                                    OPS_RUNS schema and rejects a value whose
-                                    shape does not match its declared column
-
-    The other four remain as characterised, and the honest reading below is
-    unchanged: these narrow the class of first-run surprise, they do not
-    replace the real connection.
+    The honest reading is unchanged for the five that remain: green Notion
+    tests here demonstrate that OUR logic is self-consistent, not that Notion
+    will accept what we send. Only the real connection can show that. This
+    class is what keeps the list of what is still unproven from drifting.
     """
 
     def _double(self):
@@ -1628,13 +1623,6 @@ class TestDoubleFidelityTests(unittest.TestCase):
         accepted = []
 
         probes = {
-            "oversized_rich_text": lambda: transport.create_page(
-                "DB-1",
-                {
-                    "Project": {"title": [{"text": {"content": "P"}}]},
-                    "Blocker": {"rich_text": [{"text": {"content": "X" * 2001}}]},
-                },
-            ),
             "unknown_property_name": lambda: transport.create_page(
                 "DB-1", {"NotInSchema": {"rich_text": [{"text": {"content": "x"}}]}}
             ),
@@ -1663,14 +1651,105 @@ class TestDoubleFidelityTests(unittest.TestCase):
         with self.assertRaises(NotionAPIError):
             self._double().update_page("page-does-not-exist", {"Status": {"select": {"name": "X"}}})
 
-    def test_a_stricter_double_exists_for_the_limit_that_was_needed(self):
-        """The partial mitigation, so it is not deleted as unused."""
-        transport_source = (
-            REPO_ROOT / "tests" / "test_runner_failure_paths.py"
-        ).read_text(encoding="utf-8")
+    def test_the_text_limit_is_on_the_double_itself_not_a_subclass(self):
+        """C50: the mitigation that used to be a subclass is now the rule.
 
-        self.assertIn("class StrictNotionTransport", transport_source)
-        self.assertIn("MAX_TEXT = 2000", transport_source)
+        Asserted three ways, because each could regress on its own: the
+        double really refuses an over-long item, it refuses it with the
+        status the retry classifier reads, and it reads the limit from the
+        module that owns it rather than restating the number.
+        """
+        from notion.properties import RICH_TEXT_LIMIT
+        from notion.transport import InMemoryNotionTransport, NotionAPIError
+
+        transport = InMemoryNotionTransport()
+        with self.assertRaises(NotionAPIError) as caught:
+            transport.create_page(
+                "DB-1",
+                {
+                    "Project": {"title": [{"text": {"content": "P"}}]},
+                    "Blocker": {
+                        "rich_text": [
+                            {"text": {"content": "X" * (RICH_TEXT_LIMIT + 1)}}
+                        ]
+                    },
+                },
+            )
+        self.assertEqual(caught.exception.status_code, 400)
+
+        source = (
+            REPO_ROOT / "src" / "notion" / "transport.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("from .properties import RICH_TEXT_LIMIT", source)
+        self.assertNotIn("2000", source)
+
+    def test_exactly_at_the_limit_still_passes_the_double(self):
+        """An off-by-one here would refuse a payload Notion accepts, which is
+        the opposite failure and just as invisible."""
+        from notion.properties import RICH_TEXT_LIMIT
+        from notion.transport import InMemoryNotionTransport
+
+        transport = InMemoryNotionTransport()
+        page = transport.create_page(
+            "DB-1",
+            {"Blocker": {"rich_text": [{"text": {"content": "X" * RICH_TEXT_LIMIT}}]}},
+        )
+        self.assertIn("id", page)
+
+    def test_no_test_module_keeps_its_own_copy_of_the_text_limit(self):
+        """Three copies of these eight lines existed at one point (C50).
+
+        The rule belongs to the double: a private strict subclass protects the
+        one file that defines it and leaves every other Notion test blind,
+        which is exactly how four unbounded authored fields survived.
+
+        Scoped to **transport subclasses**, not to the number. A test class
+        may perfectly well hold `LIMIT = 2000` to assert against — several do,
+        and each ties that constant back to `properties.RICH_TEXT_LIMIT` so
+        the two cannot drift. What must not come back is a second
+        implementation of the check.
+        """
+        offenders = []
+        for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = {
+                    base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+                    for base in node.bases
+                }
+                if "InMemoryNotionTransport" not in bases:
+                    continue
+                literals = {
+                    child.value
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Constant) and child.value == 2000
+                }
+                if literals:
+                    offenders.append(f"{path.name}::{node.name}")
+        self.assertEqual(
+            offenders,
+            [],
+            "a test module re-implements Notion's text limit in its own "
+            "transport subclass; the double enforces it for everyone",
+        )
+
+    def test_the_scan_above_can_see_a_transport_subclass_at_all(self):
+        """A guard whose scan finds nothing passes forever. There is one such
+        subclass in the tree — `SchemaMismatchNotionTransport` — and it is
+        legitimate: it refuses for a *schema* reason, not a length one."""
+        found = []
+        for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and any(
+                    (base.id if isinstance(base, ast.Name) else getattr(base, "attr", ""))
+                    == "InMemoryNotionTransport"
+                    for base in node.bases
+                ):
+                    found.append(node.name)
+        self.assertIn("SchemaMismatchNotionTransport", found)
 
     def test_a_type_enforcing_double_exists_for_the_other_one(self):
         """C49's mitigation, recorded here for the same reason: an unused

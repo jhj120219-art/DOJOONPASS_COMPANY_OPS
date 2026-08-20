@@ -1598,3 +1598,221 @@ class TheEvidenceRangeCheckSurvivesBadInputTests(CompanyHistoryCanOutliveTheEvid
         self.assertIn("증거 범위 밖", printed)
         self.assertIn("2026-08-02", printed)
         self.assertEqual(attention, [])
+
+
+class OneEventIsCountedOnceTests(ControlTowerTestCase):
+    """C50: two files, one `event_id`, and every number was doubled.
+
+    Not a hypothetical. `collector/runtime.py` files a DUPLICATE into
+    `processed/` under **the incoming filename** rather than under
+    `safe_event_filename(event_id)`, so the same Event arriving twice under
+    two names leaves two files behind. Driven through the real Collector in
+    `TheRealCollectorProducesTheSecondFileTests` below; the fixtures here
+    place the two files directly so each property can be stated on its own.
+
+    Measured before the fold, on one MILESTONE_COMPLETED Event:
+
+        events_read              2
+        PAY event_count          2
+        metric milestones        2      <- a company KPI, doubled
+        DESKTOP_1 event_count    2
+
+    The Collector was right about all of it — it *detected* the duplicate and
+    logged `duplicate=1` — and keeping the file rather than deleting it is
+    docs/10 §46's rule. Only this module's counting was wrong.
+    """
+
+    def _twin(self, event, name):
+        """A second file under `name` carrying the same Event."""
+        (self.processed / name).write_text(event.to_json(), encoding="utf-8")
+
+    def test_the_same_event_under_two_names_is_one_event(self):
+        event = self.put("E1", "PAY", "CTO_BACKEND", "MILESTONE_COMPLETED",
+                         "IN_PROGRESS", 12, milestone="M1")
+        self._twin(event, "hand-copy.json")
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.events_read, 1)
+        self.assertEqual(rollup.project("PAY").event_count, 1)
+        self.assertEqual(rollup.metric("events").value, 1)
+        self.assertEqual(rollup.metric("milestones_completed").value, 1)
+        self.assertEqual(
+            [d.event_count for d in rollup.desktops if d.source == "DESKTOP_1"], [1]
+        )
+
+    def test_the_folded_file_is_reported_rather_than_dropped(self):
+        """A number that silently differs from the file count in the
+        directory is one nobody can check — the same reason `unreadable`
+        exists."""
+        event = self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+        self._twin(event, "hand-copy.json")
+
+        duplicates = self.rollup().duplicates
+
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(duplicates[0].event_id, "E1")
+        self.assertEqual(duplicates[0].kept, "E1.json")
+        self.assertEqual(duplicates[0].ignored, "hand-copy.json")
+        self.assertTrue(duplicates[0].identical)
+
+    def test_two_different_events_are_still_two(self):
+        """The guard must not fold anything but a genuine repeat."""
+        self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+        self.put("E2", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.events_read, 2)
+        self.assertEqual(rollup.duplicates, ())
+
+    def test_which_file_is_kept_does_not_change_between_runs(self):
+        """`read_events()` returns the directory in name order and the sort is
+        stable, so the same file is counted every time. A rollup that picked a
+        different file each run would make two consecutive status views
+        disagree for no reason a person could see."""
+        event = self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+        for name in ("aaa.json", "zzz.json", "mmm.json"):
+            self._twin(event, name)
+
+        kept = {self.rollup().duplicates[0].kept for _ in range(5)}
+
+        self.assertEqual(kept, {"E1.json"})
+        self.assertEqual(len(self.rollup().duplicates), 3)
+
+    def test_a_conflicting_twin_is_named_as_a_conflict(self):
+        """Same `event_id`, different contents: one of the two is not the
+        Event it claims to be, and which one got counted is decided by
+        filename order. That is a fact about the data, not about the fold."""
+        self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+        impostor = create_event(
+            source="DESKTOP_2",
+            role="CMO",
+            project_id="BRAND",
+            event_type="STARTED",
+            status="IN_PROGRESS",
+            summary="not the same event at all",
+            history_candidate=True,
+            event_id="E1",
+            timestamp="2026-08-12T09:00:00+09:00",
+        )
+        (self.processed / "zz-impostor.json").write_text(
+            impostor.to_json(), encoding="utf-8"
+        )
+
+        duplicates = self.rollup().duplicates
+
+        self.assertEqual(len(duplicates), 1)
+        self.assertFalse(duplicates[0].identical)
+        self.assertEqual(duplicates[0].kept, "E1.json")
+        self.assertEqual(duplicates[0].ignored, "zz-impostor.json")
+
+    def test_only_the_conflicting_kind_reaches_the_risk_panel(self):
+        """An identical twin needs no operator. A contradicting one does."""
+        from controltower import build_dashboard
+
+        event = self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+        self._twin(event, "benign-copy.json")
+
+        panel = build_dashboard(self.rollup(), now=NOW).panel("RISKS")
+        self.assertEqual(
+            [r for r in panel.rows if r.values["kind"] == "EVENT_ID_CONFLICT"], []
+        )
+
+        impostor = create_event(
+            source="DESKTOP_2", role="CMO", project_id="BRAND", event_type="STARTED",
+            status="IN_PROGRESS", summary="different", history_candidate=True,
+            event_id="E1", timestamp="2026-08-12T09:00:00+09:00",
+        )
+        (self.processed / "zz-impostor.json").write_text(
+            impostor.to_json(), encoding="utf-8"
+        )
+
+        panel = build_dashboard(self.rollup(), now=NOW).panel("RISKS")
+        conflicts = [r for r in panel.rows if r.values["kind"] == "EVENT_ID_CONFLICT"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].values["kept"], "E1.json")
+        self.assertEqual(conflicts[0].values["ignored"], "zz-impostor.json")
+
+    def test_the_coverage_counts_them_without_calling_the_view_incomplete(self):
+        """A folded duplicate makes the numbers right, not partial. A
+        qualifier that fires on a correct answer is the standing alarm this
+        project keeps removing."""
+        from controltower import build_dashboard
+
+        event = self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+        self._twin(event, "hand-copy.json")
+
+        coverage = build_dashboard(self.rollup(), now=NOW).coverage
+
+        self.assertEqual(coverage.duplicates, 1)
+        self.assertEqual(coverage.unreadable, 0)
+        self.assertTrue(coverage.complete)
+
+
+class TheRealCollectorProducesTheSecondFileTests(unittest.TestCase):
+    """The premise, driven rather than asserted.
+
+    `OneEventIsCountedOnceTests` places two files by hand. This runs the real
+    `collector.run_once()` twice over the same Event under two filenames and
+    checks that the second one really does end up in `processed/` — because
+    if it did not, the fold above would be guarding against nothing.
+
+    docs/11 permits writing into `incoming/` by hand, which is the shortest
+    way to produce this; a re-sent OneDrive delivery under a different name
+    and a partial restore produce the same shape.
+    """
+
+    def test_a_duplicate_the_collector_detects_still_lands_in_processed(self):
+        from collector import Collector
+        from collector.runtime import run_once as collector_run_once
+        from collector.state import PersistentSeenEventStore
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        incoming, processed, rejected = root / "in", root / "proc", root / "rej"
+        for directory in (incoming, processed, rejected):
+            directory.mkdir(parents=True)
+
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="PAY",
+            event_type="MILESTONE_COMPLETED", status="IN_PROGRESS",
+            summary="one real event", history_candidate=True, milestone="M1",
+            timestamp="2026-08-12T10:00:00+09:00",
+        )
+        first = incoming / "EVT-1.json"
+        first.write_text(event.to_json(), encoding="utf-8")
+
+        collector = Collector(
+            seen_store=PersistentSeenEventStore(root / "collector_state.json")
+        )
+        run_one = collector_run_once(
+            collector=collector, incoming_dir=incoming, processed_dir=processed,
+            rejected_dir=rejected, log_path=root / "collector.log",
+        )
+        (incoming / "a-hand-placed-copy.json").write_text(
+            event.to_json(), encoding="utf-8"
+        )
+        run_two = collector_run_once(
+            collector=collector, incoming_dir=incoming, processed_dir=processed,
+            rejected_dir=rejected, log_path=root / "collector.log",
+        )
+
+        self.assertEqual((run_one.accepted, run_one.duplicate), (1, 0))
+        self.assertEqual((run_two.accepted, run_two.duplicate), (0, 1))
+        self.assertEqual(
+            sorted(p.name for p in processed.iterdir()),
+            ["EVT-1.json", "a-hand-placed-copy.json"],
+        )
+
+        rollup = build_company_rollup(processed_dir=processed, now=NOW)
+
+        self.assertEqual(rollup.events_read, 1)
+        self.assertEqual(rollup.metric("milestones_completed").value, 1)
+        self.assertEqual(len(rollup.duplicates), 1)
+        self.assertTrue(rollup.duplicates[0].identical)
+
+
+if __name__ == "__main__":
+    unittest.main()

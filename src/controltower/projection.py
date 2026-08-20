@@ -48,6 +48,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from notion.properties import RICH_TEXT_LIMIT as _NOTION_RICH_TEXT_LIMIT
+
 from .dashboard import DashboardModel
 
 # The `OPS_RUNS` columns this projection fills, mapped from the keyword
@@ -68,7 +70,13 @@ OPS_RUNS_CONTROL_TOWER_COLUMNS: dict[str, str] = {
 # can tell the difference between "four Desktops reported" and "the value
 # did not fit". Nothing is lost that is not elsewhere — the same counts are
 # on the Dashboard Model's DESKTOPS panel and in the Run Manifest.
-RICH_TEXT_LIMIT = 2000
+#
+# C49 declared the number here, which made it the second copy of a fact
+# about the Notion API — `notion/properties.py` sends four *authored* text
+# properties to the same API and had no bound at all (C50). Re-exported
+# rather than restated, for C28's rule: one limit, one place, and a caller
+# of either module reads the same 2,000.
+RICH_TEXT_LIMIT = _NOTION_RICH_TEXT_LIMIT
 
 
 def _desktops_reporting(model: DashboardModel) -> str:

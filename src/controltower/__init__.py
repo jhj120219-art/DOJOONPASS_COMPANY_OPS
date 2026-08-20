@@ -24,6 +24,7 @@ from .projection import (
 from .rollup import (
     CompanyRollup,
     DesktopRollup,
+    DuplicateEvent,
     EvidenceRef,
     Metric,
     PairMismatch,
@@ -45,6 +46,7 @@ __all__ = [
     "DashboardRow",
     "OPS_RUNS_CONTROL_TOWER_COLUMNS",
     "DesktopRollup",
+    "DuplicateEvent",
     "EvidenceRef",
     "Metric",
     "PairMismatch",

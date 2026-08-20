@@ -203,6 +203,20 @@ Event 자신의 timestamp로 날짜를 나누므로(docs/06 §12), 어긋나면 
 >
 > 자세한 재현과 두 명세의 관계는 `BACKLOG.md` E-23에 있다.
 
+> **`blocker` / `milestone`이 2,000자를 넘으면 Notion 화면에서만 잘린다.**
+>
+> Notion은 텍스트 Property 하나를 2,000자로 제한하고, 넘으면 그 항목이 아니라
+> **행 전체를 거절한다**(HTTP 400). 그래서 PROJECTS View로 보내는 값은 2,000자로
+> 맞춰 나가고, 잘린 값은 `…`로 끝나므로 화면에서 바로 알아볼 수 있다.
+>
+> **원문은 잃지 않는다.** Event 파일(`runtime/events/processed/`)과
+> `history_candidate`면 Company History에 그대로 있고, `python ops_status.py`의
+> CONTROL TOWER 블록은 그 원문을 보여 준다 — docs/14 §1이 Notion을 "View이며 절대
+> Source가 아니다"로 고정하는 것이 바로 이 뜻이다.
+>
+> 길어질 것 같으면 요약을 `blocker`에, 상세는 `evidence`에 두는 편이 화면에서 읽기
+> 좋다.
+
 ### 거부되는 Signal
 
 거부된 Signal은 삭제되지 않고 `runtime/agent/signals_rejected/<날짜>/`로

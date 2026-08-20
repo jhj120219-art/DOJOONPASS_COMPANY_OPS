@@ -48,6 +48,44 @@ from reporter import Reporter  # noqa: E402
 from scheduler import SchedulerStatus  # noqa: E402
 
 
+
+def _rmtree_ignoring_readonly(target) -> None:
+    """`shutil.rmtree`, retrying a read-only entry after clearing the bit.
+
+    Needed at all because these fixtures contain real git repositories, and
+    git leaves `.git/objects` entries read-only on Windows — a plain
+    `rmtree` of one raises `PermissionError`.
+
+    Needed **here**, once, because the keyword that does it changed name:
+    `onexc=` (callback takes the exception) is Python 3.12+, and `onerror=`
+    (callback takes an `exc_info` triple) is what every earlier version has.
+    On this project's actual interpreter — Anaconda 3.9.7, see
+    `EveryTrackedModuleParsesOnThisInterpreterTests` — `onexc=` is not an
+    ignored keyword but a `TypeError`, raised inside `tearDownClass`, which
+    pytest reports as an ERROR against **every test in the class**.
+
+    Measured at HEAD 43771a9: three teardowns, ten errors, not one of them
+    about the code under test. Three copies of the callback existed and all
+    three had the same bug, which is why this is one function now.
+    """
+    import shutil
+    import stat as _stat
+
+    def _retry(func, path, _exc):
+        try:
+            Path(path).chmod(_stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target, onexc=_retry)
+    else:
+        shutil.rmtree(
+            target, onerror=lambda func, path, info: _retry(func, path, info[1])
+        )
+
+
 class OperationsScenarioTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -678,17 +716,7 @@ class ProductionEntrypointE2ETests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        import shutil
-        import stat as _stat
-
-        def onexc(func, target, exc):
-            try:
-                Path(target).chmod(_stat.S_IWRITE)
-                func(target)
-            except OSError:
-                pass
-
-        shutil.rmtree(cls._tmp.name, onexc=onexc)
+        _rmtree_ignoring_readonly(cls._tmp.name)
 
     @classmethod
     def _git(cls, args, cwd):
@@ -890,17 +918,7 @@ class RestoreThroughTheProductionEntrypointTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        import shutil
-        import stat as _stat
-
-        def onexc(func, target, exc):
-            try:
-                Path(target).chmod(_stat.S_IWRITE)
-                func(target)
-            except OSError:
-                pass
-
-        shutil.rmtree(cls._tmp.name, onexc=onexc)
+        _rmtree_ignoring_readonly(cls._tmp.name)
 
     # -- scaffolding ------------------------------------------------------
 
@@ -942,17 +960,7 @@ class RestoreThroughTheProductionEntrypointTests(unittest.TestCase):
 
     @classmethod
     def _lose_everything(cls):
-        import shutil
-        import stat as _stat
-
-        def onexc(func, target, exc):
-            try:
-                Path(target).chmod(_stat.S_IWRITE)
-                func(target)
-            except OSError:
-                pass
-
-        shutil.rmtree(cls.sandbox / "runtime", onexc=onexc)
+        _rmtree_ignoring_readonly(cls.sandbox / "runtime")
 
     @classmethod
     def _restore_from_the_remote(cls):

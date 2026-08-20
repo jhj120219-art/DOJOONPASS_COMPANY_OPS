@@ -44,6 +44,15 @@ The three layers that DO have a source — Team (`role`), Project
 (`project_id`), and the execution results themselves — are what this builds,
 and KPI/Risk are derived from those rather than declared.
 
+One Event, counted once
+-----------------------
+The unit is the `event_id`, not the file. `collector/runtime.py` files a
+DUPLICATE into `processed/` under the incoming filename, so one Event that
+arrived twice under two names leaves two files — and counting both inflated
+every number here by exactly the number of duplicates the pipeline had
+already correctly detected (C50). `DuplicateEvent` says what was folded and
+what was kept; nothing is dropped in silence.
+
 Traceability is the point, not a feature
 ----------------------------------------
 A Control Tower number nobody can trace is a rumour. Every rollup and every
@@ -272,6 +281,44 @@ class DesktopRollup:
 
 
 @dataclass(frozen=True)
+class DuplicateEvent:
+    """Two files under `processed/` claiming one `event_id`.
+
+    Ordinary rather than exotic. `collector/runtime.py` files a DUPLICATE
+    into `processed/` under **the incoming filename**, not under
+    `safe_event_filename(event_id)` — so the same Event arriving twice under
+    two names leaves two files, and the Collector's own log says so:
+
+        run 1  accepted=1 duplicate=0
+        run 2  accepted=0 duplicate=1
+        processed/  EVT-1.json, hand-copy-of-the-same-event.json
+
+    docs/11 permits writing into `incoming/` by hand, and a partial restore
+    or a re-sent OneDrive delivery produces the same shape. The Collector is
+    right about all of it — it detected the duplicate, and keeping the file
+    rather than deleting it is docs/10 §46's rule.
+
+    What was wrong was this module counting both. Measured, before the fold
+    below: one Event, one milestone, and a Control Tower reporting
+    `events_read=2`, `PAY event_count=2`, and **`완료된 Milestone 2`** — a
+    company KPI inflated by exactly the number of duplicates the pipeline had
+    already correctly identified.
+
+    `identical` is the half that is not benign, and it is separated for the
+    same reason `app/desktop_activity._promotable()` separates its two: a
+    second file with the same id and the **same content** is a duplicate and
+    there is nothing to do about it, while a second file with the same id and
+    *different* content means one of the two is not what it claims to be, and
+    only one of those deserves a Risk row.
+    """
+
+    event_id: str
+    kept: str
+    ignored: str
+    identical: bool
+
+
+@dataclass(frozen=True)
 class Risk:
     """An open blocker. The only risk this system has a source for.
 
@@ -313,6 +360,10 @@ class CompanyRollup:
     metrics: tuple[Metric, ...] = ()
     desktops: tuple[DesktopRollup, ...] = ()
     mismatches: tuple[PairMismatch, ...] = ()
+    # Files in the directory that carry an `event_id` another file already
+    # carried. Counted once above, listed here — never dropped silently, for
+    # the reason `unreadable` is never dropped silently.
+    duplicates: tuple[DuplicateEvent, ...] = ()
     events_read: int = 0
     unreadable: tuple[tuple[str, str], ...] = ()
     since: date_type | None = None
@@ -528,6 +579,12 @@ def build_company_rollup(
 
     in_period.sort(key=lambda pair: (event_instant_key(pair[0]), pair[0].event_id))
 
+    # One Event, one entry — see `DuplicateEvent`. Deterministic without a
+    # third sort key: `read_events()` returns the directory in name order and
+    # Python's sort is stable, so two files with the same instant and the
+    # same id keep that order and the same one is always kept.
+    in_period, duplicates = _fold_duplicates(in_period)
+
     projects = _roll_projects(in_period)
     teams = _roll_teams(in_period, projects)
     desktops = _roll_desktops(in_period)
@@ -542,6 +599,7 @@ def build_company_rollup(
         teams=teams,
         desktops=desktops,
         mismatches=mismatches,
+        duplicates=duplicates,
         risks=risks,
         metrics=metrics,
         events_read=len(in_period),
@@ -549,6 +607,40 @@ def build_company_rollup(
         since=since,
         until=until,
     )
+
+
+def _fold_duplicates(
+    pairs: Sequence[tuple[Event, str]],
+) -> tuple[list[tuple[Event, str]], tuple[DuplicateEvent, ...]]:
+    """`pairs` with one entry per `event_id`, plus what was folded away.
+
+    Keyed on `event_id` rather than on the file's contents, because that is
+    what the Event's identity *is* (docs/02 §4) and what the Collector's seen
+    store already keys on — asking a different question here would be a
+    second opinion about which two files are the same Event (C28).
+
+    The contents are compared all the same, but only to classify: `to_dict()`
+    on two Events that are already parsed costs nothing on the normal path,
+    where this loop finds no duplicate at all.
+    """
+    kept: list[tuple[Event, str]] = []
+    first: dict[str, tuple[Event, str]] = {}
+    duplicates: list[DuplicateEvent] = []
+    for event, name in pairs:
+        seen = first.get(event.event_id)
+        if seen is None:
+            first[event.event_id] = (event, name)
+            kept.append((event, name))
+            continue
+        duplicates.append(
+            DuplicateEvent(
+                event_id=event.event_id,
+                kept=seen[1],
+                ignored=name,
+                identical=seen[0].to_dict() == event.to_dict(),
+            )
+        )
+    return kept, tuple(duplicates)
 
 
 def _ref(event: Event, name: str) -> EvidenceRef:

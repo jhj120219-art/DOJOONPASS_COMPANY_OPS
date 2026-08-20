@@ -81,30 +81,39 @@ class NotStableTests(IntakeTestCase):
         process holds, or one deleted between the listing and the check all
         produce exactly this.
         """
-        import os
-
         path = self._write(self.transport_dir, "unstattable.json", '{"a": 1}')
 
-        real_stat = os.stat
+        # `Path.stat`, not `os.stat` — and the difference is an interpreter
+        # version, not a style choice. `_is_stable()` calls `path.stat()`,
+        # and only on Python 3.11+ does that reach the module-level
+        # `os.stat` a test can rebind; 3.9 and 3.10's `pathlib` capture the
+        # function on `_NormalAccessor` at import time, so patching `os.stat`
+        # there changes nothing and the file is promoted as though it had
+        # stat'ed cleanly — the test failed while asserting the very
+        # behaviour it was written to protect. This project's interpreter is
+        # 3.9.7 (see
+        # `EveryTrackedModuleParsesOnThisInterpreterTests`). Patching the
+        # method the production code actually calls works on every version.
+        real_stat = Path.stat
         blocked = str(path)
 
-        def failing_stat(target, *args, **kwargs):
+        def failing_stat(self, *args, **kwargs):
             # Only this one path, and only in `transport/`. A broader match
             # also breaks the `incoming/` check below, which would make the
             # test pass for the wrong reason.
-            if str(target) == blocked:
+            if str(self) == blocked:
                 raise OSError(5, "cannot stat")
-            return real_stat(target, *args, **kwargs)
+            return real_stat(self, *args, **kwargs)
 
-        os.stat = failing_stat
-        self.addCleanup(setattr, os, "stat", real_stat)
+        Path.stat = failing_stat
+        self.addCleanup(setattr, Path, "stat", real_stat)
 
         summary = self._run()
 
-        # Restored before asserting: `Path.exists()` is itself an `os.stat`,
-        # so the assertion would otherwise raise the injected error instead
-        # of answering the question.
-        os.stat = real_stat
+        # Restored before asserting: `Path.exists()` is itself a `stat`, so
+        # the assertion would otherwise raise the injected error instead of
+        # answering the question.
+        Path.stat = real_stat
 
         self.assertEqual(summary.moved, ())
         self.assertTrue(path.exists(), "the file was moved on no evidence")

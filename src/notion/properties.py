@@ -10,6 +10,7 @@ Event Sync and are not touched by this module.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Mapping
 
 from events import Event
@@ -35,6 +36,143 @@ def humanize_project_id(project_id: str) -> str:
     """
 
     return project_id.replace("_", " ").title()
+
+
+# Notion's own cap on the text of ONE `rich_text` / `title` item. A value
+# over it is not truncated by Notion and it is not partially accepted — the
+# whole request comes back HTTP 400, and `sync.PERMANENTLY_REFUSING_STATUS_CODES`
+# classifies 400 as an answer that will not change by retrying. So an Event
+# whose payload is one character too long is an Event that:
+#
+#     never reaches the PROJECTS View          the row keeps yesterday's state
+#     stays in `notion_retry_queue.json`       nothing ever removes it (A-22)
+#     holds ATTENTION open as PERMANENT        an alert nobody can clear
+#
+# and none of that is visible as "the text was too long" anywhere except in
+# the 400's own body.
+#
+# **Every authored field this module sends can exceed it.** `validate_event()`
+# type-checks `blocker`, `milestone`, `project_id` and `event_id` and bounds
+# none of them (docs/02 §4 declares them `string`, with no length). Measured
+# through the real builders: a 3,600-character `blocker` validates, folds,
+# and builds a 3,600-character `Blocker` property; the same holds for a
+# 2,500-character `milestone`, `project_id` (which lands in *two* properties,
+# `Project` and `Project ID`) and `event_id`.
+#
+# C49 bounded the one string this project *generates* for Notion
+# (`controltower/projection.RICH_TEXT_LIMIT`, `Desktops Reporting`) for
+# exactly this reason. These are the ones a **person types**, on another
+# Desktop, and a pasted stack trace in a `blocker` is the ordinary way to
+# reach 2,000 characters — not an adversarial one.
+#
+# The number lives here rather than in `controltower/` because it is a fact
+# about the Notion API and this is the module that speaks it; `projection.py`
+# imports it rather than restating it (C28: no second opinion).
+RICH_TEXT_LIMIT = 2000
+
+
+def _fit_text(text: str) -> str:
+    """`text`, short enough for one Notion text item, and **visibly** so.
+
+    Truncation ends with `…`, never silently: Notion is a View and the Event
+    file under `runtime/events/processed/` is the Source (docs/14 §1), so
+    nothing is lost by shortening the View — but a reader who cannot tell a
+    2,000-character blocker from a blocker that *was* 2,000 characters is
+    being told something false. Same posture, and the same `…`, as
+    `controltower/projection._desktops_reporting()`.
+
+    A non-string is handed back untouched rather than raising, and that is a
+    deliberate limit on this change's blast radius. `PropertyHelperNullGuardTests`
+    pins what these builders do with a null — `_title(None)` emits
+    `{"content": None}` — and records *why* it cannot happen through the
+    production path. This function is about **length**; turning a null into a
+    `TypeError` here would convert that verified non-defect into an
+    uncaught exception inside a pipeline step, which is a different change
+    that nobody asked for.
+    """
+    if not isinstance(text, str) or len(text) <= RICH_TEXT_LIMIT:
+        return text
+    return text[: RICH_TEXT_LIMIT - 1] + "…"
+
+
+def fit_key(text: str) -> str:
+    """Same bound, for a value Notion rows are **looked up** by.
+
+    Public where `_fit_text()` is not, and the asymmetry is the contract:
+    `NotionClient.find_project()` has to shorten a filter value exactly the
+    way this module shortened the stored one, so this is the module's one
+    export on the subject. `DeadCapabilityInventoryTests` is what keeps that
+    honest — it reported `_fit_text` (then public) the moment it had no
+    caller outside
+    `fit_properties()`.
+
+    `Project ID` is the property `NotionClient.find_project()` filters on and
+    `Last Event ID` is the one docs/04 §62's duplicate guard compares, so for
+    these two "short enough" is not the only requirement — two different
+    values must not become the same string. Plain truncation would merge two
+    projects whose ids agree on their first 1,999 characters into one row,
+    which is a worse failure than the 400 it replaces: the 400 writes
+    nothing, and a merged row writes one project's state over another's.
+
+    The tail is therefore a digest of the **whole** value, so the mapping is
+    injective for every input anyone will ever have while staying a pure
+    function of the input — which is what lets the write side and the lookup
+    side agree without either of them storing anything.
+
+    Non-strings pass through for `_fit_text()`'s reason.
+    """
+    if not isinstance(text, str) or len(text) <= RICH_TEXT_LIMIT:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return text[: RICH_TEXT_LIMIT - len(digest) - 1] + "…" + digest
+
+
+# The two properties Notion rows are **looked up** or **compared** by, and
+# therefore the two that `fit_properties()` shortens with `fit_key()` rather
+# than `_fit_text()`. Named here so the payload boundary and
+# `NotionClient.find_project()` cannot disagree about which they are.
+KEY_PROPERTIES: frozenset = frozenset({"Project ID", "Last Event ID"})
+
+
+def fit_properties(properties: dict) -> dict:
+    """One PROJECTS payload, with every text value bounded for the API.
+
+    **Applied on the way out, never on the way in** — the same split
+    `controltower/dashboard.to_payload()` makes for redaction, and for a
+    reason measured rather than assumed. The first version of this bound sat
+    inside `_rich_text()`, which looks like the payload boundary and is not:
+    `controltower/rollup._blocker_change()` calls
+    `_type_specific_properties()` to ask docs/04 §20-28's *rule* what an
+    Event does to blocker state (C28 — no second opinion about it), so a
+    truncation there shortened `ProjectRollup.open_blocker` as well. The
+    Control Tower would then have been reporting a blocker it had the full
+    text of, cut to Notion's convenience, on a screen that never talks to
+    Notion. Measured through the real pipeline: a 3,411-character blocker
+    came back off the rollup at 2,000.
+
+    So `_rich_text()` / `_title()` stay verbatim statements of the spec's
+    property mapping, and the two `build_*_properties()` functions — the only
+    two callers that are actually building a request — end here.
+    """
+    fitted: dict = {}
+    for name, value in properties.items():
+        shorten = fit_key if name in KEY_PROPERTIES else _fit_text
+        if not isinstance(value, dict):  # pragma: no cover - builders emit dicts
+            fitted[name] = value
+            continue
+        for kind in ("title", "rich_text"):
+            items = value.get(kind)
+            if not items:
+                continue
+            value = dict(value)
+            value[kind] = [
+                dict(item, text=dict(item["text"], content=shorten(item["text"]["content"])))
+                if isinstance(item.get("text"), dict)
+                else item
+                for item in items
+            ]
+        fitted[name] = value
+    return fitted
 
 
 def _title(text: str) -> dict:
@@ -98,7 +236,7 @@ def build_create_properties(event: Event, *, project_name: str) -> dict[str, Any
         "Last Event Type": _select(event.event_type),
     }
     properties.update(_type_specific_properties(event))
-    return properties
+    return fit_properties(properties)
 
 
 def build_update_properties(event: Event) -> dict[str, Any]:
@@ -115,7 +253,7 @@ def build_update_properties(event: Event) -> dict[str, Any]:
         "Last Event Type": _select(event.event_type),
     }
     properties.update(_type_specific_properties(event))
-    return properties
+    return fit_properties(properties)
 
 
 def _extract_rich_text(prop: dict | None) -> str | None:

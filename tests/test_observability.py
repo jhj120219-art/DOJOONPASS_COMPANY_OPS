@@ -734,6 +734,13 @@ class StateConsistencyInStatusTests(unittest.TestCase):
         (runtime / "local_master" / "daily" / "2026-08-09.md").write_text(
             "# ok", encoding="utf-8"
         )
+        # mtime resolution: `_history_newer_than_the_last_backup()` orders the
+        # file's real mtime against `_healthy_backup_state()`'s real
+        # `datetime.now()` snapshot. Without a gap, the two land close enough
+        # in wall-clock time that they can invert under load (observed
+        # flake), the same trap `BackupAlertSweepTests` already guards with
+        # `time.sleep(1.1)  # mtime resolution`.
+        time.sleep(1.1)
         # See `_healthy_backup_state`: history that exists was also backed up.
         _healthy_backup_state(runtime / "state")
 
@@ -896,6 +903,11 @@ class StatusEntrypointTests(unittest.TestCase):
         monthly = module.RUNTIME_DIR / "local_master" / "monthly"
         monthly.mkdir(parents=True)
         (monthly / "2026-07.md").write_text("# 2026-07\n", encoding="utf-8")
+        # mtime resolution: see the identical gap added in
+        # StateConsistencyInStatusTests::test_a_matching_state_and_history_needs_no_attention
+        # (both order this file's real mtime against `_healthy_backup_state()`'s
+        # real `datetime.now()` snapshot, with no guaranteed gap otherwise).
+        time.sleep(1.1)
         # A machine that produced Company History also ran Backup: it is a
         # step in the same pipeline, not an optional one, and it writes state
         # on failure as well as success. History with no backup state at all
@@ -2473,6 +2485,14 @@ class GuardsAddedButNeverExecutedTests(unittest.TestCase):
         real = transport / "real.json"
         real.write_text(json.dumps({"source": "DESKTOP_1"}), encoding="utf-8")
         vanished = transport / "gone.json"
+
+        # mtime resolution: `_count_transport()` takes its own `now = time.time()`
+        # snapshot internally, after this write. Normally that snapshot lands
+        # safely after the file's real mtime, but with no gap the two land
+        # close enough in wall-clock time to invert under load (observed
+        # flake in the full suite) — the same trap `time.sleep(1.1)  # mtime
+        # resolution` already guards elsewhere in this file.
+        time.sleep(1.1)
 
         original = activity._json_paths
 
@@ -8177,6 +8197,12 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         return printed, [a for a in attention if "junction" in a]
 
     def test_a_junction_inside_daily_is_reported_with_its_target(self):
+        if not hasattr(os.path, "isjunction"):
+            self.skipTest(
+                "os.path.isjunction() is Python 3.12+; on this interpreter "
+                "_junctions_in_scope() correctly reports nothing (see "
+                "test_it_reports_nothing_when_the_platform_cannot_answer)"
+            )
         runtime, outside = self._runtime()
         daily = runtime / "local_master" / "daily"
         daily.mkdir()
@@ -8195,6 +8221,12 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         """The layout the record calls legitimate — redirecting `daily/` to
         another drive. Still stated, because the operator should be able to
         see it from the status view."""
+        if not hasattr(os.path, "isjunction"):
+            self.skipTest(
+                "os.path.isjunction() is Python 3.12+; on this interpreter "
+                "_junctions_in_scope() correctly reports nothing (see "
+                "test_it_reports_nothing_when_the_platform_cannot_answer)"
+            )
         runtime, outside = self._runtime()
         self._junction(runtime / "local_master" / "daily", outside)
 
@@ -8231,7 +8263,12 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         result = sync_to_working_copy(master, wc)
 
         self.assertFalse(link.is_symlink(), "a junction is not a symlink")
-        self.assertTrue(os.path.isjunction(link))
+        # os.path.isjunction() is Python 3.12+ (see
+        # test_it_reports_nothing_when_the_platform_cannot_answer below);
+        # the sync behaviour under test does not depend on it, so only the
+        # extra confirmation is skipped on older interpreters.
+        if hasattr(os.path, "isjunction"):
+            self.assertTrue(os.path.isjunction(link))
         self.assertTrue(any("linked" in name for name in result.added), result.added)
         self.assertEqual(scan_for_secrets(master), (), "ordinary names are not flagged")
 

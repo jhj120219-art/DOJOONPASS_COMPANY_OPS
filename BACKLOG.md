@@ -2084,6 +2084,322 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 
 ---
 
+## C50. 테스트 스위트가 두 커밋 동안 한 번도 돌지 않았다 — 그리고 그 아래 있던 것
+
+이번 Sprint는 Control Tower → Notion 흐름을 검증하려고 시작했고, 첫 명령에서 멈췄다.
+
+    python -m pytest tests/
+    ERROR tests/test_daily_late_events.py - TypeError: unsupported operand type(s) for |
+    !!!!! Interrupted: 1 error during collection !!!!!
+    2999 tests collected, 1 error
+
+**한 개도 실행되지 않았다.** C47(058133d)이 `tests/test_daily_late_events.py`에
+`def _field(...) -> str | None`을 추가하면서 그 파일에만 `from __future__ import
+annotations`가 없었고, 메서드 시그니처의 annotation은 `def` 시점에 평가되므로 PEP 604의
+`|`가 3.10 미만에서 실제 `type.__or__` 호출이 된다. 그것이 **collection 중에** 터지면
+pytest는 세션 전체를 중단한다.
+
+그 사이 C48과 C49는 둘 다 "fresh 전체 실행"을 기록했다. 중단된 스위트와 통과한 스위트는
+긴 로그의 맨 아래 한 줄만 다르다 — C38이 Sprint 하나를 통째로 쓴 바로 그 모양이다.
+
+---
+
+### 1. 게이트를 만들었다 (신규, 구조)
+
+한 줄 고치는 것은 재발을 막지 못한다. C17이 이미 같은 드리프트를 한 번 기록했고
+("이전 Sprint 기록('이 머신, Python 3.13')과 달리 현재 기본 `python`은 Anaconda의
+3.9.7") 그때 인스턴스만 고쳤기 때문에 다시 돌아왔다.
+
+`EveryTrackedModuleParsesOnThisInterpreterTests` — 추적되는 모든 `.py`를 **지금 도는
+인터프리터**로 컴파일하고, `from __future__ import annotations` 없이 런타임에 평가되는
+위치(파라미터/반환/`AnnAssign` annotation)에 PEP 604 `|`가 있으면 실패한다. 버전을
+하드코딩하지 않으므로 머신이 올라가면 조용히 아무것도 찾지 않고, 내려가면 다시 잡는다.
+탐지기 자신이 정말 탐지하는지도 고정했다(C47이 커밋한 그 소스 그대로 넣어 확인).
+
+---
+
+### 2. 스위트가 다시 돌자 18건이 드러났다
+
+전부 같은 뿌리 — **3.10/3.12 전용 API를 쓰는 테스트**. 프로덕션 코드의 결함이 아니다.
+
+| 무엇 | 필요 버전 | 결과 |
+|---|---|---|
+| `shutil.rmtree(onexc=)` × 3 (teardown) | 3.12+ | **ERROR 10건** (클래스 전체) |
+| `os.path.isjunction()` × 4 | 3.12+ | FAILED 4건 |
+| `os.stat` 패치가 `Path.stat()`에 닿음 | 3.11+ | FAILED 1건 |
+| `Path.parents[1:]` 슬라이스 | 3.10+ | FAILED 1건 |
+
+전부 고쳤다. `rmtree` 콜백은 **세 벌**이 같은 버그를 갖고 있어서 한 함수로 합쳤고,
+junction 판별은 같은 파일이 이미 쓰던 reparse-point 관용구로 통일했으며, `_is_stable()`이
+실제로 부르는 것은 `path.stat()`이므로 그쪽을 패치하도록 바꿨다(3.9의 `pathlib`은
+`os.stat`을 import 시점에 캡처하므로 기존 패치는 **아무 일도 하지 않았고**, 테스트는
+자기가 지키려던 동작을 검증하지 못한 채 실패하고 있었다).
+
+`os.path.isjunction()` 두 건은 skip으로 바꿨다 — `_junctions_in_scope()` 자체가 3.12
+미만에서 "추측하지 않고 침묵한다"가 명시된 동작이므로, 그 환경에서 실패해야 할 것은
+없다.
+
+---
+
+### 3. 남은 1건은 **프로덕션 결함**이고, 고치지 않았다 (SKIP, 사유는 아래)
+
+`ReservedDeviceNameTests::test_a_reserved_name_round_trips_through_the_real_writer`.
+`event_id`가 `NUL`/`CON`/`COM1`이면 `safe_event_filename()`이 `NUL.json`을 그대로
+돌려주고, Windows는 그것을 파일이 아니라 **장치**로 해석한다 — 빈 디렉터리에서도
+`Path("NUL.json").exists()`가 True이므로 `write_event_json()`이 `FileExistsError`를 낸다.
+세 sanitizer(`reporter/local_output.py`, `transport/onedrive.py`,
+`history/file_repository.py`) 어디에도 예약 이름 처리가 없다.
+
+**고치지 않은 이유는 승인이 아니라 중복이다.** 이 결함의 완성된 수정이 이미
+`stash@{0}`에 있다(§5). 손으로 다시 쓰면 세 벌을 byte-for-byte 유지해야 하고
+(`DuplicatedRulesStayInStepTests`), 나중에 그 stash를 적용할 때 충돌만 만든다.
+
+---
+
+### 4. Notion이 영원히 거절할 payload를 파이프라인이 만들고 있었다 (신규, **Notion 계약**)
+
+C49가 `Desktops Reporting`에 2,000자 상한을 넣었다. 그것은 **기계가 만드는** 문자열
+하나다. 같은 API로 나가는 **사람이 타이핑한** 네 필드에는 상한이 전혀 없었다.
+
+    blocker      -> Blocker            docs/02가 사람의 문장을 요구하고 길이는 안 정한다
+    milestone    -> Current Milestone
+    project_id   -> Project(title) + Project ID   한 값이 두 property에 들어간다
+    event_id     -> Last Event ID
+
+`validate_event()`는 넷 다 타입만 본다(docs/02 §4는 `string`이라고만 적는다). 실측:
+3,600자 blocker가 검증을 통과하고 3,600자 payload가 만들어진다.
+
+그 payload의 운명은 하나뿐이다. Notion은 **행 전체를 400으로 거절**하고,
+`sync.PERMANENTLY_REFUSING_STATUS_CODES`가 400을 PERMANENT로 분류하므로:
+
+    PROJECTS 행     갱신되지 않는다 — 팀이 BLOCKED를 보고했는데 View는 IN_PROGRESS
+    Retry Queue     들어가서 나오지 않는다 (A-22)
+    ATTENTION       PERMANENT로 뜨고 **아무도 지울 수 없다**
+
+Control Tower 쪽 숫자는 **내내 옳았다**. Event는 `processed/`에 있고 PROJECTS 패널도
+RISKS 패널도 그 blocker를 안다. 틀린 것은 운영자가 실제로 여는 화면 하나뿐이었다.
+
+**`NotionPayloadBoundaryTests`가 이것을 이미 알고 있었다** — 특성화로. 그때 적힌 판단은
+"고치는 것은 결정이다(truncate and lose data / Event 경계에서 거부 / retry 상한)"였다.
+그 판단을 두 가지가 무효로 만들었고 둘 다 새 의견이 아니다:
+
+- **"lose data"가 거짓이다.** docs/14 §1이 Notion을 "View이며 절대 Source가 아니다"로
+  고정한다. 원본은 `runtime/events/processed/`의 Event 파일이고 history_candidate라면
+  Company History다. View를 줄이는 것은 셋 중 **아무것도 잃지 않는 유일한 선택지**다.
+- **이 저장소가 이미 그것을 골랐다.** C49가 같은 상한, 같은 `…`, 같은 논거로.
+
+나머지 둘은 여전히 닫혀 있고 여전히 결정이다: Event 경계에서 거부하면 Company History에서
+그 일이 **삭제**되고, retry 상한은 Event를 조용히 버린다.
+
+---
+
+### 5. 그리고 그 상한을 **어디에** 두는가가 두 번째 결함이었다 (실측)
+
+첫 판은 `_rich_text()` / `_title()` 안에 넣었다. payload 경계처럼 보이지만 아니다 —
+`controltower/rollup._blocker_change()`가 docs/04 §20-28의 *규칙*을 묻기 위해
+`_type_specific_properties()`를 부른다(C28: 두 번째 의견을 만들지 않는다). 그래서
+그 truncation이 **Control Tower의 rollup까지** 잘랐다.
+
+실 파이프라인 E2E로 잡았다: 3,411자 blocker가 rollup에서 2,000자로 돌아왔다. Notion과
+말도 섞지 않는 화면이 Notion의 사정으로 잘린 blocker를 보고할 뻔했다.
+
+`fit_properties()`를 두고 `build_create_properties()` / `build_update_properties()`
+**끝**에서만 부른다 — `to_payload()`가 redaction에 대해 만드는 것과 같은 분할이다.
+`_rich_text()` / `_title()`은 다시 spec 매핑의 그대로가 됐다.
+
+`Project ID` / `Last Event ID`는 `fit_text()`가 아니라 `fit_key()`로 줄인다. 이 둘은
+행을 **찾고 비교하는** 값이므로 짧게만 만들면 안 되고 서로 달라야 한다 — 앞 1,999자가
+같은 두 project가 한 행을 나눠 쓰는 것은 400보다 나쁘다(400은 아무것도 안 쓰고, 합쳐진
+행은 한 project의 상태를 다른 project 위에 쓴다). 꼬리에 전체 값의 digest를 붙여 단사로
+만들고, `NotionClient.find_project()`가 **같은 함수**를 필터 값에 적용한다 — 쓰는 키와
+찾는 키가 공유 상태 없이 같아진다.
+
+`RICH_TEXT_LIMIT`은 이제 한 곳에만 있다. `controltower/projection.py`가 재수출한다.
+
+---
+
+### 6. E2E로 실제 파이프라인을 흘렸다 (신규)
+
+`NotionRefusesOverLongTextE2ETests`가 Signal 파일 → 실제 Agent → OneDrive 폴더 →
+intake → Collector → Runner → 실 payload 빌더 → Notion까지 전부 진짜로 흘린다. Notion
+쪽만 in-memory 이중이고, 그 이중은 이제 실제 API처럼 2,000자 초과를 400으로 거절한다
+(§10). 고치기 전 상태로 되돌리면 이 클래스가 실패한다(확인함).
+
+---
+
+### 7. `stash@{0}` — 커밋되지 않은 Sprint 하나가 통째로 있다 (**발견, 미해결**)
+
+    stash@{0}  2026-08-20 23:08  "On main: desktop1-before-pull"   base 9ec2152 (C31)
+               43 files changed, 3199 insertions(+), 133 deletions(-)
+
+Desktop 1이 pull 전에 stash했고, pull이 다른 Desktop의 C47/C48/C49를 가져왔다. 그
+stash 안의 작업은 **main에 한 번도 들어오지 않았다.** HEAD에서 확인한 것 중 두 건은
+살아 있는 P0다.
+
+**`oplog.redact()` ReDoS (P0, DoS).** `SECRET_PATTERNS`의 `[A-Za-z0-9_]*` 무한 prefix가
+alternation 앞에 있어 catastrophic backtracking이 된다. HEAD에서 실측:
+
+    n= 1,000    74.5 ms
+    n= 2,000   289.2 ms
+    n= 4,000  1128.1 ms
+    n= 8,000  4446.0 ms      (2배 입력마다 4배 — 이차)
+
+Event 필드는 무한이고 `validate_event()`의 오류 문자열이 그 값을 `{value!r}`로 되돌려
+싣는다. stash의 수정은 prefix를 `{0,40}`으로 묶는다.
+
+**PEM 본문이 redaction을 통과한다 (P0, 보안).** HEAD의 패턴은
+`-----BEGIN ... PRIVATE KEY-----` 배너까지만 매치한다. 나머지 여섯 패턴은 전부 값 자체를
+삼키는 문자 클래스로 끝나는데 이것만 배너에서 끝나므로, `[REDACTED]` 바로 뒤에 키
+본문이 그대로 남는다. stash의 수정은 END 마커까지 삼킨다.
+
+그 밖에 stash가 들고 있는 것: 예약 장치명(§3), `project_id` 타입 강제,
+`extract_last_updated()` / `extract_last_event_id()`의 `or {}` null 방어,
+`scheduler/lock.py` UNC 경로, `_LABEL_BULLET` 구분자, bidi 로그 위조 — 그리고 BACKLOG
+1,305줄.
+
+**적용하지 않았다.** `git stash apply`는 병합 결정이고 이 세션의 Git 정책 밖이며,
+`ops_status.py`(그 사이 C48/C49가 다시 씀)와 `BACKLOG.md`에서 실제 충돌이 난다.
+손으로 옮기는 것은 같은 병합을 나쁘게 하는 것뿐이다. 이 절이 그 결정에 필요한 근거다.
+
+이 Sprint가 stash와 겹치는 파일을 건드린 곳(`tests/test_observability.py`의 junction
+skip, `tests/test_agent_fault_injection.py`의 슬라이스 삭제)은 **stash의 diff를 그대로**
+넣었다 — 내용이 같으면 git이 충돌 없이 병합한다.
+
+---
+
+### 8. Control Tower가 하나의 Event를 두 번 세고 있었다 (신규, **중복 집계**)
+
+`collector/runtime.py`는 DUPLICATE로 판정한 파일도 `processed/`로 옮긴다 — 그리고
+목적지 이름을 `safe_event_filename(event_id)`가 아니라 **들어온 파일 이름**으로 정한다.
+
+    destination = target_dir / path.name
+
+그래서 같은 Event가 다른 이름으로 두 번 도착하면 `processed/`에 파일이 **둘** 남는다.
+Collector 자신은 옳다 — 중복을 정확히 탐지했고(`duplicate=1`), 지우지 않는 것은
+docs/10 §46의 규칙이다. 틀린 것은 그 디렉터리를 세는 쪽이었다.
+
+실측(실 Collector 2회 실행, docs/11이 허용하는 손으로 놓은 사본 하나):
+
+    run1  accepted=1 duplicate=0
+    run2  accepted=0 duplicate=1
+    processed/  EVT-1.json, a-hand-placed-copy.json
+
+    events_read              2      <- 실제 Event 1건
+    PAY event_count          2
+    metric milestones        2      <- **전사 KPI가 두 배**
+    DESKTOP_1 event_count    2
+
+즉 Control Tower의 모든 숫자가 **파이프라인이 이미 정확히 걸러낸 중복의 수만큼**
+부풀어 있었다. 도달 경로는 손으로 놓은 파일만이 아니다 — OneDrive 재전송, 부분 복원,
+그리고 `transport/`에서 이름이 바뀐 채 올라온 파일이 전부 같은 모양을 만든다.
+
+**고친 곳은 `build_company_rollup()` 하나다.** `event_id`로 접는다 — Event의 정체가
+`event_id`라는 것은 docs/02 §4이고 Collector의 seen store가 이미 그 키로 판정하므로,
+여기서 다른 질문을 하면 "어떤 두 파일이 같은 Event인가"에 대한 두 번째 의견이 된다(C28).
+
+**조용히 접지 않는다.** `CompanyRollup.duplicates`가 무엇을 세고 무엇을 안 셌는지
+파일 이름까지 들고 있고, `Coverage.duplicates`로 payload에 실리며, 화면은
+"중복 파일 N건" 한 줄을 찍는다. 다만 **경보는 아니다** — 접힌 중복은 숫자를 *맞게*
+만든 것이지 부족하게 만든 것이 아니므로 `complete`에 넣지 않았다.
+
+**위험한 절반은 따로 뗐다.** 같은 `event_id`에 **내용이 다른** 파일 둘은 중복이 아니라
+둘 중 하나가 자기가 말하는 Event가 아니라는 뜻이고, 어느 쪽을 셀지는 파일 이름 순서가
+정한다. 그것만 RISKS 패널의 `EVENT_ID_CONFLICT` 행이 되고 ATTENTION에 뜬다 — 사람이
+두 파일을 열어 아닌 쪽을 치워야 하는 유일한 경우다.
+
+`app/desktop_activity._promotable()`이 `transport/`에서 이미 같은 구분을 한다
+(같은 id면 `already_collected`, 다르면 `suppressed`). 이 Sprint 전까지 `processed/`
+쪽에는 그 구분이 없었다.
+
+**Collector는 건드리지 않았다.** DUPLICATE 파일을 `processed/` 밖으로 보내는 것은
+파이프라인 계약 변경이고(어디로? `rejected/`는 다른 뜻이고 삭제는 금지다), 이 결함은
+세는 쪽에서 한 번에 닫힌다.
+
+### 9. 줄바꿈 — 편집 하나가 파일 전체를 다시 쓴다 (신규, 저장소 위생)
+
+`git diff --stat`이 이 Sprint 중간에 **42,985 deletions**를 보고했다. 내용이 아니라
+줄바꿈이었다 — 편집 스크립트가 쓴 `pathlib.Path.write_text()`의 기본 `newline=None`이
+`\n`을 `os.linesep`으로 번역하고, 이 머신에서 그것은 `\r\n`이다. 저장소는 추적 파일
+163개가 **전부 LF**이고 `core.autocrlf`는 `false`이며 `.gitattributes`도 없으므로 git은
+받은 것을 그대로 저장한다.
+
+여섯 줄을 고친 편집이 1,163줄을 다시 쓴 diff는 리뷰가 불가능하다. 전부 LF로 되돌리고
+`SourceEncodingGuardTests`에 게이트를 넣었다 — 이미 UTF-8과 BOM을 보는 자리이고 같은
+한 번의 walk로 끝난다.
+
+여러 Windows Desktop에서 편집하는 저장소이므로(AGENT.md §1) 이것은 스크립트만의
+문제가 아니다. 편집기 하나, `Set-Content` 한 번이면 같은 일이 벌어지고, 그때는 아무도
+보지 못한다.
+
+`.coverage`와 `.pytest_cache/`도 `.gitignore`에 넣었다. 둘 다 `git add -A` 사정권에
+있었고 `.coverage`는 UTF-8이 아니어서 저장소를 훑는 모든 검사에 예외로 걸린다.
+
+### 10. 이중이 Notion을 흉내내지 않고 있었다 — 그리고 사본이 셋이었다 (신규, 테스트 인프라)
+
+§4의 결함이 스위트 전체에 안 보였던 구조적 이유는 하나다: **`InMemoryNotionTransport`가
+Notion이 거절하는 것을 받아 준다.** 모든 테스트가 짧은 문자열을 쓰므로 아무도 몰랐다.
+
+그리고 이 저장소는 이미 그것을 알고 있었다 — 세 번, 따로. `tests/test_runner_failure_paths.py`에
+`StrictNotionTransport`가 있었고(2,000자 초과를 400으로 거절), 이번 Sprint가 처음에
+`test_notion_sync.py`와 `test_controltower_e2e.py`에 같은 여덟 줄을 두 벌 더 만들었다.
+하나의 규칙, 네 벌.
+
+**규칙을 이중 자신에게 옮겼다.** `InMemoryNotionTransport.create_page()` /
+`update_page()`가 이제 `RICH_TEXT_LIMIT`을 강제한다 — `notion/properties.py`에서
+import하므로 빌더가 맞추는 한도와 이중이 거절하는 한도가 같은 숫자다(C28). 세 벌의
+subclass는 지웠다. **이제 스위트의 모든 테스트가 이 검사를 지난다** — 앞으로 어떤 필드가
+상한 없이 추가되든, 그 필드를 쓰는 첫 테스트가 실패한다.
+
+**`NotionPermanentFailurePathTests`의 매개체를 바꿨다.** 그 클래스(BUG-13/14: 영구
+거절이 무한 재시도된다)는 2,500자 `milestone`으로 400을 만들어 냈는데, §4의 수정 이후
+그 경로가 닫혔다 — 고치지 않았다면 세 테스트가 **아무것도 검사하지 않는 테스트**로
+조용히 바뀌었을 것이다. 새 매개체는 `Status`가 select가 아니라 checkbox인 PROJECTS
+Database(`SchemaMismatchNotionTransport`)다. 같은 파일의 `HealthCheckCoverageTests`가
+"health_check()는 그런 workspace를 healthy로 보고한다"를 이미 측정해 두었으므로,
+운영자가 셋업을 끝내고 파이프라인을 돌리면 실제로 도달하는 상태다. BUG-13/14는 그대로
+열려 있고, 이제 닫힌 경로가 아니라 열린 경로로 고정된다.
+
+### 11. 40%로 실패하는 테스트 하나 (신규, 테스트 신뢰성)
+
+`test_backup_git_ops.py::NonBlockingGuaranteeTests::test_a_timeout_becomes_a_git_operation_error`가
+전체 실행에서 실패했다. 단독으로 20회 돌려 재현했다 — **9회 통과 뒤 실패**, 유휴 머신에서.
+
+원인은 경합이다. 테스트는 `_GIT_TIMEOUT_SECONDS = 0.001`로 줄이고 진짜 `git status`를
+돌려 timeout을 **기다린다**. 그런데 `subprocess.run()`은 마감을 `communicate()`의 wait
+지점에서만 강제하므로, 자식이 이미 끝났으면 얼마가 걸렸든 정상 반환한다. 1 ms는
+"항상 timeout"이 아니라 "대개 timeout"이다.
+
+검사하려던 성질은 **변환**이다 — `TimeoutExpired`가 `GitOperationError`가 되는가
+(`backup/runner.py`가 분류하는 것은 후자이고, 다른 예외는 그 분류를 빠져나가 Backup
+도중 Runner를 죽인다). 그래서 timeout을 기다리지 않고 **주입**한다. 마감이 실제로
+연결돼 있는가는 별개의 성질이고 바로 위 `test_every_git_call_carries_a_timeout`이
+소스에서 이미 확인하므로 잃는 것이 없다 — 여기에 주입값이 production이 넘기는 값과
+같은지 읽어 보는 테스트를 하나 더 붙였다.
+
+고친 뒤 12회 연속 통과. **흔들리는 테스트는 없는 테스트보다 나쁘다**: 읽는 사람에게
+"보지 말고 다시 돌려라"를 가르치고, 그것이 진짜 회귀를 통과시키는 습관이다.
+
+### 12. 측정 (이 머신, Python **3.9.7**, Windows 10 Pro)
+
+| | |
+|---|---|
+| 전체 스위트 (HEAD) | **수집 중단** — 0개 실행 |
+| 전체 스위트 (수집 고친 직후) | 3,038 passed / 10 failed / 10 error, 688초 |
+| 3,600자 blocker payload | 3,600자 → 2,000자, `…`로 끝남 |
+| `fit_key` 단사성 | 앞 2,400자가 같은 두 id → 서로 다른 2,000자 |
+| rollup blocker | 3,411자 그대로 (§5 이전에는 2,000자로 잘렸다) |
+| 중복 파일 1개 (§8) | 고치기 전 `events_read=2` / milestone KPI 2, 고친 뒤 1 / 1 |
+| 중복 fold 비용 (6,000 Event) | 80.8 ms -> 90.4 ms (+9.6 ms). 같은 디렉터리 read_events() 850.4 ms |
+| 줄바꿈 | 추적 파일 163개 전부 LF, 게이트로 고정 |
+| 흔들리는 테스트 (§11) | 단독 20회 중 9회째 실패 -> 고친 뒤 12회 연속 통과 |
+| mtime 경합 flake 3건 | stash@{0}의 `time.sleep(1.1)` hunk을 그대로 적용(충돌 없음) |
+| 전체 스위트 (C50 최종) | **3,096 passed / 1 failed / 2 skipped, 630초** |
+| 남은 1건 | `ReservedDeviceNameTests` — §3의 프로덕션 결함, 수정은 stash@{0} |
+| ReDoS (미수정, stash) | n=8,000에서 4.4초, 이차 증가 |
+
+
+---
+
 ## C49. 하나의 Model, 두 소비자 — 그리고 "무엇에 대해"
 
 C48은 화면을 Dashboard Model 위로 옮겼다. 이번 질문은 그 다음이었다: **Notion으로 나가는

@@ -26,6 +26,7 @@ from .properties import (
     build_update_properties,
     extract_last_event_id,
     extract_last_updated,
+    fit_key,
     humanize_project_id,
 )
 from .transport import NotionAPIError
@@ -169,7 +170,17 @@ class ExecutionPlanSync:
         page_id = existing.get("id")
 
         # §62 Duplicate 방어: 이미 반영된 event_id가 다시 도착하면 재적용하지 않는다.
-        if extract_last_event_id(existing) == event.event_id:
+        #
+        # `fit_key()` on this side too, for `NotionClient.find_project()`'s
+        # reason: an `event_id` past Notion's 2,000-character text limit is
+        # **stored** shortened (C50), so comparing the stored value against
+        # the raw id would never match and this guard would quietly stop
+        # guarding. §29-30's timestamp guard usually catches the
+        # re-application a step later — but the two exist precisely because
+        # neither covers the other's case, and the case this one is alone in
+        # is a stored `Last Updated` that cannot be compared (a human's
+        # date-picker entry, docs/04 §43), where the code below proceeds.
+        if extract_last_event_id(existing) == fit_key(event.event_id):
             return SyncResult(
                 status=SyncStatus.NOTION_SKIPPED_OLD_EVENT,
                 event_id=event.event_id,

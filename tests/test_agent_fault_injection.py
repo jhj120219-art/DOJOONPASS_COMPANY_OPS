@@ -396,7 +396,6 @@ class SecretLeakTests(FaultTestCase):
             if path.is_file()
             and self.signals not in path.parents
             and self.rejected not in path.parents
-            and self.rejected not in path.parents[1:]
         ]
         self.assertTrue(produced, "the run produced no files at all")
         for path in produced:

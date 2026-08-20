@@ -1271,6 +1271,9 @@ class CoverageSaysWhatTheNumbersDoNotCoverTests(DashboardTestCase):
                 "evidence_from": "2026-08-12",
                 "evidence_to": "2026-08-12",
                 "unreadable": 1,
+                # C50: folded duplicates are reported, never dropped in
+                # silence. Zero here because this fixture has none.
+                "duplicates": 0,
                 "history_uncovered_from": "2026-08-01",
                 "complete": False,
             },

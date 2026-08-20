@@ -104,35 +104,62 @@ def _force_rmtree(path: Path) -> None:
         shutil.rmtree(path, onerror=onerror)
 
 
-class StrictNotionTransport(InMemoryNotionTransport):
-    """InMemoryNotionTransport that also enforces Notion's own documented
-    payload limits, so a spec-violating payload fails the way the live API
-    would (HTTP 400) instead of silently succeeding.
+def _is_junction(path) -> bool:
+    """Whether `path` is an NTFS junction, on any interpreter this runs on.
 
-    Only the limit this audit actually exercises is implemented: rich_text /
-    title content is capped at 2000 characters by the Notion API.
+    `os.path.isjunction()` is Python 3.12+; below that the same fact is the
+    reparse-point bit on the lstat result, which every version reports on
+    Windows. Written once here because two tests in
+    `BackupJunctionTraversalTests` ask the question and one of them used to
+    ask it in the 3.12-only form — an `AttributeError` on 3.9.7, not a
+    False, so the test failed for a reason that had nothing to do with
+    junctions.
+    """
+    if hasattr(os.path, "isjunction"):
+        return os.path.isjunction(path)
+    attributes = getattr(Path(path).lstat(), "st_file_attributes", 0)
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+class SchemaMismatchNotionTransport(InMemoryNotionTransport):
+    """A permanent HTTP 400 that no payload bound can prevent.
+
+    Replaces `StrictNotionTransport` (C50), which produced its 400 by
+    enforcing Notion's 2,000-character text cap. Two things made that the
+    wrong vehicle for this class:
+
+        the cap now lives on the double itself
+            `InMemoryNotionTransport` enforces it for every test in the
+            suite, so a strict subclass has nothing left to add
+
+        the cap is no longer reachable
+            `properties.fit_properties()` bounds every authored field on the
+            way out, so no Event input can build an over-long payload any
+            more — which is the fix, and it would have quietly turned the
+            three tests below into tests of nothing
+
+    This is the failure they were always about, in a shape that survives:
+    the PROJECTS database whose `Status` property is a **checkbox** where
+    docs/04 §8 says select. `HealthCheckCoverageTests` in this same file
+    measures that `health_check()` reports such a workspace as healthy, so an
+    operator reaches it by finishing setup and running the pipeline. Every
+    create and every update carries `Status`, so every call is refused, and
+    no retry ever changes that — which is exactly BUG-13's shape.
     """
 
-    MAX_TEXT = 2000
-
-    def _reject_oversized(self, properties):
-        for name, prop in (properties or {}).items():
-            for key in ("rich_text", "title"):
-                for item in prop.get(key, []) or []:
-                    content = item.get("text", {}).get("content", "")
-                    if len(content) > self.MAX_TEXT:
-                        raise NotionAPIError(
-                            f"Notion API returned 400: properties.{name} content "
-                            f"length {len(content)} exceeds {self.MAX_TEXT}",
-                            status_code=400,
-                        )
+    def _refuse_status(self, properties):
+        if "Status" in (properties or {}):
+            raise NotionAPIError(
+                "body failed validation: Status is expected to be checkbox.",
+                status_code=400,
+            )
 
     def create_page(self, database_id, properties):
-        self._reject_oversized(properties)
+        self._refuse_status(properties)
         return super().create_page(database_id, properties)
 
     def update_page(self, page_id, properties):
-        self._reject_oversized(properties)
+        self._refuse_status(properties)
         return super().update_page(page_id, properties)
 
 
@@ -871,15 +898,15 @@ class NotionPermanentFailurePathTests(RunnerFailurePathTestCase):
     the Notion path has no equivalent.
     """
 
-    def _oversized_sync(self):
-        transport = StrictNotionTransport()
+    def _refusing_sync(self):
+        transport = SchemaMismatchNotionTransport()
         return ExecutionPlanSync(
             client=NotionClient(transport=transport, database_id="DB-1")
         )
 
     def test_permanent_notion_rejection_is_queued_for_retry(self):
-        self._write_event(event_id="FAILPATH-NOTION-001", milestone="M" * 2500)
-        sync = self._oversized_sync()
+        self._write_event(event_id="FAILPATH-NOTION-001")
+        sync = self._refusing_sync()
 
         self._run(notion_sync=sync)
 
@@ -888,8 +915,8 @@ class NotionPermanentFailurePathTests(RunnerFailurePathTestCase):
         self.assertEqual(queue["entries"][0]["event_id"], "FAILPATH-NOTION-001")
 
     def test_attempt_count_grows_without_bound(self):
-        self._write_event(event_id="FAILPATH-NOTION-002", milestone="M" * 2500)
-        sync = self._oversized_sync()
+        self._write_event(event_id="FAILPATH-NOTION-002")
+        sync = self._refusing_sync()
 
         counts = []
         for hour in (12, 13, 14):
@@ -901,14 +928,38 @@ class NotionPermanentFailurePathTests(RunnerFailurePathTestCase):
 
     def test_history_and_backup_still_complete_despite_the_notion_failure(self):
         """README RULE 5 holds here: the Notion failure itself is contained."""
-        self._write_event(event_id="FAILPATH-NOTION-003", milestone="M" * 2500)
-        sync = self._oversized_sync()
+        self._write_event(event_id="FAILPATH-NOTION-003")
+        sync = self._refusing_sync()
 
         result = self._run(notion_sync=sync)
 
         self.assertIsNotNone(result)
         self.assertTrue((self.keep_dir / "HIST-FAILPATH-NOTION-003.json").exists())
         self.assertEqual(result[3].final_status, BackupStatus.SUCCESS)
+
+    def test_the_old_vehicle_no_longer_reaches_this_loop_at_all(self):
+        """C50, stated where the loop is: a 2,500-character `milestone` used
+        to be the shortest way into this class, and now it is not one.
+
+        Driven through the whole Runner rather than through the payload
+        builder, and against the ordinary double — which now refuses an
+        over-long text item exactly as Notion does, so a payload that still
+        exceeded the cap would land in the queue here and fail this test.
+        """
+        self._write_event(event_id="FAILPATH-NOTION-004", milestone="M" * 2500)
+        sync = ExecutionPlanSync(
+            client=NotionClient(transport=InMemoryNotionTransport(), database_id="DB-1")
+        )
+
+        self._run(notion_sync=sync)
+
+        self.assertFalse(
+            self.notion_retry_queue_path.exists()
+            and json.loads(self.notion_retry_queue_path.read_text(encoding="utf-8"))[
+                "entries"
+            ],
+            "an over-long milestone still parks an Event in the retry queue",
+        )
 
 
 class RetryQueueBatchSaveDurabilityTests(RunnerFailurePathTestCase):
@@ -4159,7 +4210,15 @@ class BackupJunctionTraversalTests(unittest.TestCase):
 
         self.assertFalse(junction.is_symlink())
         self.assertTrue(junction.is_dir(follow_symlinks=False))
-        self.assertTrue(os.path.isjunction(junction.path))
+        # `os.path.isjunction()` is Python 3.12+ and this project's actual
+        # interpreter is 3.9.7 (see
+        # `EveryTrackedModuleParsesOnThisInterpreterTests`), where the call
+        # is an `AttributeError` rather than a False. The reparse-point
+        # attribute is the same fact and every version has it — the idiom is
+        # already used by `test_the_stdlib_can_identify_a_junction_even_though_is_symlink_cannot`
+        # below, and this line was the one place in the class that assumed
+        # the newer name unguarded.
+        self.assertTrue(_is_junction(junction.path))
 
     def test_no_walk_setting_would_have_prevented_the_descent(self):
         """Re-measured: `os.walk(followlinks=False)` — the obvious "just turn
@@ -4206,11 +4265,7 @@ class BackupJunctionTraversalTests(unittest.TestCase):
         self._make_junction(link, outside)
 
         self.assertFalse(link.is_symlink())
-        if hasattr(os.path, "isjunction"):
-            self.assertTrue(os.path.isjunction(link))
-        else:  # pragma: no cover - Python < 3.12
-            attributes = getattr(link.lstat(), "st_file_attributes", 0)
-            self.assertTrue(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        self.assertTrue(_is_junction(link))
 
 
 class NotionErrorBodyTests(unittest.TestCase):

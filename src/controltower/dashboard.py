@@ -234,6 +234,16 @@ class Coverage:
     evidence_to: str | None = None
     unreadable: int = 0
     history_uncovered_from: str | None = None
+    # Files whose `event_id` another file already carried. Counted once by
+    # the rollup and reported here rather than dropped in silence — see
+    # `rollup.DuplicateEvent` for how two files come to claim one Event.
+    #
+    # Deliberately NOT an input to `complete`: a folded duplicate makes the
+    # numbers *right*, not partial, and a qualifier that fires on a correct
+    # answer is the standing alarm this project keeps removing. The half that
+    # is a real problem — two files, one id, different contents — is a RISKS
+    # row instead, where an operator has something to do about it.
+    duplicates: int = 0
 
     @property
     def complete(self) -> bool:
@@ -329,6 +339,7 @@ class DashboardModel:
                 "evidence_from": self.coverage.evidence_from,
                 "evidence_to": self.coverage.evidence_to,
                 "unreadable": self.coverage.unreadable,
+                "duplicates": self.coverage.duplicates,
                 "history_uncovered_from": self.coverage.history_uncovered_from,
                 "complete": self.coverage.complete,
             },
@@ -516,6 +527,7 @@ def _coverage(rollup: CompanyRollup) -> Coverage:
         evidence_from=min(days).isoformat() if days else None,
         evidence_to=max(days).isoformat() if days else None,
         unreadable=len(rollup.unreadable),
+        duplicates=len(rollup.duplicates),
     )
 
 
@@ -837,6 +849,10 @@ _RISK_COLUMNS = (
     "source",
     "claimed_role",
     "expected_role",
+    # `EVENT_ID_CONFLICT` only: the two filenames, so "which file did the
+    # Control Tower believe" is answerable without a second tool.
+    "kept",
+    "ignored",
 )
 
 
@@ -875,6 +891,10 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
                     "source": None,
                     "claimed_role": None,
                     "expected_role": None,
+                    # Only `EVENT_ID_CONFLICT` fills these; present-and-null
+                    # here so every row of this panel has one shape.
+                    "kept": None,
+                    "ignored": None,
                 },
                 evidence=(risk.evidence,),
             )
@@ -898,8 +918,38 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
                     "source": mismatch.source,
                     "claimed_role": mismatch.claimed_role,
                     "expected_role": mismatch.expected_role,
+                    "kept": None,
+                    "ignored": None,
                 },
                 evidence=(mismatch.evidence,),
+            )
+        )
+    for duplicate in rollup.duplicates:
+        # Only the contradicting half. An identical twin is a duplicate the
+        # pipeline already handled and the fold already counted once; saying
+        # so on a Risk panel would be an alert with no action behind it. Two
+        # files claiming one `event_id` with *different* contents is a
+        # different sentence: one of them is not the Event it says it is, and
+        # which one the Control Tower counted is arbitrary.
+        if duplicate.identical:
+            continue
+        rows.append(
+            DashboardRow(
+                key=f"CONFLICT:{duplicate.event_id}",
+                values={
+                    "kind": "EVENT_ID_CONFLICT",
+                    "project_id": None,
+                    "team": "",
+                    "blocker": None,
+                    "since": None,
+                    "days_open": None,
+                    "event_id": duplicate.event_id,
+                    "source": None,
+                    "claimed_role": None,
+                    "expected_role": None,
+                    "kept": duplicate.kept,
+                    "ignored": duplicate.ignored,
+                },
             )
         )
     return DashboardPanel(
@@ -909,7 +959,7 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
         columns=_RISK_COLUMNS,
         rows=tuple(rows),
         source="열린 Blocker(docs/02가 요구하는 사람이 쓴 텍스트) + docs/02 §8을 "
-        "어긴 source/role 짝",
+        "어긴 source/role 짝 + 하나의 event_id를 두고 내용이 다른 파일 둘",
         note=(
             "실패 / Pending / Recovery는 여기 없다 — 전부 Run Manifest의 사실이고 "
             "OPS_RUNS 행(`Failed Steps` / `Notion Queued` / `Reused Days` / "

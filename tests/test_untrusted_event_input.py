@@ -1290,35 +1290,55 @@ class OneDriveExistenceShortCircuitTests(unittest.TestCase):
 
 
 class NotionPayloadBoundaryTests(unittest.TestCase):
-    """The exact threshold behind BUG-13, measured rather than described.
+    """The exact threshold behind BUG-13 — now the threshold of the fix.
 
-    CHARACTERIZATION: asserts today's behaviour. It will fail if truncation or
-    a length check is added, which is the point.
+    WAS CHARACTERIZATION, IS NOW A GUARD (C50). This class used to assert
+    that `notion/properties.py` had no length check at all, on the recorded
+    reasoning:
 
-    Notion caps a `rich_text` or `title` content string at 2000 characters and
-    rejects a longer one with HTTP 400. `notion/properties.py` contains no
-    truncation, no length check, and not even the constant 2000 — every field
-    is passed through verbatim. Three untrusted values reach a capped
-    property:
+        "Fixing it is a decision (truncate and lose data / reject at the
+         Event boundary and change the schema / cap retries), so this only
+         pins the threshold."
 
-        milestone     -> Current Milestone (rich_text)
-        blocker       -> Blocker           (rich_text)
-        project_name  -> Project           (title)
+    Two things settled that decision after it was written, and neither is a
+    new opinion:
 
-    Measured boundary: 2000 characters produces a valid payload, 2001 does
-    not. `summary` is NOT affected — it is never sent to Notion, so the
-    longest string in a summary-only payload stays the 25-character timestamp.
+    **`truncate and lose data` is false.** docs/14 §1 fixes Notion as
+    "View이며 절대 Source가 아니다". The Source is the Event file in
+    `runtime/events/processed/` and, for a history_candidate, Company
+    History — neither of which this touches. Shortening the View loses
+    nothing; it is the only one of the three options that does not.
 
-    Why it matters beyond one rejected call: ExecutionPlanSync maps every
-    NotionAPIError to NOTION_RETRY_REQUIRED, so a payload Notion will NEVER
-    accept is queued and retried on every subsequent run, forever, with
-    attempt_count incrementing and nothing capping it (BUG-13/BUG-14). An
-    over-long milestone is therefore not a transient failure — it is a
-    permanent one wearing a retryable failure's clothes.
+    **The project already chose it, for the same limit.** C49 bounded
+    `Desktops Reporting` at `RICH_TEXT_LIMIT = 2000` with a visible `…` and
+    argued exactly this. That string is machine-generated. The four this
+    class is about — `blocker`, `milestone`, `project_id`, `event_id` — are
+    typed by a person on another Desktop, which makes them the ones that
+    actually reach 2,000 characters (a pasted stack trace in a blocker), and
+    they were the half left unbounded.
 
-    Fixing it is a decision (truncate and lose data / reject at the Event
-    boundary and change the schema / cap retries), so this only pins the
-    threshold.
+    The other two options remain closed and remain decisions: rejecting at
+    the Event boundary would delete the work from Company History, and
+    capping retries would drop the Event from Notion silently.
+
+    What the fix does, and what is still true here:
+
+        milestone     -> Current Milestone (rich_text)   shortened, visibly
+        blocker       -> Blocker           (rich_text)   shortened, visibly
+        project_name  -> Project           (title)       shortened, visibly
+        project_id    -> Project ID        (rich_text)   `fit_key`, injective
+        event_id      -> Last Event ID     (rich_text)   `fit_key`, injective
+
+    Measured boundary, unchanged: 2000 characters passes through untouched,
+    2001 is the first that is shortened. `summary` is still NOT affected — it
+    is never sent to Notion.
+
+    `notion/dashboard.py` still has no guard and still does not need one:
+    every string it sends is machine-generated (`Run ID` is a ~25-character
+    timestamp, `Failed Steps` a join of nine fixed component names,
+    `Desktops Reporting` bounded by `controltower/projection.py`). The last
+    two tests below keep pinning that half, because "not reachable" is a
+    property of its callers and callers change.
     """
 
     LIMIT = 2000
@@ -1354,23 +1374,44 @@ class NotionPayloadBoundaryTests(unittest.TestCase):
                 props = self._properties(**{field: "X" * self.LIMIT}, **extra)
                 self.assertEqual(self._longest_string(props)[0], self.LIMIT)
 
-    def test_one_character_over_the_limit_is_passed_through_unchanged(self):
-        """Nothing truncates, so the payload Notion will reject is built."""
+    def test_one_character_over_the_limit_is_shortened_to_fit(self):
+        """2,001 is the first value that changes, and it changes visibly."""
         for field, extra, prop in (
             ("milestone", {}, "Current Milestone"),
             ("blocker", {"event_type": "BLOCKED", "status": "BLOCKED"}, "Blocker"),
         ):
             with self.subTest(field=field):
                 props = self._properties(**{field: "X" * (self.LIMIT + 1)}, **extra)
-                longest, where = self._longest_string(props)
-                self.assertEqual(longest, self.LIMIT + 1)
-                self.assertIn(prop, where)
+                longest, _ = self._longest_string(props)
+                self.assertEqual(longest, self.LIMIT)
+                text = props[prop]["rich_text"][0]["text"]["content"]
+                self.assertTrue(text.endswith("\u2026"))
 
-    def test_the_project_title_is_uncapped_too(self):
+    def test_the_project_title_is_capped_too(self):
+        """The title property has the same 2,000 cap as rich_text, and
+        `Project` is derived from `project_id` — so an over-long id used to
+        refuse the row through *two* properties at once."""
         props = self._properties(project_name="N" * 10_000)
-        longest, where = self._longest_string(props)
-        self.assertEqual(longest, 10_000)
-        self.assertIn("Project", where)
+        longest, _ = self._longest_string(props)
+        self.assertEqual(longest, self.LIMIT)
+        self.assertTrue(
+            props["Project"]["title"][0]["text"]["content"].endswith("\u2026")
+        )
+
+    def test_nothing_at_or_under_the_limit_is_touched(self):
+        """The guard must be invisible for every ordinary value, which is
+        every value this system has ever actually carried."""
+        for size in (0, 1, 40, self.LIMIT - 1, self.LIMIT):
+            with self.subTest(size=size):
+                text = "X" * size
+                props = self._properties(
+                    blocker=text or "b", event_type="BLOCKED", status="BLOCKED"
+                )
+                stored = "".join(
+                    item["text"]["content"]
+                    for item in props["Blocker"]["rich_text"]
+                )
+                self.assertEqual(stored, text or "b")
 
     def test_summary_never_reaches_a_capped_notion_property(self):
         """The one untrusted field that is safe here, and the reason the
@@ -1378,23 +1419,38 @@ class NotionPayloadBoundaryTests(unittest.TestCase):
         props = self._properties(summary="S" * 10_000)
         self.assertLess(self._longest_string(props)[0], 100)
 
-    def test_no_notion_payload_module_has_a_length_guard(self):
-        """The structural cause, so a refactor cannot lose the finding.
+    def test_the_guard_is_in_the_module_untrusted_input_reaches(self):
+        """The structural half, so a refactor cannot quietly undo the fix.
 
-        Extended after measuring: `notion/dashboard.py` builds payloads the
-        same way and has no guard either. Its `Run ID` goes into a title
-        property and crosses 2000 at exactly the same boundary — but the
-        default run_id is a ~25-character timestamp and the value is
-        caller-supplied, so unlike `milestone`/`blocker` it is not reachable
-        from untrusted Event input. Same defect, wider than first recorded.
+        `notion/properties.py` is the module an Event's own text reaches, and
+        it now declares the limit. `notion/dashboard.py` still does not, and
+        that asymmetry is the finding rather than an oversight: nothing an
+        Event carries reaches it. If that ever changes, the two tests below
+        are where it shows up.
         """
         src = Path(__file__).resolve().parents[1] / "src" / "notion"
-        for module in ("properties.py", "dashboard.py"):
-            with self.subTest(module=module):
-                self.assertNotIn("2000", (src / module).read_text(encoding="utf-8"))
+
+        self.assertIn(
+            "RICH_TEXT_LIMIT = 2000",
+            (src / "properties.py").read_text(encoding="utf-8"),
+        )
+        self.assertNotIn("2000", (src / "dashboard.py").read_text(encoding="utf-8"))
+
+    def test_the_limit_the_guard_uses_is_the_one_this_class_measured(self):
+        from notion.properties import RICH_TEXT_LIMIT
+
+        self.assertEqual(RICH_TEXT_LIMIT, self.LIMIT)
 
     def test_the_dashboard_run_id_crosses_the_same_boundary(self):
-        """Reachable only via an explicit run_id, not via Event input."""
+        """Still unbounded, and still reachable only via an explicit run_id.
+
+        Kept exactly as it was: the `properties.py` half is fixed and this
+        half is not, and the reason is a property of `record_run()`'s callers
+        (the Runner passes its manifest's own ~25-character timestamp), not
+        of `build_ops_run_properties()`. A future caller that lets an Event
+        value into `run_id` would make this the same defect again, and this
+        is where that would be visible.
+        """
         from datetime import datetime
 
         from notion.dashboard import build_ops_run_properties

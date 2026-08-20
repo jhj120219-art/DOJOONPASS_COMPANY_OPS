@@ -290,17 +290,71 @@ class NonBlockingGuaranteeTests(unittest.TestCase):
     def test_a_timeout_becomes_a_git_operation_error(self):
         """Not a raw TimeoutExpired: `backup/runner.py` classifies
         GitOperationError, and anything else would escape that handling and
-        take the Runner down mid-Backup."""
+        take the Runner down mid-Backup.
+
+        The property under test is the **conversion**, so the timeout is
+        injected rather than raced for. This test used to set
+        `_GIT_TIMEOUT_SECONDS = 0.001` and run a real `git status`, which is
+        a race and not a guarantee: `subprocess.run()` enforces its deadline
+        at the `communicate()` wait, so a child that has already exited
+        returns normally no matter how long it took. Measured at HEAD before
+        this change — 20 consecutive runs of this one test, standalone, on an
+        otherwise idle machine:
+
+            9 passed, then `AssertionError: GitOperationError not raised`
+
+        A ~10-40% flake, and it fired in the full suite (C50). A flaky test
+        is worse than a missing one: it trains a reader to re-run rather than
+        to look, which is the habit that lets a real regression through.
+
+        That the *deadline is wired up at all* is a separate property and is
+        pinned separately, by `test_every_git_call_carries_a_timeout` above —
+        which reads `_run_git`'s source for `timeout=_GIT_TIMEOUT_SECONDS`
+        and `subprocess.TimeoutExpired`. Between the two, nothing is lost.
+        """
+        import subprocess
+
         from backup import git_ops
 
-        original = git_ops._GIT_TIMEOUT_SECONDS
-        git_ops._GIT_TIMEOUT_SECONDS = 0.001
-        self.addCleanup(setattr, git_ops, "_GIT_TIMEOUT_SECONDS", original)
+        real_run = subprocess.run
+
+        def _always_times_out(command, *args, **kwargs):
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 300.0))
+
+        subprocess.run = _always_times_out
+        self.addCleanup(setattr, subprocess, "run", real_run)
 
         with self.assertRaises(GitOperationError) as caught:
             git_ops._run_git(["status", "--porcelain"], self.repo)
 
         self.assertIn("timed out", str(caught.exception))
+
+    def test_the_injected_timeout_is_the_one_the_real_call_would_hit(self):
+        """The injection above must not drift from what production passes.
+
+        `_run_git()` hands `subprocess.run` its `timeout=` keyword, and this
+        reads the value back out of the call it actually makes — so a rename
+        or a dropped keyword fails here rather than leaving the test above
+        asserting a conversion that no real call can reach.
+        """
+        import subprocess
+
+        from backup import git_ops
+
+        real_run = subprocess.run
+        seen = {}
+
+        def _record(command, *args, **kwargs):
+            seen.update(kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+        subprocess.run = _record
+        self.addCleanup(setattr, subprocess, "run", real_run)
+
+        with self.assertRaises(GitOperationError):
+            git_ops._run_git(["status", "--porcelain"], self.repo)
+
+        self.assertEqual(seen.get("timeout"), git_ops._GIT_TIMEOUT_SECONDS)
 
     def test_a_timeout_is_not_mistaken_for_an_authentication_failure(self):
         """A timeout is transient -> BACKUP_PENDING (retry next run). An auth

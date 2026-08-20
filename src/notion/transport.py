@@ -16,6 +16,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Mapping
 
+from .properties import RICH_TEXT_LIMIT
+
 NOTION_API_BASE_URL = "https://api.notion.com/v1"
 NOTION_API_VERSION = "2022-06-28"
 
@@ -288,6 +290,16 @@ class InMemoryNotionTransport(NotionTransport):
     """In-memory NotionTransport double for Mock Tests (docs §57-65).
 
     Not for production use — RealNotionTransport is the live implementation.
+
+    It enforces the API's own 2,000-character cap on one `rich_text` /
+    `title` item, answering a longer one with the HTTP 400 the live API
+    answers with. That is not decoration: a double which accepts what Notion
+    refuses is the reason `notion/properties.py` could send four unbounded
+    authored fields for the whole life of this project and every test still
+    pass (C50). Three separate test modules had grown their own strict
+    subclass by then, each a copy of the same eight lines; the rule belongs
+    to the double.
+
     Set `fail_next_call = True` before a call to simulate Mock Test 8
     (§64, Notion API Failure) on whichever call comes next, regardless of
     method; it resets itself after firing once. To target one specific
@@ -409,10 +421,38 @@ class InMemoryNotionTransport(NotionTransport):
         ]
         return {"results": matches}
 
+    def _refuse_over_long_text(self, properties: Mapping[str, Any] | None) -> None:
+        """Notion's cap on one text item, applied the way the API applies it.
+
+        The whole request is refused, not the one property, and the status is
+        400 — which is what `sync.PERMANENTLY_REFUSING_STATUS_CODES` reads to
+        tell "retry this" from "this will never work".
+
+        The limit is imported rather than restated: it is the same fact
+        `properties.fit_properties()` uses on the way out, and two copies of a
+        number is how the double and the builder start disagreeing about what
+        the API accepts (C28).
+        """
+        for name, value in (properties or {}).items():
+            if not isinstance(value, Mapping):
+                continue
+            for kind in ("title", "rich_text"):
+                for item in value.get(kind) or ():
+                    content = (item.get("text") or {}).get("content") or ""
+                    if len(content) > RICH_TEXT_LIMIT:
+                        raise NotionAPIError(
+                            "body failed validation: "
+                            f"properties.{name}.{kind}[0].text.content.length "
+                            f"should be \u2264 {RICH_TEXT_LIMIT}, instead was "
+                            f"{len(content)}.",
+                            status_code=400,
+                        )
+
     def create_page(
         self, database_id: str, properties: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         self._maybe_fail("create_page")
+        self._refuse_over_long_text(properties)
         page_id = f"mock-page-{self._next_id}"
         self._next_id += 1
         page = {"id": page_id, "properties": dict(properties)}
@@ -424,6 +464,7 @@ class InMemoryNotionTransport(NotionTransport):
         self, page_id: str, properties: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         self._maybe_fail("update_page")
+        self._refuse_over_long_text(properties)
         if page_id not in self._pages:
             raise NotionAPIError(f"unknown page_id: {page_id}", status_code=404)
         self._pages[page_id]["properties"].update(properties)

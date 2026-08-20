@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .properties import fit_key
 from .transport import NotionAPIError, NotionTransport
 
 
@@ -80,8 +81,20 @@ class NotionClient:
         return self._transport.update_database(self._database_id, properties)
 
     def find_project(self, project_id: str) -> Mapping[str, Any] | None:
-        """docs §7: `project_id`로 기존 PROJECTS Row를 검색한다. 없으면 None."""
-        filter_ = {"property": "Project ID", "rich_text": {"equals": project_id}}
+        """docs §7: `project_id`로 기존 PROJECTS Row를 검색한다. 없으면 None.
+
+        `fit_key()` because the row was **written** through it — a
+        `project_id` past Notion's 2,000-character text limit is stored
+        shortened (`properties.RICH_TEXT_LIMIT`), and looking it up by the
+        full value would find nothing and create a second row on every single
+        run. The write side and this side call the same pure function so that
+        "the key we store is the key we look up" needs no shared state; the
+        function is a no-op for every ordinary id.
+        """
+        filter_ = {
+            "property": "Project ID",
+            "rich_text": {"equals": fit_key(project_id)},
+        }
         response = self._transport.query_database(self._database_id, filter_)
         results = response.get("results") or []
         return results[0] if results else None

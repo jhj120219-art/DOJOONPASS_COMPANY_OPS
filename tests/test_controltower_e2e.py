@@ -49,6 +49,7 @@ from controltower import build_company_rollup, build_dashboard  # noqa: E402
 from notion import (  # noqa: E402
     ExecutionPlanSync,
     InMemoryNotionTransport,
+    NotionAPIError,
     NotionClient,
 )
 from reporter.profiles import PROFILES  # noqa: E402
@@ -252,7 +253,22 @@ class TheProjectsRowOwnerIsTheCreatorNotTheBlockerTests(unittest.TestCase):
         )
 
 
-class ThreeDesktopsReachNotionTests(unittest.TestCase):
+class _ThreeDesktopPipeline:
+    """The harness: three Desktops, one shared folder, one real Runner.
+
+    Split out of `ThreeDesktopsReachNotionTests` (C50) so a second class can
+    drive the **same** pipeline against a different Notion double without
+    inheriting that class's tests — subclassing a `TestCase` re-runs every
+    test it owns, and this harness is a real Agent run plus a real git
+    backup per call.
+
+    `TRANSPORT_FACTORY` is the one seam: `NotionRefusesOverLongTextE2ETests`
+    swaps in a transport that enforces Notion's own 2,000-character text
+    limit, which `InMemoryNotionTransport` does not.
+    """
+
+    TRANSPORT_FACTORY = InMemoryNotionTransport
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -265,7 +281,7 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
         self.working_copy = self.runtime / "backup_working_copy"
         self.working_copy.mkdir(parents=True)
         self._init_git()
-        self.transport = InMemoryNotionTransport()
+        self.transport = self.TRANSPORT_FACTORY()
 
     def _git(self, args, cwd):
         result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
@@ -371,6 +387,8 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
             if key in page.get("properties", {})
         ]
 
+
+class ThreeDesktopsReachNotionTests(_ThreeDesktopPipeline, unittest.TestCase):
     # ---------------------------------------------------------------- tests
     def test_every_desktops_work_arrives_attributed_to_that_desktop(self):
         self._run_the_agents()
@@ -915,3 +933,141 @@ class ThreeDesktopsReachNotionTests(unittest.TestCase):
         ]
         self.assertEqual(_prop(row, "Failed Steps"), ", ".join(failed))
         self.assertEqual(summary.exit_code, 0)
+
+
+class NotionRefusesOverLongTextE2ETests(_ThreeDesktopPipeline, unittest.TestCase):
+    """C50, end to end: a Desktop reports a blocker longer than Notion allows.
+
+    The same chain as `ThreeDesktopsReachNotionTests` — real Signal files,
+    real Agent, real OneDrive folder, real intake, real Collector, real
+    Runner, real payload builders — over the ordinary in-memory Notion
+    double, which since C50 refuses an over-long text item with the same
+    HTTP 400 the live API answers with.
+
+    A 2,000-character blocker is not an adversarial input. docs/02 requires
+    a `BLOCKED` Event to carry the reporter's own words and bounds their
+    length nowhere; one pasted stack trace or one PG error dump reaches it.
+
+    Before the bound, this run produced:
+
+        PROJECTS row      never updated — still IN_PROGRESS for a project
+                          the team reported BLOCKED
+        SyncResult        NOTION_RETRY_REQUIRED, status_code 400
+        retry queue       one entry, re-attempted every run, never draining
+        Run Manifest      notion_sync FAILED / PERMANENT
+        ops_status        an ATTENTION line nobody can clear
+
+    and the Control Tower's own rollup was *correct the whole time* — the
+    Event is in `processed/`, the blocker is on the PROJECTS panel, the RISKS
+    panel names it. Only the Notion View disagreed, which is the worst place
+    for the disagreement to be: it is the surface an operator actually opens.
+    """
+
+    LONG_BLOCKER = "PG 승인 대기 — " + ("응답 코드 4001 재현 로그 " * 200)
+
+    def _signals_with_a_long_blocker(self):
+        signals = {desktop: list(entries) for desktop, entries in SIGNALS.items()}
+        signals["DESKTOP_1"] = [
+            (name, dict(payload, **({"blocker": self.LONG_BLOCKER} if payload.get("blocker") else {})))
+            for name, payload in signals["DESKTOP_1"]
+        ]
+        return signals
+
+    def test_the_transport_really_refuses_what_notion_refuses(self):
+        """Control. Without it, every assertion below would pass on a double
+        that simply accepts everything — which is exactly what it did before
+        C50 gave `InMemoryNotionTransport` the API's own cap."""
+        transport = InMemoryNotionTransport()
+        with self.assertRaises(NotionAPIError) as caught:
+            transport.create_page(
+                "PROJECTS",
+                {"Blocker": {"rich_text": [{"text": {"content": "x" * 2001}}]}},
+            )
+        self.assertEqual(caught.exception.status_code, 400)
+
+    def test_the_signal_this_test_sends_really_is_over_the_limit(self):
+        """The premise, stated: a shorter blocker would make every assertion
+        below true for the wrong reason."""
+        self.assertGreater(len(self.LONG_BLOCKER), 2000)
+
+    def test_the_blocked_project_still_reaches_the_projects_view(self):
+        self._run_the_agents(signals=self._signals_with_a_long_blocker())
+        result = self._run_the_runner()
+
+        self.assertEqual(
+            # `run_once()` returns a 5-tuple; index 4 is the SyncResults.
+            [r for r in result[4] if r.is_permanently_refused],
+            [],
+            "Notion permanently refused a payload this pipeline built",
+        )
+        rows = self._rows("Project ID")
+        blocked = [r for r in rows if _prop(r["properties"], "Project ID") == "SEARCH_BACKEND"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(_prop(blocked[0]["properties"], "Status"), "BLOCKED")
+
+    def test_the_view_says_it_was_shortened_rather_than_lying(self):
+        self._run_the_agents(signals=self._signals_with_a_long_blocker())
+        self._run_the_runner()
+
+        row = [
+            r for r in self._rows("Project ID")
+            if _prop(r["properties"], "Project ID") == "SEARCH_BACKEND"
+        ][0]
+        blocker = _prop(row["properties"], "Blocker")
+
+        self.assertEqual(len(blocker), 2000)
+        self.assertTrue(blocker.endswith("\u2026"))
+        self.assertTrue(blocker.startswith("PG 승인 대기"))
+
+    def test_the_evidence_keeps_the_whole_thing(self):
+        """Nothing is lost, and this is the sentence that makes shortening
+        the View acceptable: docs/14 §1 fixes Notion as a View and the Event
+        file as the Source, so the operator who needs the other 1,600
+        characters opens the file the RISKS panel already names."""
+        self._run_the_agents(signals=self._signals_with_a_long_blocker())
+        self._run_the_runner()
+
+        rollup = self._rollup()
+        project = rollup.project("SEARCH_BACKEND")
+
+        self.assertEqual(project.open_blocker, self.LONG_BLOCKER)
+        evidence = self.runtime / "events" / "processed" / project.open_blocker_evidence.path
+        self.assertIn(self.LONG_BLOCKER, evidence.read_text(encoding="utf-8"))
+
+    def test_the_retry_queue_stays_empty_and_the_run_is_clean(self):
+        """The failure this closes is not one rejected call — it is a queue
+        that never drains and an ATTENTION line that never clears."""
+        self._run_the_agents(signals=self._signals_with_a_long_blocker())
+        self._run_the_runner()
+
+        queue = self.runtime / "state" / "notion_retry_queue.json"
+        if queue.exists():
+            self.assertEqual(json.loads(queue.read_text(encoding="utf-8"))["entries"], [])
+
+        summary = read_summary(self.runtime / "runs" / "last_run.json")
+        notion = [c for c in summary.components if c.name == "notion_sync"]
+        self.assertEqual(len(notion), 1)
+        self.assertEqual(notion[0].status.value, "SUCCESS", notion[0].failure)
+
+    def test_a_second_run_adds_no_second_row_for_the_shortened_project(self):
+        """The regression the `fit_key` half guards: a shortened `Project ID`
+        that the lookup filter does not shorten would create a new row every
+        run. `SEARCH_BACKEND` is short, so this drives the ordinary path — the
+        long-key path is unit-tested in `test_notion_sync.py` — and pins that
+        the bound changed nothing for every id this system actually has."""
+        self._run_the_agents(signals=self._signals_with_a_long_blocker())
+        self._run_the_runner()
+        before = len(self._rows("Project ID"))
+
+        self._run_the_agents(
+            signals=self._signals_with_a_long_blocker(),
+            day=DAY + timedelta(days=1),
+            now=NOW_AGENT + timedelta(days=1),
+        )
+        self._run_the_runner(now=NOW_RUNNER + timedelta(days=1))
+
+        self.assertEqual(len(self._rows("Project ID")), before)
+
+
+if __name__ == "__main__":
+    unittest.main()

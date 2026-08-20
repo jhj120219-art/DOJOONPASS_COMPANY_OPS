@@ -14,6 +14,13 @@ Each of the spec's five steps gets its own coverage here:
     §41  실패 시 기존 History 유지, 다음 실행 재시도
 """
 
+# `-> str | None` below is a PEP 604 annotation, and a method signature is
+# evaluated at `def` time. Without this import that is a `TypeError` on any
+# interpreter older than 3.10 -- raised during *collection*, which aborts the
+# whole run rather than failing one file (C50). Every other module in this
+# tree already carries it; this one was the exception.
+from __future__ import annotations
+
 import sys
 import tempfile
 import unittest

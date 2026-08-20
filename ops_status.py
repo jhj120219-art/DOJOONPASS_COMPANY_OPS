@@ -3552,6 +3552,20 @@ def _print_control_tower(now: datetime) -> list[str]:
     else:
         print(f"  집계 대상           : Event {model.events_read}건 (전체 기간)")
 
+    # One Event that arrived as two files is counted once (C50), and that is
+    # said out loud for the same reason `unreadable` is: a number that
+    # silently differs from the file count in the directory is one nobody can
+    # check. Not an alert — the pipeline did the right thing and there is
+    # nothing for a person to do. The half that IS actionable, two files
+    # claiming one `event_id` with different contents, comes through the
+    # RISKS panel below like every other risk.
+    if model.coverage.duplicates:
+        print(
+            f"  중복 파일           : {model.coverage.duplicates}건 (같은 event_id를 "
+            "가진 파일이 processed/ 에 둘 이상 있다 — 위 숫자는 Event당 한 번만 "
+            "센다)"
+        )
+
     project_rows = _rows("PROJECTS")
 
     # Company History can outlive the evidence the Control Tower reads — see
@@ -3691,6 +3705,15 @@ def _print_control_tower(now: datetime) -> list[str]:
                 f"(증거 {_authored(row.evidence[0].describe())}) — "
                 "Blocker는 파이프라인이 스스로 지우지 않는다. 그 팀이 RESUMED / "
                 "ISSUE_RESOLVED / COMPLETED를 보고할 때까지 열려 있다"
+            )
+        elif values["kind"] == "EVENT_ID_CONFLICT":
+            attention.append(
+                f"같은 event_id를 두고 내용이 다른 파일이 둘 있다: "
+                f"{_authored(values['event_id'])} — Control Tower는 "
+                f"{_authored(values['kept'])}를 세었고 "
+                f"{_authored(values['ignored'])}는 세지 않았다. 둘 중 하나는 "
+                "자기가 말하는 그 Event가 아니며, 어느 쪽을 셀지는 파일 이름 "
+                "순서가 정한다 — 두 파일을 열어 보고 아닌 쪽을 치워야 한다"
             )
         else:
             attention.append(

@@ -235,6 +235,40 @@ class SourceEncodingGuardTests(unittest.TestCase):
                 failures.append(f"{path.relative_to(REPO_ROOT)}: {exc}")
         self.assertEqual(failures, [])
 
+    def test_every_tracked_text_file_uses_lf_line_endings(self):
+        """All 163 of them do, and one CRLF file is invisible until it is not.
+
+        This project is edited on several Windows Desktops (AGENT.md §1), and
+        every Windows editor, every `Set-Content` without `-NoNewline`
+        handling, and every `pathlib.Path.write_text()` will happily write
+        `\r\n` — `write_text()` because its default `newline=None` translates
+        `\n` to `os.linesep`, which on this machine is `\r\n`. Measured
+        during C50: a scripted edit that changed six lines of one file
+        rewrote all 1,163 of them, and `git diff --stat` reported 42,985
+        deletions across the Sprint. Nothing was wrong with the content; the
+        review was simply impossible.
+
+        `core.autocrlf` is `false` here and there is no `.gitattributes`, so
+        git stores exactly what it is given and nothing normalises this on
+        the way in or out. That is the gap this closes.
+        """
+        offenders = []
+        for path in _tracked_files():
+            if path.suffix.lower() not in {".py", ".md", ".json", ".example", ".gitignore"}:
+                continue
+            if not path.is_file():
+                continue
+            raw = path.read_bytes()
+            count = raw.count(b"\r\n")
+            if count:
+                offenders.append(f"{path.relative_to(REPO_ROOT)}: {count} CRLF line(s)")
+        self.assertEqual(
+            offenders,
+            [],
+            "CRLF in a tree that is otherwise entirely LF — a whole-file diff "
+            "that hides the real change:\n  " + "\n  ".join(offenders),
+        )
+
     def test_no_tracked_file_starts_with_a_utf8_bom(self):
         offenders = []
         for path in _tracked_files():
@@ -2131,6 +2165,159 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
         self.assertIsNotNone(
             unexpected_arguments(["run_agent.py", "x"], tool="t", configured_by=("A",))
         )
+
+
+class EveryTrackedModuleParsesOnThisInterpreterTests(unittest.TestCase):
+    """C50: one 3.10-only annotation stopped the entire suite from running.
+
+    What happened, measured on this machine at HEAD 43771a9:
+
+        python -m pytest tests/
+        ERROR tests/test_daily_late_events.py - TypeError: unsupported operand
+        !!!! Interrupted: 1 error during collection !!!!
+        2999 tests collected, 1 error
+
+    `tests/test_daily_late_events.py` gained `def _field(...) -> str | None`
+    in C47 and did not carry `from __future__ import annotations`. A method
+    signature is evaluated at `def` time, so PEP 604's `|` ran as a real
+    `type.__or__` on an interpreter that does not have one -- during
+    **collection**, which pytest treats as fatal for the whole session.
+
+    The damage is not the one file. It is that **no test ran at all** for two
+    commits, while C48 and C49 both recorded a "fresh 전체 실행". A suite that
+    aborts and a suite that passes differ by one line near the top of a long
+    log, and this project has a Sprint (C38) about exactly that shape.
+
+    Why it survived: C17 already recorded this environment drift once --
+    "이전 Sprint 기록('이 머신, Python 3.13')과 달리 현재 기본 `python`은
+    Anaconda의 3.9.7" -- and fixed the instances then. Nothing was left
+    behind that would fail the next time, so the next time it came back.
+
+    This is that thing. It checks the interpreter that is actually running,
+    not a version this repository believes it is on, so the gate stays
+    correct if the machine is upgraded (the check simply stops finding
+    anything) and correct if it is downgraded again.
+    """
+
+    def _python_files(self):
+        return [
+            path
+            for path in _tracked_files()
+            if path.suffix == ".py" and path.is_file()
+        ]
+
+    def test_the_scan_finds_the_files_we_know_exist(self):
+        """A guard that silently scanned nothing would pass forever."""
+        names = {path.name for path in self._python_files()}
+
+        self.assertIn("test_daily_late_events.py", names)
+        self.assertIn("ops_status.py", names)
+        self.assertGreater(len(names), 50)
+
+    def test_every_tracked_python_file_compiles(self):
+        """Syntax, on this interpreter. Catches the constructs that are not
+        annotations at all -- `match`, `except*`, a walrus in a comprehension
+        target -- which fail earlier and just as fatally."""
+        for path in self._python_files():
+            with self.subTest(path=str(path.relative_to(REPO_ROOT))):
+                source = path.read_text(encoding="utf-8")
+                try:
+                    compile(source, str(path), "exec")
+                except SyntaxError as exc:  # pragma: no cover - the guard
+                    self.fail(
+                        f"{path.relative_to(REPO_ROOT)}:{exc.lineno} does not "
+                        f"compile on Python {sys.version_info.major}."
+                        f"{sys.version_info.minor}: {exc.msg}"
+                    )
+
+    @staticmethod
+    def _has_future_annotations(tree) -> bool:
+        for node in tree.body:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _annotations(tree):
+        """Every annotation expression that is **evaluated at runtime**.
+
+        A `def`'s parameter and return annotations, and an `AnnAssign`'s.
+        Deliberately not every `Subscript` in the file: a `|` inside a string
+        annotation, a comment, or `typing.get_type_hints()` input is not
+        evaluated at import time and is not what broke.
+        """
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arguments = node.args
+                for group in (
+                    arguments.posonlyargs,
+                    arguments.args,
+                    arguments.kwonlyargs,
+                    [arguments.vararg] if arguments.vararg else [],
+                    [arguments.kwarg] if arguments.kwarg else [],
+                ):
+                    for argument in group:
+                        if argument.annotation is not None:
+                            yield argument.annotation
+                if node.returns is not None:
+                    yield node.returns
+            elif isinstance(node, ast.AnnAssign) and node.annotation is not None:
+                yield node.annotation
+
+    def test_no_module_evaluates_a_pep604_annotation_without_the_future_import(self):
+        """`X | None` in a runtime-evaluated position, in a file that does not
+        carry `from __future__ import annotations`.
+
+        Every module in this tree already carries the import -- it is the
+        convention, not a workaround -- so the fix for anything this finds is
+        one line, and finding it here costs one test rather than a whole
+        session's results.
+        """
+        offenders = []
+        for path in self._python_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            if self._has_future_annotations(tree):
+                continue
+            for annotation in self._annotations(tree):
+                for node in ast.walk(annotation):
+                    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+                        offenders.append(
+                            f"{path.relative_to(REPO_ROOT)}:{node.lineno}"
+                        )
+        self.assertEqual(
+            offenders,
+            [],
+            "PEP 604 annotation evaluated at import time without "
+            "`from __future__ import annotations` -- this aborts pytest "
+            "collection for the WHOLE suite on Python < 3.10:\n  "
+            + "\n  ".join(offenders),
+        )
+
+    def test_the_detector_actually_detects(self):
+        """The guard above passes on a clean tree, which is also what a
+        broken guard does. This drives it over the exact source that was in
+        `tests/test_daily_late_events.py`, and over the fixed version."""
+        broken = "def _field(self, text: str, prefix: str) -> str | None:\n    return None\n"
+        fixed = "from __future__ import annotations\n" + broken
+
+        def _offends(source: str) -> bool:
+            tree = ast.parse(source)
+            if self._has_future_annotations(tree):
+                return False
+            return any(
+                isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
+                for annotation in self._annotations(tree)
+                for node in ast.walk(annotation)
+            )
+
+        self.assertTrue(_offends(broken))
+        self.assertFalse(_offends(fixed))
+        self.assertFalse(_offends("def f(a: int) -> str:\n    return ''\n"))
+        self.assertFalse(_offends("x = 1 | 2\n"))
 
 
 if __name__ == "__main__":
