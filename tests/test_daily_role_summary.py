@@ -38,6 +38,44 @@ def candidate(
     )
 
 
+class AskingForARoleThatIsNotOneTests(unittest.TestCase):
+    """`for_role()` raises rather than answering.
+
+    Every `events.ROLES` entry is in the summary, silent ones included, so a
+    miss means the caller asked for something that is not a role. Returning
+    an empty `RoleActivity` instead would read as "this role did nothing",
+    which is a statement about a team that does not exist — and the same
+    trap `CompanyActivitySnapshot.for_source()` avoids the same way.
+
+    The module has no production caller yet (BACKLOG A-3, and it is in
+    `DeadCapabilityInventoryTests.EXPECTED` for that reason), which is
+    exactly why the behaviour is worth fixing in place now: the wiring
+    decision should not also be the first time this line runs.
+    """
+
+    def _summary(self):
+        return build_role_summary((), date(2026, 8, 1))
+
+    def test_an_unknown_role_is_a_key_error(self):
+        with self.assertRaises(KeyError):
+            self._summary().for_role("CFO")
+
+    def test_the_error_names_what_was_asked_for(self):
+        with self.assertRaises(KeyError) as caught:
+            self._summary().for_role("CFO")
+
+        self.assertIn("CFO", str(caught.exception))
+
+    def test_every_real_role_is_answered(self):
+        """The other side. `for_role()` may only raise for a name that is not
+        a role — a real one missing would be the summary being incomplete,
+        not the caller being wrong."""
+        summary = self._summary()
+        for role in sorted(ROLES):
+            with self.subTest(role=role):
+                self.assertEqual(summary.for_role(role).role, role)
+
+
 class RoleSummaryTests(unittest.TestCase):
     def test_every_schema_role_is_always_present(self):
         summary = build_role_summary([], date(2026, 8, 8))

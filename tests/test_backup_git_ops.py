@@ -37,6 +37,56 @@ class GitOpsTestCase(unittest.TestCase):
         _run_git(["config", "user.name", "Git Ops Test"], cwd=self.repo_dir)
 
 
+class PorcelainBlankLineTests(unittest.TestCase):
+    """`_parse_porcelain()`'s blank-line guard, which had never executed.
+
+    `git status --porcelain` ends its output with a newline, so
+    `splitlines()` on a *non-empty* result yields no empty entry and the
+    guard looks like belt-and-braces. It is not: the empty string is exactly
+    what a **clean** repository returns, and `"".splitlines()` is `[]` — so
+    the guard's real job is the case in between, an output that is only
+    whitespace, which is what a git build that prints a bare newline for a
+    clean tree produces.
+
+    Without the guard that line becomes `code, path = "", ""` and a clean
+    repository reports one changed file with an empty name. `has_changes`
+    then goes True, and docs/08's deletion gate and the commit path both act
+    on a change that does not exist.
+    """
+
+    def _parse(self, output):
+        from backup.git_ops import _parse_porcelain
+
+        return _parse_porcelain(output)
+
+    def test_a_bare_newline_is_not_a_changed_file(self):
+        result = self._parse("\n")
+
+        self.assertFalse(result.has_changes)
+        self.assertEqual(result.changed_files, ())
+        self.assertEqual(result.deleted_files, ())
+
+    def test_a_blank_line_between_entries_is_skipped(self):
+        result = self._parse(" M daily/2026-08-01.md\n\n M daily/2026-08-02.md\n")
+
+        self.assertEqual(
+            result.changed_files, ("daily/2026-08-01.md", "daily/2026-08-02.md")
+        )
+
+    def test_empty_output_is_still_a_clean_tree(self):
+        result = self._parse("")
+
+        self.assertFalse(result.has_changes)
+
+    def test_a_deletion_beside_a_blank_line_is_still_a_deletion(self):
+        """The half docs/08 §31's gate reads. A blank line must not be able
+        to hide it or to invent one."""
+        result = self._parse("\n D daily/2026-08-01.md\n")
+
+        self.assertEqual(result.deleted_files, ("daily/2026-08-01.md",))
+        self.assertEqual(result.changed_files, ())
+
+
 class GitStatusTests(GitOpsTestCase):
     def test_clean_repo_has_no_changes(self):
         (self.repo_dir / "a.txt").write_text("a", encoding="utf-8")

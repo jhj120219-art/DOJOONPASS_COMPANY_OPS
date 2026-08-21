@@ -106,6 +106,29 @@ class NotionTransport(abc.ABC):
         """
         raise NotImplementedError("this transport cannot search the workspace")
 
+    def list_pages(self, database_id: str) -> list[Mapping[str, Any]]:
+        """Every row currently in one database (read-only).
+
+        `query_database()` answers "which row matches this filter"; this
+        answers "what is in there at all", and only the second question can
+        find a row that **should no longer be there**.
+
+        That is not a hypothetical distinction. A projection built with
+        find-then-update can create a row and refresh a row and has no way to
+        notice one whose subject has gone: a resolved blocker's RISK row is
+        simply never visited again, so the operator's one at-a-glance view
+        keeps reporting a problem that was solved. Measured end to end in
+        `test_a_resumed_project_stops_being_blocked_on_the_row` — the project
+        row cleared, the risk row did not.
+
+        Deliberately NOT an abstractmethod, for `search_pages()`'s reason:
+        every existing `NotionTransport` double predates it, and a
+        reconciliation that cannot run must degrade to "not attempted"
+        rather than break a write path that works. Callers catch
+        `NotImplementedError` and say so.
+        """
+        raise NotImplementedError("this transport cannot list a database")
+
     @abc.abstractmethod
     def create_database(
         self, parent_page_id: str, title: str, properties: Mapping[str, Any]
@@ -137,6 +160,11 @@ class RealNotionTransport(NotionTransport):
         # here so a caller can read it before the first search rather than
         # hitting AttributeError.
         self.search_truncated = False
+        # The same flag for `list_pages()`, and it carries more weight than
+        # its sibling: a truncated *search* costs a diagnostic some rows,
+        # while a caller that reconciles against a truncated *listing* would
+        # retire every row it did not see.
+        self.list_truncated = False
 
     def _request(
         self, method: str, path: str, body: Mapping[str, Any] | None = None
@@ -200,6 +228,32 @@ class RealNotionTransport(NotionTransport):
         self, database_id: str, filter_: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         return self._request("POST", f"/databases/{database_id}/query", {"filter": filter_})
+
+    def list_pages(self, database_id: str) -> list[Mapping[str, Any]]:
+        """Paged the same way `search_pages()` is, and bounded the same way.
+
+        `has_more` with no cursor is a response this cannot page through, so
+        the loop stops rather than spinning; `list_truncated` says it
+        happened. A caller that reconciles on a truncated listing would
+        retire every row it did not see, which is worse than not reconciling
+        — `controltower/notion_projection.py` checks the flag.
+        """
+        results: list[Mapping[str, Any]] = []
+        cursor: str | None = None
+        self.list_truncated = False
+        for _ in range(self._SEARCH_PAGE_LIMIT):
+            body: dict[str, Any] = {"page_size": 100}
+            if cursor is not None:
+                body["start_cursor"] = cursor
+            response = self._request("POST", f"/databases/{database_id}/query", body)
+            results.extend(response.get("results") or [])
+            if not response.get("has_more"):
+                return results
+            cursor = response.get("next_cursor")
+            if not cursor:
+                break
+        self.list_truncated = True
+        return results
 
     def create_page(
         self, database_id: str, properties: Mapping[str, Any]
@@ -420,6 +474,17 @@ class InMemoryNotionTransport(NotionTransport):
             and _text_value(page["properties"].get(property_name), kind) == target
         ]
         return {"results": matches}
+
+    def list_pages(self, database_id: str) -> list[Mapping[str, Any]]:
+        """Scoped to the database, like `query_database()` and like the real
+        API. A double that returned every page in the pool would let a
+        reconciliation over one database retire the rows of another."""
+        self._maybe_fail("list_pages")
+        return [
+            page
+            for page_id, page in self._pages.items()
+            if self._page_database.get(page_id) == database_id
+        ]
 
     def _refuse_over_long_text(self, properties: Mapping[str, Any] | None) -> None:
         """Notion's cap on one text item, applied the way the API applies it.

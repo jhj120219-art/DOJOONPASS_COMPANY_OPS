@@ -1892,6 +1892,20 @@ def _print_company(now: datetime) -> list[str]:
             f"role={roles:<14} 작업일 {silent}일 전{arrival_note}"
         )
 
+    if snapshot.duplicate_event_files:
+        # The same sentence the CONTROL TOWER block prints about its own
+        # fold, at the block that does the other one. Without it the two
+        # blocks disagree about how many Events a Desktop sent and nothing on
+        # the page says why — measured at C51 on this repository's own
+        # evidence: COMPANY said DESKTOP_4 events=2, CONTROL TOWER said 1.
+        #
+        # A qualifier, not an ATTENTION line: folding made the number right.
+        print(
+            f"  중복 파일          : {len(snapshot.duplicate_event_files)}건 "
+            "(같은 event_id를 가진 파일이 processed/ 에 둘 이상 있다 — "
+            "위 숫자는 Event당 한 번만 센다)"
+        )
+
     silent_sources = snapshot.silent_for(now, days=SILENT_AFTER_DAYS)
     if silent_sources:
         # Split the silent Desktops by whether anything arrived recently.
@@ -3014,12 +3028,7 @@ def _queue_age_days(added_at: str, now: datetime) -> float | None:
         added = datetime.fromisoformat(added_at)
     except (TypeError, ValueError):
         return None
-    reference = now
-    if added.tzinfo is None:
-        reference = reference.replace(tzinfo=None)
-    elif reference.tzinfo is None:
-        reference = reference.astimezone()
-    return (reference - added).total_seconds() / 86400
+    return (_comparable(now, added) - added).total_seconds() / 86400
 
 
 def _print_notion(now: datetime) -> list[str]:
@@ -3480,6 +3489,54 @@ def _company_history_older_than_the_evidence(daily_dir: Path, earliest_event) ->
     return None
 
 
+# How many rows of 최근 활동 / 최근 완료 this block prints.
+#
+# Smaller than `rollup.RECENT_LIMIT`, which bounds the *model*. The panel is
+# what a projection consumes; this is a glance in a terminal that already
+# prints six other sections, and a screen where one section can push the
+# ATTENTION block off the top is a screen nobody scrolls back up.
+#
+# The true total is printed beside the label whenever it is larger, so five
+# lines can never read as "five things happened" — the same rule
+# `of_total` / `truncated` follow on the rows.
+_RECENT_ON_SCREEN = 5
+
+
+def _comparable(reference: datetime, other: datetime) -> datetime:
+    """`reference`, made safe to subtract `other` from.
+
+    Python raises `TypeError` on **any** comparison or subtraction between a
+    naive and an aware datetime, and this view reads timestamps back out of
+    files it does not own — a Run Manifest, a lock file, a retry-queue
+    entry. Each is written with an offset by this system and each can arrive
+    without one: hand-edited (docs/11 permits it), restored from a machine
+    whose clock had no zone, or written by an older build. The exception
+    would then come out of the tool an operator opens **because** something
+    already looks wrong.
+
+    One helper, three callers. It was five lines copied three times
+    (`_queue_age_days`, the Runner-lock age, the last-run age), and each
+    copy's docstring said "the same guard X uses for the same reason" —
+    which is the shape C28 names and `DuplicatedRulesStayInStepTests` exists
+    to catch. Prose saying two things are the same is not the same as their
+    being one thing, and branch coverage showed it: the second arm — an
+    aware stored value against a naive reference — had never run in any of
+    the three.
+
+    Both directions matter and they resolve oppositely. A naive stored value
+    drags the reference down to naive, because there is no offset to invent.
+    A naive **reference** is lifted to aware instead, because the caller's
+    `now` is a local wall clock and `astimezone()` is what that means. The
+    fourth copy of this rule lives on `AgentStatusSnapshot`, where it is a
+    method on the value it guards rather than a helper over two of them.
+    """
+    if other.tzinfo is None:
+        return reference.replace(tzinfo=None)
+    if reference.tzinfo is None:
+        return reference.astimezone()
+    return reference
+
+
 def _print_control_tower(now: datetime) -> list[str]:
     """CONTROL TOWER — the business layer, which no view had.
 
@@ -3693,6 +3750,37 @@ def _print_control_tower(now: datetime) -> list[str]:
         if len(project_rows) > len(shown):
             print(f"      외 {len(project_rows) - len(shown)}건")
 
+    # 최근 활동 / 최근 완료 — the two panels that are a *list of Events*
+    # rather than a fold over them, and the two the request asks for by name.
+    #
+    # On the screen and **not** in Notion, which is the opposite of every
+    # other panel here and is deliberate: a Notion database keyed by
+    # `event_id` grows one row per Event forever (this repository does not
+    # delete) and its reconciliation stops working past 1,000 rows, where
+    # `list_pages()` truncates. `notion_projection.UNPROJECTED_PANELS`
+    # carries that reasoning and the tests measure it. The terminal has no
+    # such problem: it re-renders from scratch every run.
+    #
+    # Short on purpose. This block is a glance, not a log — the panels
+    # themselves stop at `RECENT_LIMIT` and this prints fewer still, with the
+    # true total beside it so five lines cannot read as "five things
+    # happened". Whoever wants the rest opens `processed/`.
+    for key, label in (("ACTIVITY", "최근 활동"), ("COMPLETIONS", "최근 완료")):
+        rows = _rows(key)
+        if not rows:
+            continue
+        shown = rows[:_RECENT_ON_SCREEN]
+        total = shown[0].values["of_total"]
+        suffix = f" (총 {total}건)" if total > len(shown) else ""
+        print(f"  {label}{suffix}")
+        for row in shown:
+            values = row.values
+            print(
+                f"    {one_line(values['at'])}  {one_line(values['source']):<11}"
+                f"{one_line(values['event_type']):<20} "
+                f"{_authored(values['project_id'])} — {_authored(values['summary'])}"
+            )
+
     for row in _rows("RISKS"):
         values = row.values
         if values["kind"] == "OPEN_BLOCKER":
@@ -3734,16 +3822,50 @@ def _print_control_tower(now: datetime) -> list[str]:
     # the model's own panels rather than from the constant alone, so a layer
     # that gained a source and lost its panel entry stops being announced
     # here too instead of being announced forever.
-    print(
-        "  (원천 없음          : "
-        + ", ".join(
+    # Two sentences, because the layers are unsourced for two different
+    # reasons and one sentence made the screen say something false.
+    #
+    # Goal / Sprint / Task have no source **yet** — the decision of where one
+    # would live is open and BACKLOG carries it. Critical Path and 완료 조건
+    # are refused: docs/03 §4, docs/04 §44 and docs/04 §68 each say they are
+    # not derived from Events, so "이 계층이 없다" reads as an omission when
+    # it is a rule. Grouped by the panel that claims each layer, which is
+    # already the model's own split (`_goals_panel` / `_sprints_panel` vs
+    # `_judgements_panel`) rather than a second list kept in step by hand.
+    coverage = unsourced_layer_coverage(model)
+
+    def _layers_claimed_by(panel_key: str) -> list[str]:
+        """The unsourced layers one panel accounts for, in the constant's
+        order. Read off the model rather than from a second list here, so a
+        layer that gained a source and lost its panel entry stops being
+        announced instead of being announced forever."""
+        return [
             layer
             for layer in UNSOURCED_LAYERS
-            if layer in unsourced_layer_coverage(model)
+            if coverage.get(layer) == panel_key
+        ]
+
+    refused = _layers_claimed_by("JUDGEMENTS")
+    if refused:
+        print(
+            "  (자동화 안 함       : "
+            + ", ".join(refused)
+            + " — docs/03 §4 · docs/04 §44 · docs/04 §68이 Event만으로 결정하지 "
+            "않는다고 고정한다. 사람이 정하는 것이며 어디에 적을지는 BACKLOG 참조)"
         )
-        + " — Event Schema에도 Company Repository에도 이 계층이 없다. "
-        "BACKLOG 참조)"
-    )
+
+    missing = [
+        layer
+        for layer in UNSOURCED_LAYERS
+        if layer in coverage and layer not in refused
+    ]
+    if missing:
+        print(
+            "  (원천 없음          : "
+            + ", ".join(missing)
+            + " — Event Schema에도 Company Repository에도 이 계층이 없다. "
+            "BACKLOG 참조)"
+        )
     return attention
 
 
@@ -3799,11 +3921,7 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
         # against different references — harmless in production (both are
         # real now) and a trap in a fixture, which is exactly where a pinned
         # `started_at` compared against wall-clock time was already found.
-        lock_reference = now or datetime.now().astimezone()
-        if held_since.tzinfo is None:
-            lock_reference = lock_reference.replace(tzinfo=None)
-        elif lock_reference.tzinfo is None:
-            lock_reference = lock_reference.astimezone()
+        lock_reference = _comparable(now or datetime.now().astimezone(), held_since)
         held_hours = (lock_reference - held_since).total_seconds() / 3600
         print(f"  Runner Lock : 보유 중 (획득 {held_since.isoformat(timespec='seconds')})")
         if held_hours >= LOCK_STUCK_AFTER_HOURS:
@@ -3897,10 +4015,7 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     except (TypeError, ValueError):
         started = None
     if started is not None:
-        if started.tzinfo is None:
-            reference = reference.replace(tzinfo=None)
-        elif reference.tzinfo is None:
-            reference = reference.astimezone()
+        reference = _comparable(reference, started)
         age_days = (reference - started).total_seconds() / 86400
         if age_days >= SILENT_AFTER_DAYS:
             attention.append(
@@ -4028,6 +4143,59 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     return attention
 
 
+def _block(label: str, render, now: datetime) -> list[str]:
+    """One section of the report, and the guarantee that it produces one.
+
+    Every block here is written to answer even when part of the evidence is
+    damaged, and a dozen `except OSError` arms inside them say so. They all
+    guard the *second* call rather than the first: `_json_paths()` is the
+    pattern —
+
+        if not path.is_dir():          <- unguarded
+            return []
+        try:
+            entries = list(os.scandir(path))
+        except OSError:                <- guarded
+            return []
+
+    and `Path.is_dir()` does **not** swallow a permission error.
+    `pathlib._abc._IGNORED_ERRNOS` is `(ENOENT, ENOTDIR, EBADF, ELOOP)`;
+    `EACCES` is re-raised. So the guard is one line too late, at 36 call
+    sites across this file and `app/desktop_activity.py`.
+
+    That matters because the directory most likely to answer "access denied"
+    is the one this project reads across a network: `events/transport/` is
+    the shared OneDrive folder (AGENT.md §1), and a syncing or re-authorising
+    OneDrive returns exactly that. The result was a traceback from the tool
+    an operator opens **because** something already looks wrong.
+
+    Fixed here rather than at the 36 sites, and the reason is not effort.
+    Making each predicate return `False` on a refusal would turn "I could not
+    read this" into "there is nothing here" — a partial report presented as
+    complete, which is the silent-loss shape this project keeps removing. A
+    block that cannot be read says so, raises ATTENTION, and the exit code
+    follows.
+
+    `OSError` only. A `TypeError` from a rollup is a bug in this program and
+    must not be dressed up as a disk problem; docs/10 §46's contract is about
+    damaged *evidence*.
+    """
+    try:
+        return list(render(now))
+    except OSError as exc:
+        # `_authored()`: the path in the message can be an Event filename,
+        # and `safe_event_filename()` builds those from `event_id` — a string
+        # another Desktop chose and `validate_event()` only type-checks.
+        detail = _authored(f"{type(exc).__name__}: {exc}")
+        print(f"{label} — 읽지 못했다")
+        print("-" * 60)
+        print(f"  {detail}")
+        return [
+            f"{label} 블록을 읽지 못했다 ({detail}) — 이 섹션의 상태는 이번 "
+            "출력에 없다. 디스크나 권한 문제이며 사람이 확인해야 한다"
+        ]
+
+
 def main(argv: Sequence[str] = ()) -> int:
     refusal = unexpected_arguments(
         argv,
@@ -4051,18 +4219,17 @@ def main(argv: Sequence[str] = ()) -> int:
     print(f"DOJOONPASS Company Ops — Status @ {now.isoformat(timespec='seconds')}")
     print()
 
-    attention = _print_company(now)
-    print()
-    attention.extend(_print_history(now))
-    print()
-    attention.extend(_print_control_tower(now))
-    print()
-    attention.extend(_print_last_run(now))
-    print()
-    attention.extend(_print_notion(now))
-    print()
-    attention.extend(_print_agent(now))
-    print()
+    attention: list[str] = []
+    for label, block in (
+        ("COMPANY", _print_company),
+        ("HISTORY", _print_history),
+        ("CONTROL TOWER", _print_control_tower),
+        ("LAST RUN", _print_last_run),
+        ("NOTION", _print_notion),
+        ("AGENT", _print_agent),
+    ):
+        attention.extend(_block(label, block, now))
+        print()
 
     if not attention:
         print("ATTENTION — 없음. 사람이 지금 할 일은 없다.")

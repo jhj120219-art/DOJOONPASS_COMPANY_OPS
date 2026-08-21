@@ -7,7 +7,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from events import Event  # noqa: E402
-from notion.retry_queue import dequeue, enqueue, load_queue, save_queue  # noqa: E402
+import json  # noqa: E402
+from notion.retry_queue import (  # noqa: E402
+    RetryQueueEntry,
+    RetryQueueError,
+    dequeue,
+    enqueue,
+    load_queue,
+    save_queue,
+)
 
 
 def sample_event(event_id: str) -> Event:
@@ -232,6 +240,177 @@ class IndexedUpsertRemoveTests(unittest.TestCase):
 
         for i, entry in enumerate(entries):
             self.assertEqual(idx[entry.event_id], i)
+
+
+class TheQueueFileShapeIsPinnedTests(unittest.TestCase):
+    """`notion_retry_queue.json` is persisted state holding **Events**, and
+    it has no version field.
+
+    C53 gave the Dashboard payload and the Run Manifest a recorded shape
+    because a version that never moves is a version that hides drift. Both of
+    those are read by something that tolerates the unknown. This file is
+    different in a way that makes the record matter more, not less:
+
+        the Run Manifest   `read_summary()` defaults every added field
+                           (`.get("reason", "")`), so an older file loads
+        this queue         `from_dict()` indexes four keys directly, so an
+                           older file raises and **the whole queue** — every
+                           Event still waiting for Notion — is unreadable
+
+    Strict is the right choice here and this does not change it: an entry
+    missing `event_id` is an entry nobody can retry, and guessing would put a
+    made-up id in a log. What was missing is the **record** — nothing said
+    which keys are required, so the next field added as a required one would
+    break every queue file that already exists, and would do it silently
+    until a deployment with a non-empty queue upgraded.
+
+    The blast radius is already contained and pinned elsewhere: the Runner
+    opens `notion_sync` before loading, so an abort is recorded as a FAILED
+    step instead of the `SUCCESS / exit 0` it used to report
+    (`app/runner.py`'s own comment carries the measurement). What this adds is
+    noticing before it happens.
+    """
+
+    REQUIRED = ("event_id", "project_id", "event_data", "added_at")
+    TOLERATED = {"attempt_count": 0}
+
+    def _entry(self):
+        return RetryQueueEntry(
+            event_id="EVT-1",
+            project_id="PAY",
+            event_data={"event_id": "EVT-1"},
+            added_at="2026-08-20T09:00:00+09:00",
+            attempt_count=2,
+        )
+
+    def _write(self, tmp, entries):
+        path = Path(tmp) / "notion_retry_queue.json"
+        path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        return path
+
+    def test_the_written_keys_are_exactly_these(self):
+        self.assertEqual(
+            sorted(self._entry().to_dict()),
+            sorted(self.REQUIRED + tuple(self.TOLERATED)),
+        )
+
+    def test_every_required_key_really_is_required(self):
+        """Driven rather than read off the source. Each one removed in turn,
+        because a key that quietly gained a default would widen the contract
+        without anybody deciding to."""
+        for missing in self.REQUIRED:
+            entry = self._entry().to_dict()
+            entry.pop(missing)
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(RetryQueueError):
+                    load_queue(self._write(tmp, [entry]))
+
+    def test_one_bad_entry_costs_the_whole_queue(self):
+        """CHARACTERIZATION, and the reason the record above matters.
+
+        The failure is not scoped to the damaged entry — `load_queue()`
+        builds the list in one comprehension, so a single malformed record
+        takes every healthy one with it. That is a deliberate all-or-nothing
+        (a half-loaded queue would silently drop Events), and it is exactly
+        why adding a required field is not a free change.
+        """
+        good = self._entry().to_dict()
+        bad = self._entry().to_dict()
+        bad.pop("added_at")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(RetryQueueError):
+                load_queue(self._write(tmp, [good, bad]))
+
+    def test_a_tolerated_key_may_be_absent(self):
+        """`attempt_count` was added later and defaults, which is why a queue
+        written before it still loads. The contrast with `added_at` — added
+        in the same area and *not* defaulted — is the whole finding."""
+        entry = self._entry().to_dict()
+        entry.pop("attempt_count")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = load_queue(self._write(tmp, [entry]))
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].attempt_count, self.TOLERATED["attempt_count"])
+
+    def test_an_unknown_key_is_ignored_rather_than_refused(self):
+        """The forward direction: a queue written by *newer* code must load
+        under older code, or a rollback strands every queued Event."""
+        entry = dict(self._entry().to_dict(), invented_later="x")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = load_queue(self._write(tmp, [entry]))
+
+        self.assertEqual(loaded[0].event_id, "EVT-1")
+
+    def test_a_round_trip_preserves_every_field(self):
+        original = self._entry()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "q.json"
+            save_queue(path, [original])
+            loaded = load_queue(path)
+
+        self.assertEqual(loaded, [original])
+
+
+class ThePendingFileShapeIsPinnedTests(unittest.TestCase):
+    """`dashboard_pending.json`, same treatment and the same split.
+
+    It holds `OPS_RUNS` rows a run could not write. Losing one costs a
+    Dashboard row rather than an Event, which is why it is second — but it is
+    the same strict `from_dict()` with the same untold contract, and
+    `drain_pending()` is what would stop working.
+    """
+
+    REQUIRED = ("run_id", "properties", "queued_at")
+    TOLERATED = {"attempt_count": 0}
+
+    def _record(self):
+        from notion.dashboard_pending import PendingDashboardRecord
+
+        return PendingDashboardRecord(
+            run_id="RUN-1",
+            properties={"Run ID": {"title": []}},
+            queued_at="2026-08-20T09:00:00+09:00",
+            attempt_count=1,
+        )
+
+    def test_the_written_keys_are_exactly_these(self):
+        self.assertEqual(
+            sorted(self._record().to_dict()),
+            sorted(self.REQUIRED + tuple(self.TOLERATED)),
+        )
+
+    def test_every_required_key_really_is_required(self):
+        from notion.dashboard_pending import PendingDashboardRecord
+
+        for missing in self.REQUIRED:
+            data = self._record().to_dict()
+            data.pop(missing)
+            with self.subTest(missing=missing):
+                with self.assertRaises(KeyError):
+                    PendingDashboardRecord.from_dict(data)
+
+    def test_a_tolerated_key_may_be_absent(self):
+        from notion.dashboard_pending import PendingDashboardRecord
+
+        data = self._record().to_dict()
+        data.pop("attempt_count")
+
+        self.assertEqual(
+            PendingDashboardRecord.from_dict(data).attempt_count,
+            self.TOLERATED["attempt_count"],
+        )
+
+    def test_an_unknown_key_is_ignored_rather_than_refused(self):
+        from notion.dashboard_pending import PendingDashboardRecord
+
+        data = dict(self._record().to_dict(), invented_later="x")
+
+        self.assertEqual(PendingDashboardRecord.from_dict(data).run_id, "RUN-1")
 
 
 if __name__ == "__main__":

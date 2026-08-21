@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from runsummary import (  # noqa: E402
     EXIT_DEGRADED,
+    SCHEMA_VERSION,
     EXIT_FAILED,
     EXIT_SUCCESS,
     ComponentResult,
@@ -221,7 +222,11 @@ class SerialisationTests(unittest.TestCase):
 
         self.assertEqual(data["overall_status"], "DEGRADED")
         self.assertEqual(data["exit_code"], EXIT_DEGRADED)
-        self.assertEqual(data["schema_version"], "1.0")
+        # Read off the constant, not restated. A version bump should not
+        # have to hunt for copies of itself in assertions about JSON, and
+        # `TheManifestShapeIsPinnedToItsVersionTests` is what holds the
+        # constant to meaning something.
+        self.assertEqual(data["schema_version"], SCHEMA_VERSION)
 
     def test_artifact_refs_are_relative_not_absolute(self):
         """A manifest may be read on another machine, and an absolute path
@@ -369,6 +374,210 @@ class ManifestNotALogTests(unittest.TestCase):
         )
 
         self.assertEqual([c.name for c in summary.failures()], ["notion_sync"])
+
+
+class TheManifestShapeIsPinnedToItsVersionTests(unittest.TestCase):
+    """Drift detection for the Run Manifest, and it carries further than the
+    Dashboard payload's.
+
+    `to_payload()` is rebuilt every run and read by nothing that persists, so
+    a shape change there is only a contract problem. This manifest is
+    **written to disk** and read back by a later process — `ops_status.py`'s
+    LAST RUN block, `run_company_ops.py`'s reporting — and after a restore
+    the file can be older than the code reading it.
+
+    `SCHEMA_VERSION` said "1.0" through C31 adding `failure.reason`, for the
+    same reason the Dashboard's did: nothing compared the number to the
+    shape. `read_summary()` handles the older shape correctly, which is why
+    nobody noticed — and "handled correctly" was a claim about source text
+    (`ReadSummaryValidatesOnlyTheThreeEnums` greps for `.get("reason", "")`)
+    rather than a behaviour anybody drove. Both halves are here now.
+    """
+
+    #: Add an entry; never rename one — see
+    #: `ThePayloadShapeIsPinnedToItsVersionTests.RECORDED` for what renaming
+    #: cost the payload's gate.
+    RECORDED = {
+        # 1.0 is 1.1 minus `failure.reason`, which C31 added. It is the shape
+        # `test_a_manifest_written_before_reason_existed_still_reads` writes
+        # to disk and loads, so the two halves — "an old file still parses"
+        # and "no key was dropped getting here" — are checked against the
+        # same recorded fact.
+        "1.0": {
+            "top_level": [
+                "components", "exit_code", "finished_at", "overall_status",
+                "run_id", "schema_version", "started_at",
+            ],
+            "component": ["artifact_refs", "failure", "metrics", "name", "status"],
+            "failure": ["classification", "retryability", "severity"],
+        },
+        "1.1": {
+            "top_level": [
+                "components", "exit_code", "finished_at", "overall_status",
+                "run_id", "schema_version", "started_at",
+            ],
+            "component": ["artifact_refs", "failure", "metrics", "name", "status"],
+            "failure": ["classification", "reason", "retryability", "severity"],
+        }
+    }
+
+    def _summary(self):
+        return RunSummary(
+            run_id="RUN-1",
+            started_at="2026-08-20T09:00:00+09:00",
+            finished_at="2026-08-20T09:00:05+09:00",
+            components=(
+                ComponentResult(
+                    name="transport",
+                    status=ComponentStatus.SUCCESS,
+                    metrics={"moved": 1},
+                    artifact_refs=("events/transport/",),
+                ),
+                ComponentResult(
+                    name="backup",
+                    status=ComponentStatus.FAILED,
+                    failure=Failure(
+                        classification="BACKUP_FAILED",
+                        severity=Severity.CRITICAL,
+                        retryability=Retryability.RETRYABLE,
+                        reason="remote unreachable",
+                    ),
+                ),
+            ),
+        )
+
+    def _shape(self, data):
+        failed = next(c for c in data["components"] if "failure" in c)
+        return {
+            "top_level": sorted(data),
+            "component": sorted(failed),
+            "failure": sorted(failed["failure"]),
+        }
+
+    def test_the_version_has_a_recorded_shape(self):
+        self.assertIn(SCHEMA_VERSION, self.RECORDED)
+
+    def test_the_manifest_still_has_that_shape(self):
+        self.assertEqual(
+            self._shape(self._summary().to_dict()), self.RECORDED[SCHEMA_VERSION]
+        )
+
+    def test_a_component_without_a_failure_omits_the_key(self):
+        """`failure` is present only on a component that has one — the
+        recorded `component` list is the failing shape, and a successful one
+        is a strict subset. Stated so the fingerprint above cannot be read as
+        "every component carries a null failure"."""
+        data = self._summary().to_dict()
+        healthy = next(c for c in data["components"] if c["name"] == "transport")
+
+        self.assertNotIn("failure", healthy)
+        self.assertEqual(
+            set(healthy) | {"failure"}, set(self.RECORDED[SCHEMA_VERSION]["component"])
+        )
+
+    def test_the_removal_rule_actually_compared_something(self):
+        """Same guard, same reason: a loop over no earlier version passes
+        without checking anything."""
+        major = SCHEMA_VERSION.split(".")[0]
+        earlier = [
+            version
+            for version in self.RECORDED
+            if version.split(".")[0] == major and version != SCHEMA_VERSION
+        ]
+
+        self.assertTrue(earlier, "no earlier manifest shape is recorded")
+
+    def test_nothing_recorded_earlier_has_been_removed(self):
+        """MAJOR's rule. An added key is invisible to a reader that ignores
+        what it does not know; a removed one is a KeyError in a process that
+        may be running older code against a newer file."""
+        major = SCHEMA_VERSION.split(".")[0]
+        current = self.RECORDED[SCHEMA_VERSION]
+
+        for version, shape in self.RECORDED.items():
+            if version.split(".")[0] != major or version == SCHEMA_VERSION:
+                continue
+            for section, keys in shape.items():
+                with self.subTest(version=version, section=section):
+                    self.assertEqual(set(keys) - set(current[section]), set())
+
+    def test_the_version_is_a_major_minor_pair(self):
+        major, _, minor = SCHEMA_VERSION.partition(".")
+
+        self.assertTrue(major.isdigit(), SCHEMA_VERSION)
+        self.assertTrue(minor.isdigit(), SCHEMA_VERSION)
+
+    def test_a_manifest_written_before_reason_existed_still_reads(self):
+        """The MINOR promise, driven rather than grepped.
+
+        A manifest on disk can predate the code reading it — most obviously
+        after a restore, and ordinarily whenever a machine is upgraded
+        between runs. C31 added `failure.reason`; a file written before it
+        has a `failure` object with three keys, and it must still load.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old_manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "run_id": "OLD-1",
+                        "started_at": "2026-01-01T09:00:00+09:00",
+                        "finished_at": "2026-01-01T09:00:05+09:00",
+                        "components": [
+                            {
+                                "name": "backup",
+                                "status": "FAILED",
+                                "failure": {
+                                    "classification": "BACKUP_FAILED",
+                                    "severity": "CRITICAL",
+                                    "retryability": "RETRYABLE",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = read_summary(path)
+
+        self.assertEqual(summary.run_id, "OLD-1")
+        self.assertEqual(summary.components[0].failure.reason, "")
+        self.assertEqual(summary.schema_version, "1.0")
+
+    def test_a_manifest_with_no_metrics_or_refs_still_reads(self):
+        """The other two tolerant defaults, for the same reason. A component
+        written before either existed is a two-key object."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "older_manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "run_id": "OLDER-1",
+                        "started_at": "2026-01-01T09:00:00+09:00",
+                        "finished_at": "2026-01-01T09:00:05+09:00",
+                        "components": [{"name": "transport", "status": "SUCCESS"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = read_summary(path)
+
+        self.assertEqual(summary.components[0].metrics, {})
+        self.assertEqual(summary.components[0].artifact_refs, ())
+        # No `schema_version` at all — the reader defaults it to the current
+        # one, which is the documented behaviour and the reason a *removal*
+        # has to be a MAJOR bump: an unversioned file is read as current.
+        self.assertEqual(summary.schema_version, SCHEMA_VERSION)
+
+    def test_the_gate_would_notice_a_removed_key(self):
+        """The detector detects."""
+        data = self._summary().to_dict()
+        data.pop("exit_code")
+
+        self.assertNotEqual(self._shape(data), self.RECORDED[SCHEMA_VERSION])
 
 
 if __name__ == "__main__":

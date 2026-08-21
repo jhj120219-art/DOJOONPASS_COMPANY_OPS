@@ -51,6 +51,28 @@ class NotionClient:
         """Pages this integration can see (read-only diagnostic)."""
         return self._transport.search_pages()
 
+    def list_pages(self) -> list[Mapping[str, Any]]:
+        """Every row in this client's database (read-only).
+
+        The one question `find_project()` / `find_by_title()` cannot answer:
+        they find a row from a value, and reconciliation needs the rows whose
+        value is no longer produced at all. Raises `NotImplementedError` for
+        a transport that cannot list — see `NotionTransport.list_pages()`.
+        """
+        return self._transport.list_pages(self._database_id)
+
+    @property
+    def list_truncated(self) -> bool:
+        """True when the last `list_pages()` stopped before the end.
+
+        Surfaced here because the flag lives on the transport and every
+        caller of `list_pages()` holds a client, and because reading it is
+        not optional: a reconciliation over a partial listing retires every
+        row it did not see. Defaults to False for a transport that does not
+        set it — a transport that cannot page cannot truncate.
+        """
+        return bool(getattr(self._transport, "list_truncated", False))
+
     def get_database_schema(self) -> Mapping[str, Any]:
         """Notion Database Auto Bootstrap: 현재 Property 정의(스키마) 조회.
 

@@ -39,17 +39,87 @@ from pathlib import Path
 # moving them down adds no dependency edge; the reverse would have made this
 # module import `agent` and close a cycle. `agent.signals` re-exports both
 # names, so its own callers and tests are unaffected.
+# Longest namespace prefix a variable name may carry before the keyword.
+# It exists only to bound the quantifier below; see `_NAMESPACE` for why an
+# unbounded one was a denial of service.
+MAX_SECRET_NAME_PREFIX = 40
+
+# The optional namespace in front of `API_KEY` / `PASSWORD` / ….
+#
+# No leading `\b`: the realistic shape is `NOTION_API_TOKEN=...`, and `_` is a
+# word character, so `\bAPI` never matches inside it. The prefix is what lets
+# a namespaced variable name match.
+#
+# **Bounded, and the bound is the whole point.** As `[A-Za-z0-9_]*` this was
+# a quadratic-backtracking denial of service: the quantifier is unanchored, so
+# for a run of N word characters that never reaches the keyword the engine
+# tries every start position against every prefix length. Measured on this
+# machine before the bound, against a plain run of `A`s — the shape a summary
+# or a blocker takes, and `validate_event()` bounds neither:
+#
+#     n= 1,000     32 ms
+#     n= 2,000    137 ms
+#     n= 4,000    552 ms
+#     n= 8,000  2,211 ms       (double the input, quadruple the time)
+#
+# `redact()` is on the path of every operational log line
+# (`append_line()`), every Dashboard payload string
+# (`controltower/dashboard.to_payload()`), and every rejected-Event error
+# message — and `validate_event()` echoes the value it rejected back into
+# that message as `{value!r}`. One Event field from another Desktop is
+# therefore enough to spend minutes of CPU per run, once per line, forever.
+#
+# 40 characters is longer than every namespaced name this project has
+# (`NOTION_API_TOKEN` is 16), and the bound makes the scan linear: the engine
+# tries at most 41 prefix lengths per start position instead of N.
+_NAMESPACE = r"[A-Za-z0-9_]{0,%d}" % MAX_SECRET_NAME_PREFIX
+
+# A PEM block, **body included**.
+#
+# This pattern used to stop at the banner — `-----BEGIN [A-Z ]*PRIVATE
+# KEY-----` and nothing more. Every other pattern here ends in a character
+# class that swallows the value itself, so only this one left its secret on
+# the line: `redact()` returned `[REDACTED]` followed by the entire key.
+# Measured on HEAD:
+#
+#     redact("-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKC...\\n-----END ...")
+#     -> "[REDACTED]\\nMIIEowIBAAKC...\\n-----END RSA PRIVATE KEY-----"
+#
+# A private key reaching a log is the worst of the seven shapes to miss, and
+# it was the only one being missed.
+#
+# Two branches, tried in order:
+#
+#   1. through the matching END marker, which is the whole block and the
+#      ordinary case. Lazy and bounded — an unbounded `[\s\S]*?` searching
+#      for an END that is not there would rescan the tail of every log line
+#      that mentions a private key.
+#   2. banner plus whatever base64-shaped material follows, for a block that
+#      was truncated before its END marker (`bounded()` cuts at 600
+#      characters, so this is not hypothetical). Over-matching here is the
+#      documented posture: the banner alone is already conclusive.
+#
+# `\\` is in the second class because `one_line()` runs **before** `redact()`
+# and has already turned the block's newlines into literal `\n` two-character
+# sequences.
+_PEM_BODY = 4096
+_PEM_BLOCK = (
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    r"(?:"
+    r"[\s\S]{0,%d}?-----END [A-Z ]*PRIVATE KEY-----"
+    r"|"
+    r"[A-Za-z0-9+/=\s\\]{0,%d}"
+    r")"
+) % (_PEM_BODY, _PEM_BODY)
+
 SECRET_PATTERNS = (
     r"\bntn_[A-Za-z0-9]{10,}",
     r"\bsecret_[A-Za-z0-9]{10,}",
     r"Bearer\s+[A-Za-z0-9._-]{20,}",
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    _PEM_BLOCK,
     r"\bgh[pousr]_[A-Za-z0-9]{20,}",
-    # No leading `\b`: the realistic shape is `NOTION_API_TOKEN=...`, and `_`
-    # is a word character, so `\bAPI` never matches inside it. The optional
-    # `[A-Za-z0-9_]*` prefix is what lets a namespaced variable name match.
-    r"[A-Za-z0-9_]*(?:API|ACCESS|AUTH|SECRET)[_-]?(?:KEY|TOKEN)\s*[=:]\s*\S+",
-    r"[A-Za-z0-9_]*(?:PASSWORD|PASSWD|CLIENT[_-]?SECRET)\s*[=:]\s*\S+",
+    _NAMESPACE + r"(?:API|ACCESS|AUTH|SECRET)[_-]?(?:KEY|TOKEN)\s*[=:]\s*\S+",
+    _NAMESPACE + r"(?:PASSWORD|PASSWD|CLIENT[_-]?SECRET)\s*[=:]\s*\S+",
 )
 # These two deliberately over-match: a work note reading "auth token: rotated"
 # is refused even though it carries no secret. A refusal is visible, names its

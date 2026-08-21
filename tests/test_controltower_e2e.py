@@ -45,7 +45,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent import run_once as agent_run_once  # noqa: E402
 from app.runner import run_once as runner_run_once  # noqa: E402
-from controltower import build_company_rollup, build_dashboard  # noqa: E402
+from controltower import (  # noqa: E402
+    UNSOURCED_LAYERS,
+    build_company_rollup,
+    build_dashboard,
+)
+from controltower import notion_projection as ct_projection  # noqa: E402
 from notion import (  # noqa: E402
     ExecutionPlanSync,
     InMemoryNotionTransport,
@@ -571,7 +576,11 @@ class ThreeDesktopsReachNotionTests(_ThreeDesktopPipeline, unittest.TestCase):
                 for panel in payload["panels"]
                 for layer in panel["unsourced_layers"]
             ),
-            ["COMPANY_GOAL", "SPRINT", "TASK", "TEAM_GOAL"],
+            # Read off the constant rather than restated: a layer added to
+            # one and not the other is exactly the drift
+            # `EveryUnsourcedLayerIsClaimedByExactlyOnePanelTests` guards,
+            # and this assertion should not be a second place it can happen.
+            sorted(UNSOURCED_LAYERS),
         )
 
     def test_the_projects_rows_agree_with_the_rollup(self):
@@ -1067,6 +1076,305 @@ class NotionRefusesOverLongTextE2ETests(_ThreeDesktopPipeline, unittest.TestCase
         self._run_the_runner(now=NOW_RUNNER + timedelta(days=1))
 
         self.assertEqual(len(self._rows("Project ID")), before)
+
+
+class TheControlTowerReachesTheNotionDashboardTests(
+    _ThreeDesktopPipeline, unittest.TestCase
+):
+    """The last arrow of the chain, driven by the same real pipeline.
+
+        Signal files on three Desktops
+            -> real Agent -> OneDrive folder -> intake -> Collector
+            -> the real Runner -> `processed/` on disk
+            -> build_company_rollup()   read back off disk
+            -> build_dashboard()        the panels
+            -> project_panels()         the Notion rows
+            -> five in-memory databases
+
+    Everything before `project_panels()` is the pipeline the sibling classes
+    above already drive; nothing is re-stubbed. What this adds is that the
+    Company / Team / Project view an operator would open in Notion is built
+    from the **same Events that reached `processed/`**, with the same counts,
+    and that a second run refreshes those rows instead of duplicating them.
+
+    Five separate `NotionClient`s over one transport, which is how production
+    wires Notion today (`run_company_ops.py` builds one transport and hands
+    it to a PROJECTS client and an OPS_RUNS client). A projection that
+    ignored the database id would let a Team row answer a lookup for a
+    Project row — the trap `InMemoryNotionTransport._page_database` was added
+    for.
+    """
+
+    def _project(self, now=NOW_RUNNER):
+        return build_dashboard(self._rollup(now=now), now=now)
+
+    def _clients(self):
+        return {
+            name: NotionClient(transport=self.transport, database_id=f"CT::{name}")
+            for name in ct_projection.control_tower_databases()
+        }
+
+    def _control_tower_page_count(self):
+        return sum(
+            1
+            for page_id in self.transport._pages
+            if self.transport._page_database[page_id].startswith("CT::")
+        )
+
+    def _rows_in(self, database):
+        return [
+            page
+            for page_id, page in self.transport._pages.items()
+            if self.transport._page_database[page_id] == f"CT::{database}"
+        ]
+
+    def _row(self, database, key):
+        for page in self._rows_in(database):
+            if _prop(page["properties"], ct_projection.ROW_KEY_PROPERTY) == key:
+                return page
+        self.fail(f"no {database} row keyed {key!r}")
+
+    # ---------------------------------------------------------------- tests
+    def test_the_whole_chain_reaches_five_notion_databases(self):
+        self._run_the_agents()
+        self._run_the_runner()
+
+        result = ct_projection.sync_control_tower(self._clients(), self._project())
+
+        self.assertIs(result.outcome, ct_projection.ProjectionOutcome.RECORDED)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.skipped, 0)
+        self.assertGreater(result.created, 0)
+
+    def test_nothing_in_the_payload_is_something_notion_would_refuse(self):
+        self._run_the_agents()
+        self._run_the_runner()
+
+        rows = ct_projection.project_panels(self._project())
+
+        self.assertEqual(ct_projection.validate_rows(rows), [])
+
+    def test_each_desktops_row_carries_the_events_that_desktop_really_sent(self):
+        """Counted by `source`, so this is the same attribution
+        `test_every_desktops_work_arrives_attributed_to_that_desktop` pins one
+        layer down — now on the row a person reads."""
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        expected = {desktop: len(entries) for desktop, entries in SIGNALS.items()}
+        for desktop, count in expected.items():
+            with self.subTest(desktop=desktop):
+                row = self._row("CT_DESKTOPS", desktop)
+                self.assertEqual(_prop(row["properties"], "Events"), count)
+
+        # DESKTOP_3 sent nothing. It is still a row, and its row says zero —
+        # the panel's "a status view must not confuse no activity with not
+        # counted".
+        silent = self._row("CT_DESKTOPS", "DESKTOP_3")
+        self.assertEqual(_prop(silent["properties"], "Events"), 0)
+        self.assertFalse(silent["properties"]["Has Activity"]["checkbox"])
+
+    def test_the_projects_row_carries_the_blocker_a_person_typed(self):
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        row = self._row("CT_PROJECTS", "SEARCH_BACKEND")
+        self.assertEqual(
+            _prop(row["properties"], "Blocker"), "벤더 API 키 발급 대기"
+        )
+        self.assertEqual(_prop(row["properties"], "State"), "BLOCKED")
+        # The `role`, not its display name: the rollup stores
+        # `event.role` because the question the column answers is "which
+        # team has to report RESUMED", and the Team layer is keyed by role.
+        self.assertEqual(_prop(row["properties"], "Blocker Team"), "CTO_BACKEND")
+
+    def test_the_risk_row_is_the_same_blocker_seen_from_the_other_side(self):
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        risk = self._row("CT_RISKS", "BLOCKER:SEARCH_BACKEND")
+        self.assertEqual(_prop(risk["properties"], "Kind"), "OPEN_BLOCKER")
+        self.assertEqual(
+            _prop(risk["properties"], "Blocker"),
+            _prop(self._row("CT_PROJECTS", "SEARCH_BACKEND")["properties"], "Blocker"),
+        )
+
+    def test_the_evidence_cell_names_a_file_that_is_really_on_disk(self):
+        """The point of `EvidenceRef` reaching Notion at all: a number on a
+        dashboard that cannot be traced back to a file is a number nobody can
+        check."""
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        row = self._row("CT_PROJECTS", "SEARCH_BACKEND")
+        cell = _prop(row["properties"], "Evidence")
+        self.assertTrue(cell)
+        processed = self.runtime / "events" / "processed"
+        for ref in cell.split(" | "):
+            name = ref.rsplit(" -> ", 1)[1]
+            with self.subTest(ref=ref):
+                self.assertTrue((processed / name).is_file(), name)
+
+    def test_every_number_on_a_row_equals_the_rollups_own(self):
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        rollup = self._rollup()
+        for project in rollup.projects:
+            with self.subTest(project=project.project_id):
+                row = self._row("CT_PROJECTS", project.project_id)
+                self.assertEqual(
+                    _prop(row["properties"], "Events"), project.event_count
+                )
+        for team in rollup.teams:
+            with self.subTest(team=team.team):
+                row = self._row("CT_TEAMS", team.team)
+                self.assertEqual(_prop(row["properties"], "Events"), team.event_count)
+
+    def test_a_second_delivery_updates_the_rows_instead_of_duplicating_them(self):
+        """The stale-View failure, driven end to end. Find-or-create would
+        leave `SEARCH_BACKEND` at one Event forever."""
+        self._run_the_agents()
+        self._run_the_runner()
+        clients = self._clients()
+        ct_projection.sync_control_tower(clients, self._project())
+        # Counted over the CT_* databases only. The pool also holds the
+        # PROJECTS rows `ExecutionPlanSync` writes and one OPS_RUNS row per
+        # Runner execution, and the second run adds one of those legitimately.
+        before = self._control_tower_page_count()
+        events_before = _prop(
+            self._row("CT_PROJECTS", "SEARCH_BACKEND")["properties"], "Events"
+        )
+
+        later_day = DAY + timedelta(days=1)
+        self._run_the_agents(
+            signals={
+                "DESKTOP_1": [
+                    ("search-more.json", {
+                        "project_id": "SEARCH_BACKEND",
+                        "event_type": "MILESTONE_COMPLETED",
+                        "status": "IN_PROGRESS",
+                        "summary": "샤딩 적용",
+                        "milestone": "Sharding",
+                        "history_candidate": True,
+                    }),
+                ]
+            },
+            day=later_day,
+            now=NOW_AGENT + timedelta(days=1),
+        )
+        later = NOW_RUNNER + timedelta(days=1)
+        self._run_the_runner(now=later)
+        second = ct_projection.sync_control_tower(clients, self._project(now=later))
+
+        self.assertEqual(self._control_tower_page_count(), before)
+        self.assertEqual(second.created, 0)
+        self.assertGreater(second.updated, 0)
+        self.assertEqual(
+            _prop(self._row("CT_PROJECTS", "SEARCH_BACKEND")["properties"], "Events"),
+            events_before + 1,
+        )
+
+    def test_a_resumed_project_stops_being_blocked_on_the_row(self):
+        """A blocker that clears on the screen and not in Notion is the worst
+        shape this projection can take: the operator's one at-a-glance view
+        reporting a problem that was solved."""
+        self._run_the_agents()
+        self._run_the_runner()
+        clients = self._clients()
+        ct_projection.sync_control_tower(clients, self._project())
+        self.assertEqual(
+            _prop(self._row("CT_PROJECTS", "SEARCH_BACKEND")["properties"], "State"),
+            "BLOCKED",
+        )
+
+        self._run_the_agents(
+            signals={
+                "DESKTOP_1": [
+                    ("unblocked.json", {
+                        "project_id": "SEARCH_BACKEND",
+                        "event_type": "RESUMED",
+                        "status": "IN_PROGRESS",
+                        "summary": "키 발급 완료",
+                        "history_candidate": True,
+                    }),
+                ]
+            },
+            day=DAY + timedelta(days=1),
+            now=NOW_AGENT + timedelta(days=1),
+        )
+        later = NOW_RUNNER + timedelta(days=1)
+        self._run_the_runner(now=later)
+        ct_projection.sync_control_tower(clients, self._project(now=later))
+
+        row = self._row("CT_PROJECTS", "SEARCH_BACKEND")
+        self.assertEqual(_prop(row["properties"], "State"), "ACTIVE")
+        self.assertEqual(_prop(row["properties"], "Blocker"), "")
+
+        # The risk row is still there — this repository marks rather than
+        # deletes, and "the risk was open until this instant" is a fact an
+        # archived page would take with it — but it is retired, which is what
+        # an operator's view filters on. Without the reconciliation pass it
+        # would still read OPEN_BLOCKER: nothing produces that row any more,
+        # so nothing would ever have visited it again.
+        risk = self._row("CT_RISKS", "BLOCKER:SEARCH_BACKEND")
+        self.assertFalse(risk["properties"]["Present"]["checkbox"])
+        self.assertEqual(
+            _prop(risk["properties"], "Retired At"), later.isoformat()
+        )
+        self.assertEqual(
+            [
+                page
+                for page in self._rows_in("CT_RISKS")
+                if page["properties"]["Present"]["checkbox"]
+            ],
+            [],
+        )
+
+    def test_the_ops_runs_row_and_the_control_tower_rows_agree(self):
+        """Two projections of one fold. `ops_runs_fields()` puts
+        `Desktops Reporting` on the per-run row from **this run's** Events;
+        these rows are the all-time view. They are allowed to differ in
+        period and not in attribution — the same Desktop names, and every
+        count on the run row no larger than the all-time one."""
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        ops_row = self._rows("Desktops Reporting")[0]
+        reported = dict(
+            item.split(":")
+            for item in _prop(ops_row["properties"], "Desktops Reporting").split()
+        )
+        for desktop, count in reported.items():
+            with self.subTest(desktop=desktop):
+                row = self._row("CT_DESKTOPS", desktop)
+                self.assertLessEqual(
+                    int(count), _prop(row["properties"], "Events")
+                )
+
+    def test_no_goal_or_sprint_database_appears(self):
+        """The request asks for a Goal and a Sprint dashboard. This system has
+        no source for either, and the honest projection of "no source" is no
+        table — not an empty one. `CONTRACTED_DATABASES` records what four
+        permanently empty databases cost the last time."""
+        self._run_the_agents()
+        self._run_the_runner()
+        ct_projection.sync_control_tower(self._clients(), self._project())
+
+        databases = {
+            self.transport._page_database[page_id] for page_id in self.transport._pages
+        }
+        self.assertNotIn("CT::CT_COMPANY_GOALS", databases)
+        self.assertNotIn("CT::CT_SPRINTS", databases)
+        for layer in ("COMPANY_GOAL", "TEAM_GOAL", "SPRINT", "TASK"):
+            with self.subTest(layer=layer):
+                self.assertIn(layer, ct_projection.UNSOURCED_LAYER_NOTES)
 
 
 if __name__ == "__main__":

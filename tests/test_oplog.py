@@ -10,9 +10,11 @@ These tests cover the shared module's own contract, so the guarantees are
 asserted once rather than three times.
 """
 
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -244,6 +246,189 @@ class RedactionTests(unittest.TestCase):
         oplog.append_line(self.log_path, FAKE_BEARER)
 
         self.assertNotIn(FAKE_TOKEN_BODY, self.log_path.read_text(encoding="utf-8"))
+
+
+class PrivateKeyBodiesAreRedactedTests(unittest.TestCase):
+    r"""The PEM pattern used to stop at the banner, and it was the only one
+    that did.
+
+    Every other pattern in `SECRET_PATTERNS` ends in a character class that
+    swallows the secret itself — `\bntn_[A-Za-z0-9]{10,}` takes the token,
+    `...KEY\s*[=:]\s*\S+` takes the value. This one matched
+    `-----BEGIN [A-Z ]*PRIVATE KEY-----` and stopped, so `redact()` replaced
+    the *announcement* of a private key and left the key.
+
+    Measured on the code this replaces:
+
+        redact("-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIB...")
+        -> "[REDACTED]\\nMIIEowIB..."
+
+    Of the seven shapes, a private key is the worst one to miss: a token can
+    be rotated in a minute from a page the operator already has open, and a
+    deploy key that reached a log and a GitHub backup cannot be un-published.
+    """
+
+    #: Not a real key. Base64-shaped so it exercises the same characters a
+    #: real body has, and short enough to assert on whole.
+    BODY = "MIIEowIBAAKCAQEA1234567890abcdefGHIJKLMNOP+/=="
+
+    def _block(self, kind: str = "RSA", *, end: bool = True) -> str:
+        block = f"-----BEGIN {kind} PRIVATE KEY-----\n{self.BODY}\n"
+        if end:
+            block += f"-----END {kind} PRIVATE KEY-----"
+        return block
+
+    def test_the_body_between_the_markers_is_gone(self):
+        redacted = oplog.redact(self._block())
+
+        self.assertNotIn(self.BODY, redacted)
+        self.assertNotIn("PRIVATE KEY", redacted)
+        self.assertEqual(redacted, "[REDACTED]")
+
+    def test_every_key_type_this_project_could_meet(self):
+        """`[A-Z ]*` in the banner is what makes the type free-form; the
+        replacement has to keep matching all of them, END marker included."""
+        for kind in ("RSA", "OPENSSH", "EC", "DSA", "ENCRYPTED", ""):
+            with self.subTest(kind=kind):
+                redacted = oplog.redact(self._block(kind))
+                self.assertNotIn(self.BODY, redacted)
+
+    def test_a_block_cut_short_before_its_end_marker_still_loses_its_body(self):
+        """`bounded()` caps a logged error at 600 characters, so a key
+        arriving inside an exception message is routinely truncated
+        mid-body. Matching only the complete block would have turned that
+        into a leak with no banner left to notice it by."""
+        redacted = oplog.redact(self._block(end=False))
+
+        self.assertNotIn(self.BODY, redacted)
+
+    def test_it_survives_the_escaping_that_runs_before_it(self):
+        """`append_line()` is `redact(one_line(body))`, so by the time the
+        pattern sees a PEM block its real newlines are the two-character
+        sequence `\\n`. A pattern that only spanned real newlines would
+        match nothing on the one path that matters."""
+        oplog.append_line(self.log_path, "SECRET DUMP " + self._block())
+
+        written = self.log_path.read_text(encoding="utf-8")
+        self.assertNotIn(self.BODY, written)
+        self.assertIn("SECRET DUMP", written)
+
+    def test_the_text_around_the_block_is_untouched(self):
+        redacted = oplog.redact("before " + self._block() + " after")
+
+        self.assertTrue(redacted.startswith("before "))
+        self.assertTrue(redacted.endswith(" after"))
+
+    def test_prose_about_keys_is_not_swallowed(self):
+        """The second branch — banner plus trailing base64-shaped material —
+        only ever engages *after* a banner. Text that merely talks about
+        private keys must come through unchanged, or every incident note
+        about a rotation becomes unreadable."""
+        for benign in (
+            "rotated the deploy private key on DESKTOP_4",
+            "BACKUP_FAILED reason=missing private key file",
+            "docs/08 §21 covers the private key credential failure",
+        ):
+            with self.subTest(text=benign):
+                self.assertEqual(oplog.redact(benign), benign)
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.log_path = Path(tmp.name) / "test.log"
+
+
+class RedactionCostIsLinearTests(unittest.TestCase):
+    """`redact()` was quadratic in the length of its input.
+
+    Two of the seven patterns began with an unanchored `[A-Za-z0-9_]*`. For a
+    run of N word characters that never reaches `API`/`PASSWORD`/…, the
+    engine tries every start position against every prefix length, so the
+    work is N²/2 rather than N. Measured on the code this replaces:
+
+        n= 1,000     32 ms
+        n= 2,000    137 ms
+        n= 4,000    552 ms
+        n= 8,000  2,211 ms
+
+    Reachable from outside the machine, three ways. `validate_event()` bounds
+    neither `summary` nor `blocker` nor `project_id`, and it echoes the value
+    it rejected back into its own error string as `{value!r}`; that string
+    reaches `oplog.append_line()`, which redacts every line it writes.
+    `controltower/dashboard.to_payload()` redacts every authored string in
+    every row. One Event file written on another Desktop is therefore enough
+    to spend CPU on every run, on every line, until someone deletes the file.
+
+    Asserting on a ratio rather than on wall-clock milliseconds: an absolute
+    bound would be a machine specification, and this test has to give the
+    same verdict on a slow CI box. Quadratic growth shows up as a ratio near
+    4 when the input doubles; linear shows up as a ratio near 2. The
+    threshold sits at 3 so ordinary timing noise cannot decide it.
+    """
+
+    #: Word characters and nothing else — the worst case for the bounded
+    #: prefix, because every one of them is a candidate start.
+    FILLER = "A"
+
+    def _measure(self, n: int) -> float:
+        text = self.FILLER * n
+        oplog.redact(text)  # warm the pattern cache; not timed
+        start = time.perf_counter()
+        for _ in range(3):
+            oplog.redact(text)
+        return (time.perf_counter() - start) / 3
+
+    def test_doubling_the_input_does_not_quadruple_the_work(self):
+        small = self._measure(4000)
+        large = self._measure(8000)
+
+        # A sub-millisecond `small` would make the ratio meaningless — it
+        # would be measuring the clock. Linear at these sizes puts `small`
+        # well above that on any machine that can run the suite.
+        self.assertGreater(small, 0.0)
+        self.assertLess(
+            large / small,
+            3.0,
+            "redact() is growing faster than its input — the unbounded "
+            f"prefix quantifier is back ({small * 1000:.1f}ms at 4,000 chars, "
+            f"{large * 1000:.1f}ms at 8,000)",
+        )
+
+    def test_the_prefix_quantifier_is_bounded_in_every_pattern(self):
+        """The property directly, so the reason survives even if a future
+        machine is fast enough to hide the timing.
+
+        An unbounded `*` or `+` at the very start of a pattern is the shape
+        that costs N² here; a bounded `{0,n}` is not.
+        """
+        for pattern in oplog.SECRET_PATTERNS:
+            with self.subTest(pattern=pattern):
+                self.assertFalse(
+                    re.match(r"^\[[^\]]+\][*+]", pattern),
+                    "an unanchored, unbounded leading character-class "
+                    "quantifier — this is the quadratic shape",
+                )
+
+    def test_a_long_value_is_still_redacted(self):
+        """The bound is on the *namespace* in front of the keyword, not on
+        the secret. A 40-character cap that stopped catching
+        `NOTION_API_TOKEN=` would trade a slow log for a leaked one."""
+        long_prefix = "A" * 39
+        self.assertEqual(
+            oplog.redact(f"{long_prefix}_API_KEY=abcdef"), "[REDACTED]"
+        )
+
+    def test_the_bound_is_wider_than_any_name_this_project_uses(self):
+        for name in (
+            "NOTION_API_TOKEN",
+            "NOTION_PARENT_PAGE_ID_CLIENT_SECRET",
+            "COMPANY_OPS_BACKUP_ACCESS_TOKEN",
+        ):
+            with self.subTest(name=name):
+                self.assertLessEqual(
+                    len(name.rsplit("_", 2)[0]), oplog.MAX_SECRET_NAME_PREFIX
+                )
+                self.assertEqual(oplog.redact(f"{name}=value"), "[REDACTED]")
 
 
 class SecretPatternHomeTests(unittest.TestCase):

@@ -406,6 +406,18 @@ class CompanyActivitySnapshot:
     desktops: tuple[DesktopActivity, ...]
     backlog: IntakeBacklog
     unreadable_events: tuple[str, ...] = field(default_factory=tuple)
+    #: Files in `processed/` whose `event_id` another file already carried,
+    #: and which the counts above therefore do **not** include.
+    #:
+    #: Named files rather than a bare number, and reported rather than
+    #: folded in silence, for the reason `CompanyRollup.duplicates` states:
+    #: an operator who sees `events=9` where the directory holds ten files
+    #: has to be able to find the tenth. It is a **qualifier, not an alert**
+    #: — a folded duplicate makes the number right, not partial — so nothing
+    #: here raises ATTENTION. The half that is a real problem, two files with
+    #: one `event_id` and different contents, is the Control Tower's
+    #: `EVENT_ID_CONFLICT` risk, which does.
+    duplicate_event_files: tuple[str, ...] = field(default_factory=tuple)
 
     def for_source(self, source: str) -> DesktopActivity:
         for activity in self.desktops:
@@ -688,6 +700,36 @@ def read_company_activity(
     last_seen: dict[str, str] = {}
     last_arrival: dict[str, float] = {}
     unreadable: list[str] = []
+    # `event_id`s already counted, so one Event is one Event no matter how
+    # many files carry it.
+    #
+    # C50 §8 found this in `controltower/rollup.build_company_rollup()` and
+    # fixed it there. The same defect was here the whole time and the two
+    # counters sit **on one screen**: measured on this repository's own
+    # `processed/` at C51, with one hand-placed copy of one Event —
+    #
+    #     COMPANY block          DESKTOP_4 events=2
+    #     CONTROL TOWER block    DESKTOP_4 Event 1
+    #
+    # and nothing above the first number said why. The Control Tower prints
+    # "중복 파일 1건" inside its own block; the COMPANY block had no such
+    # line and no such fold, so an operator reading down the page met two
+    # different answers to one question.
+    #
+    # How two files come to carry one Event is `collector/runtime.py`'s
+    # documented behaviour, not a bug: a DUPLICATE is still moved to
+    # `processed/` (docs/10 §46 forbids deleting it) under **the incoming
+    # file's name**, so a re-send under a different name leaves two. An
+    # OneDrive re-delivery, a partial restore, and a hand-placed copy
+    # (docs/11 permits one) all produce the same shape.
+    #
+    # Folded on `event_id` for C28's reason: the Event's identity is
+    # `event_id` (docs/02 §4), the Collector's seen store already decides
+    # duplicates with that key, and the Control Tower now folds on it too.
+    # A third question here would be a third opinion about which two files
+    # are one Event.
+    seen_event_ids: set = set()
+    duplicate_files: list[str] = []
 
     processed_paths = _json_paths(processed_dir)
     if processed_dir.is_dir():
@@ -705,6 +747,38 @@ def read_company_activity(
                 unreadable.append(path.name)
                 continue
 
+            # `last_arrival_at` is taken from **every** file, duplicate
+            # included, and deliberately before the fold below.
+            #
+            # It answers a different question from every other number here:
+            # not "what work happened" but "when did a file from this Desktop
+            # last show up", which is what separates the two ATTENTION
+            # sentences ("Agent가 멈췄다" from "밀린 분을 보낸 것으로 보인다").
+            # A re-delivered copy really did show up, so suppressing it would
+            # hide a Desktop that is transmitting.
+            #
+            # The first draft folded this too, and the test written for it
+            # caught the reason not to: with the arrival read only off the
+            # copy that survives the fold, **which** copy that is decides the
+            # answer — and that is filename order. An operational number
+            # whose value depends on what somebody named a file is worse than
+            # either choice made deliberately. A max over all copies is the
+            # same answer whatever the directory listing does.
+            if mtime is not None and mtime > last_arrival.get(source, 0.0):
+                last_arrival[source] = mtime
+
+            event_id = data.get("event_id")
+            if isinstance(event_id, str):
+                if event_id in seen_event_ids:
+                    duplicate_files.append(path.name)
+                    continue
+                seen_event_ids.add(event_id)
+            # An Event file with no readable `event_id` cannot be folded and
+            # is counted rather than dropped: `validate_event()` requires the
+            # field, so this is a hand-written or damaged file, and the
+            # honest answer is "there is a file here" — the same direction
+            # `unreadable` fails in.
+
             counts[source] = counts.get(source, 0) + 1
 
             role = data.get("role")
@@ -719,9 +793,6 @@ def read_company_activity(
                 first_seen[source] = timestamp
             if source not in last_seen or _before(last_seen[source], timestamp):
                 last_seen[source] = timestamp
-
-            if mtime is not None and mtime > last_arrival.get(source, 0.0):
-                last_arrival[source] = mtime
 
     desktops = tuple(
         DesktopActivity(
@@ -831,6 +902,7 @@ def read_company_activity(
             rejected_sources=_attribute(rejected_paths),
         ),
         unreadable_events=tuple(unreadable),
+        duplicate_event_files=tuple(sorted(duplicate_files)),
     )
 
 

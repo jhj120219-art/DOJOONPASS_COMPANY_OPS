@@ -34,7 +34,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-SCHEMA_VERSION = "1.0"
+# `MAJOR.MINOR`, with the same rule and the same gate the Dashboard payload
+# got in C53 — `MINOR` when the manifest gains something a reader can ignore,
+# `MAJOR` when a key is removed, renamed or retyped and an older reader
+# breaks. `TheManifestShapeIsPinnedToItsVersionTests` records the shape
+# beside the number.
+#
+# It matters more here than for the Dashboard payload, which is rebuilt from
+# scratch every run and read by nothing that persists. This manifest is
+# **written to disk** (`runtime/runs/last_run.json`) and read back by a later
+# process — `ops_status.py`'s LAST RUN block, and `run_company_ops.py`'s own
+# reporting — including after a restore, where the file on disk can be older
+# than the code reading it.
+#
+# 1.1 rather than 1.0: C31 added `failure.reason` and the number did not
+# move. `read_summary()` already handles that correctly — `.get("reason", "")`
+# — so an older manifest still parses, which is exactly the property the
+# MINOR half asserts and `test_a_manifest_written_before_reason_existed_still_reads`
+# now drives rather than assumes.
+SCHEMA_VERSION = "1.1"
 
 
 class ComponentStatus(enum.Enum):

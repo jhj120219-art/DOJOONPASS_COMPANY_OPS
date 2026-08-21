@@ -229,6 +229,67 @@ class ReviewCliBoundaryTests(unittest.TestCase):
             self.assertNotIn(token, code_without_docstrings)
 
 
+class MainWiresTheRealRepositoryToTheRealReviewerTests(unittest.TestCase):
+    """`main()` is three lines and the suite had never run one of them.
+
+    Every other test here drives `run_interactive_review()` with a spy, which
+    is the right level for the behaviour — and leaves the composition
+    completely unchecked. That is the half a wiring mistake lives in: a
+    `main()` that built the reviewer around the wrong repository, or forgot
+    to pass it, would fail only for the operator running the real command.
+    BACKLOG C49 §11c listed these lines as "cheap to cover, left by
+    priority".
+
+    `run_interactive_review` is replaced rather than the repository stubbed,
+    because the point is what `main()` **constructs**, not what the review
+    then does — and a real interactive session would block on stdin.
+    """
+
+    def setUp(self):
+        self.captured = []
+        real = review_cli.run_interactive_review
+        review_cli.run_interactive_review = self.captured.append
+        self.addCleanup(setattr, review_cli, "run_interactive_review", real)
+
+    def test_main_starts_a_review(self):
+        review_cli.main()
+
+        self.assertEqual(len(self.captured), 1)
+
+    def test_the_reviewer_is_the_repository_backed_one(self):
+        """Not a spy, not a bare `HistoryReviewer` — the concrete pairing the
+        operator's command depends on."""
+        review_cli.main()
+
+        self.assertIsInstance(self.captured[0], RepositoryHistoryReviewer)
+
+    def test_it_is_built_over_the_file_repository(self):
+        """The reviewer holds a `FileHistoryRepository`, which is what makes
+        the CLI read the Candidates that are actually on disk. Reached
+        through the object rather than by patching the class, so the test
+        checks the wiring instead of restating it."""
+        review_cli.main()
+
+        reviewer = self.captured[0]
+        repository = next(
+            value
+            for value in vars(reviewer).values()
+            if isinstance(value, FileHistoryRepository)
+        )
+        self.assertIsInstance(repository, FileHistoryRepository)
+
+    def test_the_module_guard_calls_main_and_nothing_else(self):
+        """Line-for-line the one statement no import can execute. Asserted as
+        source rather than run, because running it means running the whole
+        module as `__main__` — a second import of a module that reconfigures
+        `sys.stdout` at import time."""
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "review_cli.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('if __name__ == "__main__":\n    main()\n', source)
+
+
 class SaveFailureIsolationTests(unittest.TestCase):
     """One candidate's save failure must not end the session.
 

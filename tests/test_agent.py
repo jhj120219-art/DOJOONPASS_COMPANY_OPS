@@ -1653,6 +1653,106 @@ from events import create_event  # noqa: E402
 from reporter.local_output import safe_event_filename  # noqa: E402
 
 
+class TheStagingRaceIsAbsorbedNotReRaisedTests(unittest.TestCase):
+    """`stage()`'s one swallowed `FileExistsError`, and only that one.
+
+    Two things can make `write_event_json(overwrite=False)` raise
+    `FileExistsError`, and they mean opposite things:
+
+        the Event file appeared between the `is_file()` check and the write
+            — another writer persisted the same Event. It IS on disk, the
+              function's promise is kept, and re-raising would fail a date
+              that actually succeeded.
+        anything else — notably `mkdir(parents=True)` meeting a plain file
+              where the outbox must be — the Event is NOT on disk, and
+              swallowing it reports a phantom success and lets the
+              collection date advance with the Event nowhere.
+
+    `OutboxNameOccupiedByADirectoryTests` covers the second. The first —
+    the line that returns the winner's file — had never run: it needs the
+    filesystem to change between two statements, which no ordinary test
+    does. Driven here by making the write itself lose the race.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.outbox = Path(tmp.name) / "outbox"
+        self.outbox.mkdir(parents=True)
+
+    def _event(self):
+        return create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="PRJ",
+            event_type="MILESTONE_COMPLETED",
+            status="IN_PROGRESS",
+            summary="race probe",
+            history_candidate=True,
+            event_id="EVT-RACE",
+            timestamp="2026-08-01T10:00:00+09:00",
+        )
+
+    def test_the_loser_returns_the_winners_file(self):
+        import agent.outbox as outbox_module
+
+        event = self._event()
+        destination = self.outbox / safe_event_filename(event.event_id)
+
+        def _lose_the_race(evt, *, directory, overwrite):
+            # Exactly what a concurrent writer leaves behind, then the error
+            # this process would get for arriving second.
+            destination.write_text(evt.to_json(), encoding="utf-8")
+            raise FileExistsError(destination)
+
+        real = outbox_module.write_event_json
+        outbox_module.write_event_json = _lose_the_race
+        self.addCleanup(setattr, outbox_module, "write_event_json", real)
+
+        staged = outbox_module.stage(event, outbox_dir=self.outbox)
+
+        self.assertEqual(staged, destination)
+        self.assertTrue(destination.is_file())
+
+    def test_the_event_really_is_on_disk_and_readable(self):
+        """The property the swallow depends on. Returning a path to a file
+        that is not a readable Event would be the phantom success in a
+        different costume."""
+        import agent.outbox as outbox_module
+
+        event = self._event()
+        destination = self.outbox / safe_event_filename(event.event_id)
+
+        def _lose_the_race(evt, *, directory, overwrite):
+            destination.write_text(evt.to_json(), encoding="utf-8")
+            raise FileExistsError(destination)
+
+        real = outbox_module.write_event_json
+        outbox_module.write_event_json = _lose_the_race
+        self.addCleanup(setattr, outbox_module, "write_event_json", real)
+
+        staged = outbox_module.stage(event, outbox_dir=self.outbox)
+
+        self.assertEqual(
+            Event.from_json(staged.read_text(encoding="utf-8")).event_id, "EVT-RACE"
+        )
+
+    def test_a_failure_that_leaves_nothing_on_disk_is_re_raised(self):
+        """The asymmetry, stated as its own test: same exception type, and
+        the verdict turns entirely on whether the Event ended up persisted."""
+        import agent.outbox as outbox_module
+
+        def _fail_with_nothing_written(evt, *, directory, overwrite):
+            raise FileExistsError("the outbox path is a plain file")
+
+        real = outbox_module.write_event_json
+        outbox_module.write_event_json = _fail_with_nothing_written
+        self.addCleanup(setattr, outbox_module, "write_event_json", real)
+
+        with self.assertRaises(FileExistsError):
+            outbox_module.stage(self._event(), outbox_dir=self.outbox)
+
+
 class OutboxNameOccupiedByADirectoryTests(AgentTestCase):
     """`stage()` promises on its first line to persist the Event. With a
     directory wearing the Event's filename it returned that path and wrote

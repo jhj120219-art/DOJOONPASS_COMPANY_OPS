@@ -82,7 +82,158 @@ def _tracked_files() -> list[Path]:
     by `test_secret_and_runtime_paths_are_git_ignored` instead.
     """
     result = _git("ls-files", "--cached", "--others", "--exclude-standard")
+    # A failed scan is an error, not an empty repository.
+    #
+    # Every guard in this file iterates this list, so a `git` that is absent,
+    # a directory that is not a checkout (a copied or exported tree — this
+    # project is moved between Desktops), or any git error at all made
+    # `stdout` empty and turned the secret scan, the UTF-8 scan, the LF scan
+    # and the BOM scan into loops over nothing. All four passed. Measured:
+    # with `_git` stubbed to return an empty stdout,
+    # `test_no_secret_material_in_any_tracked_file` reported success over
+    # zero files.
+    #
+    # Raising rather than asserting: this is a helper, and the tests that
+    # call it should fail with the reason rather than with an empty-list
+    # symptom thirty lines later.
+    if result.returncode != 0:
+        raise RuntimeError(
+            "git ls-files failed, so every guard built on it would scan "
+            f"nothing: {result.stderr.strip() or result.returncode}"
+        )
     return [REPO_ROOT / line for line in result.stdout.splitlines() if line.strip()]
+
+
+# The suffixes the encoding guards treat as text. One tuple rather than a
+# literal repeated at each guard: the set drifting between two of them is how
+# a file ends up covered for UTF-8 and not for line endings.
+_TEXT_SUFFIXES = frozenset({".py", ".md", ".json", ".example", ".gitignore"})
+
+
+def _tracked_eols() -> "list[tuple[str, str, Path]]":
+    """`(index_eol, worktree_eol, path)` for every file `_tracked_files()` sees.
+
+    `git ls-files --eol` is the only thing that can answer "what does the
+    repository store" without re-implementing git's own normalisation rules
+    (`core.autocrlf`, `core.eol`, `.gitattributes` `text`/`eol`, and the
+    binary heuristic all feed into it). Its output is
+
+        i/lf    w/crlf  attr/                 <TAB>path/to/file
+
+    with the columns tab-separated from the path, so the path is taken after
+    the first tab and never split on whitespace — `.env.example` survives
+    that, a path with a space in it would not.
+
+    An untracked file (`--others`) has no index entry and git reports `i/`
+    with nothing after the slash; it comes back as `""` so a caller can tell
+    "not in the index" from "in the index as LF".
+    """
+    result = _git("ls-files", "--eol", "--cached", "--others", "--exclude-standard")
+    rows = []
+    for line in result.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        columns, _, name = line.partition("\t")
+        fields = columns.split()
+        index_eol = ""
+        worktree_eol = ""
+        for field in fields:
+            if field.startswith("i/") and not index_eol:
+                index_eol = field[2:]
+            elif field.startswith("w/") and not worktree_eol:
+                worktree_eol = field[2:]
+        rows.append((index_eol, worktree_eol, REPO_ROOT / name))
+    return rows
+
+
+def _git_normalises_line_endings() -> bool:
+    """True when git rewrites CRLF to LF as a file is staged.
+
+    Three independent ways to turn it on and any one of them is enough:
+    `core.autocrlf=true` (CRLF in the checkout, LF in the commit — the
+    Git-for-Windows installer default), `core.autocrlf=input` (LF in the
+    commit, checkout left alone), or a `.gitattributes` marking paths `text`,
+    which overrides both.
+    """
+    autocrlf = _git("config", "--get", "core.autocrlf").stdout.strip().lower()
+    if autocrlf in ("true", "input"):
+        return True
+    attributes = REPO_ROOT / ".gitattributes"
+    if attributes.is_file():
+        for raw in attributes.read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            for token in line.split()[1:]:
+                if token in ("text", "text=auto", "eol=lf"):
+                    return True
+    return False
+
+
+class TheScansThisFileTrustsAreNotEmptyTests(unittest.TestCase):
+    """Every guard below loops over a scan. A scan that returns nothing makes
+    its guard pass without checking anything.
+
+    This is the same shape C57 found in the schema fingerprint — a
+    comparison over an empty collection reports green — but the consequence
+    here is worse, because the guards built on `_tracked_files()` are the
+    **security** ones. Measured, with `_git` stubbed to an empty stdout:
+    `test_no_secret_material_in_any_tracked_file` passed over zero files.
+
+    The trigger is ordinary rather than exotic. `git ls-files` returns
+    nothing whenever the working directory is not a checkout — a copied
+    tree, an export, a Desktop where the repository was moved — and this
+    project is deliberately worked on from several machines (AGENT.md §1).
+    `_tracked_files()` now raises on a failed `git`, and this pins the
+    remaining case: git succeeds and the tree really is empty.
+
+    Ordered first in the file on purpose: if these fail, no verdict below
+    them means anything.
+    """
+
+    def test_the_tracked_file_scan_finds_the_repository(self):
+        files = _tracked_files()
+
+        self.assertGreater(
+            len(files),
+            50,
+            "the tracked-file scan came back nearly empty — every guard in "
+            "this file loops over it and would pass without checking",
+        )
+
+    def test_the_eol_scan_finds_the_same_repository(self):
+        rows = _tracked_eols()
+
+        self.assertGreater(len(rows), 50)
+
+    def test_the_two_scans_agree_about_how_many_files_there_are(self):
+        """They ask git two different questions (`ls-files` and
+        `ls-files --eol`); a divergence means one of them is filtering
+        something the other is not, and the guards would disagree about
+        what they cover."""
+        self.assertEqual(len(_tracked_files()), len(_tracked_eols()))
+
+    def test_the_source_tree_scan_finds_modules(self):
+        """`DependencyGuardTests` and `NaiveAwareComparisonGuardTests` both
+        walk `src/` this way."""
+        self.assertGreater(len(list(SRC.rglob("*.py"))), 40)
+
+    def test_a_failed_git_is_an_error_rather_than_an_empty_result(self):
+        """The fix, driven. Before it, a broken `git` was indistinguishable
+        from a repository with no files."""
+        import subprocess as subprocess_module
+
+        real = globals()["_git"]
+        globals()["_git"] = lambda *args: subprocess_module.CompletedProcess(
+            args, 128, stdout="", stderr="fatal: not a git repository"
+        )
+        try:
+            with self.assertRaises(RuntimeError) as caught:
+                _tracked_files()
+        finally:
+            globals()["_git"] = real
+
+        self.assertIn("scan nothing", str(caught.exception))
 
 
 class SecretExposureGuardTests(unittest.TestCase):
@@ -235,38 +386,84 @@ class SourceEncodingGuardTests(unittest.TestCase):
                 failures.append(f"{path.relative_to(REPO_ROOT)}: {exc}")
         self.assertEqual(failures, [])
 
-    def test_every_tracked_text_file_uses_lf_line_endings(self):
-        """All 163 of them do, and one CRLF file is invisible until it is not.
+    def test_the_repository_stores_every_text_file_with_lf_line_endings(self):
+        """The property is about what git **stores**, not about the bytes on
+        this machine's disk — and the first version of this gate confused the
+        two, which cost a whole-suite failure on a clean tree.
 
-        This project is edited on several Windows Desktops (AGENT.md §1), and
-        every Windows editor, every `Set-Content` without `-NoNewline`
-        handling, and every `pathlib.Path.write_text()` will happily write
-        `\r\n` — `write_text()` because its default `newline=None` translates
-        `\n` to `os.linesep`, which on this machine is `\r\n`. Measured
-        during C50: a scripted edit that changed six lines of one file
-        rewrote all 1,163 of them, and `git diff --stat` reported 42,985
-        deletions across the Sprint. Nothing was wrong with the content; the
-        review was simply impossible.
+        The harm being prevented is a review-destroying diff: a scripted edit
+        that changed six lines of one file rewrote all 1,163 of them, and
+        `git diff --stat` reported 42,985 deletions across C50. That harm is
+        a property of the *blob*. A working tree full of CRLF is harmless as
+        long as git normalises on the way in, and `core.autocrlf=true` — the
+        Git-for-Windows installer's default, and the setting on the machine
+        this Sprint ran on — does exactly that: `git ls-files --eol` reported
+        `i/lf w/crlf` for 158 files whose blobs were already pure LF.
 
-        `core.autocrlf` is `false` here and there is no `.gitattributes`, so
-        git stores exactly what it is given and nothing normalises this on
-        the way in or out. That is the gap this closes.
+        C50 wrote the earlier gate against `path.read_bytes()` and recorded
+        "`core.autocrlf` is `false` here" as the justification. That was true
+        of one Desktop. This project is edited on several (AGENT.md §1), and
+        a gate whose verdict depends on an unrecorded local git setting
+        reports the setting rather than the repository. Measured: same
+        commit, same clean tree, `git status` empty — 41 files reported as
+        offenders and the suite red.
+
+        `git ls-files --eol` answers the real question directly and gives the
+        same answer on every machine, because the `i/` column is read out of
+        the index.
         """
         offenders = []
-        for path in _tracked_files():
-            if path.suffix.lower() not in {".py", ".md", ".json", ".example", ".gitignore"}:
+        for index_eol, _worktree_eol, path in _tracked_eols():
+            if path.suffix.lower() not in _TEXT_SUFFIXES or not path.is_file():
                 continue
-            if not path.is_file():
-                continue
-            raw = path.read_bytes()
-            count = raw.count(b"\r\n")
-            if count:
-                offenders.append(f"{path.relative_to(REPO_ROOT)}: {count} CRLF line(s)")
+            # `none` is git's answer for a file with no line ending at all —
+            # an empty file, or a single line with no terminator. Nothing to
+            # be wrong about. `""` is an untracked file, which has no index
+            # entry yet; the working-tree guard below is what covers those.
+            if index_eol not in ("lf", "none", ""):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT)}: index eol is {index_eol}"
+                )
         self.assertEqual(
             offenders,
             [],
-            "CRLF in a tree that is otherwise entirely LF — a whole-file diff "
+            "git is storing CRLF for a file in a repository that is otherwise "
+            "entirely LF — every later edit to it produces a whole-file diff "
             "that hides the real change:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_a_crlf_working_copy_is_flagged_only_where_git_will_not_fix_it(self):
+        """The working-tree half, and it is conditional on purpose.
+
+        With `core.autocrlf` set to `true` or `input`, or with a
+        `.gitattributes` marking these paths `text`, git normalises CRLF to
+        LF when the file is staged — so CRLF on disk never becomes CRLF in a
+        blob and there is nothing to report. Without any of those, the bytes
+        on disk are the bytes that get committed, and *then* a CRLF file is
+        the C50 finding: it enters the index as CRLF and the guard above can
+        only catch it after the commit that already did the harm.
+
+        So this fires exactly where it can still prevent something. On a
+        machine that normalises it skips and says which setting made it skip,
+        rather than passing for a reason a reader would have to reconstruct.
+        """
+        if _git_normalises_line_endings():
+            autocrlf = _git("config", "--get", "core.autocrlf").stdout.strip()
+            self.skipTest(
+                "git normalises on staging here (core.autocrlf="
+                f"{autocrlf or 'unset'}), so working-tree CRLF cannot reach a blob"
+            )
+        offenders = []
+        for _index_eol, worktree_eol, path in _tracked_eols():
+            if path.suffix.lower() not in _TEXT_SUFFIXES or not path.is_file():
+                continue
+            if worktree_eol == "crlf":
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+        self.assertEqual(
+            offenders,
+            [],
+            "CRLF on disk on a machine where git stages bytes verbatim — "
+            "these would enter the index as CRLF:\n  " + "\n  ".join(offenders),
         )
 
     def test_no_tracked_file_starts_with_a_utf8_bom(self):
@@ -494,29 +691,104 @@ class EnvironmentContractTests(unittest.TestCase):
             declared.add(stripped.split("=", 1)[0].strip())
         return declared
 
+    #: How this project can read an environment variable.
+    #:
+    #: `os.getenv(...)` was missing until C58 and nothing noticed, because
+    #: nothing in the tree happened to use it — a gate promising "every
+    #: variable the code actually looks up" that recognised only one of the
+    #: two ordinary spellings. Measured: an injected
+    #: `os.getenv("COMPANY_OPS_UNDOCUMENTED")` passed this class cleanly
+    #: while the same read written `os.environ.get(...)` failed it.
+    #:
+    #: `test_the_scanner_recognises_every_spelling` is the detector for the
+    #: detector, and it is the point of naming the patterns here rather than
+    #: burying them in the method: a pattern list nobody exercises is a gate
+    #: whose coverage is assumed.
+    READ_PATTERNS = (
+        # os.environ.get("X") / os.environ["X"] / os.environ("X")
+        r"""os\.environ(?:\.get)?\(?\[?\s*[\x22']([A-Z_][A-Z0-9_]*)[\x22']""",
+        # os.getenv("X")
+        r"""os\.getenv\(\s*[\x22']([A-Z_][A-Z0-9_]*)[\x22']""",
+        # `from os import environ` then environ.get("X") / environ["X"]
+        r"""(?<!\.)\benviron(?:\.get)?\(?\[?\s*[\x22']([A-Z_][A-Z0-9_]*)[\x22']""",
+        # a Mapping passed in place of os.environ (agent/reporter do this)
+        r"""source\.get\(\s*[\x22']([A-Z_][A-Z0-9_]*)[\x22']""",
+        # NAME_ENV_VAR = "COMPANY_OPS_PROFILE" — the indirection
+        # `reporter/profiles.py` uses, which is the only place the variable
+        # is named at all.
+        r"""^[A-Z_]*ENV_VAR\s*=\s*[\x22']([A-Z_][A-Z0-9_]*)[\x22']""",
+    )
+
+    @classmethod
+    def _variables_in(cls, text: str) -> set:
+        """The variables one source text reads. Split out of the file walk so
+        the pattern list can be exercised directly — see
+        `test_the_scanner_recognises_every_spelling`."""
+        names: set = set()
+        for pattern in cls.READ_PATTERNS:
+            names |= {m.group(1) for m in re.finditer(pattern, text, re.M)}
+        return names
+
     def _read_variables(self) -> dict[str, set[str]]:
         """Every environment variable the code actually looks up.
 
-        Matches both the direct `os.environ.get("NAME")` form and the
-        `NAME_ENV_VAR = "COMPANY_OPS_PROFILE"` indirection
-        `reporter/profiles.py` uses, since only the latter names the
-        variable at all.
+        Spellings covered are `READ_PATTERNS`; the indirection form is there
+        because `reporter/profiles.py` names the variable only in a constant.
         """
         found: dict[str, set[str]] = {}
         sources = list(SRC.rglob("*.py")) + [REPO_ROOT / name for name in self.ENTRYPOINTS]
         for path in sources:
             if "__pycache__" in str(path) or not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8")
-            patterns = (
-                r'os\.environ(?:\.get)?\(?\[?\s*["\']([A-Z_][A-Z0-9_]*)["\']',
-                r'source\.get\(\s*["\']([A-Z_][A-Z0-9_]*)["\']',
-                r'^[A-Z_]*ENV_VAR\s*=\s*["\']([A-Z_][A-Z0-9_]*)["\']',
-            )
-            for pattern in patterns:
-                for match in re.finditer(pattern, text, re.M):
-                    found.setdefault(match.group(1), set()).add(path.name)
+            for name in self._variables_in(path.read_text(encoding="utf-8")):
+                found.setdefault(name, set()).add(path.name)
         return found
+
+    def test_the_scanner_recognises_every_spelling(self):
+        """The detector for the detector.
+
+        This class's verdict is only as wide as its pattern list, and a
+        missing spelling is invisible: the gate reports green because it
+        found nothing to complain about, not because there was nothing.
+        Every form below is one a Python file in this project could
+        plausibly use, and each is asserted rather than assumed.
+        """
+        for label, snippet in (
+            ("os.environ.get", 'os.environ.get("COMPANY_OPS_PROBE")'),
+            ("os.environ[]", 'os.environ["COMPANY_OPS_PROBE"]'),
+            ("os.getenv", 'os.getenv("COMPANY_OPS_PROBE")'),
+            ("os.getenv with default", 'os.getenv("COMPANY_OPS_PROBE", "x")'),
+            ("bare environ.get", 'environ.get("COMPANY_OPS_PROBE")'),
+            ("bare environ[]", 'environ["COMPANY_OPS_PROBE"]'),
+            ("mapping source", 'source.get("COMPANY_OPS_PROBE")'),
+            ("ENV_VAR constant", 'PROFILE_ENV_VAR = "COMPANY_OPS_PROBE"'),
+        ):
+            with self.subTest(spelling=label):
+                self.assertIn(
+                    "COMPANY_OPS_PROBE",
+                    self._variables_in(snippet),
+                    f"the scanner does not recognise {label} — a variable read "
+                    "that way is undocumented and this class says nothing",
+                )
+
+    def test_the_scanner_does_not_invent_variables(self):
+        """The other direction. A pattern loose enough to match ordinary code
+        would fill this class with names nobody reads, and the first response
+        to that noise is to weaken the gate."""
+        for snippet in (
+            'print("COMPANY_OPS_PROBE")',
+            'path = "COMPANY_OPS_PROBE"',
+            '# os.environ.get("COMPANY_OPS_PROBE") in a comment',
+        ):
+            with self.subTest(snippet=snippet):
+                if snippet.lstrip().startswith("#"):
+                    continue  # a commented read is still a read to a reviewer
+                self.assertEqual(self._variables_in(snippet), set())
+
+    def test_the_scan_still_finds_the_variables_this_project_has(self):
+        """Non-emptiness, for C57's reason: a scan that returns nothing makes
+        every assertion below it pass over an empty loop."""
+        self.assertGreaterEqual(len(self._read_variables()), 3)
 
     def test_every_variable_the_code_reads_is_documented(self):
         declared = self._declared_variables()
@@ -930,6 +1202,69 @@ class DashboardDatabasesWithNoWriterTests(unittest.TestCase):
                 )
 
 
+class StrayShellArtifactsInTheRepositoryRootTests(unittest.TestCase):
+    """CHARACTERIZATION (C51): five empty, extension-less files are committed
+    at the repository root, and every one of them is the name of a command.
+
+        FETCH_HEAD  cd  claude  git  main
+
+    All five are zero bytes and all five entered in one commit (43771a9).
+    That is the signature of a shell redirection that went to a file instead
+    of to a program — `git ... > main`, `> FETCH_HEAD` — on a project whose
+    own AGENT.md says it is driven from several Windows Desktops.
+
+    Nothing breaks. They carry no content, no guard here reads them (none has
+    a text suffix), and `PATHEXT` means an extension-less `git` in the
+    working directory is not executable on Windows. What they cost is
+    legibility: `git`, `cd` and `main` sitting beside `src/` and `docs/` read
+    as though they mean something.
+
+    **Not deleted, and the reason is the session's Git policy rather than a
+    judgement about the files** — removing tracked files is outside what this
+    Sprint may do. So this pins the set instead, and it is deliberately
+    exact-match in both directions: a sixth artifact fails immediately, and
+    the day someone does delete these the test fails too and this record has
+    to go with them. A characterization that could quietly outlive its
+    subject is the drift `DeadCapabilityInventoryTests` exists to stop.
+    """
+
+    KNOWN = {"FETCH_HEAD", "cd", "claude", "git", "main"}
+
+    def _stray_root_files(self):
+        return {
+            path.name
+            for path in _tracked_files()
+            if path.parent == REPO_ROOT
+            and path.is_file()
+            and not path.suffix
+            and not path.name.startswith(".")
+        }
+
+    def test_the_stray_set_is_exactly_what_is_recorded(self):
+        self.assertEqual(
+            self._stray_root_files(),
+            self.KNOWN,
+            "extension-less files at the repository root changed — a new one "
+            "is a shell redirection that missed, and a missing one means "
+            "these were cleaned up and this record should go",
+        )
+
+    def test_every_one_of_them_is_empty(self):
+        """If one ever gains content it stops being an artifact and starts
+        being a file somebody meant, which is a different conversation."""
+        for name in sorted(self.KNOWN):
+            with self.subTest(name=name):
+                self.assertEqual((REPO_ROOT / name).stat().st_size, 0)
+
+    def test_none_of_them_shadows_a_python_module(self):
+        """The one way an empty file here could actually do something: a name
+        that `import` would find before the real module. None of these is a
+        `.py`, so none can — asserted rather than assumed."""
+        for name in sorted(self.KNOWN):
+            with self.subTest(name=name):
+                self.assertFalse((REPO_ROOT / f"{name}.py").exists())
+
+
 class DeadCapabilityInventoryTests(unittest.TestCase):
     """The complete list of public functions nothing in production calls.
 
@@ -984,19 +1319,34 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         "enqueue",                        # retry_queue's one-shot API; the
         "dequeue",                        # Runner uses the batch API (B안)
         # --- waiting on a credentialled sink, not on a decision -----------
-        "to_payload",                     # C48: `DashboardModel.to_payload()`
-                                          # is the Control Tower's hand-off
-                                          # contract for a Notion projection,
-                                          # and the Workspace it would write
-                                          # to needs credentials this
-                                          # repository does not have (A-8).
-                                          # Distinct from the four above: no
-                                          # decision is outstanding and the
-                                          # shape is fixed by tests against
-                                          # the very model `ops_status.py`
-                                          # renders, so the screen and the
-                                          # payload cannot drift while it
-                                          # waits.
+        #
+        # `to_payload` left this list in C51. It is what
+        # `controltower/notion_projection.project_panels()` builds every
+        # Notion row out of, deliberately — reading `DashboardRow.values`
+        # directly would have made the projection a second redaction
+        # boundary, and `_UNAUTHORED_KEYS` exists because the first draft of
+        # that list leaked a secret-shaped `project_id` through a row key.
+        # The Control Tower's hand-off contract finally has a consumer.
+        "sync_control_tower",             # C51: writes the five CT_* rows.
+                                          # Unwired for the reason
+                                          # `bootstrap_dashboard_databases`
+                                          # above is, plus one more: docs/14
+                                          # §1 fixes the Operational
+                                          # Projection as `Notion (PROJECTS /
+                                          # OPS_RUNS)`, so these databases are
+                                          # out of contract until that table
+                                          # is widened — a spec decision, not
+                                          # a coding one.
+                                          # `ControlTowerDatabasesAreNot
+                                          # ContractedYetTests` pins the gap
+                                          # and fails the day it closes.
+                                          # Everything below the write —
+                                          # schema, mapping, payload,
+                                          # validation — is exercised end to
+                                          # end against the in-memory
+                                          # transport, so what waits is the
+                                          # sink and the sanction, never the
+                                          # shape.
         # --- convenience accessors nothing needed yet ---------------------
         # `component` left this list in C46: `ops_status._same_instant_skips_
         # from_the_last_run()` needs one named component's metrics out of the

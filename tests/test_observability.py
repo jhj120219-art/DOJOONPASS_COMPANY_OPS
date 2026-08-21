@@ -21,7 +21,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -117,6 +117,492 @@ class AgentStatusTestCase(unittest.TestCase):
     def touch(self, directory: Path, name: str):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / name).write_text("{}", encoding="utf-8")
+
+
+class TheStatusViewAnswersWhenTheDiskRefusesTests(unittest.TestCase):
+    """`ops_status.py` has forty-one exception handlers and a dozen of them
+    had never run.
+
+    Every one is the same promise, written out in a dozen docstrings: *this
+    is a diagnostic; it must still produce an answer when part of the
+    evidence is damaged.* The promise is load-bearing in a way that is easy
+    to under-rate — this is the tool an operator opens **because** something
+    already looks wrong, so the run where a handler is missing is exactly the
+    run where it is needed, and the failure is a traceback instead of a
+    report.
+
+    Covering each arm separately would be a dozen micro-tests about
+    `os.scandir`. The property they share is one sentence, so it is driven as
+    one: for each filesystem primitive the view uses, make it fail for
+    **every path under the runtime tree** and assert the whole report still
+    renders and still exits sanely.
+
+    Scoped to the runtime tree rather than patched globally, for two reasons.
+    It is the realistic fault — a permission change or a mount going away
+    under `runtime/`, not `pathlib` breaking — and a global patch takes
+    pytest's own imports down with it, which would make this test about the
+    harness instead of about the subject.
+    """
+
+    #: Every block `main()` prints, in the order it prints them. Named so a
+    #: block added later is covered by this sweep without anybody editing it
+    #: — the loop asks the module, and `test_the_sweep_covers_every_block`
+    #: checks the list against what `main()` actually calls.
+    BLOCKS = (
+        "_print_company",
+        "_print_history",
+        "_print_control_tower",
+        "_print_last_run",
+        "_print_notion",
+        "_print_agent",
+    )
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.runtime = Path(tmp.name) / "runtime"
+        # A tree with something real in every corner, so the sweep is
+        # breaking reads that would otherwise have succeeded. Faults over an
+        # empty tree prove nothing: the early `is_dir()` guards return first
+        # and no handler is reached.
+        for relative in (
+            "events/processed", "events/transport", "events/incoming",
+            "events/rejected", "local_master/daily", "local_master/monthly",
+            "history_candidates/keep", "history_candidates/review",
+            "state", "logs", "runs", "agent/state", "agent/logs",
+        ):
+            (self.runtime / relative).mkdir(parents=True, exist_ok=True)
+
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="PAY",
+            event_type="BLOCKED", status="BLOCKED", blocker="vendor key",
+            summary="blocked on the vendor", history_candidate=True,
+            event_id="EVT-1", timestamp="2026-08-05T10:00:00+09:00",
+        )
+        (self.runtime / "events" / "processed" / "EVT-1.json").write_text(
+            event.to_json(), encoding="utf-8"
+        )
+        (self.runtime / "local_master" / "daily" / "2026-08-05.md").write_text(
+            "# 2026-08-05\n\n- EVT-1 blocked on the vendor\n", encoding="utf-8"
+        )
+        (self.runtime / "local_master" / "monthly" / "2026-08.md").write_text(
+            "# 2026-08\n", encoding="utf-8"
+        )
+        (self.runtime / "runs" / "last_run.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "run_id": "RUN-1",
+                    "started_at": "2026-08-05T10:00:00+09:00",
+                    "finished_at": "2026-08-05T10:00:05+09:00",
+                    "components": [{"name": "transport", "status": "SUCCESS"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.runtime / "state" / "notion_retry_queue.json").write_text(
+            json.dumps({"entries": []}), encoding="utf-8"
+        )
+        (self.runtime / "agent" / "state" / "agent_state.json").write_text(
+            json.dumps({"desktop_id": "DESKTOP_4", "last_run": None}), encoding="utf-8"
+        )
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_faults", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.runtime
+        # A separate knob on purpose: `_agent_dir()`'s docstring records that
+        # the manifest path "belongs to `app.runner`, which decides where the
+        # manifest lives", so rebinding `RUNTIME_DIR` deliberately does not
+        # move it. Without this line the LAST RUN block reads the real
+        # repository's manifest and the sweep silently tests nothing there.
+        module.DEFAULT_RUN_SUMMARY_PATH = self.runtime / "runs" / "last_run.json"
+        return module
+
+    def _under_runtime(self, target) -> bool:
+        try:
+            Path(target).resolve().relative_to(self.runtime.resolve())
+        except (ValueError, OSError, TypeError):
+            return False
+        return True
+
+    @contextlib.contextmanager
+    def _refusing(self, *primitives):
+        """Make each named primitive raise `OSError` for runtime-tree paths.
+
+        `PermissionError` rather than a bare `OSError`: it is an `OSError`
+        subclass, so a handler written for the base class catches it, and one
+        written for something narrower does not — which is the mistake worth
+        catching.
+        """
+        import os as os_module
+
+        undo = []
+        if "scandir" in primitives:
+            real = os_module.scandir
+
+            def fake_scandir(path=".", *args, **kwargs):
+                if self._under_runtime(path):
+                    raise PermissionError(f"refused: {path}")
+                return real(path, *args, **kwargs)
+
+            os_module.scandir = fake_scandir
+            undo.append(lambda: setattr(os_module, "scandir", real))
+        if "iterdir" in primitives:
+            real_iterdir = Path.iterdir
+
+            def fake_iterdir(self_path):
+                if self._under_runtime(self_path):
+                    raise PermissionError(f"refused: {self_path}")
+                return real_iterdir(self_path)
+
+            Path.iterdir = fake_iterdir
+            undo.append(lambda: setattr(Path, "iterdir", real_iterdir))
+        if "stat" in primitives:
+            real_stat = Path.stat
+
+            def fake_stat(self_path, *args, **kwargs):
+                if self._under_runtime(self_path):
+                    raise PermissionError(f"refused: {self_path}")
+                return real_stat(self_path, *args, **kwargs)
+
+            Path.stat = fake_stat
+            undo.append(lambda: setattr(Path, "stat", real_stat))
+        if "read_text" in primitives:
+            real_read = Path.read_text
+
+            def fake_read(self_path, *args, **kwargs):
+                if self._under_runtime(self_path):
+                    raise PermissionError(f"refused: {self_path}")
+                return real_read(self_path, *args, **kwargs)
+
+            Path.read_text = fake_read
+            undo.append(lambda: setattr(Path, "read_text", real_read))
+        try:
+            yield
+        finally:
+            for restore in reversed(undo):
+                restore()
+
+    def _run_blocks(self, module):
+        """Through `_block()`, which is where the guarantee lives.
+
+        Calling the `_print_*` functions directly would test something else:
+        each of them is allowed to raise on a refused disk (they contain 36
+        unguarded `is_dir()` / `is_file()` predicates and `Path.is_dir()`
+        re-raises `EACCES`). What `main()` promises is that the *report*
+        survives, one section at a time.
+        """
+        labels = {
+            "_print_company": "COMPANY",
+            "_print_history": "HISTORY",
+            "_print_control_tower": "CONTROL TOWER",
+            "_print_last_run": "LAST RUN",
+            "_print_notion": "NOTION",
+            "_print_agent": "AGENT",
+        }
+        buffer = io.StringIO()
+        attention = []
+        with contextlib.redirect_stdout(buffer):
+            for name in self.BLOCKS:
+                attention.extend(
+                    module._block(labels[name], getattr(module, name), NOW)
+                )
+        return buffer.getvalue(), attention
+
+    # ------------------------------------------------------------ tests
+    def test_the_sweep_covers_every_block_main_prints(self):
+        """Guard against the list going stale. A block added to `main()` and
+        not here would be swept by nothing and nobody would see it."""
+        import inspect
+
+        module = self._module()
+        source = inspect.getsource(module.main)
+        called = {
+            name
+            for name in dir(module)
+            if name.startswith("_print_") and f", {name})" in source
+        }
+
+        self.assertEqual(called, set(self.BLOCKS))
+
+    def test_the_healthy_tree_really_produces_a_report(self):
+        """Control. Faults over a tree that produces nothing would prove
+        nothing — the early `is_dir()` guards would return before any
+        handler ran."""
+        printed, _ = self._run_blocks(self._module())
+
+        for heading in ("COMPANY", "HISTORY", "CONTROL TOWER", "LAST RUN"):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, printed)
+        self.assertIn("EVT-1", printed)
+
+    def test_every_block_survives_each_primitive_refusing(self):
+        for primitive in ("scandir", "iterdir", "stat", "read_text"):
+            with self.subTest(primitive=primitive):
+                module = self._module()
+                with self._refusing(primitive):
+                    printed, attention = self._run_blocks(module)
+                self.assertIn("COMPANY", printed)
+                self.assertIn("CONTROL TOWER", printed)
+                self.assertIsInstance(attention, list)
+
+    def test_every_block_survives_all_of_them_refusing_at_once(self):
+        """The worst case an operator meets: the runtime directory is there
+        and nothing under it can be read."""
+        module = self._module()
+
+        with self._refusing("scandir", "iterdir", "stat", "read_text"):
+            printed, attention = self._run_blocks(module)
+
+        for heading in ("COMPANY", "HISTORY", "CONTROL TOWER", "LAST RUN"):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, printed)
+        self.assertIsInstance(attention, list)
+
+    def test_main_still_exits_with_a_code_rather_than_a_traceback(self):
+        """The whole entry point, not just the blocks. An operator runs
+        `python ops_status.py`; an uncaught `PermissionError` there is exit
+        1 with a stack trace where a report belongs."""
+        module = self._module()
+        buffer = io.StringIO()
+
+        with self._refusing("scandir", "iterdir", "stat", "read_text"):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(())
+
+        self.assertNotEqual(code, 0, "a report missing every block is not a pass")
+        self.assertIn("DOJOONPASS Company Ops", buffer.getvalue())
+        self.assertIn("ATTENTION", buffer.getvalue())
+
+    def test_a_refused_block_says_so_instead_of_reporting_zero(self):
+        """The direction that matters more than not crashing.
+
+        Making each predicate return `False` on a refusal — the obvious fix
+        at the 36 call sites — would turn "I could not read this" into
+        "there is nothing here": a partial report presented as complete,
+        which is the silent-loss shape this project keeps removing. The block
+        says it failed instead, and the Event on disk is neither counted nor
+        quietly dropped.
+        """
+        module = self._module()
+
+        with self._refusing("scandir", "iterdir", "stat", "read_text"):
+            printed, attention = self._run_blocks(module)
+
+        self.assertIn("읽지 못했다", printed)
+        self.assertTrue(
+            any("읽지 못했다" in item for item in attention),
+            "an unreadable section must reach ATTENTION — otherwise a report "
+            "missing a whole block exits 0",
+        )
+        self.assertNotIn("EVT-1", printed)
+
+    def test_a_refused_block_does_not_take_the_healthy_ones_with_it(self):
+        """One section at a time. `events/processed/` refusing must not cost
+        the LAST RUN block, which reads a different file."""
+        module = self._module()
+        real_iterdir = Path.iterdir
+        real_scandir = __import__("os").scandir
+        processed = (self.runtime / "events" / "processed").resolve()
+
+        def only_processed(target) -> bool:
+            try:
+                return Path(target).resolve() == processed
+            except (OSError, ValueError, TypeError):
+                return False
+
+        import os as os_module
+
+        def fake_scandir(path=".", *a, **k):
+            if only_processed(path):
+                raise PermissionError(f"refused: {path}")
+            return real_scandir(path, *a, **k)
+
+        os_module.scandir = fake_scandir
+        self.addCleanup(setattr, os_module, "scandir", real_scandir)
+
+        def fake_iterdir(self_path):
+            if only_processed(self_path):
+                raise PermissionError(f"refused: {self_path}")
+            return real_iterdir(self_path)
+
+        Path.iterdir = fake_iterdir
+        self.addCleanup(setattr, Path, "iterdir", real_iterdir)
+
+        printed, _ = self._run_blocks(module)
+
+        self.assertIn("LAST RUN", printed)
+        # The block read the fixture manifest, not a failure marker: its own
+        # `started_at`. (`run_id` is not printed — the block reports the
+        # instant and the verdict, which is what an operator reads.)
+        self.assertIn("2026-08-05T10:00:00+09:00", printed)
+        self.assertNotIn("LAST RUN — 읽지 못했다", printed)
+
+
+class OneRuleForNaiveAndAwareTests(unittest.TestCase):
+    """`ops_status._comparable()` — five lines that were written three times.
+
+    `_queue_age_days()`, the Runner-lock age and the last-run age each
+    carried an identical copy, and each copy's docstring said "the same
+    guard X uses for the same reason". Prose saying two things are the same
+    is not the same as their being one thing — that is C28's rule and the
+    shape `DuplicatedRulesStayInStepTests` exists to catch — and branch
+    coverage showed the cost: the **second** arm, an aware stored value
+    against a naive reference, had never run in any of the three.
+
+    Both directions are asserted here because they resolve oppositely, and
+    getting either backwards is a `TypeError` out of the tool an operator
+    opens *because* something already looks wrong.
+    """
+
+    AWARE = datetime(2026, 8, 20, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+    NAIVE = datetime(2026, 8, 20, 9, 0)
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_comparable", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_naive_stored_value_drags_the_reference_down(self):
+        """There is no offset to invent for the stored value, so the
+        reference gives its own up."""
+        result = self._module()._comparable(self.AWARE, self.NAIVE)
+
+        self.assertIsNone(result.tzinfo)
+        self.assertEqual((result - self.NAIVE).total_seconds(), 0)
+
+    def test_a_naive_reference_is_lifted_instead(self):
+        """The arm that had never run. The caller's `now` is a local wall
+        clock, and `astimezone()` is what that means — dropping the stored
+        value's offset instead would silently shift the age by hours."""
+        result = self._module()._comparable(self.NAIVE, self.AWARE)
+
+        self.assertIsNotNone(result.tzinfo)
+        self.assertEqual(result, self.NAIVE.astimezone())
+
+    def test_two_aware_datetimes_are_left_alone(self):
+        module = self._module()
+        other = self.AWARE - timedelta(days=1)
+
+        self.assertIs(module._comparable(self.AWARE, other), self.AWARE)
+
+    def test_two_naive_datetimes_are_left_comparable(self):
+        module = self._module()
+        other = self.NAIVE - timedelta(days=1)
+
+        result = module._comparable(self.NAIVE, other)
+        self.assertIsNone(result.tzinfo)
+        self.assertEqual((result - other).days, 1)
+
+    def test_no_pairing_raises(self):
+        """The property the three call sites depend on: whatever mix of
+        naive and aware arrives, a subtraction follows."""
+        module = self._module()
+        for reference in (self.AWARE, self.NAIVE):
+            for other in (self.AWARE, self.NAIVE):
+                with self.subTest(reference=reference, other=other):
+                    (module._comparable(reference, other) - other).total_seconds()
+
+    def test_the_queue_age_survives_a_hand_edited_entry(self):
+        """One of the three callers, end to end. `load_queue()` shape-checks
+        `added_at` and never validates it as a timestamp, so an offset-less
+        one reaches this arithmetic from a file a person edited."""
+        module = self._module()
+
+        self.assertIsNotNone(
+            module._queue_age_days("2026-08-19T09:00:00", self.AWARE)
+        )
+        self.assertIsNotNone(
+            module._queue_age_days("2026-08-19T09:00:00+09:00", self.NAIVE)
+        )
+
+    def test_an_unparseable_added_at_is_none_rather_than_an_error(self):
+        self.assertIsNone(
+            self._module()._queue_age_days("last tuesday", self.AWARE)
+        )
+
+
+class ATimestampWithNoOffsetIsStillComparableTests(unittest.TestCase):
+    """`days_since_last_run()`'s naive/aware normalisation, never executed.
+
+    `agent_state.json` is written by `datetime.now().astimezone()`, so every
+    `last_run` this project produces carries an offset and the aware path is
+    the only one the suite ever took. The naive path is not dead: a
+    hand-edited state file, a restore from a machine whose clock had no
+    zone, or a state written by an older build all produce
+    `2026-08-10T09:00:00`, and Python raises `TypeError` on **any**
+    comparison between a naive and an aware datetime.
+
+    That exception would come out of `ops_status.py`'s AGENT block — the
+    view an operator opens **because** something already looks wrong. The
+    guard turns it into an answer; nothing had checked that the answer is
+    right.
+
+    Both directions are covered, because `now` can be the naive one too:
+    `read_status()` takes whatever the caller passes.
+    """
+
+    def _snapshot(self, last_run):
+        from agent.status import AgentStatusSnapshot
+
+        return AgentStatusSnapshot(
+            desktop_id="DESKTOP_1",
+            last_run=last_run,
+            last_successful_collection_date=None,
+            pending_dates=(),
+            outbox_count=0,
+            sent_count=0,
+            rejected_signal_count=0,
+        )
+
+    def test_a_naive_last_run_against_an_aware_now(self):
+        snapshot = self._snapshot("2026-08-10T09:00:00")
+        now = datetime(2026, 8, 13, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+
+        self.assertEqual(snapshot.days_since_last_run(now), 3)
+
+    def test_an_aware_last_run_against_a_naive_now(self):
+        snapshot = self._snapshot("2026-08-10T09:00:00+09:00")
+
+        self.assertEqual(
+            snapshot.days_since_last_run(datetime(2026, 8, 13, 9, 0)), 3
+        )
+
+    def test_both_naive(self):
+        snapshot = self._snapshot("2026-08-10T09:00:00")
+
+        self.assertEqual(
+            snapshot.days_since_last_run(datetime(2026, 8, 13, 9, 0)), 3
+        )
+
+    def test_the_ordinary_aware_pair_is_unchanged(self):
+        """The path every real state file takes, asserted beside the others
+        so the guard is evidence about a difference rather than about one
+        case."""
+        snapshot = self._snapshot("2026-08-10T09:00:00+09:00")
+        now = datetime(2026, 8, 13, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+
+        self.assertEqual(snapshot.days_since_last_run(now), 3)
+
+    def test_a_naive_pair_never_raises_on_comparison(self):
+        """The property, stated directly: whatever mix arrives, this returns
+        a number rather than a TypeError out of a status view."""
+        for last_run in ("2026-08-13T09:00:00", "2026-08-13T09:00:00+09:00"):
+            for now in (
+                datetime(2026, 8, 13, 10, 0),
+                datetime(2026, 8, 13, 10, 0, tzinfo=timezone(timedelta(hours=9))),
+            ):
+                with self.subTest(last_run=last_run, now=now):
+                    self.assertEqual(self._snapshot(last_run).days_since_last_run(now), 0)
 
 
 class AgentStatusTests(AgentStatusTestCase):
@@ -310,6 +796,311 @@ class CompanyActivityTestCase(unittest.TestCase):
             incoming_dir=self.incoming,
             rejected_dir=self.rejected,
         )
+
+
+class TheDiagnosticSurvivesADamagedFileTests(CompanyActivityTestCase):
+    """The three guards in `desktop_activity.py` that had never executed.
+
+    BACKLOG C49 §11c classified the module's remaining unexecuted branches as
+    "real conditions, cheap to cover, left by priority". Every one of them is
+    a `processed/` file that is present and wrong — which is not exotic:
+    docs/11 permits a hand-placed Event, a partial restore leaves whatever it
+    managed to copy, and this whole module exists to keep answering when part
+    of the evidence is damaged.
+
+    A guard that has never run is a guard nobody has checked, and the failure
+    mode if one is wrong is the worst kind for a status view: an exception
+    out of the thing an operator runs *because* something is already broken.
+    """
+
+    def _write(self, name, payload):
+        (self.processed / name).write_text(
+            payload if isinstance(payload, str) else json.dumps(payload),
+            encoding="utf-8",
+        )
+
+    def test_an_unparseable_timestamp_leaves_the_date_unknown_not_crashing(self):
+        """`DesktopActivity.last_event_date` parses `last_event_at`, which is
+        whatever the file said. `validate_event()` would have refused this,
+        but nothing re-validates a file already sitting in `processed/`."""
+        self._write(
+            "bad-timestamp.json",
+            {
+                "schema_version": "1.0",
+                "event_id": "EVT-BAD-TS",
+                "timestamp": "yesterday afternoon",
+                "source": "DESKTOP_1",
+                "role": "CTO_BACKEND",
+                "project_id": "PRJ",
+                "event_type": "MILESTONE_COMPLETED",
+                "status": "IN_PROGRESS",
+                "summary": "x",
+                "history_candidate": True,
+            },
+        )
+
+        activity = self.snapshot().for_source("DESKTOP_1")
+
+        self.assertEqual(activity.event_count, 1)
+        self.assertIsNone(activity.last_event_date)
+
+    def test_a_desktop_that_is_not_in_the_schema_is_a_key_error(self):
+        """`for_source()` covers every `events.SOURCES` entry, so a miss means
+        the caller asked for something that is not a Desktop. Raising beats
+        returning an empty activity, which would read as "reported nothing"."""
+        with self.assertRaises(KeyError):
+            self.snapshot().for_source("DESKTOP_9")
+
+    def test_a_json_file_that_is_not_an_object_cannot_answer_the_twin_question(self):
+        """`_event_id_of()` decides whether two files sharing a name are the
+        same Event. A file holding a JSON *list* parses fine and has no
+        `event_id`; treating it as a match would count a suppressed collision
+        as an already-collected one and clear an ATTENTION line that should
+        stay."""
+        from app import desktop_activity
+
+        self._write("a-list.json", [1, 2, 3])
+
+        self.assertIsNone(desktop_activity._event_id_of(self.processed / "a-list.json"))
+
+    def test_the_same_file_is_still_reported_as_unreadable_where_it_matters(self):
+        """The two guards answer differently on purpose: `_event_id_of()`
+        returns None so the caller stays cautious, and the `processed/` scan
+        counts the file in `unreadable_events` so a person is told it is
+        there."""
+        self._write("a-list.json", [1, 2, 3])
+
+        self.assertIn("a-list.json", self.snapshot().unreadable_events)
+
+
+class TheDuplicateQualifierReachesTheCompanyBlockTests(CompanyActivityTestCase):
+    """The screen half of C51 §6.
+
+    The fold itself is pinned by `TheTwoBlocksCountTheSameEventsTests`; this
+    is the line that tells the operator it happened. Without it the COMPANY
+    block reports `events=1` over a directory holding two files and nothing
+    says why — which is the same silent difference the fold was fixing, moved
+    one layer out.
+    """
+
+    def _block(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_dupline", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.root
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_company(
+                datetime(2026, 8, 20, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+            )
+        return buffer.getvalue()
+
+    def setUp(self):
+        super().setUp()
+        # `_print_company()` reads RUNTIME_DIR/events/*
+        events = self.root / "events"
+        events.mkdir(parents=True, exist_ok=True)
+        self.processed.rename(events / "processed")
+        self.processed = events / "processed"
+
+    def test_a_duplicate_file_is_named_on_the_screen(self):
+        self.add_event(
+            source="DESKTOP_4", role="COO", timestamp="2026-08-05T10:00:00+09:00",
+            event_id="EVT-TWICE",
+        )
+        (self.processed / "a-copy.json").write_text(
+            (self.processed / "EVT-TWICE.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        printed = self._block()
+
+        self.assertIn("중복 파일", printed)
+        self.assertIn("1건", printed)
+        self.assertIn("DESKTOP_4   events=1", printed)
+
+    def test_a_clean_directory_prints_no_qualifier(self):
+        """A qualifier that always appears is one an operator stops
+        reading — the same rule the CONTROL TOWER block's copy follows."""
+        self.add_event(
+            source="DESKTOP_1", role="CTO_BACKEND",
+            timestamp="2026-08-05T10:00:00+09:00",
+        )
+
+        self.assertNotIn("중복 파일", self._block())
+
+
+class TheTwoBlocksCountTheSameEventsTests(CompanyActivityTestCase):
+    """One screen, two counters, and they used to disagree.
+
+    `collector/runtime.py` moves a DUPLICATE into `processed/` as well —
+    docs/10 §46 forbids deleting it — and names the destination after **the
+    incoming file**, not after the `event_id`. So one Event arriving twice
+    under two names leaves two files, which is a re-send, a partial restore,
+    or the hand-placed copy docs/11 permits.
+
+    C50 §8 found the COMPANY-wide effect of that in
+    `controltower.build_company_rollup()` and folded it on `event_id` there.
+    `read_company_activity()` was never folded, and the two counters print
+    one below the other. Measured on this repository's own `processed/` at
+    C51, with exactly one such pair:
+
+        COMPANY block          DESKTOP_4 events=2
+        CONTROL TOWER block    DESKTOP_4 Event 1        + "중복 파일 1건"
+
+    An operator reading down the page met two answers to one question, and
+    only the lower one carried an explanation.
+    """
+
+    #: Two files, one Event. The second name is what a re-delivery or a
+    #: hand-placed copy looks like — the Collector never renames it.
+    def _one_event_in_two_files(self, *, source="DESKTOP_4", role="COO"):
+        self.add_event(
+            source=source,
+            role=role,
+            timestamp="2026-08-05T10:00:00+09:00",
+            event_id="EVT-TWICE",
+        )
+        original = self.processed / "EVT-TWICE.json"
+        (self.processed / "a-hand-placed-copy.json").write_text(
+            original.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    def test_one_event_in_two_files_is_counted_once(self):
+        self._one_event_in_two_files()
+
+        self.assertEqual(self.snapshot().for_source("DESKTOP_4").event_count, 1)
+
+    def test_the_fold_is_reported_rather_than_silent(self):
+        """`CompanyRollup.duplicates` states the rule this follows: an
+        operator who sees `events=1` where the directory holds two files has
+        to be able to find the second.
+
+        *Which* of the two is named is decided by sorted filename order —
+        the same thing that decides it in `build_company_rollup()`, and for
+        identical copies it makes no difference to any number. It is asserted
+        as "one of the two, not both" rather than by name so the test pins
+        the property instead of the ordering."""
+        self._one_event_in_two_files()
+
+        snapshot = self.snapshot()
+        self.assertEqual(len(snapshot.duplicate_event_files), 1)
+        self.assertIn(
+            snapshot.duplicate_event_files[0],
+            ("EVT-TWICE.json", "a-hand-placed-copy.json"),
+        )
+
+    def test_a_clean_directory_reports_no_duplicates(self):
+        """A qualifier that always appears is one an operator stops
+        reading."""
+        self.add_event(
+            source="DESKTOP_1", role="CTO_BACKEND", timestamp="2026-08-05T10:00:00+09:00"
+        )
+
+        self.assertEqual(self.snapshot().duplicate_event_files, ())
+
+    def test_the_two_counters_agree_on_the_same_directory(self):
+        """The property, asserted against the other counter rather than
+        against a number this test chose. That is what makes it a guard on
+        the *disagreement* instead of on one implementation."""
+        from datetime import datetime, timedelta, timezone
+
+        from controltower import build_company_rollup
+
+        self._one_event_in_two_files()
+        self.add_event(
+            source="DESKTOP_1", role="CTO_BACKEND", timestamp="2026-08-06T10:00:00+09:00"
+        )
+
+        now = datetime(2026, 8, 20, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+        snapshot = self.snapshot()
+        rollup = build_company_rollup(processed_dir=self.processed, now=now)
+
+        for desktop in rollup.desktops:
+            with self.subTest(source=desktop.source):
+                self.assertEqual(
+                    snapshot.for_source(desktop.source).event_count,
+                    desktop.event_count,
+                )
+
+    def test_the_arrival_time_does_not_depend_on_what_a_file_is_called(self):
+        """The trap the first draft of this fold fell into.
+
+        `last_arrival_at` answers "when did a file from this Desktop last
+        show up", which is what separates the two ATTENTION sentences
+        ("Agent가 멈췄다" from "밀린 분을 보낸 것으로 보인다"). Read off only
+        the copy that survives the fold, the answer becomes whichever copy
+        sorted first — so renaming a file would change an operational
+        number. It is a max over every copy instead."""
+        self._one_event_in_two_files()
+        recent = time.time()
+        old = recent - 86_400 * 30
+
+        for name, when in (
+            ("EVT-TWICE.json", old),
+            ("a-hand-placed-copy.json", recent),
+        ):
+            os.utime(self.processed / name, (when, when))
+        newest_first = self.snapshot().for_source("DESKTOP_4").last_arrival_at
+
+        for name, when in (
+            ("EVT-TWICE.json", recent),
+            ("a-hand-placed-copy.json", old),
+        ):
+            os.utime(self.processed / name, (when, when))
+        newest_second = self.snapshot().for_source("DESKTOP_4").last_arrival_at
+
+        self.assertAlmostEqual(newest_first, newest_second, places=3)
+        self.assertAlmostEqual(newest_first, recent, places=3)
+
+    def test_a_duplicate_does_not_widen_the_event_date_range(self):
+        """The copy carries the same timestamp, so `first_event_at` /
+        `last_event_at` must not move — and a copy edited to a different
+        date is a different Event by content, which is the Control Tower's
+        `EVENT_ID_CONFLICT`, not this counter's business."""
+        self._one_event_in_two_files()
+        activity = self.snapshot().for_source("DESKTOP_4")
+
+        self.assertEqual(activity.first_event_at, activity.last_event_at)
+
+    def test_a_file_with_no_event_id_is_counted_rather_than_dropped(self):
+        """It cannot be folded, and dropping it would make the block quieter
+        than the directory. `unreadable` fails in the same direction."""
+        (self.processed / "no-id.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "timestamp": "2026-08-05T10:00:00+09:00",
+                    "source": "DESKTOP_2",
+                    "role": "CMO",
+                    "project_id": "PRJ",
+                    "event_type": "MILESTONE_COMPLETED",
+                    "status": "IN_PROGRESS",
+                    "summary": "no id",
+                    "history_candidate": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.for_source("DESKTOP_2").event_count, 1)
+        self.assertEqual(snapshot.duplicate_event_files, ())
+
+    def test_three_files_of_one_event_leave_one_count_and_two_duplicates(self):
+        self._one_event_in_two_files()
+        (self.processed / "another-copy.json").write_text(
+            (self.processed / "EVT-TWICE.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.for_source("DESKTOP_4").event_count, 1)
+        self.assertEqual(len(snapshot.duplicate_event_files), 2)
 
 
 class CompanyActivityTests(CompanyActivityTestCase):
@@ -809,12 +1600,19 @@ class StatusEntrypointTests(unittest.TestCase):
             with self.subTest(view=name):
                 self.assertTrue(callable(getattr(module, name)))
 
+        # Matched as "named in `main()`'s block table", not as the literal
+        # call `_print_company(now)`. C55 wrapped every block in `_block()`
+        # so a refused disk costs one section instead of the whole report,
+        # and the calls stopped being written that way — a wiring check that
+        # breaks on the *shape* of the call reports on the refactor rather
+        # than on the wiring.
         import inspect
 
         source = inspect.getsource(module.main)
         for name in ("_print_company", "_print_history", "_print_agent"):
             with self.subTest(view=name):
-                self.assertIn(f"{name}(now)", source)
+                self.assertIn(f", {name})", source)
+                self.assertIn("_block(label, block, now)", source)
 
     def test_the_history_view_survives_a_missing_local_master(self):
         """On Desktop 1/2/3 there is no Local Master at all; the view must
@@ -10310,7 +11108,9 @@ class NotionQueueVisibilityTests(unittest.TestCase):
         )
         main_body = source.split("def main(", 1)[1]
 
-        self.assertIn("_print_notion(now)", main_body)
+        # See `StatusEntrypointTests.test_all_three_views_are_wired_into_main`
+        # for why this matches the block table rather than a literal call.
+        self.assertIn(", _print_notion)", main_body)
 
     def test_the_paths_are_derived_per_call_from_runtime_dir(self):
         """C31 §10's trap: a path frozen at import makes `RUNTIME_DIR` a knob

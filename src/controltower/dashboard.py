@@ -44,9 +44,19 @@ through the `OPS_RUNS` row `notion/dashboard.record_run()` writes:
     History        `Accepted` / `Duplicate` / `Rejected` / `Failed Steps`
     Backup         `Backup Status` / `Deleted Files`
     Recovery       `Reused Days` / `Deleted Files`
-    Notion Sync    `Notion Synced` / `Skipped` / `Retried` / `Unreadable` /
-                   `Queued`
+    Notion Sync    `Notion Synced` / `Notion Skipped` / `Notion Retried` /
+                   `Notion Unreadable` / `Notion Queued`
     Desktop        `Desktops Reporting` / `Role Mismatches`  (C47)
+
+Every name above is a real `OPS_RUNS` column and
+`TheOperationalHalfReallyIsInOpsRunsTests` checks each one against
+`notion/dashboard.DASHBOARD_DATABASES`. That gate is not decoration: this
+list is the **reason** those facts are absent from the panels below, so a
+column renamed out from under it would turn the justification false and the
+fact would then reach nobody — the model would not carry it and the row
+would not have it. Four of the five Notion Sync names were written in
+shorthand (`Skipped`, `Retried`, …) until the gate was added, which is
+exactly how far a list nothing reads can drift while still reading fine.
 
 Restating them here would be a second opinion about a run, and `runsummary`
 is deliberately a leaf so that every reporter reads the same manifest. This
@@ -84,15 +94,46 @@ from typing import Any, Mapping
 from oplog import bounded, one_line, redact
 
 from .rollup import (
+    RECENT_LIMIT,
     UNSOURCED_LAYERS,
     CompanyRollup,
     EvidenceRef,
 )
 
-# Bumped when the shape of `to_payload()` changes in a way a consumer would
-# have to be taught. Same role as `runsummary.SCHEMA_VERSION`: the payload is
-# read by something that was written against a version of it.
-DASHBOARD_SCHEMA_VERSION = "1.0"
+# `MAJOR.MINOR`, and both halves now have a rule a test enforces.
+#
+#     MINOR   the payload gained something. A reader written against an
+#             earlier version still finds every key it knew, so it keeps
+#             working — but something new exists and nobody was told.
+#     MAJOR   a key, panel or column was **removed or renamed**, or changed
+#             type. A reader written against the old number breaks.
+#
+# Until C52 this was a decorative field. It said "1.0" through C49 adding the
+# whole `coverage` block, C50 adding `coverage.duplicates`, and C52 adding
+# three panels and two columns — three shape changes, none of them announced,
+# because nothing compared the number to the shape. That is the drift a
+# version string exists to make visible and this one was hiding.
+#
+# `ThePayloadShapeIsPinnedToItsVersionTests` closes it from here: it records
+# the structural fingerprint (top-level keys, coverage keys, row keys,
+# evidence keys, panel keys, every panel's columns) beside the version it
+# belongs to. Change the shape without changing the number and it fails;
+# remove or rename anything without changing MAJOR and it fails; change the
+# number without recording the new shape and it fails.
+#
+# 1.1 rather than 1.0: every change since the field was introduced has been
+# additive. Rather than invent the two intermediate numbers nobody published,
+# this records one minor bump and starts counting properly.
+#
+# 1.2 adds `coverage.history_checked`. Additive — a 1.1 reader finds every
+# key it knew — so MINOR. The *value* of `coverage.complete` also changes for
+# a model nobody enriched (it was `true`, it is now `false`), and that is the
+# defect being fixed rather than a contract break: no reader was entitled to
+# the old answer, because no reader could tell it apart from a checked one.
+#
+# Same role as `runsummary.SCHEMA_VERSION`: the payload is read by something
+# that was written against a version of it.
+DASHBOARD_SCHEMA_VERSION = "1.2"
 
 # How many `EvidenceRef`s one payload row carries. The model keeps every one
 # of them; this bounds only what leaves the machine.
@@ -157,6 +198,13 @@ _UNAUTHORED_KEYS: frozenset[str] = frozenset(
         "claimed_role",
         "expected_role",
         "blocker_team",
+        # `events.EVENT_TYPES`, a frozenset of eight words `validate_event()`
+        # enforces. Added when the ACTIVITY panel first needed it as a Notion
+        # `select`, and found by the gate that says a select column must be
+        # on this list — which is what that gate is for. It belongs here on
+        # the same footing as `status`: neither can carry a character a
+        # person typed.
+        "event_type",
     }
 )
 
@@ -244,20 +292,53 @@ class Coverage:
     # is a real problem — two files, one id, different contents — is a RISKS
     # row instead, where an operator has something to do about it.
     duplicates: int = 0
+    # Whether anybody actually asked the Company-History question.
+    #
+    # `with_history_coverage()`'s docstring claimed calling it with `None`
+    # was "still meaningful … the difference between 'asked and there is no
+    # gap' and 'never asked'". It was not: both left
+    # `history_uncovered_from` at `None`, so the two payloads were
+    # byte-identical and no consumer could tell them apart. The distinction
+    # the docstring described had nowhere to live.
+    #
+    # That mattered because of what `complete` did with it. A model nobody
+    # enriched answered `complete = True` — "this is the whole picture" —
+    # about a question nobody had asked. `ops_status.py` is the only
+    # production caller of `with_history_coverage()`, and
+    # `notion_projection` is the intended second consumer: wired as it
+    # stood, every Notion row would have carried `Coverage Complete = true`
+    # on coverage nobody verified.
+    #
+    # This is the same distinction the panels make between empty and
+    # `UNSOURCED`, which this module treats as load-bearing everywhere else.
+    # It now has a field.
+    history_checked: bool = False
 
     @property
     def complete(self) -> bool:
         """True when every number in the model covers everything it claims to.
 
-        Two quite different ways to be incomplete, and both belong here
-        because a consumer's next question is the same for either: "is what I
-        am looking at the whole picture?"
+        Three ways to fall short, and a consumer's next question is the same
+        for all of them: "is what I am looking at the whole picture?"
 
             unreadable                a file is there and could not be used
             history_uncovered_from    the work is recorded and its evidence
                                       is gone
+            history_checked is False  nobody looked
+
+        The third is not a lesser member. "I did not check" and "I checked
+        and it is fine" are different answers, and only one of them justifies
+        the word *complete*; conflating them is how a model that never
+        consulted Company History came to report full coverage.
+
+        `duplicates` is still deliberately not an input — see its comment: a
+        folded duplicate makes the numbers right, not partial.
         """
-        return self.unreadable == 0 and self.history_uncovered_from is None
+        return (
+            self.unreadable == 0
+            and self.history_uncovered_from is None
+            and self.history_checked
+        )
 
 
 @dataclass(frozen=True)
@@ -307,6 +388,10 @@ class DashboardModel:
                     if history_uncovered_from is not None
                     else None
                 ),
+                # The half that was missing. Without it, calling this with
+                # `None` left the model byte-identical to one nobody called
+                # it on, and `complete` said yes to both.
+                history_checked=True,
             ),
         )
 
@@ -341,6 +426,7 @@ class DashboardModel:
                 "unreadable": self.coverage.unreadable,
                 "duplicates": self.coverage.duplicates,
                 "history_uncovered_from": self.coverage.history_uncovered_from,
+                "history_checked": self.coverage.history_checked,
                 "complete": self.coverage.complete,
             },
             "unreadable": [
@@ -458,6 +544,22 @@ _SPRINT_NOTE = (
 )
 
 
+_JUDGEMENT_NOTE = (
+    "docs/04 §44 '자동화하지 않는 COO 판단'과 docs/04 §68 'V1에서 만들지 않는 것'이 "
+    "Critical Path / Launch Readiness / COO Recommendation / Go·No-Go / "
+    "CEO Decision Required를 Event만으로 결정하지 않는다고 고정하고, docs/03 §4가 "
+    "Collector 쪽에서 같은 것을 한 번 더 적는다. 여기서 계산하면 세 명세를 동시에 "
+    "어긴다. 완료 조건은 그 목록에 없는데 이유가 다르다 — 명세가 거절해서가 아니라 "
+    "아무 명세도 다루지 않기 때문이다: 완료는 docs/04 §25의 `Completed Date`로 "
+    "**보고**될 뿐 **정의**되지 않으며, 무엇을 done으로 볼지 적는 Event 필드도 "
+    "Company History 필드도 없다.\n"
+    "어느 쪽도 '아직 계산하지 못했다'가 아니라 '사람이 정한다'이다. 그 판단이 "
+    "어디에 적혀야 권위를 갖는지는 Goal과 똑같이 열려 있는 질문이고 — docs/14 §1이 "
+    "Notion을 View로 고정하므로 Notion에 적어 넣는 것으로는 답이 되지 않는다 — "
+    "BACKLOG가 그 결정을 들고 있다."
+)
+
+
 def build_dashboard(rollup: CompanyRollup, *, now: datetime) -> DashboardModel:
     """Arrange one `CompanyRollup` into the Control Tower's panels.
 
@@ -474,6 +576,9 @@ def build_dashboard(rollup: CompanyRollup, *, now: datetime) -> DashboardModel:
             _sprints_panel(),
             _desktops_panel(rollup, now),
             _risks_panel(rollup, now),
+            _activity_panel(rollup),
+            _completions_panel(rollup),
+            _judgements_panel(),
         ),
         events_read=rollup.events_read,
         unreadable=rollup.unreadable,
@@ -965,6 +1070,166 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
             "OPS_RUNS 행(`Failed Steps` / `Notion Queued` / `Reused Days` / "
             "`Deleted Files`)이 이미 나른다. stale은 DESKTOPS의 `days_silent`다."
         ),
+    )
+
+
+_ACTIVITY_COLUMNS = (
+    "event_id",
+    "at",
+    "source",
+    "team",
+    "project_id",
+    "event_type",
+    "status",
+    "summary",
+    "milestone",
+    # The panel's own bound, repeated on every row.
+    #
+    # Panel-level facts have nowhere else to go — a Notion database is rows —
+    # and this is the same choice `Coverage Complete` makes for the same
+    # stated reason: it is per-row that the question gets asked. Twenty rows
+    # with no "of 340" beside them is precisely the false reading
+    # `evidence_truncated` exists to prevent one level down.
+    "of_total",
+    "truncated",
+)
+
+
+def _activity_row(entry, *, total: int) -> DashboardRow:
+    """One `ActivityEntry` as a row. Shared by both activity panels.
+
+    `team` rather than `role` as the column name, because that is what the
+    TEAMS panel calls the same value and `_out()` decides redaction by column
+    name alone — two names for one thing is how an exemption list becomes a
+    leak, and one name for two things is the collision `derived_from` was
+    renamed to avoid.
+    """
+    return DashboardRow(
+        key=entry.event_id,
+        values={
+            "event_id": entry.event_id,
+            "at": entry.at,
+            "source": entry.source,
+            "team": entry.role,
+            "project_id": entry.project_id,
+            "event_type": entry.event_type,
+            "status": entry.status,
+            "summary": entry.summary,
+            # Present-and-null on the rows that have no milestone, so every
+            # row of the panel has one shape.
+            "milestone": entry.milestone,
+            "of_total": total,
+            "truncated": total > RECENT_LIMIT,
+        },
+        evidence=(entry.evidence,) if entry.evidence is not None else (),
+    )
+
+
+# The bound, stated once, in prose that does not move.
+#
+# The first draft interpolated the counts into this string and
+# `AuthoredValuesAreRedactedOnTheWayOutTests` refused it — correctly. That
+# sweep builds one model over clean Events and one over poisoned Events and
+# demands the panel **metadata** (`title` / `source` / `note` / `columns`)
+# come out byte-identical, which is what makes "this module wrote these
+# strings, so `_out()` need not redact them" a checkable claim rather than an
+# assertion. A note carrying a count is not a leak, but it destroys the check
+# that would catch one: the comparison can no longer tell "a number moved"
+# from "a secret got in".
+#
+# So the numbers live where numbers live — on the rows, as `of_total` and
+# `truncated`, exactly as `evidence_count` / `evidence_truncated` already do
+# one level down.
+_RECENT_NOTE = (
+    f"최근 {RECENT_LIMIT}건까지만 싣는다 (`rollup.RECENT_LIMIT`) — 작업량에 비례해 "
+    "커지는 것은 로그이며 그러면 Dashboard일 수 없다(docs/14 §3). 각 행의 "
+    "`of_total` / `truncated`가 실제 총계를 말한다. 잘려 나간 것은 잃은 것이 "
+    "아니다: 원본은 runtime/events/processed/ 에 있고 history_candidate라면 "
+    "Company History에도 있다."
+)
+
+
+def _activity_panel(rollup: CompanyRollup) -> DashboardPanel:
+    """최근 활동 — the newest Events, in the order they happened.
+
+    The first panel here that is a **list of Events** rather than a fold over
+    them, and the request asks for it in all three of its dashboards. Every
+    other panel answers "what is the state of X"; a fold cannot answer "what
+    happened lately", because the answer is the individual Events.
+
+    Newest first, which is the opposite of `rollup`'s internal order and the
+    right one for a reader: the row a person wants is at the top.
+
+    Bounded at `RECENT_LIMIT` and saying so — see the constant for why, and
+    `_truncation_note()` for why the sentence is unconditional.
+    """
+    rows = tuple(
+        _activity_row(entry, total=rollup.events_read) for entry in rollup.recent
+    )
+    return DashboardPanel(
+        key="ACTIVITY",
+        title="최근 활동",
+        status=PanelStatus.SOURCED,
+        columns=_ACTIVITY_COLUMNS,
+        rows=rows,
+        source="수집된 Event를 시각 역순으로 — 접지 않고 그대로",
+        note=_RECENT_NOTE,
+    )
+
+
+def _completions_panel(rollup: CompanyRollup) -> DashboardPanel:
+    """최근 완료 — the newest Events that finished something.
+
+    Not a filter a consumer could apply to ACTIVITY itself, and that is the
+    point: ACTIVITY is bounded, so on a busy week every completion falls off
+    the end of it and "최근 완료" would report nothing on exactly the weeks
+    it matters. `rollup.completions` is cut from the whole period.
+
+    `COMPLETED` and `MILESTONE_COMPLETED` both, per
+    `rollup.COMPLETION_EVENT_TYPES` — the second is 14 of the 16 Events on
+    this repository's own evidence, and a panel that showed only finished
+    *projects* would have been empty while the company completed fourteen
+    things. `CANCELLED` is not a completion; `PROJECT_STATES` keeps the same
+    distinction.
+    """
+    rows = tuple(
+        _activity_row(entry, total=rollup.completions_total)
+        for entry in rollup.completions
+    )
+    return DashboardPanel(
+        key="COMPLETIONS",
+        title="최근 완료",
+        status=PanelStatus.SOURCED,
+        columns=_ACTIVITY_COLUMNS,
+        rows=rows,
+        source="event_type이 COMPLETED / MILESTONE_COMPLETED인 Event, 시각 역순",
+        note=_RECENT_NOTE,
+    )
+
+
+def _judgements_panel() -> DashboardPanel:
+    """COO 판단 — present, empty, and naming three specs.
+
+    The request's Company Dashboard asks for Critical Path and its Project
+    Dashboard asks for 완료 조건. Neither has a source, and until now neither
+    was **declared** to have none — which this module treats as the worst of
+    the three states: a consumer cannot tell "nobody decided" from "the model
+    forgot".
+
+    Separate from `_goals_panel()` because the two are unsourced for
+    different reasons. A Goal has no source *yet* and BACKLOG carries the
+    open question of where to put one. These are refused on purpose:
+    docs/04 §44, docs/04 §68 and docs/03 §4 each say they are not derived
+    from Events. Merging them would put "undecided" and "decided not to" in
+    one panel, and the second is not waiting for anything.
+    """
+    return DashboardPanel(
+        key="JUDGEMENTS",
+        title="COO 판단 (자동화하지 않음)",
+        status=PanelStatus.UNSOURCED,
+        source="",
+        note=_JUDGEMENT_NOTE,
+        unsourced_layers=("CRITICAL_PATH", "COMPLETION_CRITERIA"),
     )
 
 

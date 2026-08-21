@@ -104,7 +104,57 @@ DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "runtime" / "events" / "processed"
 # The layers a Control Tower usually has and this system has no source for.
 # Named so a view can say so out loud instead of showing an empty panel that
 # reads as "nothing is happening".
-UNSOURCED_LAYERS: tuple[str, ...] = ("COMPANY_GOAL", "TEAM_GOAL", "SPRINT", "TASK")
+# Layers and judgements this system has no source for.
+#
+# The first four are layers of the work hierarchy. The last two are the
+# **COO judgements** docs/04 §44 lists under "자동화하지 않는 COO 판단" and
+# docs/04 §68 repeats under "V1에서 만들지 않는 것" — `Critical Path`,
+# `Launch Readiness`, `COO Recommendation`, `Go / No-Go Opinion`,
+# `CEO Decision Required` — plus the one the request asks for that no spec
+# names because nothing produces it: a project's 완료 조건.
+#
+# Why they are here rather than simply absent: the request's Company
+# Dashboard asks for Critical Path and its Project Dashboard asks for 완료
+# 조건, and this module's whole posture is that "empty" and "no source" mean
+# opposite things. A field the model neither sources nor declares is the one
+# a consumer cannot tell apart from an oversight.
+#
+# `CRITICAL_PATH` is the strongest case of the six: three separate specs say
+# it is not derived (docs/03 §4 "Critical Path 자동 확정" under what the
+# Collector does not do, docs/04 §44, docs/04 §68). Deriving one here would
+# contradict all three.
+#
+# `COMPLETION_CRITERIA` has no spec section refusing it because no spec
+# section discusses it. That is the finding: `PROJECT_STATES` reads COMPLETE
+# off docs/04 §25's `Completed Date`, so completion is **reported** and never
+# **defined** — no Event field and no Company History field says what would
+# have counted as done.
+UNSOURCED_LAYERS: tuple[str, ...] = (
+    "COMPANY_GOAL",
+    "TEAM_GOAL",
+    "SPRINT",
+    "TASK",
+    "CRITICAL_PATH",
+    "COMPLETION_CRITERIA",
+)
+
+# How many Events the recent-activity and recent-completion slices carry.
+#
+# Bounded for docs/14 §3's reason, which `EVIDENCE_IN_PAYLOAD` already
+# applies one layer out: "작업량에 비례해 커지는 것은 로그이며, 그러면
+# Manifest일 수 없다". An unbounded activity feed is a log, and a Control
+# Tower panel that grows with the company's output stops being a glance.
+#
+# Twenty rather than five: this is the panel a person reads *as a list*,
+# where five is one bad afternoon, and it is one screen in every renderer
+# this projects to. Everything older is not lost — it is in
+# `runtime/events/processed/` and, for `history_candidate` Events, in
+# Company History, which is the Source (docs/14 §1).
+#
+# Never silent: `CompanyRollup.events_read` is the true total behind
+# `recent`, `completions_total` the one behind `completions`, and both
+# panels say so.
+RECENT_LIMIT = 20
 
 # Stable presentation order, the same one `daily/role_summary.ROLE_ORDER`
 # uses and for the same reason: a report that reorders itself between runs is
@@ -135,6 +185,42 @@ class EvidenceRef:
 
     def describe(self) -> str:
         return f"{self.event_id} ({self.at}) {self.path}"
+
+
+@dataclass(frozen=True)
+class ActivityEntry:
+    """One Event, kept whole, for the panels that answer "what happened".
+
+    Every other rollup here **folds** — `ProjectRollup` collapses a
+    project's Events into one state, `Metric` collapses them into a count.
+    This one does not, and that is the point: "최근 활동" and "최근 완료" are
+    the two questions a fold cannot answer, because the answer is the
+    individual Events in the order they happened.
+
+    Fields are the Event's own, verbatim and unredacted, for the reason the
+    Dashboard Model states about `EvidenceRef`: a rollup that quietly
+    rewrote its evidence would make the reference unusable for finding the
+    file. `to_payload()` is the boundary where `summary` / `milestone` /
+    `blocker` / `project_id` are redacted, and it applies to these the same
+    way it applies to every other authored value.
+
+    `summary` is here and nowhere else in this module. Every existing panel
+    reports counts and states; this is the first one that carries a sentence
+    a person wrote, which is why `RECENT_LIMIT` exists and why the panels
+    built from it declare their own truncation.
+    """
+
+    event_id: str
+    at: str
+    source: str
+    role: str
+    project_id: str
+    event_type: str
+    status: str
+    summary: str
+    milestone: str | None = None
+    blocker: str | None = None
+    evidence: EvidenceRef | None = None
 
 
 @dataclass(frozen=True)
@@ -364,6 +450,27 @@ class CompanyRollup:
     # carried. Counted once above, listed here — never dropped silently, for
     # the reason `unreadable` is never dropped silently.
     duplicates: tuple[DuplicateEvent, ...] = ()
+    # The most recent Events, newest first, bounded by `RECENT_LIMIT`.
+    # `events_read` is the true total behind it.
+    recent: tuple[ActivityEntry, ...] = ()
+    # The most recent Events that **finished** something — `COMPLETED` (a
+    # project) and `MILESTONE_COMPLETED` (a step inside one).
+    #
+    # A separate slice rather than a filter over `recent`, and the reason is
+    # a loss this project would otherwise have shipped: `recent` is bounded,
+    # so a busy week pushes completions out of it entirely and "최근 완료"
+    # reports nothing on exactly the weeks it matters most. Measured on this
+    # repository's own evidence — 16 Events, 14 of them MILESTONE_COMPLETED —
+    # the two lists are nearly the same today, and one noisy Desktop is all
+    # it takes for them not to be.
+    #
+    # `CANCELLED` is not here. It ends a project without finishing anything,
+    # and `PROJECT_STATES` already tells it apart from COMPLETE for the same
+    # reason.
+    completions: tuple[ActivityEntry, ...] = ()
+    # The true total behind `completions`, which `events_read` cannot give
+    # because it counts every Event.
+    completions_total: int = 0
     events_read: int = 0
     unreadable: tuple[tuple[str, str], ...] = ()
     since: date_type | None = None
@@ -480,28 +587,81 @@ def read_events(processed_dir: Path) -> tuple[tuple[tuple[Event, str], ...], tup
     Collector accepts it and moves it here under the staging name.
     """
     processed_dir = Path(processed_dir)
-    if not processed_dir.is_dir():
-        return (), ()
+    # No `is_dir()` pre-check, and its removal is the point.
+    #
+    # `Path.is_dir()` does **not** swallow a permission error —
+    # `pathlib._abc._IGNORED_ERRNOS` is `(ENOENT, ENOTDIR, EBADF, ELOOP)` and
+    # `EACCES` is re-raised. So the old shape
+    #
+    #     if not processed_dir.is_dir(): return (), ()
+    #     try:  entries = sorted(os.scandir(processed_dir), ...)
+    #     except OSError as exc: return (), ((str(processed_dir), str(exc)),)
+    #
+    # guarded the second call and not the first, and the first raises the
+    # same class. That mattered here more than at a typical call site,
+    # because this function **already has somewhere to put the answer**: the
+    # `unreadable` channel, which the Control Tower renders as "읽지 못한
+    # 파일 N건 — 아래 숫자는 그만큼 적다". The pre-check threw that away and
+    # took the whole block with it instead.
+    #
+    # Asking `scandir` is also the only way to ask without a race: between an
+    # `is_dir()` that says yes and a `scandir` that runs, the directory can
+    # go away — which is not hypothetical on a folder OneDrive is syncing.
+    #
+    # The two "there is simply nothing here" cases stay silent, because they
+    # are normal rather than damage: a reporting Desktop (1/2/3) has no
+    # `processed/` at all, and `NotADirectoryError` is a file wearing the
+    # name, which `is_dir()` also answered False for.
     try:
         entries = sorted(os.scandir(processed_dir), key=lambda e: e.name)
+    except (FileNotFoundError, NotADirectoryError):
+        return (), ()
     except OSError as exc:
         return (), ((str(processed_dir), str(exc)),)
 
     paths: list[tuple[str, str]] = []
+    unreadable: list[tuple[str, str]] = []
     for entry in entries:
         if not entry.name.endswith(".json") or entry.name.startswith(".tmp-"):
             continue
         try:
+            # A directory wearing an event filename stays silent. It exists,
+            # it is not an Event, and every reader in this repository says so
+            # the same way (`backup/working_copy.py`, `ops_status.py`
+            # twice) — sending a person to look at it would waste the trip.
             if not entry.is_file():
                 continue
-        except OSError:
+        except OSError as exc:
+            # But a `stat` that **fails** is not that. Here the answer to
+            # "is this an Event?" is unknown, and the entry is as likely to
+            # be a perfectly good Event file on a OneDrive folder that
+            # briefly went away as it is to be a directory.
+            #
+            # It used to `continue` in silence, and that is the one
+            # conversion this function is built to refuse: 17 files on disk,
+            # 16 in the rollup, nothing anywhere saying a 17th was ever
+            # seen. `Event 16건` is also what a quieter company looks like.
+            # Measured before this change, with one entry's `is_file()`
+            # raising: `events=16, unreadable=0` against a baseline of 17.
+            #
+            # The `unreadable` channel already exists for exactly this, and
+            # the view already renders it — "읽지 못한 파일 N건 — 아래
+            # 숫자는 그만큼 적다". C55 removed an `is_dir()` pre-check from
+            # this same function for this same reason; this is the same
+            # conversion one loop further in.
+            #
+            # The three other `except OSError: continue` loops in this
+            # repository are left alone deliberately: none of them has an
+            # `unreadable` channel to report into, and in each the dropped
+            # entry surfaces as a *gap* in a sequence the view is already
+            # looking for holes in. Here it surfaces as nothing at all.
+            unreadable.append((entry.name, str(exc)))
             continue
         paths.append((entry.name, entry.path))
     if not paths:
-        return (), ()
+        return (), tuple(unreadable)
 
     events: list[tuple[Event, str]] = []
-    unreadable: list[tuple[str, str]] = []
     # Read serially, and that is a measurement rather than an oversight.
     #
     # `history/reconciliation.py`, `agent/delivery.py` and
@@ -593,6 +753,7 @@ def build_company_rollup(
     )
     risks = _roll_risks(projects)
     metrics = _roll_metrics(projects, teams, risks, in_period, mismatches)
+    recent, completions, completions_total = _roll_recent(in_period)
 
     return CompanyRollup(
         projects=projects,
@@ -602,6 +763,9 @@ def build_company_rollup(
         duplicates=duplicates,
         risks=risks,
         metrics=metrics,
+        recent=recent,
+        completions=completions,
+        completions_total=completions_total,
         events_read=len(in_period),
         unreadable=tuple(unreadable) + tuple(undated),
         since=since,
@@ -645,6 +809,60 @@ def _fold_duplicates(
 
 def _ref(event: Event, name: str) -> EvidenceRef:
     return EvidenceRef(event_id=event.event_id, at=event.timestamp, path=name)
+
+
+# The Event types that finish something. `COMPLETED` ends a project (docs/04
+# §25 writes its `Completed Date`); `MILESTONE_COMPLETED` ends a step inside
+# one (§24). Named here rather than inline so "what counts as 완료" is one
+# decision with one place to read it.
+COMPLETION_EVENT_TYPES: frozenset = frozenset({"COMPLETED", "MILESTONE_COMPLETED"})
+
+
+def _entry(event: Event, name: str) -> ActivityEntry:
+    return ActivityEntry(
+        event_id=event.event_id,
+        at=event.timestamp,
+        source=event.source,
+        role=event.role,
+        project_id=event.project_id,
+        event_type=event.event_type,
+        status=event.status,
+        summary=event.summary,
+        milestone=event.milestone,
+        blocker=event.blocker,
+        evidence=_ref(event, name),
+    )
+
+
+def _roll_recent(
+    pairs: Sequence[tuple[Event, str]],
+) -> tuple[tuple[ActivityEntry, ...], tuple[ActivityEntry, ...], int]:
+    """`(recent, completions, completions_total)` — newest first, bounded.
+
+    `pairs` arrives sorted oldest-first by `event_instant_key()`, so the tail
+    is the newest and reversing it is the whole of "recent". No second sort:
+    a different ordering here would be a second opinion about which of two
+    Events at the same instant came first, which `event_instant_key()`
+    already settles and `_fold_duplicates()` already depends on.
+
+    Both slices are cut **after** reversing, so each holds the newest
+    `RECENT_LIMIT` of its own kind rather than the newest of the other's —
+    which is exactly the loss a single filtered list would have.
+
+    `completions_total` counts every completion in the period, not the
+    length of the slice. Without it a panel showing twenty completions
+    cannot say whether there were twenty or two hundred, and "최근 완료"
+    reading as "all the completions" is a false statement about a good week.
+    """
+    newest_first = list(reversed(pairs))
+    recent = tuple(_entry(event, name) for event, name in newest_first[:RECENT_LIMIT])
+    finished = [
+        (event, name)
+        for event, name in newest_first
+        if event.event_type in COMPLETION_EVENT_TYPES
+    ]
+    completions = tuple(_entry(event, name) for event, name in finished[:RECENT_LIMIT])
+    return recent, completions, len(finished)
 
 
 def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, ...]:

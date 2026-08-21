@@ -38,6 +38,7 @@ from controltower import (  # noqa: E402
     build_company_rollup,
     read_events,
 )
+from controltower.rollup import RECENT_LIMIT  # noqa: E402
 from events import ROLES, create_event  # noqa: E402
 
 KST = timezone(timedelta(hours=9))
@@ -61,16 +62,22 @@ class ControlTowerTestCase(unittest.TestCase):
         self.processed.mkdir(parents=True)
 
     def put(self, event_id, project, role, event_type, status, day, **extra):
+        # `day` places the Event; an explicit `timestamp` or `summary`
+        # overrides the default built from it. Two Events on one day need
+        # distinct instants to have an order at all, which the panels that
+        # list them in order depend on.
         event = create_event(
             source=SOURCE_FOR_ROLE[role],
             role=role,
             project_id=project,
             event_type=event_type,
             status=status,
-            summary=f"summary for {event_id}",
+            summary=extra.pop("summary", None) or f"summary for {event_id}",
             history_candidate=True,
             event_id=event_id,
-            timestamp=f"2026-08-{day:02d}T09:00:00+09:00",
+            timestamp=(
+                extra.pop("timestamp", None) or f"2026-08-{day:02d}T09:00:00+09:00"
+            ),
             **extra,
         )
         (self.processed / f"{event_id}.json").write_text(
@@ -398,6 +405,406 @@ class CompletionEvidenceNamesTheCompletingEventTests(ControlTowerTestCase):
                 self.assertEqual(len(metric.evidence), metric.value, key)
 
 
+class RecentSlicesAreCutFromTheWholePeriodTests(ControlTowerTestCase):
+    """`_roll_recent()` — the one derivation here that does not fold.
+
+    Everything else in this module collapses Events into a state or a count.
+    These two keep them whole, because "무엇이 일어났는가" and "무엇이 끝났는가"
+    are questions a fold has already thrown the answer away for.
+    """
+
+    def _fill(self, count, *, event_type="STARTED", status="IN_PROGRESS", start=0):
+        for index in range(count):
+            self.put(
+                f"E{start + index:03d}",
+                "PAY",
+                "CTO_BACKEND",
+                event_type,
+                status,
+                5,
+                timestamp=f"2026-08-05T{index % 24:02d}:{index % 60:02d}:00+09:00",
+            )
+
+    def test_recent_is_newest_first(self):
+        self.put("OLD", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 5)
+        self.put("NEW", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9)
+
+        self.assertEqual(
+            [entry.event_id for entry in self.rollup().recent], ["NEW", "OLD"]
+        )
+
+    def test_recent_is_bounded_and_events_read_is_not(self):
+        """The bound is on the slice, never on the count behind it. A panel
+        that reported `20` as its total would be saying something false about
+        a busy month."""
+        self._fill(RECENT_LIMIT + 7)
+
+        rollup = self.rollup()
+        self.assertEqual(len(rollup.recent), RECENT_LIMIT)
+        self.assertEqual(rollup.events_read, RECENT_LIMIT + 7)
+
+    def test_completions_are_cut_after_filtering_not_before(self):
+        """The whole reason `completions` is its own slice.
+
+        One completion at the bottom of the period, then `RECENT_LIMIT`
+        noisier Events on top. Filtering `recent` would find nothing; cutting
+        the filtered list finds it.
+        """
+        self.put(
+            "DONE", "PAY", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5,
+            milestone="M1", timestamp="2026-08-05T00:00:00+09:00",
+        )
+        self._fill(RECENT_LIMIT + 3, start=100)
+
+        rollup = self.rollup()
+        self.assertNotIn("DONE", [entry.event_id for entry in rollup.recent])
+        self.assertEqual(
+            [entry.event_id for entry in rollup.completions], ["DONE"]
+        )
+
+    def test_the_completion_total_is_the_true_one(self):
+        self._fill(RECENT_LIMIT + 4, event_type="MILESTONE_COMPLETED")
+
+        rollup = self.rollup()
+        self.assertEqual(len(rollup.completions), RECENT_LIMIT)
+        self.assertEqual(rollup.completions_total, RECENT_LIMIT + 4)
+
+    def test_only_the_two_finishing_types_count(self):
+        for index, event_type in enumerate(
+            ("STARTED", "BLOCKED", "RESUMED", "CANCELLED", "ISSUE_RESOLVED",
+             "DECISION_APPROVED")
+        ):
+            extra = {}
+            status = "IN_PROGRESS"
+            if event_type == "BLOCKED":
+                extra["blocker"] = "b"
+                status = "BLOCKED"
+            if event_type == "CANCELLED":
+                status = "CANCELLED"
+            self.put(
+                f"X{index}", "PAY", "CTO_BACKEND", event_type, status, 5,
+                timestamp=f"2026-08-05T{index:02d}:00:00+09:00", **extra,
+            )
+
+        self.assertEqual(self.rollup().completions, ())
+        self.assertEqual(self.rollup().completions_total, 0)
+
+    def test_a_folded_duplicate_is_not_two_entries(self):
+        """`_roll_recent()` runs after `_fold_duplicates()`, so one Event
+        that arrived as two files is one row — the same rule every other
+        number here follows since C50."""
+        event = self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 5)
+        (self.processed / "a-copy.json").write_text(
+            event.to_json(), encoding="utf-8"
+        )
+
+        rollup = self.rollup()
+        self.assertEqual([e.event_id for e in rollup.recent], ["E1"])
+        self.assertEqual(len(rollup.duplicates), 1)
+
+    def test_an_entry_keeps_the_event_verbatim(self):
+        """Unredacted on the rollup, on purpose: `to_payload()` is the
+        boundary, and a rollup that rewrote its own evidence would make the
+        `EvidenceRef` useless for finding the file."""
+        self.put(
+            "E1", "PAY", "CTO_BACKEND", "BLOCKED", "BLOCKED", 5,
+            blocker="벤더 대기", summary="키 대기",
+        )
+
+        entry = self.rollup().recent[0]
+        self.assertEqual(entry.summary, "키 대기")
+        self.assertEqual(entry.blocker, "벤더 대기")
+        self.assertEqual(entry.project_id, "PAY")
+        self.assertEqual(entry.evidence.event_id, "E1")
+
+    def test_the_period_filter_applies_to_both_slices(self):
+        """`since` / `until` bound by the Event's own date, so a slice that
+        ignored them would report work from outside the period a caller
+        asked about."""
+        self.put("IN", "PAY", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5,
+                 milestone="M")
+        self.put("OUT", "PAY", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 20,
+                 milestone="M")
+
+        rollup = self.rollup(until=date(2026, 8, 10))
+        self.assertEqual([e.event_id for e in rollup.recent], ["IN"])
+        self.assertEqual([e.event_id for e in rollup.completions], ["IN"])
+        self.assertEqual(rollup.completions_total, 1)
+
+    def test_an_empty_period_produces_empty_slices_not_an_error(self):
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.recent, ())
+        self.assertEqual(rollup.completions, ())
+        self.assertEqual(rollup.completions_total, 0)
+
+
+class ARefusedEvidenceDirectoryIsReportedNotFatalTests(ControlTowerTestCase):
+    """`read_events()` has a channel for "I could not read this" and the
+    `is_dir()` above it used to throw the answer away.
+
+    `Path.is_dir()` re-raises a permission error — `pathlib._abc`'s ignored
+    set is `(ENOENT, ENOTDIR, EBADF, ELOOP)` and `EACCES` is not in it. So
+    the old shape guarded `os.scandir` and not the `is_dir()` one line
+    above, which raises the same class.
+
+    Here that cost more than a traceback. This function already reports an
+    unusable path through `unreadable`, which the Control Tower renders as
+    "읽지 못한 파일 N건 — 아래 숫자는 그만큼 적다": the numbers stay, and they
+    come with the sentence that says they are a lower bound. The pre-check
+    turned that into nothing at all.
+
+    The directory most likely to answer access-denied is the one this
+    project reads across a network — `events/transport/` is the shared
+    OneDrive folder (AGENT.md §1) and `processed/` sits beside it.
+    """
+
+    def _refusing(self, target):
+        """`os.scandir` raising `PermissionError` for one directory."""
+        import os as os_module
+
+        real = os_module.scandir
+        resolved = Path(target).resolve()
+
+        def fake(path=".", *args, **kwargs):
+            try:
+                same = Path(path).resolve() == resolved
+            except (OSError, ValueError, TypeError):
+                same = False
+            if same:
+                raise PermissionError(f"refused: {path}")
+            return real(path, *args, **kwargs)
+
+        os_module.scandir = fake
+        self.addCleanup(setattr, os_module, "scandir", real)
+
+    def test_a_refused_directory_becomes_an_unreadable_entry(self):
+        from controltower.rollup import read_events
+
+        self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 5)
+        self._refusing(self.processed)
+
+        pairs, unreadable = read_events(self.processed)
+
+        self.assertEqual(pairs, ())
+        self.assertEqual(len(unreadable), 1)
+        self.assertIn("refused", unreadable[0][1])
+
+    def test_the_rollup_says_the_numbers_are_short(self):
+        """The point of reporting rather than returning empty: the view can
+        tell an operator that zero is not the truth."""
+        self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 5)
+        self._refusing(self.processed)
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.events_read, 0)
+        self.assertEqual(len(rollup.unreadable), 1)
+
+    def test_the_dashboard_carries_it_as_incomplete_coverage(self):
+        """One layer out: `Coverage.complete` is what tells a consumer the
+        panels are a lower bound rather than a quiet week."""
+        from controltower import build_dashboard
+
+        self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 5)
+        self._refusing(self.processed)
+
+        model = build_dashboard(self.rollup(), now=NOW)
+
+        self.assertFalse(model.coverage.complete)
+        self.assertEqual(model.coverage.unreadable, 1)
+
+    def test_a_missing_directory_stays_silent(self):
+        """Not damage. Desktop 1/2/3 are reporting machines and have no
+        `processed/` at all — reporting that as unreadable would put a
+        permanent ATTENTION line on every one of them."""
+        from controltower.rollup import read_events
+
+        pairs, unreadable = read_events(self.processed.parent / "not-there")
+
+        self.assertEqual(pairs, ())
+        self.assertEqual(unreadable, ())
+
+    def test_a_file_wearing_the_directory_name_stays_silent(self):
+        """`NotADirectoryError`, which `is_dir()` also answered False for.
+        Keeping it silent preserves the old behaviour for the case that is
+        not a permission problem."""
+        from controltower.rollup import read_events
+
+        impostor = self.processed.parent / "impostor"
+        impostor.write_text("not a directory", encoding="utf-8")
+
+        pairs, unreadable = read_events(impostor)
+
+        self.assertEqual(pairs, ())
+        self.assertEqual(unreadable, ())
+
+
+class TheTwoDoorsDisagreeAboutAnEmptyProjectIdTests(ControlTowerTestCase):
+    """CHARACTERIZATION (A-15). The Agent refuses an empty `project_id`; the
+    Collector accepts one.
+
+    Measured at both doors:
+
+        agent.signals.load_signals()   invalid — "missing required field(s):
+                                       ['project_id']". `REQUIRED_SIGNAL_FIELDS`
+                                       is checked with `not data.get(name)`,
+                                       so `""` counts as missing.
+        events.validate_event()        no errors. docs/02 §4 says `string`,
+                                       and `""` is one.
+
+    So a person typing a Signal on their own Desktop cannot create this, and
+    an Event arriving from anywhere else can: a hand-placed file (docs/11
+    permits one), a partial restore, or a Desktop running different code.
+    That is the same send-side/receive-side asymmetry
+    `TransportSanitisationAsymmetryTests` and
+    `ANonStringSignalFieldIsRefusedOnTheSendingSideTests` already record for
+    other fields — this is the one for `project_id`.
+
+    **Nothing is hidden, and that is the finding.** The first reading of this
+    was "an unnamed project is counted and never shown"; printing the raw
+    section disproved it — the row is there, with a blank name column, and
+    the count includes it truthfully. There is no silent loss to fix, so
+    nothing here is fixed. What was missing is the record: the behaviour is
+    pinned so a change to it has to be deliberate, and closing the door is
+    A-15's decision (docs/02 contract change), not this module's.
+    """
+
+    def _empty_project_event(self, event_id):
+        return self.put(
+            event_id, "", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12
+        )
+
+    # ----------------------------------------------------- the two doors
+    def test_the_agent_refuses_an_empty_project_id(self):
+        import datetime as datetime_module
+        import json as json_module
+        import tempfile as tempfile_module
+
+        from agent.signals import load_signals
+
+        with tempfile_module.TemporaryDirectory() as tmp:
+            day = Path(tmp) / "2026-08-12"
+            day.mkdir()
+            (day / "s.json").write_text(
+                json_module.dumps(
+                    {
+                        "project_id": "",
+                        "event_type": "STARTED",
+                        "status": "IN_PROGRESS",
+                        "summary": "work with no project",
+                        "history_candidate": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            valid, invalid = load_signals(
+                Path(tmp), datetime_module.date(2026, 8, 12)
+            )
+
+        self.assertEqual(valid, ())
+        self.assertEqual(len(invalid), 1)
+        self.assertIn("project_id", str(invalid[0][1]))
+
+    def test_the_collector_door_accepts_one(self):
+        """`validate_event()` is what an Event from another Desktop meets."""
+        from events import validate_event
+
+        self.assertEqual(
+            validate_event(
+                {
+                    "schema_version": "1.0",
+                    "event_id": "E-1",
+                    "timestamp": "2026-08-12T10:00:00+09:00",
+                    "source": "DESKTOP_1",
+                    "role": "CTO_BACKEND",
+                    "project_id": "",
+                    "event_type": "STARTED",
+                    "status": "IN_PROGRESS",
+                    "summary": "x",
+                    "history_candidate": True,
+                }
+            ),
+            [],
+        )
+
+    # ------------------------------------------------ what it then does
+    def test_it_becomes_a_project_of_its_own(self):
+        self._empty_project_event("A")
+        self.put("B", "REAL", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+
+        rollup = self.rollup()
+
+        self.assertEqual(
+            sorted((p.project_id, p.event_count) for p in rollup.projects),
+            [("", 1), ("REAL", 1)],
+        )
+
+    def test_it_is_counted_in_the_company_metric(self):
+        """Truthfully — a project's worth of Events happened. The number is
+        not wrong; the project just has no name to look it up by."""
+        self._empty_project_event("A")
+        self.put("B", "REAL", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+
+        self.assertEqual(self.rollup().metric("projects_active").value, 2)
+
+    def test_two_of_them_fold_into_one_unnamed_project(self):
+        """`""` is a key like any other, so two nameless Events are one
+        nameless project rather than two."""
+        self._empty_project_event("A")
+        self._empty_project_event("B")
+
+        rollup = self.rollup()
+
+        self.assertEqual(
+            sorted((p.project_id, p.event_count) for p in rollup.projects),
+            [("", 2)],
+        )
+
+    def test_it_never_absorbs_a_named_project(self):
+        """The failure that would matter. If an empty id were treated as a
+        wildcard or normalised away, a real project's Events would land on
+        it — which is the merged-row loss `fit_key()` prevents one layer
+        out, arriving from the other end."""
+        self._empty_project_event("A")
+        self.put("B", "REAL", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+
+        named = self.rollup().project("REAL")
+
+        self.assertIsNotNone(named)
+        self.assertEqual(named.event_count, 1)
+
+    def test_whitespace_is_a_different_project_from_empty(self):
+        """No trimming anywhere in the fold. Recorded because the obvious
+        "tidy-up" — stripping the id — would silently merge two projects a
+        person meant to keep apart, and that is a policy change wearing a
+        cleanup's clothes."""
+        self._empty_project_event("A")
+        self.put("B", "   ", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+
+        self.assertEqual(
+            sorted(p.project_id for p in self.rollup().projects), ["", "   "]
+        )
+
+    def test_the_row_is_rendered_rather_than_dropped(self):
+        """The correction to this test class's own first reading.
+
+        "Counted but never shown" would be a real defect — a number an
+        operator cannot reconcile with the list beneath it. It is not what
+        happens: the row prints with a blank name column. Pinned so a future
+        change that *does* drop it fails here.
+        """
+        from controltower import build_dashboard
+
+        self._empty_project_event("A")
+        self.put("B", "REAL", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
+
+        rows = build_dashboard(self.rollup(), now=NOW).panel("PROJECTS").rows
+
+        self.assertEqual(len(rows), 2)
+        self.assertIn("", [row.key for row in rows])
+
+
 class NoInventedLayersTests(unittest.TestCase):
     """Goal / Team Goal / Sprint / Task have no source in this system.
 
@@ -408,8 +815,26 @@ class NoInventedLayersTests(unittest.TestCase):
     """
 
     def test_the_unsourced_layers_are_named(self):
+        """Six, and the last two are unsourced for a different reason.
+
+        The first four are layers of the work hierarchy that have no source
+        *yet*. `CRITICAL_PATH` and `COMPLETION_CRITERIA` are COO judgements
+        that three specs say are **not derived** — docs/03 §4, docs/04 §44,
+        docs/04 §68 — so deriving one here would contradict the spec rather
+        than get ahead of it. They are on this list because the request's
+        Dashboard asks for both, and a field the model neither sources nor
+        declares is one a consumer cannot tell from an oversight.
+        """
         self.assertEqual(
-            set(UNSOURCED_LAYERS), {"COMPANY_GOAL", "TEAM_GOAL", "SPRINT", "TASK"}
+            set(UNSOURCED_LAYERS),
+            {
+                "COMPANY_GOAL",
+                "TEAM_GOAL",
+                "SPRINT",
+                "TASK",
+                "CRITICAL_PATH",
+                "COMPLETION_CRITERIA",
+            },
         )
 
     def test_the_rollup_exposes_no_goal_or_sprint_field(self):
@@ -1176,6 +1601,173 @@ class ControlTowerBlockTests(ControlTowerTestCase):
         self.processed.rename(runtime / "events" / "processed")
         self.processed = runtime / "events" / "processed"
 
+    def test_the_recent_lists_reach_the_screen(self):
+        """The two panels that reach the screen and **not** Notion.
+
+        Every other Control Tower panel is projected to a `CT_*` database;
+        these two are not, because a Notion table keyed by `event_id` grows
+        one row per Event forever and its reconciliation stops working past
+        1,000 rows (`notion_projection.UNPROJECTED_PANELS` carries the
+        measurement). So the terminal is the only place they appear, and a
+        panel nothing renders would be a capability with no reader.
+        """
+        self.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS",
+                 9, milestone="M1")
+
+        printed, _ = self._run()
+
+        self.assertIn("최근 활동", printed)
+        self.assertIn("최근 완료", printed)
+        self.assertIn("summary for E1", printed)
+
+    def test_the_screen_says_how_many_it_is_not_showing(self):
+        """Five lines must never read as "five things happened"."""
+        for index in range(9):
+            self.put(
+                f"E{index}", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9,
+                timestamp=f"2026-08-09T{index:02d}:00:00+09:00",
+            )
+
+        printed, _ = self._run()
+
+        self.assertIn("최근 활동 (총 9건)", printed)
+
+    def test_a_complete_list_does_not_claim_a_total(self):
+        """A qualifier that always appears is one an operator stops
+        reading — the same rule the duplicate line follows."""
+        self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9)
+
+        printed, _ = self._run()
+
+        self.assertIn("최근 활동", printed)
+        self.assertNotIn("최근 활동 (총", printed)
+
+    def test_an_empty_company_prints_neither_list(self):
+        """Sourced-and-empty is a true statement, and the block already says
+        `집계 대상 : Event 0건` two lines up. A header with nothing under it
+        would be noise."""
+        printed, _ = self._run()
+
+        self.assertNotIn("최근 활동", printed)
+        self.assertNotIn("최근 완료", printed)
+
+    def test_an_authored_summary_is_redacted_on_the_screen(self):
+        """`summary` is the first authored sentence this block prints, and
+        `_authored()` is the reason it is safe to."""
+        self.put(
+            "E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9,
+            summary="token " + "ntn" + "_" + "A" * 24,
+        )
+
+        printed, _ = self._run()
+
+        self.assertNotIn("ntn_" + "A" * 24, printed)
+        self.assertIn("[REDACTED]", printed)
+
+    def test_a_newline_in_a_summary_cannot_forge_a_line(self):
+        self.put(
+            "E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9,
+            summary="real\n    2026-01-01T00:00:00+09:00  DESKTOP_9  FORGED",
+        )
+
+        printed, _ = self._run()
+
+        # The forged text is still *in* the output, escaped, on the tail of
+        # the real line — that is `one_line()`'s promise, not a miss: keeping
+        # the value recoverable is what makes docs/04 §55's "기록한다" honest.
+        # What must not exist is a **line that begins** with the forged
+        # timestamp, because that is what a reader takes for a second entry.
+        self.assertNotIn("\n    2026-01-01T00:00:00+09:00", printed)
+        self.assertIn("real\\n", printed)
+        self.assertEqual(
+            len([line for line in printed.splitlines() if "DESKTOP_9" in line]), 1
+        )
+
+    def test_the_two_reasons_for_no_source_are_printed_apart(self):
+        """Goal / Sprint / Task have no source **yet**; Critical Path and
+        완료 조건 are refused by three specs. One sentence for both made the
+        screen call a rule an omission."""
+        printed, _ = self._run()
+
+        self.assertIn("원천 없음", printed)
+        self.assertIn("자동화 안 함", printed)
+        self.assertIn("CRITICAL_PATH", printed)
+        self.assertIn("docs/04 §44", printed)
+        automated = printed.split("자동화 안 함")[1].split("\n")[0]
+        self.assertNotIn("COMPANY_GOAL", automated)
+
+    def test_a_group_that_empties_stops_being_printed(self):
+        """The day a layer gains a source.
+
+        Both "원천 없음" and "자동화 안 함" are printed only when their group
+        has members, and with today's model both always do — so the empty
+        arms had never run. They are not decoration: the whole point of
+        reading the layers off the model rather than off the constant is that
+        a layer which gained a source stops being announced, and a line
+        reading `(원천 없음 : )` with nothing after it would be the announcement
+        continuing in a worse form.
+
+        Simulated by emptying `UNSOURCED_LAYERS` in the loaded module, which
+        is what "every layer gained a source" looks like from this function.
+        """
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_empty", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.processed.parent.parent
+        module.UNSOURCED_LAYERS = ()
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_control_tower(NOW)
+        printed = buffer.getvalue()
+
+        self.assertNotIn("원천 없음", printed)
+        self.assertNotIn("자동화 안 함", printed)
+        # The block itself still rendered — this is the layers disappearing,
+        # not the function failing.
+        self.assertIn("CONTROL TOWER", printed)
+
+    def test_two_files_with_one_id_and_different_contents_reach_attention(self):
+        """`EVENT_ID_CONFLICT` — the half of a duplicate that is a real
+        problem.
+
+        Two files claiming one `event_id` with the **same** contents is a
+        duplicate the pipeline handled and the fold counted once; saying so
+        would be an alarm with no action. Different contents means one of
+        them is not the Event it says it is, and which one the Control Tower
+        counted is decided by filename order — the only case where a person
+        has to open both files.
+        """
+        event = self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9)
+        impostor = event.to_dict()
+        impostor["project_id"] = "SOMETHING_ELSE"
+        (self.processed / "a-different-file.json").write_text(
+            json.dumps(impostor, ensure_ascii=False), encoding="utf-8"
+        )
+
+        _, attention = self._run()
+
+        conflict = [line for line in attention if "event_id" in line]
+        self.assertEqual(len(conflict), 1, attention)
+        self.assertIn("E1", conflict[0])
+        self.assertIn("a-different-file.json", conflict[0])
+
+    def test_an_identical_twin_raises_no_attention(self):
+        """The other half, so the test above is about the difference."""
+        event = self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 9)
+        (self.processed / "a-copy.json").write_text(
+            event.to_json(), encoding="utf-8"
+        )
+
+        printed, attention = self._run()
+
+        self.assertEqual([line for line in attention if "event_id" in line], [])
+        self.assertIn("중복 파일", printed)
+
     def test_an_open_blocker_reaches_attention_with_its_evidence(self):
         self.put("E1", "SEARCH", "CTO_BACKEND", "BLOCKED", "BLOCKED", 9, blocker="vendor key")
 
@@ -1342,7 +1934,15 @@ class TheDirectoryItselfCanFailTests(unittest.TestCase):
     reports an empty company:
 
         scandir fails      the directory is named in `unreadable`
-        is_file fails      that entry is skipped, the others are still read
+        is_file fails      that entry is named in `unreadable`, and the
+                           others are still read
+
+    The second line said "that entry is skipped" until C62, and skipping is
+    what it did — in silence. One failed `stat` and an Event file that is on
+    disk and perfectly readable left no trace anywhere: 17 files, 16 counted,
+    nothing saying a 17th was seen. Resilience was the right goal and silence
+    was the wrong way to reach it; `unreadable` is the channel this function
+    already had for it.
 
     Driven by patching `os.scandir`, because a real permission failure is not
     reproducible on this platform without changing ACLs on a live path.
@@ -1432,6 +2032,92 @@ class TheDirectoryItselfCanFailTests(unittest.TestCase):
             events, unreadable = read_events(processed)
 
         self.assertEqual(sorted(event.event_id for event, _n in events), ["A", "C"])
+        self.assertEqual([name for name, _why in unreadable], ["b.json"])
+        self.assertIn("stat failed", unreadable[0][1])
+
+    def test_an_entry_that_cannot_be_stat_ed_is_not_reported_as_absent(self):
+        """The half that decides whether anyone notices.
+
+        `A` and `C` being read is resilience; `B` leaving no trace is data
+        loss. Every entry that carried an event filename must come out of
+        this function either as an Event or as a named failure, because the
+        view's arithmetic is exactly that sum — and `Event 2건` is also what
+        a quieter company looks like.
+        """
+        processed = self._processed()
+        for name, event_id in (("a.json", "A"), ("b.json", "B"), ("c.json", "C")):
+            self._write(processed, name, event_id)
+        real_scandir = os.scandir
+
+        class _Broken:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+                self.path = entry.path
+
+            def is_file(self):
+                raise OSError("stat failed")
+
+        def _scandir(path):
+            return [
+                _Broken(entry) if entry.name == "b.json" else entry
+                for entry in real_scandir(path)
+            ]
+
+        with mock.patch("controltower.rollup.os.scandir", _scandir):
+            events, unreadable = read_events(processed)
+
+        self.assertEqual(len(events) + len(unreadable), 3)
+
+    def test_the_rollup_carries_that_failure_to_the_view(self):
+        """`read_events()` reporting it is worth nothing if the layer above
+        drops it on the way to the screen."""
+        processed = self._processed()
+        self._write(processed, "a.json", "A")
+        self._write(processed, "b.json", "B")
+        real_scandir = os.scandir
+
+        class _Broken:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+                self.path = entry.path
+
+            def is_file(self):
+                raise OSError("stat failed")
+
+        def _scandir(path):
+            return [
+                _Broken(entry) if entry.name == "b.json" else entry
+                for entry in real_scandir(path)
+            ]
+
+        with mock.patch("controltower.rollup.os.scandir", _scandir):
+            rollup = build_company_rollup(
+                processed_dir=processed, now=datetime(2026, 8, 12, 9, 0).astimezone()
+            )
+
+        self.assertEqual(rollup.events_read, 1)
+        self.assertEqual(len(rollup.unreadable), 1)
+
+    def test_a_directory_named_like_an_event_is_still_deliberately_silent(self):
+        """The case C62 did **not** change, recorded so the difference is a
+        decision rather than an inconsistency.
+
+        A directory is a known answer to "is this an Event?" — no. A failed
+        `stat` is no answer at all, and the entry behind it is as likely to
+        be a good Event file as anything else. Every reader in this
+        repository treats the first case this way
+        (`backup/working_copy.py`, `ops_status.py` twice), and pointing an
+        operator at a directory would waste the trip.
+        """
+        processed = self._processed()
+        self._write(processed, "a.json", "A")
+        (processed / "EVT-DIR.json").mkdir()
+
+        events, unreadable = read_events(processed)
+
+        self.assertEqual(len(events), 1)
         self.assertEqual(unreadable, ())
 
 
@@ -1743,7 +2429,16 @@ class OneEventIsCountedOnceTests(ControlTowerTestCase):
         event = self.put("E1", "PAY", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 12)
         self._twin(event, "hand-copy.json")
 
-        coverage = build_dashboard(self.rollup(), now=NOW).coverage
+        # `with_history_coverage(None)` holds the *other* input to `complete`
+        # steady, so this test is about duplicates and nothing else. Since
+        # C56 an unchecked model is incomplete for a reason unrelated to
+        # folding, and leaving it unchecked here would make the assertion
+        # below pass or fail for the wrong cause.
+        coverage = (
+            build_dashboard(self.rollup(), now=NOW)
+            .with_history_coverage(None)
+            .coverage
+        )
 
         self.assertEqual(coverage.duplicates, 1)
         self.assertEqual(coverage.unreadable, 0)

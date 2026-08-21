@@ -943,6 +943,256 @@ class AtomicStateWriteInvariantTests(unittest.TestCase):
                 self.assertIn("os.remove(tmp_path)", source)
 
 
+class EveryStateWriteStagesTests(unittest.TestCase):
+    """The atomic-write family discovers its members by `mkstemp` — so a
+    writer that never stages is not a member, and no gate says anything.
+
+    Six classes guard this idiom — five here
+    (`AtomicStateWriteInvariantTests`, `AtomicWriteFailureCleanupTests`,
+    `AtomicWritesReachTheDiskBeforeTheRenameTests`,
+    `IncompleteWriteInvariantTests`, `LockAtomicityCharacterizationTests`)
+    and `test_repository_hygiene.py::AtomicWriteLeavesNoResidueTests` — and
+    every one of them starts from "functions that call `tempfile.mkstemp`".
+    That set answers "do the stagers commit and clean up?" — a good question — and cannot answer the
+    one `AtomicStateWriteInvariantTests`'s own docstring poses: *"a future
+    writer that skips tempfile+os.replace would silently lose the
+    no-torn-file property"*. A writer that skips `tempfile` is precisely
+    what a `mkstemp` sweep cannot see.
+
+    Measured. A plausible new writer added to `collector/state.py` —
+
+        def save_seen_summary(path, seen_ids):
+            path.write_text(json.dumps({"seen": sorted(seen_ids)}), ...)
+
+    — was reported by **none** of the six. All passed:
+
+        *** MISSES ***  AtomicStateWriteInvariantTests                (7 passed)
+        *** MISSES ***  AtomicWriteFailureCleanupTests                (2 passed)
+        *** MISSES ***  AtomicWritesReachTheDiskBeforeTheRenameTests  (1 passed)
+        *** MISSES ***  IncompleteWriteInvariantTests                 (5 passed)
+        *** MISSES ***  LockAtomicityCharacterizationTests            (4 passed)
+        *** MISSES ***  AtomicWriteLeavesNoResidueTests               (2 passed)
+        DETECTS         EveryStateWriteStagesTests                    (1 failed)
+
+    So this one discovers by the **write** instead. Every function under
+    `src/` that serialises JSON and writes it must stage, because a torn
+    state file is the thing C27 traced end to end: a `.tmp-` left by an
+    interrupted run was read as a finished artifact by six consumers,
+    promoted to an Event, and pushed to the backup remote as a truncated day
+    of Company History. A *non*-staged write has the same failure with no
+    `.tmp-` to notice it by.
+
+    The rule is enforceable as it stands: every JSON writer in `src/` today
+    already stages (measured — seven writing functions, and the only
+    non-stager is the append-only log line below).
+    """
+
+    #: Append-only, and deliberately not staged.
+    #:
+    #: `oplog.append_line()` adds one line to a log; there is no "torn state"
+    #: for it to leave, and staging a whole log to rewrite it would turn an
+    #: O(1) append into an O(size) copy on every Event. Named here so the
+    #: exemption is a decision rather than a gap the predicate happens to
+    #: leave — the shape C58 found in the environment scanner.
+    APPEND_ONLY = {"oplog.py::append_line"}
+
+    #: The one writer for which staging would be the **bug**.
+    #:
+    #: `try_acquire_lock()` writes JSON and must not stage, because its
+    #: atomicity *is* the write: a single `os.open(O_CREAT | O_EXCL)` that
+    #: exactly one caller can win. Its docstring records what happened when
+    #: it did stage — "check-then-write … `os.replace()` overwrites
+    #: unconditionally", measured at 8 processes x 12 trials as **2-3
+    #: simultaneous holders in every trial, and zero clean denials**, plus a
+    #: contended `os.replace()` raising PermissionError and crashing the
+    #: Runner.
+    #:
+    #: So the rule this class enforces has a documented counter-example, and
+    #: naming it is better than letting the predicate quietly not reach it:
+    #: "state writes stage" is right for files that are *replaced*, and wrong
+    #: for a file whose whole purpose is that it can only be *created* once.
+    EXCLUSIVE_CREATE = {"lock.py::try_acquire_lock"}
+
+    #: How a function in this tree actually puts bytes on disk.
+    #:
+    #: The first draft of this set was `{"write_text", "write_bytes"}` and
+    #: found **zero** writers — every real one here opens a descriptor from
+    #: `tempfile.mkstemp` with `os.fdopen()` and calls `handle.write()`. A
+    #: discovery predicate too narrow to see the code it is auditing is the
+    #: exact failure this class was written about, arriving in the class
+    #: itself; `test_the_sweep_finds_the_writers_that_exist` is what caught
+    #: it, which is why that guard is not optional.
+    WRITE_CALLS = {"write_text", "write_bytes", "write"}
+    OPEN_CALLS = {"open", "fdopen"}
+
+    @staticmethod
+    def _serialises_json(source: str) -> bool:
+        return "json.dump" in source or "json.dumps" in source
+
+    @classmethod
+    def _json_writers(cls, text: str, label: str):
+        """`[(name, stages)]` for every JSON-writing function in one source.
+
+        Written against text rather than a path so
+        `test_the_predicate_notices_a_writer_that_skips_staging` can drive it
+        with a synthetic module — a discovery predicate nobody exercises is a
+        gate whose reach is assumed.
+        """
+        found = []
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = ast.get_source_segment(text, node) or ""
+            if not cls._serialises_json(body):
+                continue
+            attrs = {
+                getattr(inner.func, "attr", None)
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Call)
+            }
+            names = {
+                getattr(inner.func, "id", None)
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Call)
+            }
+            if not (attrs & cls.WRITE_CALLS or (names | attrs) & cls.OPEN_CALLS):
+                continue
+            found.append((f"{label}::{node.name}", "mkstemp" in attrs))
+        return found
+
+    def _all_json_writers(self):
+        writers = []
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in str(path):
+                continue
+            writers.extend(
+                self._json_writers(path.read_text(encoding="utf-8"), path.name)
+            )
+        return writers
+
+    # ----------------------------------------------------------- the gate
+    def test_every_json_writer_stages_before_it_commits(self):
+        offenders = [
+            name
+            for name, stages in self._all_json_writers()
+            if not stages
+            and name not in self.APPEND_ONLY
+            and name not in self.EXCLUSIVE_CREATE
+        ]
+
+        self.assertEqual(
+            offenders,
+            [],
+            "these functions serialise JSON and write it without staging "
+            "through `tempfile.mkstemp`, so a crash mid-write leaves a torn "
+            f"file — and the four mkstemp-based guards cannot see them: {offenders}",
+        )
+
+    def test_the_sweep_finds_the_writers_that_exist(self):
+        """C57's rule: a discovery that returns nothing makes the gate above
+        pass over an empty loop."""
+        writers = self._all_json_writers()
+
+        self.assertGreaterEqual(len(writers), 6)
+        names = {name for name, _ in writers}
+        # The writers whose own body serialises. `write_event_json()` and
+        # `write_summary()` are *not* here: they delegate serialisation
+        # (`event.to_json()`, `summary.to_dict()`), so this predicate does
+        # not see them as JSON writers — and it does not need to, because
+        # both stage and the four `mkstemp` guards already cover them. What
+        # this class adds is the writers those guards cannot discover.
+        for known in (
+            "state.py::_save",
+            "retry_queue.py::save_queue",
+            "dashboard_pending.py::save_all",
+            "file_repository.py::save",
+        ):
+            with self.subTest(writer=known):
+                self.assertIn(known, names)
+
+    # ------------------------------------------------- detector's detector
+    #
+    # Built by joining lines rather than written as one literal: this file
+    # is edited by scripts, and a triple-quoted block nested inside another
+    # is how the first attempt at this class silently truncated itself.
+    SYNTHETIC_UNSTAGED = chr(10).join((
+        'import json',
+        '',
+        '',
+        'def save_state(path, data):',
+        '    path.write_text(json.dumps(data), encoding="utf-8")',
+    ))
+
+    SYNTHETIC_STAGED = chr(10).join((
+        'import json',
+        'import os',
+        'import tempfile',
+        '',
+        '',
+        'def save_state(path, data):',
+        '    fd, tmp_path = tempfile.mkstemp(dir=path.parent)',
+        '    with os.fdopen(fd, "w", encoding="utf-8") as handle:',
+        '        handle.write(json.dumps(data))',
+        '    os.replace(tmp_path, path)',
+    ))
+
+    SYNTHETIC_NO_JSON = chr(10).join((
+        'def render(path, text):',
+        '    path.write_text(text, encoding="utf-8")',
+    ))
+
+    def test_the_predicate_notices_a_writer_that_skips_staging(self):
+        """The detector for the detector (C58).
+
+        The four existing guards were blind here not because their
+        assertions were wrong but because their *discovery* was. A new
+        discovery predicate deserves the same suspicion.
+        """
+        found = self._json_writers(self.SYNTHETIC_UNSTAGED, 'synthetic.py')
+
+        self.assertEqual(found, [('synthetic.py::save_state', False)])
+
+    def test_the_predicate_accepts_a_writer_that_stages(self):
+        found = self._json_writers(self.SYNTHETIC_STAGED, 'synthetic.py')
+
+        self.assertEqual(found, [('synthetic.py::save_state', True)])
+
+    def test_the_predicate_ignores_a_function_that_writes_no_json(self):
+        """Precision matters as much as reach: a predicate that flagged
+        every write would fill this gate with markdown renderers and log
+        writers, and the first response to that noise is to weaken it.
+        """
+        self.assertEqual(
+            self._json_writers(self.SYNTHETIC_NO_JSON, 'synthetic.py'), []
+        )
+
+    def test_the_exclusive_create_exemption_is_still_exclusive_create(self):
+        """An exemption is a claim about the code, so it is checked.
+
+        If `try_acquire_lock()` ever stopped using `O_EXCL`, this exemption
+        would silently excuse an ordinary unstaged write — and the failure it
+        would hide is the one its docstring measured: several runs each told
+        they hold the same lock.
+        """
+        source = (SRC / "scheduler" / "lock.py").read_text(encoding="utf-8")
+
+        self.assertIn("O_EXCL", source)
+        self.assertIn("def try_acquire_lock", source)
+
+    def test_the_append_only_exemption_still_names_something_real(self):
+        """An exemption for a function that no longer exists is one
+        nobody can evaluate — and it would silently cover a future
+        function that took the name.
+        """
+        import oplog
+
+        self.assertTrue(callable(oplog.append_line))
+        source = Path(oplog.__file__).read_text(encoding='utf-8')
+        self.assertIn('def append_line', source)
+        self.assertNotIn('mkstemp', source)
+
+
 class AtomicWriteFailureCleanupTests(unittest.TestCase):
     """The other half of the atomic-write idiom, which nothing exercised.
 
@@ -3554,6 +3804,169 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
         )
 
 
+class EveryImportIsVisibleToTheImportGuardsTests(unittest.TestCase):
+    """Three gates read the import graph, and all three read it as AST
+    `Import` / `ImportFrom` nodes. A dynamic import is neither.
+
+    The gates:
+
+      * `LayeringInvariantTests` — `events/` may import nothing local, and
+        nothing may import `app/`. This is what keeps the dependency graph
+        acyclic.
+      * `test_repository_hygiene.py::DependencyGuardTests` — `src/` imports
+        only the standard library. This is why `python -m pytest` needs no
+        install step at all (docs/11 §101 Release Environment Check).
+      * `test_monthly_history.py::MonthlyIsNotNotionTests` — Company History
+        never reaches Notion.
+
+    Each states a rule about what this code may depend on, and each was
+    measured, one mutation at a time, to be silent about a dependency
+    spelled dynamically:
+
+        *** MISSES ***  importlib.import_module("requests")   in src/oplog.py
+        *** MISSES ***  __import__("requests")                in src/oplog.py
+        *** MISSES ***  importlib.import_module("notion")     in src/events/schema.py
+        *** MISSES ***  importlib.import_module("notion")     in src/monthly/markdown.py
+
+    Teaching three detectors to resolve a dynamic import is not possible in
+    general — the argument can be computed. So the escape hatch is closed
+    instead of chased: **production code does not import dynamically**, and
+    with that held, an AST walk over `Import`/`ImportFrom` really does see
+    every dependency, which is what the three gates already assume.
+
+    Enforceable at full precision — measured over all 80 production files:
+    no `__import__`, no `importlib` in any form, and no builtin `exec`,
+    `eval` or `compile`. (The 17 `compile` calls here are all `re.compile`,
+    which is why the check looks at the receiver and not just the name.)
+
+    Tests are deliberately out of scope: several load `ops_status.py`
+    through `importlib.util.spec_from_file_location()` on purpose, and the
+    three gates above make claims about production code, not about the
+    harness that reads it.
+    """
+
+    #: Attribute-spelled ways to import or execute code by name.
+    DYNAMIC_ATTRS = {
+        "import_module",
+        "spec_from_file_location",
+        "exec_module",
+        "load_module",
+        "SourceFileLoader",
+    }
+
+    #: Builtins that take code as a string. `re.compile` is an attribute
+    #: call and so is not one of these.
+    DYNAMIC_BUILTINS = {"__import__", "exec", "eval", "compile"}
+
+    def _production_files(self):
+        return [
+            path
+            for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in str(path)
+        ]
+
+    @classmethod
+    def _dynamic_imports(cls, tree):
+        """`[(construct, lineno)]` for every dynamic import or exec."""
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found += [
+                    (f"import {a.name}", node.lineno)
+                    for a in node.names
+                    if a.name.split(".")[0] == "importlib"
+                ]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] == "importlib":
+                    found.append((f"from {node.module} import ...", node.lineno))
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id in cls.DYNAMIC_BUILTINS:
+                    found.append((f"{func.id}()", node.lineno))
+                elif isinstance(func, ast.Attribute) and func.attr in cls.DYNAMIC_ATTRS:
+                    found.append((f".{func.attr}()", node.lineno))
+        return found
+
+    def test_no_production_module_imports_dynamically(self):
+        offenders = {}
+        for path in self._production_files():
+            found = self._dynamic_imports(ast.parse(path.read_text(encoding="utf-8")))
+            if found:
+                offenders[str(path.relative_to(REPO_ROOT))] = found
+
+        self.assertEqual(
+            offenders,
+            {},
+            "a dependency spelled this way is invisible to LayeringInvariantTests, "
+            "DependencyGuardTests and MonthlyIsNotNotionTests, all three of which "
+            f"read the import graph as AST Import nodes: {offenders}",
+        )
+
+    def test_the_sweep_reaches_the_files_it_claims_to(self):
+        """C57's rule: a gate whose candidate set is empty passes without
+        checking anything. This one sweeps two roots, and a wrong `SRC` or a
+        renamed entrypoint would quietly empty either half."""
+        files = {path.name for path in self._production_files()}
+
+        self.assertGreaterEqual(len(files), 50)
+        for expected in ("oplog.py", "schema.py", "markdown.py", "ops_status.py"):
+            with self.subTest(module=expected):
+                self.assertIn(expected, files)
+
+    # --------------------------------------------- detector's detector (C61)
+    DYNAMIC = {
+        "__import__": ("def f():", "    return __import__('requests')"),
+        "importlib.import_module": (
+            "import importlib",
+            "def f():",
+            "    return importlib.import_module('requests')",
+        ),
+        "from importlib import import_module": (
+            "from importlib import import_module",
+            "def f():",
+            "    return import_module('requests')",
+        ),
+        "spec_from_file_location": (
+            "def f(p):",
+            "    return util.spec_from_file_location('m', p)",
+        ),
+        "exec of a string": ("def f(src):", "    exec(src)"),
+        "eval of a string": ("def f(src):", "    return eval(src)"),
+    }
+
+    STATIC = {
+        "an ordinary import": ("import json", "def f():", "    return json"),
+        "an ordinary from-import": (
+            "from datetime import datetime",
+            "def f():",
+            "    return datetime",
+        ),
+        "re.compile": (
+            "import re",
+            "PATTERN = re.compile(r'x')",
+        ),
+        "a loader passed around but never called": (
+            "def f(loader):",
+            "    return loader",
+        ),
+    }
+
+    def test_the_detector_recognises_every_dynamic_spelling(self):
+        for label, lines in self.DYNAMIC.items():
+            with self.subTest(spelling=label):
+                found = self._dynamic_imports(ast.parse(chr(10).join(lines)))
+                self.assertTrue(found, f"{label} was not recognised")
+
+    def test_the_detector_leaves_ordinary_imports_alone(self):
+        """Precision. `re.compile` is the case that matters: there are 17 of
+        them here, and a detector that matched on the name alone would flag
+        every one and be deleted within the week."""
+        for label, lines in self.STATIC.items():
+            with self.subTest(spelling=label):
+                found = self._dynamic_imports(ast.parse(chr(10).join(lines)))
+                self.assertEqual(found, [], f"{label} was wrongly flagged: {found}")
+
+
 class LayeringInvariantTests(unittest.TestCase):
     """The whole dependency graph in one place, derived from disk.
 
@@ -5247,6 +5660,26 @@ class OneLogWriterInvariantTests(unittest.TestCase):
     and what nothing else in this repository does; every other writer here
     is an atomic `mkstemp` + `os.replace`. So a new log writer that
     bypasses the guards cannot be added without failing this.
+
+    Four spellings of "append", not one (C60). The first version of this
+    check asked for a *literal string mode containing "a"*, which is one way
+    to say it. Mutation found three others that append just as well and were
+    reported by nobody — each added to `collector/runtime.py` in turn:
+
+        DETECTS         open(p, "a")                     <- the known spelling
+        DETECTS         p.open("a")
+        *** MISSES ***  os.open(p, os.O_APPEND | ...)    <- int flags, no string
+        *** MISSES ***  open(p, "a" if x else "w")       <- mode not a constant
+        *** MISSES ***  logging.FileHandler(p)           <- stdlib, defaults to "a"
+
+    The last one matters most: it is the standard library's own log writer,
+    it appends by default, and it is the most likely way someone adds
+    logging to this repository without ever thinking about `oplog`. What it
+    would write is exactly what C51 measured reaching `notion_sync.log` —
+    a proxy's 502 page echoing `Authorization: Bearer ntn_...` — except with
+    no `redact()` anywhere on the path.
+
+    So the rule is now stated four ways, and each is checked by breaking it.
     """
 
     def _production_files(self):
@@ -5256,9 +5689,46 @@ class OneLogWriterInvariantTests(unittest.TestCase):
             if "__pycache__" not in str(path)
         ]
 
+    #: `logging` handlers that open a file. All of them default to append.
+    LOGGING_FILE_HANDLERS = (
+        "FileHandler",
+        "RotatingFileHandler",
+        "TimedRotatingFileHandler",
+        "WatchedFileHandler",
+    )
+
     @staticmethod
-    def _append_mode_calls(tree):
-        """Every call that opens a file for appending, by mode string."""
+    def _is_os_open(func):
+        """`os.open()` — int flags, not a string mode, so it reads differently."""
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "open"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+        )
+
+    @staticmethod
+    def _is_path_open(func):
+        """`some_path.open(mode)` — the mode is the first argument.
+
+        True for any `X.open(...)` whose receiver is not the `io` module,
+        which is the one attribute-spelled `open()` that still takes the
+        file first.
+        """
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "open"
+            and not (isinstance(func.value, ast.Name) and func.value.id == "io")
+        )
+
+    @classmethod
+    def _append_mode_calls(cls, tree):
+        """Every call that opens a file for appending, however it is spelled.
+
+        Returns `[(spelling, lineno)]`. The spelling is in the result because
+        a failure should say *which* of the four ways it found — the first
+        version of this method knew only one of them.
+        """
         found = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -5271,22 +5741,51 @@ class OneLogWriterInvariantTests(unittest.TestCase):
                 if isinstance(func, ast.Attribute)
                 else None
             )
+
+            # (1) os.open(path, os.O_APPEND | ...) — flags, not a mode string.
+            if cls._is_os_open(func):
+                flags = {
+                    inner.attr
+                    for inner in ast.walk(node)
+                    if isinstance(inner, ast.Attribute)
+                } | {
+                    inner.id for inner in ast.walk(node) if isinstance(inner, ast.Name)
+                }
+                if "O_APPEND" in flags:
+                    found.append(("os.open(O_APPEND)", node.lineno))
+                continue
+
+            # (2) logging's file handlers, every one of which defaults to "a".
+            if name in cls.LOGGING_FILE_HANDLERS:
+                found.append((f"logging.{name}", node.lineno))
+                continue
+            if name == "basicConfig" and any(
+                kw.arg == "filename" for kw in node.keywords
+            ):
+                found.append(("logging.basicConfig(filename=)", node.lineno))
+                continue
+
             if name not in ("open", "fdopen"):
                 continue
-            modes = [
-                arg.value
-                for arg in node.args
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
-            ]
-            modes += [
-                kw.value.value
-                for kw in node.keywords
-                if kw.arg == "mode"
-                and isinstance(kw.value, ast.Constant)
-                and isinstance(kw.value.value, str)
-            ]
-            if any("a" in mode for mode in modes):
-                found.append((name, node.lineno))
+
+            # (3)/(4) a string mode — literal, or one this cannot read.
+            #
+            # Which argument holds the mode depends on the receiver, and
+            # getting this wrong is not theoretical: fixing (4) by looking
+            # only at `args[1]` silently un-detected `p.open("a")`, whose
+            # mode is `args[0]` because the path is the receiver. The
+            # control row of the mutation matrix caught it.
+            mode_index = 0 if cls._is_path_open(func) else 1
+            mode_args = node.args[mode_index : mode_index + 1]
+            mode_args += [kw.value for kw in node.keywords if kw.arg == "mode"]
+            for arg in mode_args:
+                if not isinstance(arg, ast.Constant):
+                    # Cannot prove it is not append. No production call reads
+                    # this way today (measured), so refusing the unprovable
+                    # costs nothing and closes the `"a" if x else "w"` hole.
+                    found.append((f"{name}(<computed mode>)", node.lineno))
+                elif isinstance(arg.value, str) and "a" in arg.value:
+                    found.append((name, node.lineno))
         return found
 
     def test_only_oplog_opens_a_file_in_append_mode(self):
@@ -5303,6 +5802,110 @@ class OneLogWriterInvariantTests(unittest.TestCase):
             "a log writer that bypasses oplog.append_line()'s one_line()/redact() "
             "guards was added",
         )
+
+    # --------------------------------------------- detector's detector (C60)
+    #
+    # Built by joining lines rather than as literals: this file is edited by
+    # scripts, and a triple-quoted block nested inside another is how two
+    # earlier generators silently truncated themselves.
+    APPENDS = {
+        "builtin open": (
+            "def w(p, s):",
+            "    with open(p, 'a', encoding='utf-8') as h:",
+            "        h.write(s)",
+        ),
+        "Path.open": (
+            "def w(p, s):",
+            "    with p.open('a', encoding='utf-8') as h:",
+            "        h.write(s)",
+        ),
+        "os.fdopen": (
+            "def w(fd, s):",
+            "    with os.fdopen(fd, 'a') as h:",
+            "        h.write(s)",
+        ),
+        "os.open with O_APPEND": (
+            "def w(p, s):",
+            "    fd = os.open(p, os.O_APPEND | os.O_WRONLY)",
+            "    os.write(fd, s.encode())",
+        ),
+        "mode decided at runtime": (
+            "def w(p, s, x):",
+            "    with open(p, 'a' if x else 'w') as h:",
+            "        h.write(s)",
+        ),
+        "mode passed in": (
+            "def w(p, s, mode):",
+            "    with open(p, mode=mode) as h:",
+            "        h.write(s)",
+        ),
+        "logging.FileHandler": (
+            "def w(p):",
+            "    logging.getLogger('x').addHandler(logging.FileHandler(p))",
+        ),
+        "logging.handlers.RotatingFileHandler": (
+            "def w(p):",
+            "    return RotatingFileHandler(p)",
+        ),
+        "logging.basicConfig(filename=)": (
+            "def w(p):",
+            "    logging.basicConfig(filename=p)",
+        ),
+    }
+
+    #: Reads and whole-file writes. A detector that flagged these would fail
+    #: on nearly every module here, and the first response to that noise is
+    #: to weaken it — so precision is checked, not assumed.
+    NOT_APPENDS = {
+        "whole-file write": ("def w(p, s):", "    p.write_text(s, encoding='utf-8')"),
+        "read via Path.open": ("def r(p):", "    return p.open('r').read()"),
+        "read via open": ("def r(p):", "    return open(p, encoding='utf-8').read()"),
+        "staged write": (
+            "def w(p, s):",
+            "    fd, tmp = tempfile.mkstemp(dir=p.parent)",
+            "    with os.fdopen(fd, 'w') as h:",
+            "        h.write(s)",
+            "    os.replace(tmp, p)",
+        ),
+        "logging without a file": ("def w(s):", "    logging.getLogger('x').error(s)"),
+    }
+
+    def test_the_detector_recognises_every_way_to_append(self):
+        """Nine spellings, because the first version of this gate knew two.
+
+        Each of these was run against the real tree as a mutation before it
+        was written down here; three of them passed unnoticed.
+        """
+        for label, lines in self.APPENDS.items():
+            with self.subTest(spelling=label):
+                found = self._append_mode_calls(ast.parse(chr(10).join(lines)))
+                self.assertTrue(
+                    found,
+                    f"{label} appends to a file and the detector did not see it",
+                )
+
+    def test_the_detector_leaves_ordinary_file_access_alone(self):
+        for label, lines in self.NOT_APPENDS.items():
+            with self.subTest(spelling=label):
+                found = self._append_mode_calls(ast.parse(chr(10).join(lines)))
+                self.assertEqual(
+                    found, [], f"{label} does not append, but was flagged: {found}"
+                )
+
+    def test_the_repository_still_uses_none_of_the_spellings_it_now_refuses(self):
+        """The rules added in C60 are enforceable at full precision only
+        because nothing here reads that way today: no `O_APPEND` anywhere, no
+        `logging` in production code, and one non-constant `open()` argument
+        that is `os.open`'s int flags rather than a mode string. If that ever
+        stops being true the rule needs revisiting rather than silencing, and
+        this is what would say so.
+        """
+        for path in self._production_files():
+            if path.name == "oplog.py":
+                continue
+            with self.subTest(module=path.name):
+                self.assertEqual(self._append_mode_calls(ast.parse(
+                    path.read_text(encoding="utf-8"))), [])
 
     def test_oplog_really_is_the_one_that_appends(self):
         """The other half — if `oplog.py` stopped appending, the test above

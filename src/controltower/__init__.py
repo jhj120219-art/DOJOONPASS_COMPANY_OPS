@@ -6,6 +6,13 @@ the files it was counted from, and `dashboard.py` for the same facts arranged
 into the panels a Control Tower has, with the payload a projection consumes,
 and `projection.py` for the model's landing on the two Notion surfaces
 docs/14 §1 contracts.
+
+`notion_projection.py` is deliberately **not** re-exported here. It is the
+model's landing on five databases docs/14 §1 does not contract yet, and
+importing it pulls `notion.client` into every `import controltower` — a cost
+the read-only rollups have no reason to pay. A caller that wants it asks for
+it by name (`from controltower import notion_projection`), which is also the
+one place a reader learns it is a separate contract.
 """
 
 from .dashboard import (

@@ -1072,6 +1072,51 @@ class LimitEnforcingNotionTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.status_code, 400)
 
+    def test_a_property_that_is_not_a_mapping_is_stepped_over(self):
+        """The `continue` in `_refuse_over_long_text()`, which had never run.
+
+        Every builder in this project emits `{type: ...}` dicts, so the
+        double only ever meets mappings — but it is a **double**, and the
+        thing it stands in for accepts a request body from anywhere. A test
+        or a future builder handing it `{"Blocker": None}` would otherwise
+        get `AttributeError` out of the double's own length check, and the
+        failure would read as a bug in the code under test rather than in
+        the harness.
+
+        Stepping over is the right answer, not raising: this method's job is
+        the length rule, and "that value has no text to measure" is not a
+        length violation. Notion's own type validation is a different
+        refusal that this double does not claim to model.
+        """
+        _, _, transport = self._sync()
+
+        page = transport.create_page(
+            "DB-1",
+            {
+                "Blocker": None,
+                "Status": {"select": {"name": "OK"}},
+                "Events": {"number": 3},
+            },
+        )
+
+        self.assertEqual(page["properties"]["Events"], {"number": 3})
+
+    def test_a_mapping_beside_it_is_still_measured(self):
+        """So the test above is evidence about the skip rather than about
+        the check being off."""
+        from notion.transport import NotionAPIError
+
+        _, _, transport = self._sync()
+
+        with self.assertRaises(NotionAPIError):
+            transport.create_page(
+                "DB-1",
+                {
+                    "Blocker": None,
+                    "Milestone": {"rich_text": [{"text": {"content": "x" * 2001}}]},
+                },
+            )
+
     def test_an_over_long_blocker_now_reaches_the_projects_view(self):
         sync, client, _ = self._sync()
         sync.sync(_event(timestamp="2026-08-01T10:00:00+09:00"))

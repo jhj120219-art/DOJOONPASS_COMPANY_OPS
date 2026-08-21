@@ -77,6 +77,71 @@ class DeliveryTestCase(unittest.TestCase):
         return find_undelivered_events(sent_dir=self.sent, sync_folder=self.sync)
 
 
+class NothingSentYetTests(DeliveryTestCase):
+    """An empty `sent/` — the state every Desktop is in on its first day.
+
+    `find_undelivered_events()` opens a `ThreadPoolExecutor` only when there
+    is something to read, and the `else: verdicts = []` arm had never run.
+    BACKLOG C49 §11c listed it as a real condition left by priority.
+
+    Worth an assertion rather than a shrug: this is the answer
+    `ops_status.py` prints for a brand-new Desktop, and the two ways to get
+    it wrong are both bad — raising turns "nothing has happened" into an
+    error in the tool an operator runs to find out whether anything has
+    happened, and reporting a problem would put a permanent ATTENTION line
+    on a machine that has done nothing wrong.
+    """
+
+    def test_an_empty_sent_directory_is_a_clean_result(self):
+        result = self._run()
+
+        self.assertEqual(result.checked, 0)
+        self.assertEqual(result.undelivered, ())
+        self.assertEqual(result.unreadable_records, ())
+        self.assertEqual(result.absent, 0)
+        self.assertTrue(result.is_clean)
+
+    def test_it_opens_no_thread_pool_for_no_work(self):
+        """The guard's actual purpose. A pool per status query, on a view an
+        operator may run in a loop, is a cost with nothing to buy."""
+        import agent.delivery as delivery
+
+        created = []
+        real = delivery.ThreadPoolExecutor
+
+        def _counting(*args, **kwargs):
+            created.append(1)
+            return real(*args, **kwargs)
+
+        delivery.ThreadPoolExecutor = _counting
+        self.addCleanup(setattr, delivery, "ThreadPoolExecutor", real)
+
+        self._run()
+
+        self.assertEqual(created, [])
+
+    def test_one_record_does_open_one(self):
+        """The other side, so the test above is evidence about the guard
+        rather than about the pool never being used."""
+        import agent.delivery as delivery
+
+        created = []
+        real = delivery.ThreadPoolExecutor
+
+        def _counting(*args, **kwargs):
+            created.append(1)
+            return real(*args, **kwargs)
+
+        delivery.ThreadPoolExecutor = _counting
+        self.addCleanup(setattr, delivery, "ThreadPoolExecutor", real)
+
+        event = self._event()
+        self._file_as_sent(event)
+        self._run()
+
+        self.assertEqual(created, [1])
+
+
 class CleanCaseTests(DeliveryTestCase):
     """The two shapes that must never be reported."""
 

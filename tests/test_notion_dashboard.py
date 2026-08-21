@@ -171,6 +171,165 @@ class DashboardSchemaTests(unittest.TestCase):
                     self.assertNotIn("status", definition)
 
 
+class ARenameInAContractedDatabaseIsPermanentTests(unittest.TestCase):
+    """The drift no cross-check can see.
+
+    `DashboardSchemaMappingTests` holds `record_run()`'s payload and the
+    `OPS_RUNS` schema to each other, and `ProjectsSchemaMappingTests` does
+    the same for PROJECTS. Both compare **two derived sides**, so a rename
+    applied to both at once passes cleanly — and that is exactly how a
+    rename gets made, because a rename that only touched one side would fail
+    the first test anyone ran.
+
+    In a live workspace it is not clean at all. `create_database()` runs
+    once. After that, renaming a property in this dict does not rename
+    anything in Notion — it creates a **new** property. The old one stays,
+    holding whatever it last held, with nothing writing to it, and no code
+    path here can remove it: `bootstrap_dashboard_properties()` adds and
+    never deletes, deliberately ("없는 Property만 추가하고 기존 Property는
+    정의째 그대로 둔다"), and `rename_property()` exists only for the one
+    case `notion/bootstrap.py` uses it for — Notion's default `Name` title.
+
+    An operator then has two columns, one of them frozen at the moment of
+    the rename, and every View built on the old name silently stops moving.
+
+    These two databases are the ones docs/14 §1 contracts and the ones an
+    operator actually creates, so the recorded names below are a real
+    workspace's real columns. A Sprint that renames one has to say so here,
+    which is the whole point.
+    """
+
+    #: `notion.dashboard.DASHBOARD_DATABASES["OPS_RUNS"]`, by name and type.
+    OPS_RUNS_COLUMNS = {
+        "Run ID": "title",
+        "Run At": "date",
+        "Transport Moved": "number",
+        "Transport Blocked": "number",
+        "Accepted": "number",
+        "Duplicate": "number",
+        "Rejected": "number",
+        "Failed": "number",
+        "Scheduler Status": "select",
+        "Generated Days": "number",
+        "Reused Days": "number",
+        "Backup Status": "select",
+        "Deleted Files": "number",
+        "Notion Synced": "number",
+        "Notion Skipped": "number",
+        "Notion Retried": "number",
+        "Notion Unreadable": "number",
+        "Notion Queued": "number",
+        "Failed Steps": "rich_text",
+        "Desktops Reporting": "rich_text",
+        "Role Mismatches": "number",
+        "Overall": "select",
+    }
+
+    #: `notion.bootstrap.TARGET_PROPERTIES` — the PROJECTS database, written
+    #: on **every Event** rather than once per run.
+    PROJECTS_COLUMNS = {
+        "Project": "title",
+        "Project ID": "rich_text",
+        "Owner": "select",
+        "Source": "select",
+        "Status": "select",
+        "Current Milestone": "rich_text",
+        "Blocker": "rich_text",
+        "Last Updated": "date",
+        "Completed Date": "date",
+        "Last Event ID": "rich_text",
+        "Last Event Type": "select",
+    }
+
+    @staticmethod
+    def _typed(properties):
+        return {name: next(iter(spec)) for name, spec in properties.items()}
+
+    def test_the_ops_runs_columns_are_the_recorded_ones(self):
+        self.assertEqual(
+            self._typed(DASHBOARD_DATABASES[OPS_RUNS]), self.OPS_RUNS_COLUMNS
+        )
+
+    def test_the_projects_columns_are_the_recorded_ones(self):
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        self.assertEqual(self._typed(TARGET_PROPERTIES), self.PROJECTS_COLUMNS)
+
+    def test_no_recorded_ops_runs_column_has_lost_its_name(self):
+        """Stated separately from the equality so the failure says *rename*.
+
+        An addition is recoverable — `bootstrap_dashboard_properties()` adds
+        it to a live database and docs/13 ⑧-4 is the runbook. A rename is
+        not: the old column stays and nothing here can take it out.
+        """
+        current = self._typed(DASHBOARD_DATABASES[OPS_RUNS])
+        missing = sorted(set(self.OPS_RUNS_COLUMNS) - set(current))
+
+        self.assertEqual(
+            missing,
+            [],
+            f"OPS_RUNS no longer declares {missing} — a database an operator "
+            "already created keeps that column forever, frozen at its last "
+            "value, and every View built on it stops moving",
+        )
+
+    def test_no_recorded_projects_column_has_lost_its_name(self):
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        current = self._typed(TARGET_PROPERTIES)
+        missing = sorted(set(self.PROJECTS_COLUMNS) - set(current))
+
+        self.assertEqual(missing, [], f"PROJECTS no longer declares {missing}")
+
+    def test_no_type_changed_under_an_existing_name(self):
+        """Worse than a rename, and quieter: the Notion API cannot change a
+        property's type in place, so the write fails against the real
+        database while `InMemoryNotionTransport` — which
+        `TestDoubleFidelityTests` records as accepting a wrong type — takes
+        it happily."""
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        for label, recorded, current in (
+            ("OPS_RUNS", self.OPS_RUNS_COLUMNS, self._typed(DASHBOARD_DATABASES[OPS_RUNS])),
+            ("PROJECTS", self.PROJECTS_COLUMNS, self._typed(TARGET_PROPERTIES)),
+        ):
+            for name, kind in recorded.items():
+                if name not in current:
+                    continue
+                with self.subTest(database=label, property=name):
+                    self.assertEqual(current[name], kind)
+
+    def test_the_growth_history_and_the_record_agree(self):
+        """docs/13 ⑧-4's history line names the columns each Sprint added,
+        and `OpsRunsColumnHistoryIsCurrentTests` pins its last *count*. This
+        pins the other half: every column that line names is still a column.
+
+        A rename would leave the history naming something that no longer
+        exists, which turns the recovery runbook into instructions for
+        building the wrong database.
+        """
+        import re
+
+        doc = (
+            Path(__file__).resolve().parents[1]
+            / "docs"
+            / "13_NOTION_ENVIRONMENT_SETUP.md"
+        ).read_text(encoding="utf-8")
+        # The history is one Markdown paragraph on one line. Bounded to that
+        # line rather than to a character count: a fixed window ran past the
+        # end into ⑧-4's prose about Notion's default `Name` title, which is
+        # not a column and never was — a parse that reads the next paragraph
+        # reports on the wrong subject.
+        start = doc.index("OPS_RUNS` 스키마는 자라 왔다")
+        history = doc[start : doc.index(chr(10), start)]
+        named = set(re.findall(r"`([A-Z][A-Za-z ]+)`", history))
+
+        self.assertGreater(len(named), 6, "the history line stopped naming columns")
+        for column in sorted(named):
+            with self.subTest(column=column):
+                self.assertIn(column, self.OPS_RUNS_COLUMNS)
+
+
 class DashboardBootstrapTests(unittest.TestCase):
     def setUp(self):
         self.transport = InMemoryNotionTransport()
@@ -386,6 +545,158 @@ class TheWireShapeOfEveryRequestTests(unittest.TestCase):
         self.assertEqual(method, "POST")
         self.assertTrue(url.endswith("/databases/DB-1/query"), url)
         self.assertEqual(body, {"filter": {"property": "Project ID"}})
+
+    def test_list_pages_posts_the_query_with_no_filter(self):
+        """C51: the request `controltower/notion_projection.py`'s
+        reconciliation pass rides on.
+
+        Same endpoint as `query_database()` and a different body — *no*
+        `filter` key at all, which is how Notion is asked for every row. A
+        body carrying `{"filter": {}}` instead is a 400, and the difference
+        is invisible until a live Workspace says so.
+        """
+        result = self._transport().list_pages("DB-1")
+        method, url, body = self._last()
+
+        self.assertEqual(result, [])
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/databases/DB-1/query"), url)
+        self.assertNotIn("filter", body)
+        self.assertEqual(body, {"page_size": 100})
+
+    def test_list_pages_follows_the_cursor_and_stops(self):
+        """Pagination, and the bound on it. A `has_more` with no cursor is a
+        response this cannot page through — it stops and says so through
+        `list_truncated`, rather than looping."""
+        import json as json_module
+        import urllib.request
+
+        pages = [
+            {"results": [{"id": "p1"}], "has_more": True, "next_cursor": "C1"},
+            {"results": [{"id": "p2"}], "has_more": False},
+        ]
+        sent = []
+
+        class _Paged:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def read(self_inner):
+                return json_module.dumps(pages[len(sent) - 1]).encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            sent.append(request)
+            return _Paged()
+
+        real_urlopen = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+        transport = self._transport()
+        result = transport.list_pages("DB-1")
+
+        self.assertEqual(result, [{"id": "p1"}, {"id": "p2"}])
+        self.assertFalse(transport.list_truncated)
+        second = json_module.loads(sent[1].data.decode("utf-8"))
+        self.assertEqual(second, {"page_size": 100, "start_cursor": "C1"})
+
+    def test_a_has_more_with_no_cursor_is_reported_as_truncated(self):
+        """The one response that could hang the loop. Reported rather than
+        retried, because a reconciliation over a partial listing retires
+        every row it did not see."""
+        import json as json_module
+        import urllib.request
+
+        class _Stuck:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def read(self_inner):
+                return json_module.dumps(
+                    {"results": [{"id": "p1"}], "has_more": True}
+                ).encode("utf-8")
+
+        real_urlopen = urllib.request.urlopen
+        urllib.request.urlopen = lambda request, timeout=None: _Stuck()
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+        transport = self._transport()
+        result = transport.list_pages("DB-1")
+
+        self.assertEqual(result, [{"id": "p1"}])
+        self.assertTrue(transport.list_truncated)
+
+    def test_the_page_limit_stops_a_database_that_never_ends(self):
+        """The bound itself — the reason this is a `for` over a fixed range
+        and not a `while`.
+
+        A remote that keeps answering `has_more` with a fresh cursor would
+        page forever inside a Runner step. Ten requests is 1,000 rows, past
+        any Control Tower database this projects (67 rows at 6,000 Events),
+        and stopping there is reported through `list_truncated` rather than
+        hidden — which is what makes the reconciliation pass decline to
+        retire anything rather than retire everything it did not see.
+        """
+        import json as json_module
+        import urllib.request
+
+        sent = []
+
+        class _Endless:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *args):
+                return False
+
+            def read(self_inner):
+                return json_module.dumps(
+                    {
+                        "results": [{"id": f"p{len(sent)}"}],
+                        "has_more": True,
+                        "next_cursor": f"C{len(sent)}",
+                    }
+                ).encode("utf-8")
+
+        real_urlopen = urllib.request.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            sent.append(request)
+            return _Endless()
+
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", real_urlopen)
+
+        transport = self._transport()
+        result = transport.list_pages("DB-1")
+
+        self.assertEqual(len(sent), transport._SEARCH_PAGE_LIMIT)
+        self.assertEqual(len(result), transport._SEARCH_PAGE_LIMIT)
+        self.assertTrue(transport.list_truncated)
+
+    def test_a_clean_listing_leaves_the_flag_down(self):
+        """So the flag means something. It is set at the top of every call,
+        not only when it fires — a truncation two listings ago must not make
+        this one look partial."""
+        transport = self._transport()
+        transport.list_truncated = True
+
+        transport.list_pages("DB-1")
+
+        self.assertFalse(transport.list_truncated)
+
+    def test_the_flag_is_readable_before_the_first_listing(self):
+        """Declared in `__init__` rather than only on the first call — a
+        caller that reads it first would otherwise get AttributeError, and
+        the caller that reads it is the one deciding whether to retire
+        rows."""
+        self.assertFalse(self._transport().list_truncated)
 
     def test_create_page_names_the_database_as_the_parent(self):
         """A page created without `parent.database_id` lands nowhere Notion
