@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -522,29 +523,37 @@ def _history_newer_than_the_last_backup(local_master: Path, last_backup: datetim
     not history (C27).
     """
     if not local_master.is_dir():
-        return []
+        # No Local Master: an absent subject, not a failed read. Zero skips.
+        return [], 0
     candidates = [
         path
         for path in local_master.rglob("*.md")
         if path.is_file() and not is_incomplete_write(path.name)
     ]
     if last_backup is None:
-        return sorted(candidates)
+        return sorted(candidates), 0
     reference = last_backup
     newer = []
+    skipped = 0
     for path in candidates:
         try:
             written = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
         except OSError:
+            # C68: counted, not swallowed. This function answers "is what is
+            # on this machine actually off it?", and a file whose mtime
+            # cannot be read is a file this answer does not cover. Dropping
+            # it silently makes the list *shorter*, which is the direction
+            # that reads as reassurance.
+            skipped += 1
             continue
         if reference.tzinfo is None:
             written = written.replace(tzinfo=None)
         if written > reference:
             newer.append(path)
-    return sorted(newer)
+    return sorted(newer), skipped
 
 
-def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
+def _secrets_ever_committed(working_copy: Path) -> "tuple[tuple[str, ...], bool]":
     """Secret-shaped paths that exist anywhere in this repository's history.
 
     `_would_reach_the_commit()` answers "what will the NEXT commit carry".
@@ -616,8 +625,36 @@ def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
     same asymmetry: an unnecessary rotation costs one afternoon, an
     unreported one costs a live credential.
     """
+    # C70: `(paths, checked)`, because four different situations used to
+    # return the same `()` and only two of them meant "none".
+    #
+    #     no Working Copy directory     nothing to check      -> checked
+    #     no `.git` yet                 no history exists     -> checked
+    #     git could not be run          **could not check**   -> NOT checked
+    #     git answered non-zero         **could not check**   -> NOT checked
+    #
+    # The last two are the ones that mattered. Measured on a repository that
+    # really had committed a private key: the report says `('id_rsa',)`
+    # normally and `()` the moment git cannot answer — byte-identical to a
+    # history that was read and found clean.
+    #
+    # This function's own docstring above names that outcome: "the warning
+    # disappeared" is "the most dangerous possible answer". It was producing
+    # it. And the paragraph below the list states the principle the fix
+    # follows — `_would_reach_the_commit()` over-reports when git cannot
+    # answer, because an unnecessary rotation costs an afternoon and an
+    # unreported one costs a live credential. Over-reporting is not available
+    # here (without git there is no history to enumerate), so the honest
+    # answer is to say the check did not happen.
+    #
+    # Splitting "no `.git`" out first is what keeps this from becoming a
+    # permanent caveat: a Working Copy that has never been initialised has no
+    # history to hold a secret, exactly as an absent directory does not. Same
+    # distinction C68 drew with `FileNotFoundError`.
     if not working_copy.is_dir():
-        return ()
+        return (), True
+    if not (working_copy / ".git").exists():
+        return (), True
     try:
         result = subprocess.run(
             ["git", "rev-list", "--all", "--objects"],
@@ -629,9 +666,9 @@ def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        return ()
-    if result.returncode != 0 or not result.stdout:
-        return ()
+        return (), False
+    if result.returncode != 0:
+        return (), False
     seen: set[str] = set()
     for line in result.stdout.splitlines():
         # `<oid>` for commits, `<oid> <path>` for everything with a name.
@@ -642,7 +679,9 @@ def _secrets_ever_committed(working_copy: Path) -> tuple[str, ...]:
         name = PurePosixPath(path).name
         if _looks_like_secret(name) or _looks_like_secret(name.lower()):
             seen.add(path)
-    return tuple(sorted(seen))
+    # An empty `stdout` with a zero exit is a repository with no commits yet:
+    # read, and genuinely nothing in it.
+    return tuple(sorted(seen)), True
 
 
 def _secret_names_the_gate_will_not_recognise(root: Path) -> tuple[str, ...]:
@@ -797,6 +836,54 @@ def _secret_shaped_event_content(
     return tuple(found)
 
 
+def _is_junction(path: Path) -> bool:
+    """Whether `path` is an NTFS junction, on every interpreter this runs on.
+
+    **C70: this detector was blind on the machine it runs on.**
+    `os.path.isjunction()` is Python 3.12+, and `_junctions_in_scope()` used
+    to return `(), 0` when it was absent — "0 found", with no caveat, which
+    is byte-for-byte what a clean machine prints. This project's runtime is
+    Python 3.9.7 (BACKLOG D), so the one detector that reports the exposure
+    documented above has never once fired here. Measured before the fix, a
+    real junction under `daily/` pointing at a tree that is not Company
+    History:
+
+        _junctions_in_scope(local_master)  ->  found=(), skipped=0
+        the screen                         ->  "junction 노출 : 0건 발견"
+
+    The old comment said "on Python < 3.12 there is no way to ask". That was
+    not true. `os.lstat()` has carried `st_reparse_tag` since 3.8 and
+    `stat.IO_REPARSE_TAG_MOUNT_POINT` has existed just as long; together they
+    are exactly what CPython 3.12 implements `isjunction()` with. Measured on
+    3.9.7:
+
+        junction          st_reparse_tag 0xa0000003  (MOUNT_POINT)  -> True
+        directory symlink st_reparse_tag 0xa000000c  (SYMLINK)      -> False
+        file symlink      st_reparse_tag 0xa000000c  (SYMLINK)      -> False
+        ordinary dir/file no tag                                    -> False
+
+    **The tag, not the reparse-point bit.** `tests/test_runner_failure_paths.
+    _is_junction()` tests the bit alone, which is right for a helper checking
+    a junction it just created — but the bit is set for symlinks too, and a
+    detector that called a symlink a junction would report an exposure the
+    backup does not have: `backup/working_copy._relative_files()` already
+    excludes symlinks. Over-reporting here is not the safe direction, it is
+    the direction that trains an operator to skim the section (C26).
+
+    Non-Windows interpreters have neither attribute and get `False`, which is
+    correct rather than a fallback: a junction is an NTFS construct.
+    """
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        # Kept as the primary so a 3.12+ machine answers with the stdlib's
+        # own implementation rather than this project's copy of it.
+        return isjunction(path)
+    tag = getattr(path.lstat(), "st_reparse_tag", None)
+    if tag is None:
+        return False
+    return tag == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", object())
+
+
 def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
     """`(path, target)` for directory junctions inside the backup scope.
 
@@ -807,7 +894,7 @@ def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
     pointing outside Local Master:
 
         Path.is_symlink()            False   <- the sync's guard misses it
-        os.path.isjunction()         True    <- stdlib knows exactly
+        _is_junction()               True    <- the reparse tag knows exactly
         sync_to_working_copy() added daily/linked/notes.md,
                                      daily/linked/private.md
         scan_for_secrets(master)     ()      <- nothing flagged
@@ -831,13 +918,14 @@ def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
     redirect exists, and where it points, so a junction nobody meant to
     create is visible.
 
-    `os.path.isjunction()` is Python 3.12+; on anything older this reports
-    nothing rather than guessing.
+    Answered on **every** interpreter this runs on — see `_is_junction()`.
     """
-    isjunction = getattr(os.path, "isjunction", None)
-    if isjunction is None or not local_master.is_dir():
-        return ()
+    if not local_master.is_dir():
+        # An absent subject, not a failed read: there is no Company History
+        # here to be redirected, so nothing was skipped.
+        return (), 0
     found: list[tuple[str, str]] = []
+    skipped = 0
     for name in sorted(_ALLOWED_TOP_LEVEL_DIRS):
         scoped = local_master / name
         if not scoped.exists():
@@ -847,16 +935,25 @@ def _junctions_in_scope(local_master: Path) -> tuple[tuple[str, str], ...]:
         )
         for path in candidates:
             try:
-                if not isjunction(path):
+                if not _is_junction(path):
                     continue
                 target = os.path.realpath(path)
             except OSError:
+                # C68: counted. This is the one detector on this screen whose
+                # subject is an *exposure* — a junction is how Company History
+                # that lives outside Local Master gets committed and pushed
+                # (A-19/BUG-57). An entry dropped here makes the exposure list
+                # shorter, and a shorter exposure list is indistinguishable
+                # from a safer machine.
+                skipped += 1
                 continue
             found.append((str(path.relative_to(local_master)), target))
-    return tuple(found)
+    return tuple(found), skipped
 
 
-def _misnamed_scope_directories(local_master: Path) -> tuple[tuple[str, str], ...]:
+def _misnamed_scope_directories(
+    local_master: Path,
+) -> "tuple[tuple[tuple[str, str], ...], bool]":
     """`(actual, expected)` for directories that differ from an in-scope name
     only by case.
 
@@ -882,13 +979,27 @@ def _misnamed_scope_directories(local_master: Path) -> tuple[tuple[str, str], ..
     directory under Local Master is an operator action this code must not take
     (docs/08 §13/§46: Company History is never rewritten by the program).
     """
+    # C70: `(found, checked)`. This is a detector, and answering "none" when
+    # it could not look is the one failure a detector must not have. Measured
+    # on a Local Master holding `Monthly/` beside `daily/`:
+    #
+    #     listable     (('Monthly', 'monthly'),)
+    #     unlistable   ()                        <- identical to a clean tree
+    #
+    # What goes missing with it is not cosmetic. The line this feeds says the
+    # directory "is never backed up and Backup keeps reporting SUCCESS"
+    # (BUG-55) — losing the detection leaves exactly that state unannounced.
+    #
+    # An absent Local Master stays `checked`: there is no tree to be
+    # misnamed, so a machine where Backup was never configured grows no
+    # caveat. Same line C68 drew, and the same one part 3 drew with `.git`.
     if not local_master.is_dir():
-        return ()
+        return (), True
     found: list[tuple[str, str]] = []
     try:
         entries = sorted(local_master.iterdir())
     except OSError:
-        return ()
+        return (), False
     for entry in entries:
         if not entry.is_dir() or entry.name in _ALLOWED_TOP_LEVEL_DIRS:
             continue
@@ -897,7 +1008,7 @@ def _misnamed_scope_directories(local_master: Path) -> tuple[tuple[str, str], ..
             if folded == allowed.casefold():
                 found.append((entry.name, allowed))
                 break
-    return tuple(found)
+    return tuple(found), True
 
 
 def _split_reviewed(review_dir: Path) -> tuple[int, int]:
@@ -1785,7 +1896,9 @@ def _monthly_lags_its_daily_source(
     daily_dir = Path(daily_dir)
     monthly_dir = Path(monthly_dir)
     if not daily_dir.is_dir() or not monthly_dir.is_dir():
-        return ()
+        # An absent subject, not a failed read: with no Daily or no Monthly
+        # directory there is no lag to find. Zero skips.
+        return (), 0
 
     dirty = set(dirty_months)
     days_by_month: dict[str, list[date]] = {}
@@ -1799,14 +1912,21 @@ def _monthly_lags_its_daily_source(
     # of Daily History, healthy tree: 63.6 ms -> 14.1 ms. Which names count as
     # a day is still `_daily_dates()`' answer — this only carries times.
     mtimes: dict[str, float] = {}
+    skipped = 0
     try:
         for entry in os.scandir(daily_dir):
             try:
                 mtimes[entry.name] = entry.stat().st_mtime
             except OSError:
+                # C68: counted. A day with no mtime falls to the `0.0`
+                # default below, which makes "this Daily is newer than the
+                # Monthly" false — so an unreadable day silently argues that
+                # the Monthly is up to date.
+                skipped += 1
                 continue
     except OSError:
-        return ()
+        # The directory itself is unreadable: nothing was checked.
+        return (), 1
 
     findings: list[tuple[str, tuple[str, ...]]] = []
     for key, days in sorted(days_by_month.items()):
@@ -1844,7 +1964,7 @@ def _monthly_lags_its_daily_source(
         missing = tuple(sorted(source_ids - monthly_ids))
         if missing:
             findings.append((key, missing))
-    return tuple(findings)
+    return tuple(findings), skipped
 
 
 def _source_note(*breakdowns) -> str:
@@ -2353,7 +2473,19 @@ def _print_history(now: datetime) -> list[str]:
                     f"state 파일을 그런 머신에서 복원한 경우다 — 사람이 확인해야 한다"
                 )
 
-        unbacked = _history_newer_than_the_last_backup(local_master, last_backup)
+        unbacked, unbacked_skipped = _history_newer_than_the_last_backup(
+            local_master, last_backup
+        )
+        if unbacked_skipped:
+            # Said before the list, because it is a statement *about* the
+            # list: this check answers "is what is on this machine actually
+            # off it?", and a file whose mtime could not be read is one the
+            # answer does not cover. Dropping it silently shortens the list,
+            # which is the direction that reads as reassurance.
+            attention.append(
+                f"백업 대조에서 {unbacked_skipped}건을 확인하지 못했다 — 아래 "
+                "'원격 백업에 도달하지 않은' 목록은 그만큼 짧다"
+            )
         if unbacked:
             names = ", ".join(str(p.relative_to(local_master)) for p in unbacked[:5])
             attention.append(
@@ -2372,13 +2504,26 @@ def _print_history(now: datetime) -> list[str]:
         # Redirected History directories, stated as a fact (A-19). Not an
         # alert: whether the redirect is legitimate is a deployment decision,
         # and on a machine that meant it no action would ever clear the line.
-        for where, target in _junctions_in_scope(local_master):
+        junctions, junctions_skipped = _junctions_in_scope(local_master)
+        for where, target in junctions:
             print(f"           junction {where} -> {target}")
+        if junctions_skipped:
+            print(
+                f"           junction 검사 {junctions_skipped}건 확인 못 함 "
+                "— 이 목록은 노출을 전부 담고 있지 않다"
+            )
 
         # ...and, when it is the case-fold cause, say exactly what to rename.
         # Without this the operator has to notice a capital letter in a
         # filename and know what it means.
-        for actual, expected in _misnamed_scope_directories(local_master):
+        misnamed, misnamed_checked = _misnamed_scope_directories(local_master)
+        if not misnamed_checked:
+            attention.append(
+                f"Local Master(`{local_master}`)를 나열하지 못해 백업 범위 밖 "
+                "디렉터리를 확인 못 함 — 이것은 '없음'이 아니다. 읽을 수 있게 "
+                "된 뒤 다시 확인해야 한다(BACKLOG BUG-55)"
+            )
+        for actual, expected in misnamed:
             attention.append(
                 f"Local Master의 `{actual}/`는 백업 범위 밖이다 — Backup은 "
                 f"`{expected}/`만 본다(docs/08 §26, 대소문자 구분). 이 디렉터리의 "
@@ -2772,7 +2917,14 @@ def _print_history(now: datetime) -> list[str]:
         # out". Measured — the file-present warning cleared the moment the
         # operator deleted it, while `git show HEAD:.env` on the remote still
         # returned the token.
-        leaked = _secrets_ever_committed(working_copy)
+        leaked, leak_checked = _secrets_ever_committed(working_copy)
+        if not leak_checked:
+            attention.append(
+                "Backup 원격 history의 Secret 검사를 확인 못 함(git이 "
+                f"응답하지 않음, {working_copy}) — 이것은 '없음'이 아니라 "
+                "'확인 못 함'이다. git이 답할 수 있게 된 뒤 다시 확인해야 하며, "
+                "그전까지 이 항목에 대해서는 아무 것도 보장되지 않는다"
+            )
         if leaked:
             attention.append(
                 f"Backup 원격 history에 이미 들어간 Secret 형태 경로 {len(leaked)}건: "
@@ -2842,8 +2994,20 @@ def _print_history(now: datetime) -> list[str]:
     # Monthly check above, which existed while this one did not.
     daily_mismatch = _daily_counts_more_than_it_shows(daily_dir)
     if daily_mismatch:
-        for key, claimed, carried in daily_mismatch:
+        # C71: bounded for `_RECENT_ON_SCREEN`'s own stated reason — a
+        # section that can push the ATTENTION block off the top is a screen
+        # nobody scrolls back up. The ATTENTION line below already cuts at
+        # five and says "외"; the printed list above it did not, and this one
+        # grows with **days** of Company History (a renderer that wrote the
+        # count wrong once wrote it wrong for every day it rendered).
+        for key, claimed, carried in daily_mismatch[:_RECENT_ON_SCREEN]:
             print(f"  Daily 항목 불일치   : {key} (Event Count {claimed} / 기록된 id {carried})")
+        if len(daily_mismatch) > _RECENT_ON_SCREEN:
+            print(
+                f"  Daily 항목 불일치   : 외 "
+                f"{len(daily_mismatch) - _RECENT_ON_SCREEN}건 "
+                f"(총 {len(daily_mismatch)}건)"
+            )
         attention.append(
             f"Daily History의 자기 숫자가 어긋난 날 {len(daily_mismatch)}건: "
             + ", ".join(
@@ -2864,12 +3028,24 @@ def _print_history(now: datetime) -> list[str]:
     # A Monthly that has fallen behind the Daily files it is derived from —
     # the link the two checks around it cannot see, because both compare a
     # document with itself.
-    lagging = _monthly_lags_its_daily_source(
+    lagging, lagging_skipped = _monthly_lags_its_daily_source(
         daily_dir, monthly_dir, dirty_months=tuple(state.dirty_months)
     )
+    if lagging_skipped:
+        print(
+            f"  Monthly 원본 대조   : {lagging_skipped}건 확인 못 함 — "
+            "아래 판정은 그만큼 덜 본 결과다"
+        )
     if lagging:
-        for key, event_ids in lagging:
+        # Same bound, same reason (C71). Grows with months rather than days,
+        # which is slower and still unbounded.
+        for key, event_ids in lagging[:_RECENT_ON_SCREEN]:
             print(f"  Monthly 원본 미반영 : {key} ({len(event_ids)}건)")
+        if len(lagging) > _RECENT_ON_SCREEN:
+            print(
+                f"  Monthly 원본 미반영 : 외 {len(lagging) - _RECENT_ON_SCREEN}건 "
+                f"(총 {len(lagging)}건)"
+            )
         attention.append(
             f"Daily에는 있는데 그 달 Monthly에는 없는 Event {sum(len(i) for _k, i in lagging)}건: "
             + ", ".join(
@@ -2890,8 +3066,14 @@ def _print_history(now: datetime) -> list[str]:
     # A Monthly that counted an item it did not write down.
     shortfall = _monthly_counts_more_than_it_shows(monthly_dir)
     if shortfall:
-        for key, claimed, rendered in shortfall:
+        # Same bound, same reason (C71).
+        for key, claimed, rendered in shortfall[:_RECENT_ON_SCREEN]:
             print(f"  Monthly 항목 누락   : {key} ({claimed}건 중 {rendered}건만 기록)")
+        if len(shortfall) > _RECENT_ON_SCREEN:
+            print(
+                f"  Monthly 항목 누락   : 외 {len(shortfall) - _RECENT_ON_SCREEN}건 "
+                f"(총 {len(shortfall)}건)"
+            )
         attention.append(
             "Monthly History가 스스로 센 항목보다 적게 기록한 달 "
             f"{len(shortfall)}건: "
@@ -3445,9 +3627,29 @@ def _event_day(iso: str | None) -> date | None:
         return None
 
 
-def _company_history_older_than_the_evidence(daily_dir: Path, earliest_event) -> date | None:
-    """The earliest day Company History records work for that the Control
-    Tower's evidence cannot cover, or None.
+def _company_history_older_than_the_evidence(
+    daily_dir: Path, earliest_event
+) -> "tuple[date | None, bool]":
+    """`(earliest uncovered day or None, whether the question was answered)`.
+
+    **The second element is why this returns a pair (C68).** Both failures
+    below used to return `None`, which is also what "checked, and there is no
+    gap" returns, so `Coverage.complete` came back True for a tree whose
+    Company History nobody could read:
+
+        the directory cannot be listed      permissions, a moved path
+        a Daily file cannot be opened       one bad file is enough
+
+    Measured on one tree — 18 days of history with work in it, evidence
+    starting later — with the reads made to fail: gap `None`, `complete`
+    True, and the screen printed nothing at all. Readable, the same tree
+    gives gap `2026-08-01` and a printed qualifier.
+
+    A **missing** directory is not that case and is reported as answered: a
+    machine with no `local_master/daily/` has no Company History for the
+    evidence to fail to cover, which is a real answer rather than a failure
+    to look. `FileNotFoundError` is separated from the rest for exactly that
+    reason — the same split `controltower.read_events()` makes.
 
     **Why this can happen at all, and why it is not a bug to fix here.**
     `runtime/events/processed/` is Execution Evidence (docs/14 §2) and Backup
@@ -3477,16 +3679,34 @@ def _company_history_older_than_the_evidence(daily_dir: Path, earliest_event) ->
     Cheap by construction: it stops at the first Daily that has work, which
     on any tree is at most a few reads.
     """
+    # Listability is asked first and separately, because `_daily_dates()`
+    # answers `[]` to both "empty" and "cannot look" — and those are the two
+    # this function now has to tell apart. One extra `scandir` on a directory
+    # this function was already walking; the docstring's "cheap by
+    # construction" still holds.
+    try:
+        os.scandir(daily_dir).close()
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+
+    checked = True
     for day in _daily_dates(daily_dir):
         if earliest_event is not None and day >= earliest_event:
-            return None
+            return None, checked
         try:
             text = (daily_dir / f"{day.isoformat()}.md").read_text(encoding="utf-8")
         except (OSError, ValueError):
+            # Skipped as before — one unreadable day must not stop the scan —
+            # but no longer in silence. A gap found after this point is still
+            # a real gap; a *clean* answer after it is not one this function
+            # is entitled to give.
+            checked = False
             continue
         if _rendered_event_ids(text):
-            return day
-    return None
+            return day, checked
+    return None, checked
 
 
 # How many rows of 최근 활동 / 최근 완료 this block prints.
@@ -3500,6 +3720,28 @@ def _company_history_older_than_the_evidence(daily_dir: Path, earliest_event) ->
 # lines can never read as "five things happened" — the same rule
 # `of_total` / `truncated` follow on the rows.
 _RECENT_ON_SCREEN = 5
+
+# The same rule, applied to the block the rule above exists to protect (C71).
+#
+# `_RECENT_ON_SCREEN`'s own note says a section that can push the ATTENTION
+# block off the top is "a screen nobody scrolls back up". ATTENTION was the
+# one list with no such bound: `_print_control_tower()` appended one message
+# per `RISKS` row, and RISKS carries one row per role-mismatched **Event**.
+#
+# Measured — mismatched Events against ATTENTION lines:
+#
+#      1 event  ->   3 lines        60 events  ->  62 lines
+#     10 events ->  12 lines      1,000 events -> ~1,002 lines
+#
+# Linear, and the trigger is ordinary rather than exotic: one Desktop
+# configured with the wrong `role` makes **every** Event it sends a mismatch
+# (`validate_event()` checks the two fields separately and never the pair).
+# The section that exists to say "사람이 지금 할 일" then becomes unreadable
+# exactly when there is most to do.
+#
+# Not a new policy — the same number and the same "총 N건" disclosure the
+# loop above already uses, so five lines can never read as "five things".
+_RISKS_IN_ATTENTION = _RECENT_ON_SCREEN
 
 
 def _comparable(reference: datetime, other: datetime) -> datetime:
@@ -3636,10 +3878,22 @@ def _print_control_tower(now: datetime) -> list[str]:
     # as the terminal does, and deriving it twice is how the two would start
     # disagreeing about which days are covered.
     earliest_event = _event_day(model.coverage.evidence_from)
-    older = _company_history_older_than_the_evidence(
+    older, history_readable = _company_history_older_than_the_evidence(
         RUNTIME_DIR / "local_master" / "daily", earliest_event
     )
-    model = model.with_history_coverage(older)
+    model = model.with_history_coverage(older, checked=history_readable)
+    if not history_readable:
+        # Said out loud rather than folded into the numbers. Without this
+        # line the screen is byte-identical to a healthy one, which is the
+        # whole defect: `complete` went back to True and nothing above it
+        # changed. Not an ATTENTION — see this block's docstring on what is
+        # admitted there — but the operator has to know the qualifier below
+        # could not be computed.
+        print(
+            "  Company History     : 읽을 수 없다 — 아래 '증거 범위 밖' 판정을 "
+            "하지 못했으므로 이 숫자들이 전부인지 확인되지 않았다 "
+            "(local_master/daily 접근 실패)"
+        )
     if model.coverage.history_uncovered_from is not None:
         print(
             f"  증거 범위 밖        : Company History는 "
@@ -3781,8 +4035,23 @@ def _print_control_tower(now: datetime) -> list[str]:
                 f"{_authored(values['project_id'])} — {_authored(values['summary'])}"
             )
 
+    # Bounded per kind rather than over the whole panel: an open-blocker
+    # flood and a role-mismatch flood are different problems, and letting one
+    # crowd the other out would trade the old failure for a subtler one.
+    # Original row order is preserved — the overflow lines are appended after
+    # the loop rather than interleaved.
+    _risk_totals: dict[str, int] = {}
+    for _row in _rows("RISKS"):
+        _kind = _row.values["kind"]
+        _risk_totals[_kind] = _risk_totals.get(_kind, 0) + 1
+    _risk_shown: dict[str, int] = {}
+
     for row in _rows("RISKS"):
         values = row.values
+        _seen = _risk_shown.get(values["kind"], 0) + 1
+        _risk_shown[values["kind"]] = _seen
+        if _seen > _RISKS_IN_ATTENTION:
+            continue
         if values["kind"] == "OPEN_BLOCKER":
             days = values["days_open"]
             age = f"{days}일째 " if days is not None else ""
@@ -3814,6 +4083,34 @@ def _print_control_tower(now: datetime) -> list[str]:
                 f"Owner와 Source가 서로 다른 Desktop을 가리킨다. `validate_event()`는 두 "
                 f"필드를 각각만 검사하고 짝은 검사하지 않으므로 손으로 쓴 Event나 복원된 "
                 f"파일이 이 모양이 될 수 있다. 거부하지 않는 이유와 필요한 결정은 BACKLOG"
+            )
+
+    # One line per kind that was cut, naming the true total. Never silent:
+    # a shorter list that does not say it is shorter is the failure this
+    # file spends most of its length avoiding.
+    for kind, total in sorted(_risk_totals.items()):
+        if total <= _RISKS_IN_ATTENTION:
+            continue
+        hidden = total - _RISKS_IN_ATTENTION
+        if kind == "ROLE_MISMATCH":
+            attention.append(
+                f"Desktop과 role이 어긋난 Event 총 {total}건 — 위 "
+                f"{_RISKS_IN_ATTENTION}건 외 {hidden}건은 같은 종류다. 한 Desktop의 "
+                "role 설정이 잘못되면 그 Desktop이 보내는 모든 Event가 여기 들어오므로, "
+                "건별로 보기 전에 CONTROL TOWER의 Desktop 집계에서 한 source에 몰려 "
+                "있는지 먼저 확인하라"
+            )
+        elif kind == "OPEN_BLOCKER":
+            attention.append(
+                f"막혀 있는 Project 총 {total}건 — 위 {_RISKS_IN_ATTENTION}건 외 "
+                f"{hidden}건이 더 있다. Blocker는 파이프라인이 스스로 지우지 않으므로 "
+                "이 수는 각 팀이 RESUMED / ISSUE_RESOLVED / COMPLETED를 보고할 "
+                "때까지 줄지 않는다"
+            )
+        else:
+            attention.append(
+                f"{one_line(kind)} 총 {total}건 — 위 {_RISKS_IN_ATTENTION}건 외 "
+                f"{hidden}건이 더 있다"
             )
 
     # The layers this system has no source for, said out loud. An empty panel

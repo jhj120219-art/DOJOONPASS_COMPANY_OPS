@@ -96,6 +96,89 @@ class OneLineTests(unittest.TestCase):
         self.assertEqual(oplog.one_line(None), "None")
 
 
+class ALogLineCannotBeReorderedTests(unittest.TestCase):
+    """C64. `one_line()` closed forging a **second** line and not forging the
+    content of the line it is on.
+
+    Unicode's directional overrides and isolates reorder how a run of text
+    renders without ending the line, so bytes that say one thing display as
+    another. CVE-2021-42574 named the attack against compilers; here the
+    reader is an operator deciding whether the pipeline is healthy, and this
+    module's own docstring already states why that matters — "a forged line
+    is not cosmetic — it is a false statement about what the system did".
+
+    Measured on HEAD, all nine passed through untouched:
+
+        bytes    REJECTED EVT-1<RLO>DETPECCA<LRO>
+        renders  REJECTED EVT-1ACCEPTED
+
+    `event_id` is the field they arrive in, and docs/02 constrains it only to
+    "present and non-null".
+
+    The fix was already written: it has been in `stash@{0}` since 2026-08-20
+    with the rest of an unapplied Sprint (C50 §7, C64 §1). This is the same
+    rule; only the constant is spelled with escapes instead of literals,
+    because nine invisible codepoints in a source file is the very thing the
+    constant exists to expose.
+    """
+
+    #: The nine, by codepoint — never as literals in this file either.
+    OVERRIDES = (8234, 8235, 8236, 8237, 8238, 8294, 8295, 8296, 8297)
+
+    #: Marks, not overrides. Deliberately untouched: they nudge neighbouring
+    #: runs and cannot reverse one, and escaping every directional hint would
+    #: mangle values merely written in a right-to-left script.
+    MARKS = (0x200E, 0x200F)
+
+    def test_every_override_is_escaped(self):
+        for codepoint in self.OVERRIDES:
+            with self.subTest(codepoint=hex(codepoint)):
+                rendered = oplog.one_line("EVT" + chr(codepoint) + "1")
+                self.assertNotIn(chr(codepoint), rendered)
+                self.assertIn(r"\u%04x" % codepoint, rendered)
+
+    def test_the_forged_verdict_becomes_visible(self):
+        """The whole point: escaped, not stripped. The real value stays
+        recoverable, and what a reader sees is what was recorded."""
+        forged = "EVT-1" + chr(0x202E) + "DETPECCA " + chr(0x202D)
+        line = "2026-08-22T00:00:00+09:00 REJECTED " + oplog.one_line(forged)
+
+        self.assertNotIn(chr(0x202E), line)
+        self.assertNotIn(chr(0x202D), line)
+        self.assertTrue(line.endswith(r"EVT-1\u202eDETPECCA \u202d"))
+        # One line, still.
+        self.assertEqual(len(line.splitlines()), 1)
+
+    def test_a_directional_mark_is_left_alone(self):
+        """Precision, in the direction that costs a real user. A guard that
+        escaped every directional codepoint would start rewriting Arabic and
+        Hebrew text an operator wrote on purpose."""
+        for codepoint in self.MARKS:
+            with self.subTest(codepoint=hex(codepoint)):
+                value = "EVT" + chr(codepoint) + "1"
+                self.assertEqual(oplog.one_line(value), value)
+
+    def test_ordinary_text_is_untouched(self):
+        for value in ("EVT-001", "한글 요약", r"C:\Users\ops", "a b  c"):
+            with self.subTest(value=value):
+                self.assertEqual(oplog.one_line(value), value)
+
+    def test_line_breaking_characters_are_still_escaped(self):
+        """The property this class extends rather than replaces."""
+        self.assertEqual(oplog.one_line("a" + chr(10) + "b"), r"a\nb")
+        self.assertNotIn(chr(0x2028), oplog.one_line(chr(0x2028)))
+
+    def test_this_file_carries_no_invisible_override(self):
+        """A test about invisible characters that contained one would be
+        unreviewable, and so would the module it guards."""
+        for path in (Path(__file__), Path(__file__).resolve().parents[1] / "src" / "oplog.py"):
+            source = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertEqual(
+                    [hex(ord(c)) for c in source if ord(c) in self.OVERRIDES], []
+                )
+
+
 class BoundedTests(unittest.TestCase):
     def test_a_short_string_is_untouched(self):
         self.assertEqual(oplog.bounded("short"), "short")

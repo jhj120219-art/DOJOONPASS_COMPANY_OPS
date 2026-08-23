@@ -297,49 +297,180 @@ class HistoryRepositoryPathEscapeTests(unittest.TestCase):
 
 
 class ReservedDeviceNameTests(unittest.TestCase):
-    """Windows reserved device names, measured rather than assumed.
+    """Windows reserved device names — and the measurement that was wrong.
 
-    `_UNSAFE_FILENAME_CHARS` is a character whitelist, so an `event_id` of
-    `NUL` / `CON` / `COM1` passes it untouched — those are legal characters.
-    On Win32 those base names are *devices*: writing to one succeeds and
-    discards the bytes, which is this repository's worst failure shape
-    (docs/11 §50 "History 손실", reported as success).
-
-    Measured on this machine, directly, both shapes:
+    C31 recorded this, and drew a conclusion from it:
 
         NUL         written -> exists=True, size=0, ABSENT from the listing
         NUL.json    written -> exists=True, size=10, present
 
-    **The extension is what saves the pipeline, not the sanitiser.** Every
-    filename this project derives from an untrusted id ends in `.json`
-    (`safe_event_filename()`, `safe_candidate_filename()`), and `NUL.json` is
-    an ordinary file. Verified end to end through `write_event_json()` /
-    `read_event_json()` for five reserved names: real files, real content,
-    exact round-trip.
+        "The extension is what saves the pipeline, not the sanitiser ...
+         `NUL.json` is an ordinary file ... So there is nothing to fix."
 
-    So there is nothing to fix — and one thing to pin. If a derivation ever
-    drops the extension, the device path opens with no other guard in the
-    way. This test is that guard.
+    **The second line is false on the deployment machine.** Re-measured here
+    (Windows 10 19042, Python 3.9.7), in an empty temporary directory, before
+    anything was written:
+
+        Path("NUL.json").exists()               -> True   (is_file() False)
+        Path("NUL.json").write_text('{"a":1}')  -> succeeds
+        Path("NUL.json").read_text()            -> ""     (st_size 0)
+        list(directory.iterdir())               -> []
+        os.replace(tmp, "NUL.json")             -> WinError 183, and the
+                                                   `.tmp-….json` staging file
+                                                   is left behind
+
+    Win32 matches a device name on the segment **before the first period**,
+    so the extension never mattered: `NUL.json` is the NUL device and so is
+    `NUL.json.json`. The two failures that follow are the two this repository
+    cares most about — a write that reports success and stores nothing
+    (docs/11 §50 "History 손실"), and a `.tmp-` residue that every
+    `glob("*.json")` scanner reads as a finished artifact.
+
+    Why the original measurement was believable, and why that is the lesson:
+    **which** names resolve depends on the devices Windows has enumerated, so
+    it varies per machine. Measured here — `CON`, `AUX`, `NUL`, `COM1`,
+    `CONIN$` and `CONOUT$` resolve; `PRN`, `LPT1`-`LPT9` and `COM2`-`COM9` do
+    not. A sanitiser calibrated to one machine's answer is safe on that
+    machine and silently unsafe on the next, which is why
+    `_RESERVED_WINDOWS_STEMS` carries the full documented set and this class
+    checks names this machine happens not to resolve.
+
+    The fix itself is not new work. It has been sitting complete in
+    `stash@{0}` since 2026-08-20, and C50 §3 recorded the defect, found the
+    fix, and declined to hand-port it — "고치지 않은 이유는 승인이 아니라
+    중복이다". Thirteen Sprints later the stash was still unapplied and the
+    suite was still red, so the rule below is the **stashed text, verbatim**,
+    spliced in at the stashed anchor: identical content merges without a
+    conflict, which is the same move C50 §7 made for the two files it did
+    touch.
+
+    So there *was* something to fix, and it is fixed at all three storage
+    boundaries: the derived name is refused and routed to the digest branch,
+    exactly as a traversal attempt or an over-long id already was.
     """
 
-    RESERVED = ("NUL", "CON", "AUX", "PRN", "COM1", "LPT1", "nul", "Con")
+    #: Every name Win32 documents, plus case variants — the rule is
+    #: case-insensitive because the filesystem match is.
+    RESERVED = (
+        "NUL", "CON", "AUX", "PRN",
+        "COM1", "COM5", "COM9",
+        "LPT1", "LPT5", "LPT9",
+        "nul", "Con", "com1", "lPt9",
+    )
 
-    def test_every_derived_event_filename_keeps_an_extension(self):
-        for event_id in self.RESERVED:
+    #: Ids that are not devices and must therefore be left completely alone.
+    #: `NULx` and `x-NUL` are the near-misses a substring test would break on.
+    ORDINARY = ("NULx", "x-NUL", "COM0", "LPT0", "COM10", "CONS", "EVT-NUL-1")
+
+    def test_no_derived_event_filename_resolves_to_a_device(self):
+        """The property, stated against the OS rather than against a list.
+
+        `exists()` is the question that matters: it is True for a device in
+        an empty directory, and it is what `write_event_json()` consults
+        before deciding a file is already there.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for event_id in self.RESERVED:
+                with self.subTest(event_id=event_id):
+                    name = safe_event_filename(event_id)
+                    self.assertFalse(
+                        (directory / name).exists(),
+                        f"{event_id!r} -> {name!r} still resolves to a device",
+                    )
+
+    def test_no_derived_candidate_filename_resolves_to_a_device(self):
+        from history.file_repository import safe_candidate_filename
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for history_id in self.RESERVED:
+                with self.subTest(history_id=history_id):
+                    name = safe_candidate_filename(history_id)
+                    self.assertFalse((directory / name).exists(), name)
+
+    def test_the_extension_alone_would_not_have_been_enough(self):
+        """The refuted claim, pinned as a fact about the platform.
+
+        If this ever fails, Win32 stopped matching devices through an
+        extension and the guard above became belt-and-braces — worth knowing,
+        and not worth removing the guard over, since it would only be true of
+        the machine the test ran on.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            resolving = [
+                name
+                for name in ("NUL.json", "CON.json", "AUX.json", "NUL.json.json")
+                if (directory / name).exists()
+            ]
+            self.assertTrue(
+                resolving,
+                "no reserved name resolved through its extension on this machine",
+            )
+
+    def test_a_device_name_is_changed_the_way_every_other_unsafe_id_is(self):
+        """Routed to the existing digest branch, not to a new one.
+
+        The digest is what keeps the rule injective, and a device name has
+        the same need as a traversal attempt: `NUL` and `nul` are two ids and
+        must not become one file.
+        """
+        names = {event_id: safe_event_filename(event_id) for event_id in self.RESERVED}
+
+        self.assertEqual(len(set(names.values())), len(names))
+        for event_id, name in names.items():
             with self.subTest(event_id=event_id):
-                self.assertTrue(safe_event_filename(event_id).endswith(".json"))
+                self.assertNotEqual(name, f"{event_id}.json")
+                self.assertTrue(name.endswith(".json"))
+                self.assertLessEqual(len(name), 140)
 
-    def test_every_derived_candidate_filename_keeps_an_extension(self):
+    def test_a_name_that_merely_looks_reserved_is_left_alone(self):
+        """Precision. The guard matches the DOS base name, not a substring —
+        renaming an ordinary id would change the filename of Events that
+        already exist on disk."""
+        for event_id in self.ORDINARY:
+            with self.subTest(event_id=event_id):
+                self.assertEqual(safe_event_filename(event_id), f"{event_id}.json")
+
+    def test_the_extension_is_still_kept(self):
+        """C31's original property, unchanged: every derived name ends
+        `.json`. It is no longer load-bearing against devices, and it is
+        still what every `glob("*.json")` scanner in this repository looks
+        for."""
         from history.file_repository import safe_candidate_filename
 
         for event_id in self.RESERVED:
             with self.subTest(event_id=event_id):
+                self.assertTrue(safe_event_filename(event_id).endswith(".json"))
                 self.assertTrue(
                     safe_candidate_filename(f"HIST-{event_id}").endswith(".json")
                 )
 
+    def test_a_dotted_device_id_is_neutralised_too(self):
+        """`NUL.json` as the *id*, which the digest alone does not fix.
+
+        The digest is appended after the whole stem, so this id would have
+        produced `NUL.json-<digest>.json` — whose leading segment is still
+        `NUL`. Measured as a device before the fix; this is why the rule
+        re-checks the assembled name and prefixes it, rather than trusting
+        the digest suffix to have moved the head.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for event_id in ("NUL.json", "NUL.json.json", "COM1." + "x" * 200):
+                with self.subTest(event_id=event_id[:20]):
+                    name = safe_event_filename(event_id)
+                    self.assertFalse((directory / name).exists(), name)
+
     def test_a_reserved_name_round_trips_through_the_real_writer(self):
-        """The property the extension buys: a real file with real content."""
+        """The property the fix buys: a real file with real content.
+
+        This is C31's own test, unchanged in intent — it was the one that
+        failed, with `FileExistsError: event file already exists` naming a
+        file that did not exist, because `exists()` had answered for a
+        device.
+        """
         from events import create_event
         from reporter.local_output import read_event_json
 
@@ -359,10 +490,216 @@ class ReservedDeviceNameTests(unittest.TestCase):
                     )
                     path = write_event_json(event, directory=directory)
 
-                    self.assertTrue(path.exists())
+                    self.assertTrue(path.is_file())
                     self.assertGreater(path.stat().st_size, 0)
                     self.assertEqual(read_event_json(path).event_id, event_id)
                     self.assertIn(path.name, [p.name for p in directory.iterdir()])
+
+    def test_the_atomic_writer_leaves_no_residue_for_a_device_name(self):
+        """The second failure route, which the round-trip above cannot see.
+
+        `write_event_json()` commits with `os.replace()`, and `os.replace()`
+        onto a device raises WinError 183 *after* the staging file exists.
+        Measured before the fix: the directory was left holding one
+        `.tmp-….json`, and `.tmp-….json` matches the `glob("*.json")` every
+        scanner in this repository lists a directory with.
+        """
+        from events import create_event
+        from reporter.local_output import is_incomplete_write
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for event_id in ("NUL", "COM1"):
+                with self.subTest(event_id=event_id):
+                    write_event_json(
+                        create_event(
+                            source="DESKTOP_1",
+                            role="CTO_BACKEND",
+                            project_id="PRJ",
+                            event_type="MILESTONE_COMPLETED",
+                            status="IN_PROGRESS",
+                            summary="s",
+                            history_candidate=True,
+                            event_id=event_id,
+                        ),
+                        directory=directory,
+                    )
+            leftovers = [
+                path.name
+                for path in directory.iterdir()
+                if is_incomplete_write(path.name)
+            ]
+            self.assertEqual(leftovers, [])
+
+    def test_all_three_boundaries_refuse_the_same_set(self):
+        """One rule, three copies — the shape `DuplicatedRulesStayInStepTests`
+        exists for, checked here for the half it added."""
+        from history import file_repository
+        from reporter import local_output
+        from transport import onedrive
+
+        self.assertEqual(
+            local_output._RESERVED_WINDOWS_STEMS, onedrive._RESERVED_WINDOWS_STEMS
+        )
+        self.assertEqual(
+            local_output._RESERVED_WINDOWS_STEMS,
+            file_repository._RESERVED_WINDOWS_STEMS,
+        )
+        # The documented set, not the set this machine happens to resolve.
+        self.assertEqual(len(local_output._RESERVED_WINDOWS_STEMS), 22)
+        for name in ("PRN", "LPT1", "COM9"):
+            self.assertIn(name, local_output._RESERVED_WINDOWS_STEMS)
+
+
+class ValidationAnswersRatherThanRaisingTests(unittest.TestCase):
+    """`validate_event()` returns a list of errors. Four fields could make it
+    raise instead, and the caller has no handler for that.
+
+    `event_id`, `project_id` and `summary` are guarded with `isinstance`.
+    `source`, `role`, `event_type` and `status` were not, because they have
+    an allowed set and `value not in allowed` looked like it did the type
+    work. A frozenset lookup cannot answer without a hashable key, so a JSON
+    array or object in any of those four raised
+    `TypeError: unhashable type` out of validation itself.
+
+    Measured through the real Collector before the fix, one crafted Event
+    (`"role": ["CTO_BACKEND"]`) beside one ordinary one:
+
+        accepted=1 failed=1
+        incoming/  bad.json      <- still there, on every run, forever
+        rejected/  (empty)
+        collector.log  FAILED bad.json: unhashable type: 'list'
+
+    docs/03 §7 routes an invalid Event to `rejected/` and lets the run carry
+    on. This one became FAILED instead, so the file stayed in `incoming/` and
+    failed the same way on every retry — and the only trace named the
+    exception rather than the field, so nothing told an operator that the
+    shape of `role` was the problem.
+
+    Reachable with no crafted input beyond a hand-written or restored Event
+    with one bracket too many.
+    """
+
+    BASE = {
+        "schema_version": "1.0",
+        "event_id": "E1",
+        "source": "DESKTOP_1",
+        "role": "CTO_BACKEND",
+        "project_id": "P",
+        "event_type": "STARTED",
+        "status": "IN_PROGRESS",
+        "summary": "s",
+        "history_candidate": True,
+        "timestamp": "2026-08-15T09:00:00+09:00",
+    }
+
+    #: Every JSON shape that is not a string. `validate_event()` takes a
+    #: Mapping parsed from a file another Desktop wrote, so all of these can
+    #: arrive without anyone crafting them.
+    NOT_STRINGS = ([], {}, ["CTO_BACKEND"], {"value": "CTO_BACKEND"}, [[]], 0, 1.5, True)
+
+    ENUMERATED = ("source", "role", "event_type", "status")
+
+    def test_the_premise_the_guarded_fields_already_answer(self):
+        """The three fields that were already guarded, kept as the control:
+        this class is about the four that behaved differently."""
+        from events.schema import validate_event
+
+        for field in ("event_id", "project_id", "summary"):
+            with self.subTest(field=field):
+                errors = validate_event(dict(self.BASE, **{field: ["x"]}))
+                self.assertTrue(errors)
+
+    def test_no_shape_makes_validation_raise(self):
+        from events.schema import validate_event
+
+        for field in self.ENUMERATED:
+            for value in self.NOT_STRINGS:
+                with self.subTest(field=field, value=repr(value)):
+                    try:
+                        errors = validate_event(dict(self.BASE, **{field: value}))
+                    except Exception as exc:  # noqa: BLE001 - the defect itself
+                        self.fail(f"{field}={value!r} raised {type(exc).__name__}: {exc}")
+                    self.assertTrue(
+                        errors, f"{field}={value!r} must be an error, not silence"
+                    )
+
+    def test_the_error_names_the_field(self):
+        """The log line an operator sees. `unhashable type: 'list'` names the
+        exception; this names what to fix."""
+        from events.schema import validate_event
+
+        errors = validate_event(dict(self.BASE, role=["CTO_BACKEND"]))
+
+        self.assertTrue(any("role" in message for message in errors), errors)
+
+    def test_an_ordinary_event_is_still_accepted(self):
+        """The over-correction guard: an `isinstance` in the wrong place
+        would refuse every valid Event just as quietly."""
+        from events.schema import validate_event
+
+        self.assertEqual(validate_event(dict(self.BASE)), [])
+
+    def test_a_wrong_but_stringy_value_is_still_refused(self):
+        """And the membership test still has to run — adding the type check
+        must not replace it."""
+        from events.schema import validate_event
+
+        errors = validate_event(dict(self.BASE, role="NOT_A_ROLE"))
+
+        self.assertTrue(any("role" in message for message in errors), errors)
+
+    def test_the_collector_rejects_it_instead_of_failing_forever(self):
+        """The consequence, driven through the real Collector rather than
+        argued from the return value.
+
+        REJECTED and moved out of `incoming/` (docs/03 §7) is the difference
+        between one bad Event and a directory that never drains.
+        """
+        from collector.collector import Collector
+        from collector.runtime import run_once
+        from collector.state import PersistentSeenEventStore
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        incoming, processed, rejected, logs, state = (
+            root / "incoming", root / "processed", root / "rejected",
+            root / "logs", root / "state",
+        )
+        for directory in (incoming, processed, rejected, logs, state):
+            directory.mkdir(parents=True)
+
+        (incoming / "good.json").write_text(
+            json.dumps(dict(self.BASE, event_id="GOOD")), encoding="utf-8"
+        )
+        (incoming / "bad.json").write_text(
+            json.dumps(dict(self.BASE, event_id="BAD", role=["CTO_BACKEND"])),
+            encoding="utf-8",
+        )
+
+        summary = run_once(
+            collector=Collector(
+                seen_store=PersistentSeenEventStore(
+                    state_path=state / "collector_state.json"
+                )
+            ),
+            incoming_dir=incoming,
+            processed_dir=processed,
+            rejected_dir=rejected,
+            log_path=logs / "collector.log",
+        )
+
+        self.assertEqual(
+            (summary.accepted, summary.rejected, summary.failed), (1, 1, 0)
+        )
+        self.assertEqual([path.name for path in incoming.iterdir()], [])
+        self.assertEqual([path.name for path in rejected.iterdir()], ["bad.json"])
+        self.assertEqual([path.name for path in processed.iterdir()], ["good.json"])
+
+        log = (logs / "collector.log").read_text(encoding="utf-8")
+        self.assertIn("REJECTED bad.json", log)
+        self.assertIn("role", log)
+        self.assertNotIn("unhashable", log)
 
 
 class TransportSanitisationAsymmetryTests(unittest.TestCase):

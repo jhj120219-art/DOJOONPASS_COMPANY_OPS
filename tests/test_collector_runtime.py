@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -282,6 +283,169 @@ class RuntimePathSafetyTests(unittest.TestCase):
         content = runtime_module.read_text(encoding="utf-8")
         for token in ("C:\\Users", "D:\\", "OneDrive\\"):
             self.assertNotIn(token, content, f"{token} found in {runtime_module}")
+
+
+class EveryFileThatEntersIsAccountedForExactlyOnceTests(unittest.TestCase):
+    """The tests above check the paths **one at a time** — valid goes to
+    `processed/`, malformed to `rejected/`, a repeat is DUPLICATE, a
+    destination collision is FAILED. Each says where one kind of file goes.
+
+    None of them says that **every** file goes somewhere. A `continue` added
+    tomorrow that skips a file without counting it satisfies all of them: the
+    valid file still lands in `processed/`, the malformed one still lands in
+    `rejected/`, and the skipped one is simply in nobody's assertion.
+
+    So this states the invariant instead of the cases:
+
+        entered  ==  accepted + duplicate + rejected + failed
+        entered  ==  processed/ + rejected/ + still in incoming/
+
+    Both are needed. The first catches a file moved without being counted;
+    the second catches one deleted rather than moved.
+
+    `incoming/` is not required to be empty: a destination collision is
+    FAILED and deliberately **leaves** the file there, which is how the next
+    run retries it. That is why the second line counts what is left rather
+    than asserting zero.
+
+    A DUPLICATE is filed into `processed/` under its incoming name, so two
+    files can sit there for one `event_id` — that is conservation, not loss,
+    and `rollup.DuplicateEvent` exists to report it.
+    """
+
+    BASE = {
+        "schema_version": "1.0",
+        "source": "DESKTOP_1",
+        "role": "CTO_BACKEND",
+        "project_id": "P",
+        "event_type": "STARTED",
+        "status": "IN_PROGRESS",
+        "summary": "conservation",
+        "history_candidate": True,
+        "timestamp": "2026-08-05T09:00:00+09:00",
+    }
+
+    def _tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        for name in ("incoming", "processed", "rejected", "logs"):
+            (root / name).mkdir(parents=True)
+        return root
+
+    def _run(self, root, store=None):
+        store = store or InMemorySeenEventStore()
+        summary = run_once(
+            collector=Collector(seen_store=store),
+            incoming_dir=root / "incoming",
+            processed_dir=root / "processed",
+            rejected_dir=root / "rejected",
+            log_path=root / "logs" / "collector.log",
+        )
+        return summary, store
+
+    @staticmethod
+    def _counts(root):
+        return {
+            name: len(list((root / name).iterdir()))
+            for name in ("incoming", "processed", "rejected")
+        }
+
+    def _assert_conserved(self, root, entered, summary):
+        counted = (
+            summary.accepted + summary.duplicate + summary.rejected + summary.failed
+        )
+        self.assertEqual(
+            counted,
+            entered,
+            f"{entered} files entered and {counted} were counted — one was "
+            "handled without being reported in any bucket",
+        )
+        after = self._counts(root)
+        placed = after["processed"] + after["rejected"] + after["incoming"]
+        self.assertEqual(
+            placed,
+            entered,
+            f"{entered} files entered and {placed} are on disk — a file was "
+            f"neither moved nor left behind: {after}",
+        )
+
+    def _put(self, root, name, payload):
+        (root / "incoming" / name).write_text(payload, encoding="utf-8")
+
+    def _ok(self, event_id):
+        return json.dumps(dict(self.BASE, event_id=event_id))
+
+    def test_a_healthy_batch_is_conserved(self):
+        root = self._tree()
+        for index in range(3):
+            self._put(root, f"e{index}.json", self._ok(f"E{index}"))
+        summary, _ = self._run(root)
+
+        self._assert_conserved(root, 3, summary)
+        self.assertEqual(summary.accepted, 3)
+
+    def test_a_mixed_batch_is_conserved(self):
+        """One of each shape the Collector knows how to refuse."""
+        root = self._tree()
+        self._put(root, "good.json", self._ok("GOOD"))
+        self._put(
+            root,
+            "invalid.json",
+            json.dumps(dict(self.BASE, event_id="BAD", role=["CTO_BACKEND"])),
+        )
+        self._put(root, "unparseable.json", "{ broken")
+        self._put(root, "empty.json", "")
+        summary, _ = self._run(root)
+
+        self._assert_conserved(root, 4, summary)
+        self.assertEqual((summary.accepted, summary.rejected), (1, 3))
+
+    def test_a_duplicate_is_conserved_not_dropped(self):
+        root = self._tree()
+        self._put(root, "first.json", self._ok("SAME"))
+        summary, store = self._run(root)
+        self._assert_conserved(root, 1, summary)
+
+        self._put(root, "second.json", self._ok("SAME"))
+        summary, _ = self._run(root, store)
+
+        self.assertEqual(summary.duplicate, 1)
+        after = self._counts(root)
+        self.assertEqual(after["processed"], 2, "both files are kept")
+        self.assertEqual(after["incoming"], 0)
+
+    def test_a_collision_leaves_the_file_rather_than_losing_it(self):
+        """FAILED is the one outcome that does not move the file, and the
+        invariant has to allow for it or it would forbid the retry."""
+        root = self._tree()
+        (root / "processed" / "clash.json").write_text("{}", encoding="utf-8")
+        self._put(root, "clash.json", self._ok("CLASH"))
+        summary, _ = self._run(root)
+
+        self.assertEqual(summary.failed, 1)
+        after = self._counts(root)
+        self.assertEqual(after["incoming"], 1, "left for the next run")
+        self.assertEqual(
+            summary.accepted + summary.duplicate + summary.rejected + summary.failed,
+            1,
+        )
+
+    def test_the_invariant_can_actually_disagree(self):
+        """Guards the guard. Both halves are equalities over numbers this
+        test computes itself, so a mistake would make them trivially true —
+        this shows each side moving on its own."""
+        root = self._tree()
+        for index in range(2):
+            self._put(root, f"e{index}.json", self._ok(f"E{index}"))
+        summary, _ = self._run(root)
+        self._assert_conserved(root, 2, summary)
+
+        with self.assertRaises(AssertionError):
+            self._assert_conserved(root, 3, summary)
+
+        (root / "processed" / "e0.json").unlink()
+        with self.assertRaises(AssertionError):
+            self._assert_conserved(root, 2, summary)
 
 
 if __name__ == "__main__":

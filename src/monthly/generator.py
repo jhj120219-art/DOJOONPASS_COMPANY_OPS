@@ -138,11 +138,40 @@ def pending_months(
     happens. On a first-ever run counting starts at `history_start_date`'s
     own month (§85-86: the system never invents months that predate it).
     """
+    first_month = (history_start_date.year, history_start_date.month)
     if last_successful_monthly_close is not None:
         year, month = parse_month_key(last_successful_monthly_close)
         current = _next_month(year, month)
     else:
-        current = (history_start_date.year, history_start_date.month)
+        current = first_month
+
+    # C69, §86: the rule this function's docstring already claims, applied to
+    # the branch that did not have it. Only the first-run branch above started
+    # at `first_month`; the state-driven branch started wherever the pointer
+    # was, so a pointer older than `history_start_date` — a state file
+    # restored from another machine, or a start date corrected forward —
+    # enumerated every month in between.
+    #
+    # Those months have *zero* expected days, and `DailyCoverage.is_complete`
+    # is `not missing_dates`, so each one is vacuously COMPLETE and nothing
+    # downstream refuses it. Measured, pointer at 2026-01 with a start date
+    # of 2026-06-01: `consolidate_month(2026, 3)` returned MONTHLY_GENERATED
+    # and wrote an official `2026-03.md` reading "No material company-level
+    # changes were recorded during this month" over "Daily Coverage: COMPLETE
+    # (0 days expected)" — an assertion about a month the company did not
+    # keep history for.
+    #
+    # The dirty loop in `run_once()` already refuses exactly this, and its
+    # comment says "`pending_months()` applies this to the catch-up". That
+    # was true of one branch of two.
+    #
+    # Clamped rather than reported, which is the opposite of what the dirty
+    # loop does, and deliberately: PENDING breaks the catch-up loop, so
+    # reporting here would trade one false document for a Monthly pipeline
+    # that never advances again. The dirty loop can report because it is a
+    # separate pass that blocks nothing.
+    if current < first_month:
+        current = first_month
 
     last_closed = _previous_month(now.year, now.month)
 
@@ -177,6 +206,35 @@ def consolidate_month(
     daily_dir = Path(daily_dir)
     monthly_dir = Path(monthly_dir)
     final_path = monthly_history_path(monthly_dir, month_key(year, month))
+
+    # §86, at the point the decision is actually made. Both callers that
+    # enumerate months now refuse a pre-history one — `pending_months()` for
+    # the catch-up and the dirty loop for restored state — but this function
+    # is in `monthly.__all__`, so "no caller passes one" is a property of
+    # today's callers rather than of the rule.
+    #
+    # Checked before coverage on purpose: coverage cannot answer this. A
+    # month wholly before the start date has zero expected days, so it has
+    # zero missing days, so `is_complete` is True — the completeness gate
+    # below waves it through, which is exactly how an official `2026-03.md`
+    # came to be written saying "No material company-level changes were
+    # recorded during this month" over "Daily Coverage: COMPLETE (0 days
+    # expected)".
+    #
+    # PENDING rather than FAILED, matching the dirty loop's wording: nothing
+    # is broken, the month simply is not the system's to write. It cannot
+    # stall the catch-up, because `pending_months()` no longer yields one.
+    if (year, month) < (history_start_date.year, history_start_date.month):
+        return MonthlyResult(
+            year=year,
+            month=month,
+            status=MonthlyStatus.MONTHLY_PENDING,
+            error=(
+                f"{month_key(year, month)} predates the history start date "
+                f"({history_start_date.isoformat()}); Company History does not "
+                f"cover it and no run can consolidate it"
+            ),
+        )
 
     coverage = check_coverage(
         daily_dir, year, month, history_start_date=history_start_date

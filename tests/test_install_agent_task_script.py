@@ -272,6 +272,100 @@ class ParameterContractTests(unittest.TestCase):
         self.assertIn("$PSCmdlet.ShouldProcess(", text)
 
 
+class ATypoInTheSyncFolderIsSaidOutLoudTests(unittest.TestCase):
+    """The one installer mistake nothing downstream can catch.
+
+    Measured against this tree — `OneDriveTransport.send()` into a directory
+    that does not exist:
+
+        target exists before   False
+        send()                 -> None      (success)
+        target exists after    True
+        files written          ['E1.json']
+
+    `_write_atomic()` creates whatever directory it is handed
+    (`mkdir(parents=True, exist_ok=True)`), so a typo'd `-SyncFolder` never
+    fails. The Agent reports COLLECTED, its outbox drains, and every run on
+    that machine looks correct — while the Events land in a folder nothing
+    syncs to Desktop 4. Only Desktop 4's generic "this Desktop has been
+    silent" alarm would eventually notice, days later, naming the wrong
+    cause.
+
+    **A warning rather than a throw, deliberately.** OneDrive may not have
+    created or synced the folder yet at install time, which is a legitimate
+    "install now, folder appears shortly" sequence — the same stance this
+    script already takes toward timing it cannot control (`-DelayMinutes`).
+    Refusing to install would break that case;
+    `test_the_check_does_not_block_the_install` is what holds the
+    distinction.
+    """
+
+    def test_the_installer_checks_the_folder_at_all(self):
+        self.assertIn("Test-Path -LiteralPath $SyncFolder", _script_text())
+
+    def test_it_warns_rather_than_throwing(self):
+        text = _script_text()
+        block = text[text.index("Test-Path -LiteralPath $SyncFolder"):]
+        block = block[: block.index("}") + 1]
+
+        self.assertIn("Write-Warning", block)
+        self.assertNotIn("throw", block)
+
+    def test_the_warning_says_what_goes_wrong_rather_than_that_something_did(self):
+        """A path that does not exist is not itself an error — the operator
+        needs the consequence to decide whether to care."""
+        text = _script_text()
+        line = next(
+            l for l in text.splitlines() if "Write-Warning" in l and "SyncFolder" in l
+        )
+
+        self.assertIn("Desktop 4", line, "names who never sees the Events")
+        self.assertIn("report success", line, "names why nothing else will catch it")
+        self.assertIn("typo", line)
+
+    def test_the_check_does_not_block_the_install(self):
+        """The legitimate case: a fresh OneDrive share still syncing. The
+        warning must say so, or an operator will treat it as a failure and
+        stop."""
+        line = next(
+            l for l in _script_text().splitlines()
+            if "Write-Warning" in l and "SyncFolder" in l
+        )
+
+        self.assertIn("normal", line)
+        self.assertIn("ignored", line)
+
+    def test_the_premise_the_transport_really_does_create_it(self):
+        """Guards the guard. If the transport refused a missing folder the
+        warning would be about nothing, and this class should be deleted
+        rather than kept passing."""
+        import tempfile
+
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+        from events import create_event
+        from transport.onedrive import OneDriveTransport
+
+        target = Path(tempfile.mkdtemp()) / "OneDrve" / "CompanyOpsEvents"
+        self.assertFalse(target.exists())
+
+        OneDriveTransport(sync_folder=target).send(
+            create_event(
+                source="DESKTOP_1",
+                role="CTO_BACKEND",
+                project_id="P",
+                event_type="STARTED",
+                status="IN_PROGRESS",
+                summary="s",
+                history_candidate=True,
+                event_id="E1",
+                timestamp="2026-08-15T09:00:00+09:00",
+            )
+        )
+
+        self.assertTrue(target.is_dir(), "the transport created the typo'd folder")
+        self.assertEqual([path.name for path in target.iterdir()], ["E1.json"])
+
+
 class EntrypointContractTests(unittest.TestCase):
     def test_the_entrypoint_it_launches_exists(self):
         self.assertIn("run_agent.py", _script_text())

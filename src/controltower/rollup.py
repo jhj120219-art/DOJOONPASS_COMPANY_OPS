@@ -581,10 +581,43 @@ def _completes(event: Event) -> bool:
 def read_events(processed_dir: Path) -> tuple[tuple[tuple[Event, str], ...], tuple[tuple[str, str], ...]]:
     """`((event, filename), ...), ((filename, reason), ...)` from `processed/`.
 
-    Staging residue is excluded the way every other reader of a pipeline
-    directory excludes it. `processed/` can hold one: a `.tmp-…json` left in
-    `incoming/` by a killed writer is complete JSON often enough that the
-    Collector accepts it and moves it here under the staging name.
+    A `.tmp-…json` here **is** an Event, and that is the one place in this
+    repository where that sentence is true.
+
+    `is_incomplete_write()` exists because a scanner cannot tell an
+    abandoned staging file from a finished artifact, and every reader of a
+    directory a writer *stages into* skips it —
+    `transport/intake.py`, `agent/outbox.py`, `history/file_repository.py`,
+    `backup/working_copy.py`. This function used to skip it too, inline,
+    without going through the predicate.
+
+    **Nothing stages into `processed/`.** Every `tempfile.mkstemp()` in
+    `src/` names some other directory, and a file arrives here by exactly one
+    route: `collector/runtime.py` calls `os.replace(path, target_dir /
+    path.name)` on a file it has already parsed, validated, marked seen and
+    saved a History Candidate for. The staging name is inherited from
+    `incoming/` — where the Reporter really was killed mid-write — and the
+    Collector's own acceptance is the proof that what it carried is a
+    complete Event. `NoWriterStagesIntoProcessedTests` holds the premise.
+
+    So the skip was the right rule read off the wrong directory, and it cost
+    the thing this function was rewritten at C62 to stop costing. Measured,
+    three files in `processed/` and one of them staging-named:
+
+        controltower.read_events()          2 events, unreadable 0
+        app.desktop_activity._json_paths()  3
+        history.reconciliation              checked 3
+
+    Two blocks of one `ops_status.py` screen disagreeing about one
+    directory, and the Control Tower the only one that is short — silently,
+    because `unreadable` stayed empty so the "읽지 못한 파일 N건 — 아래
+    숫자는 그만큼 적다" line never printed. `Event 2건` is also what a
+    quieter company looks like.
+
+    The exclusion also went unexamined because the test that named it could
+    not see it: `test_staging_residue_is_not_an_event` copied one Event to a
+    second name, so `events_read == 1` was produced by the duplicate fold
+    whether the skip ran or not. Measured both ways — 1 and 1.
     """
     processed_dir = Path(processed_dir)
     # No `is_dir()` pre-check, and its removal is the point.
@@ -622,7 +655,7 @@ def read_events(processed_dir: Path) -> tuple[tuple[tuple[Event, str], ...], tup
     paths: list[tuple[str, str]] = []
     unreadable: list[tuple[str, str]] = []
     for entry in entries:
-        if not entry.name.endswith(".json") or entry.name.startswith(".tmp-"):
+        if not entry.name.endswith(".json"):
             continue
         try:
             # A directory wearing an event filename stays silent. It exists,
@@ -650,11 +683,19 @@ def read_events(processed_dir: Path) -> tuple[tuple[tuple[Event, str], ...], tup
             # this same function for this same reason; this is the same
             # conversion one loop further in.
             #
-            # The three other `except OSError: continue` loops in this
+            # The other `except OSError: continue` loops in this
             # repository are left alone deliberately: none of them has an
             # `unreadable` channel to report into, and in each the dropped
             # entry surfaces as a *gap* in a sequence the view is already
-            # looking for holes in. Here it surfaces as nothing at all.
+            # looking for holes in.
+            #
+            # C62 wrote "the three other" here and C66 counted two — the
+            # reasoning held, the number did not, because `transport/intake`
+            # and `collector/runtime` both record now. The count moved out of
+            # this comment and into
+            # `ASilentlyDroppedEntryIsARosterNotAParagraphTests`, which names
+            # each survivor and the reader that makes its silence acceptable.
+            # A paragraph cannot notice a fourth one arriving. Here it surfaces as nothing at all.
             unreadable.append((entry.name, str(exc)))
             continue
         paths.append((entry.name, entry.path))

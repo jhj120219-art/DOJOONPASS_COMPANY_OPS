@@ -28,6 +28,26 @@ DEFAULT_REVIEW_DIR = PROJECT_ROOT / "runtime" / "history_candidates" / "review"
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 
+# Windows resolves these to devices, not files, regardless of extension or
+# case — `NUL.json` and `NUL.anything.json` both name the NUL device, not a
+# file on disk. `_UNSAFE_FILENAME_CHARS` never touches them because every
+# character in "NUL" is on the whitelist. Every real caller already passes
+# a `history_id` beginning "HIST-" (never itself a reserved name), so this
+# is defense in depth for the sanitiser's general contract rather than a
+# reachable production path — kept in step with the other two storage
+# boundaries, `reporter.local_output._has_reserved_windows_head()` and
+# `transport.onedrive._has_reserved_windows_head()`.
+_RESERVED_WINDOWS_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{d}" for d in range(1, 10)}
+    | {f"LPT{d}" for d in range(1, 10)}
+)
+
+
+def _has_reserved_windows_head(name: str) -> bool:
+    """Whether the text before `name`'s first '.' is a Windows device name."""
+    return name.split(".", 1)[0].upper() in _RESERVED_WINDOWS_STEMS
+
 # Longest stem kept before the digest suffix. Windows rejects a path over
 # ~260 characters (WinError 123), and the candidate directory itself already
 # consumes part of that budget, so the stem is bounded well below the limit.
@@ -108,12 +128,19 @@ def safe_candidate_filename(history_id: str) -> str:
     through length instead of illegal characters.
     """
     sanitized = _UNSAFE_FILENAME_CHARS.sub("_", history_id).strip("._")
-    if sanitized == history_id and len(history_id) <= _MAX_FILENAME_STEM:
+    if (
+        sanitized == history_id
+        and len(history_id) <= _MAX_FILENAME_STEM
+        and not _has_reserved_windows_head(history_id)
+    ):
         return f"{history_id}.json"
 
     digest = hashlib.sha256(history_id.encode("utf-8")).hexdigest()[:12]
     stem = sanitized[:_MAX_FILENAME_STEM] or "candidate"
-    return f"{stem}-{digest}.json"
+    name = f"{stem}-{digest}.json"
+    if _has_reserved_windows_head(name):
+        name = f"_{name}"
+    return name
 
 
 class FileHistoryRepository(HistoryRepository):

@@ -276,6 +276,449 @@ class TraceabilityTests(ControlTowerTestCase):
                 self.assertEqual(len(metric.evidence), metric.value, key)
 
 
+class EveryMetricIsClassifiedByHowItCitesItsFilesTests(ControlTowerTestCase):
+    """`Metric` says a Control Tower number nobody can trace is a rumour, and
+    `evidence` is what makes it traceable. Three tests guarded that property
+    and all three were maintained by hand.
+
+        rollup, test_the_counted_metrics_carry_the_files_they_counted
+            ("events", "milestones_completed", "issues_resolved", "open_blockers")
+        rollup, test_every_counted_metric_still_carries_as_many_files_as_it_counts
+            ("events", "projects_completed", "open_blockers")
+        dashboard, test_every_row_carries_the_evidence_it_was_built_from
+            `if panel.key in ("METRICS",): continue`  — the whole panel
+
+    Union of the two key lists: **five of nine**. The third does not narrow,
+    it skips the panel outright — to accommodate the two metrics that
+    legitimately have no evidence, it stops checking the seven that do.
+
+    Measured on a rollup with one of everything:
+
+        events                     5 / 5     decisions_approved      1 / 1
+        projects_active            3 / 0     issues_resolved         1 / 1
+        projects_completed         1 / 1     open_blockers           1 / 1
+        milestones_completed       1 / 1     teams_silent            1 / 0
+                                             desktop_role_mismatches 1 / 1
+
+    So `decisions_approved` and `desktop_role_mismatches` carry their files
+    correctly and **nothing at either layer checks that they do**, and a
+    tenth metric added tomorrow would land in neither list nor the skip.
+
+    This sweeps instead. Every metric either counts its own evidence or is
+    named below with the reason it cannot — the C66 lesson about rosters
+    written by hand, applied to the layer that publishes the numbers.
+
+    `evidence_count` is not internal: `dashboard._metrics_panel()` puts
+    `len(metric.evidence)` on the row and `notion_projection` maps it to the
+    shared `Evidence Count` property, so this is what a COO reads beside the
+    number in Notion.
+    """
+
+    #: `key: why one ref per counted thing is impossible`. Not a permit to
+    #: drop evidence — both entries count something other than Events, and
+    #: `test_every_row_carries_the_evidence_it_was_built_from`'s own note
+    #: already says inventing refs for them "would be the invention this
+    #: module refuses".
+    COUNTS_SOMETHING_OTHER_THAN_EVENTS = {
+        "projects_active": (
+            "distinct project_ids, not Events — many files produce one "
+            "count, so one ref per unit does not exist"
+        ),
+        "teams_silent": (
+            "an absence. A team that reported nothing has no files behind "
+            "it, and citing the Events it did not send is not possible"
+        ),
+    }
+
+    def _one_of_everything(self):
+        """A rollup where every evidenced metric is non-zero.
+
+        Without that this class passes on `0 == 0` for whichever metric the
+        fixture happens not to exercise — the vacuous pass its own subject
+        matter is about.
+        """
+        self.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5, milestone="M")
+        self.put("E2", "SEARCH", "CTO_BACKEND", "ISSUE_RESOLVED", "IN_PROGRESS", 6)
+        self.put("E3", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 7)
+        self.put("E4", "OPSX", "COO", "BLOCKED", "BLOCKED", 8, blocker="waiting")
+        self.put("E5", "PAY", "CMO", "COMPLETED", "COMPLETED", 9)
+
+        # `put()` derives `source` from `role`, so a pair mismatch has to be
+        # written directly — DESKTOP_1 owns CTO_BACKEND (docs/02 §8).
+        mismatched = create_event(
+            source="DESKTOP_1",
+            role="CMO",
+            project_id="SEARCH",
+            event_type="STARTED",
+            status="IN_PROGRESS",
+            summary="claims a role its Desktop does not own",
+            history_candidate=True,
+            event_id="M1",
+            timestamp="2026-08-04T09:00:00+09:00",
+        )
+        (self.processed / "M1.json").write_text(mismatched.to_json(), encoding="utf-8")
+        return self.rollup()
+
+    def test_the_fixture_exercises_every_evidenced_metric(self):
+        """The vacuous-pass guard, first: a metric left at zero would satisfy
+        `len(evidence) == value` without ever citing anything."""
+        rollup = self._one_of_everything()
+        zero = sorted(
+            metric.key
+            for metric in rollup.metrics
+            if metric.key not in self.COUNTS_SOMETHING_OTHER_THAN_EVENTS
+            and metric.value == 0
+        )
+        self.assertEqual(zero, [], f"these would pass on 0 == 0: {zero}")
+
+    def test_the_sweep_sees_every_metric(self):
+        """And guards against the sweep itself matching nothing."""
+        rollup = self._one_of_everything()
+        self.assertGreaterEqual(len(rollup.metrics), 9)
+        self.assertEqual(
+            len({metric.key for metric in rollup.metrics}), len(rollup.metrics)
+        )
+
+    def test_every_metric_counts_its_evidence_or_says_why_it_cannot(self):
+        rollup = self._one_of_everything()
+        wrong = sorted(
+            f"{metric.key}: value={metric.value} evidence={len(metric.evidence)}"
+            for metric in rollup.metrics
+            if metric.key not in self.COUNTS_SOMETHING_OTHER_THAN_EVENTS
+            and len(metric.evidence) != metric.value
+        )
+        self.assertEqual(
+            wrong,
+            [],
+            "a KPI whose Evidence Count disagrees with its own value, and "
+            f"no entry saying why: {wrong}",
+        )
+
+    def test_the_roster_names_nothing_that_is_gone(self):
+        """The other direction. An entry for a metric that now carries its
+        evidence — or no longer exists — is the stale claim this replaces."""
+        rollup = self._one_of_everything()
+        by_key = {metric.key: metric for metric in rollup.metrics}
+
+        for key, why in self.COUNTS_SOMETHING_OTHER_THAN_EVENTS.items():
+            with self.subTest(metric=key):
+                self.assertIn(key, by_key, "rostered metric no longer exists")
+                self.assertEqual(
+                    len(by_key[key].evidence),
+                    0,
+                    f"{key} now carries evidence; drop it from the roster",
+                )
+                self.assertGreater(len(why), 40, "a reason, not a label")
+
+    def test_every_cited_file_is_a_file(self):
+        """The half the count cannot check. `Evidence Count` reaching Notion
+        is only worth reading while the refs behind it resolve — the
+        dashboard panel test asserts exactly this for every panel except the
+        one it skips."""
+        rollup = self._one_of_everything()
+
+        for metric in rollup.metrics:
+            for ref in metric.evidence:
+                with self.subTest(metric=metric.key, path=ref.path):
+                    self.assertTrue((self.processed / ref.path).is_file())
+
+    def test_every_metric_says_where_it_came_from(self):
+        """`source` is the sentence beside the number, and an empty one turns
+        the row back into the rumour `Metric` opens by refusing."""
+        for metric in self._one_of_everything().metrics:
+            with self.subTest(metric=metric.key):
+                self.assertGreater(len(metric.source.strip()), 10)
+
+
+class EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests(ControlTowerTestCase):
+    """The half `EveryMetricIsClassifiedByHowItCitesItsFilesTests` cannot see.
+
+    That class asks two things of every KPI: `len(evidence) == value`, and
+    that each cited path is a file. Both can hold while the citation is
+    **wrong**. Measured — `milestones_completed` made to cite the
+    `ISSUE_RESOLVED` files instead of its own:
+
+        count still equal        every cited file still exists
+        tests/test_controltower*.py  ->  480 passed
+
+    Nothing in the Control Tower suite noticed. `Metric` opens by saying a
+    number nobody can trace is a rumour; a number tracing to the wrong files
+    is a rumour with a citation, which is worse — it is checkable and wrong,
+    and `evidence_count` reaching Notion makes it look verified.
+
+    So this reads each cited file back and asks whether that Event is an
+    instance of what the metric counts.
+
+    **The predicates are the production ones, not copies.** `_completes()`
+    and `_blocker_change()` are what `_roll_metrics()` and `_roll_projects()`
+    themselves use — asking them is asking the rule rather than a second
+    opinion of it (the C28 rule), so this cannot drift from the code it
+    checks. Where the rollup compares an `event_type` literal, so does this:
+    that comparison **is** the contract, not an implementation of it.
+    """
+
+    #: metric key -> what a file it cites must be.
+    #:
+    #: Exhaustive by `test_every_metric_is_classified`: a tenth metric fails
+    #: here until someone says what its evidence means.
+    def _predicates(self):
+        from controltower.rollup import _blocker_change, _completes
+
+        return {
+            # Counts Events as such, so any Event is a valid citation.
+            "events": lambda event: True,
+            "projects_completed": _completes,
+            "milestones_completed": lambda event: event.event_type == "MILESTONE_COMPLETED",
+            "decisions_approved": lambda event: event.event_type == "DECISION_APPROVED",
+            "issues_resolved": lambda event: event.event_type == "ISSUE_RESOLVED",
+            # The risk's evidence is the Event that *set* the blocker, which
+            # is exactly what `_blocker_change()` reports a value for.
+            "open_blockers": lambda event: _blocker_change(event)[1] is not None,
+            "desktop_role_mismatches": (
+                lambda event: ROLE_FOR_SOURCE.get(event.source) != event.role
+            ),
+        }
+
+    #: Carry no evidence at all — the reason is in
+    #: `EveryMetricIsClassifiedByHowItCitesItsFilesTests`, and there is
+    #: nothing here for a predicate to be about.
+    NO_EVIDENCE = ("projects_active", "teams_silent")
+
+    def _one_of_everything(self):
+        self.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5, milestone="M")
+        self.put("E2", "SEARCH", "CTO_BACKEND", "ISSUE_RESOLVED", "IN_PROGRESS", 6)
+        self.put("E3", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 7)
+        self.put("E4", "OPSX", "COO", "BLOCKED", "BLOCKED", 8, blocker="waiting")
+        self.put("E5", "PAY", "CMO", "COMPLETED", "COMPLETED", 9)
+
+        mismatched = create_event(
+            source="DESKTOP_1",
+            role="CMO",
+            project_id="SEARCH",
+            event_type="STARTED",
+            status="IN_PROGRESS",
+            summary="claims a role its Desktop does not own",
+            history_candidate=True,
+            event_id="M1",
+            timestamp="2026-08-04T09:00:00+09:00",
+        )
+        (self.processed / "M1.json").write_text(mismatched.to_json(), encoding="utf-8")
+        return self.rollup()
+
+    def _event_at(self, ref):
+        from events import Event
+
+        return Event.from_json(
+            (self.processed / ref.path).read_text(encoding="utf-8")
+        )
+
+    def test_every_metric_is_classified(self):
+        """The roster is exhaustive or this class is decoration."""
+        rollup = self._one_of_everything()
+        known = set(self._predicates()) | set(self.NO_EVIDENCE)
+        unclassified = sorted({m.key for m in rollup.metrics} - known)
+
+        self.assertEqual(
+            unclassified,
+            [],
+            f"a KPI whose evidence nobody has said the meaning of: {unclassified}",
+        )
+
+    def test_the_fixture_exercises_every_predicate(self):
+        """Vacuous-pass guard. A metric left at zero cites nothing, and a
+        predicate applied to nothing is a predicate never run."""
+        rollup = self._one_of_everything()
+        empty = sorted(
+            key for key in self._predicates()
+            if not rollup.metric(key).evidence
+        )
+        self.assertEqual(empty, [], f"these predicates were never applied: {empty}")
+
+    def test_every_cited_file_is_an_instance_of_what_is_counted(self):
+        rollup = self._one_of_everything()
+        predicates = self._predicates()
+        wrong = []
+
+        for metric in rollup.metrics:
+            predicate = predicates.get(metric.key)
+            if predicate is None:
+                continue
+            for ref in metric.evidence:
+                event = self._event_at(ref)
+                if not predicate(event):
+                    wrong.append(f"{metric.key} cites {ref.event_id} ({event.event_type})")
+
+        self.assertEqual(
+            wrong,
+            [],
+            "a KPI citing a file that is not an instance of what it counts — "
+            f"traceable to the wrong evidence is worse than untraceable: {wrong}",
+        )
+
+    def test_the_check_would_notice_a_swapped_citation(self):
+        """Guards the guard, and it is the whole point.
+
+        The measured hole was `milestones_completed` citing the
+        `ISSUE_RESOLVED` file: right count, real file, wrong Event. The
+        predicate has to reject that pairing, or this class passes for the
+        same reason the suite already did.
+        """
+        rollup = self._one_of_everything()
+        predicates = self._predicates()
+
+        milestone_ref = rollup.metric("milestones_completed").evidence[0]
+        resolved_ref = rollup.metric("issues_resolved").evidence[0]
+
+        self.assertTrue(
+            predicates["milestones_completed"](self._event_at(milestone_ref)),
+            "the honest pairing must pass",
+        )
+        self.assertFalse(
+            predicates["milestones_completed"](self._event_at(resolved_ref)),
+            "the swapped pairing must fail",
+        )
+        self.assertFalse(
+            predicates["open_blockers"](self._event_at(milestone_ref)),
+            "a milestone did not set a blocker",
+        )
+        self.assertFalse(
+            predicates["desktop_role_mismatches"](self._event_at(milestone_ref)),
+            "an Event whose Desktop owns its role is not a mismatch",
+        )
+
+    def test_the_ref_names_the_file_it_was_read_out_of(self):
+        """`EvidenceRef` says it is "One Event, and the file it was read out
+        of". A ref whose id or instant disagrees with the file at its path
+        would send a reader to the wrong place while looking resolvable."""
+        rollup = self._one_of_everything()
+
+        for metric in rollup.metrics:
+            for ref in metric.evidence:
+                with self.subTest(metric=metric.key, ref=ref.event_id):
+                    event = self._event_at(ref)
+                    self.assertEqual(event.event_id, ref.event_id)
+                    self.assertEqual(event.timestamp, ref.at)
+
+
+class ThePredicatesTheEvidenceGateBorrowsAreThemselvesPinnedTests(ControlTowerTestCase):
+    """`EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests` deliberately
+    reuses `_completes()` and `_blocker_change()` rather than copying them,
+    so it cannot drift from the rollup. That buys accuracy and costs
+    independence: if either predicate were wrong, the gate would agree with
+    it and both would be wrong together.
+
+    Most of that risk is already covered one layer down.
+    `test_spec_conformance.py::…EXPECTED_EXTRA` pins
+    `notion/properties._type_specific_properties()` per event type against
+    docs/04 §21-28, and asserts the mapping covers **every** member of
+    `EVENT_TYPES` — so the table the two predicates read cannot quietly gain
+    or lose a row.
+
+    What that does not pin is the two-line step from that table to the
+    predicate: **which key** each one looks for. `_completes()` is
+    `"Completed Date" in _type_specific_properties(event)`; point it at
+    `"Blocker"` instead and every BLOCKED project becomes a completed one,
+    `projects_completed` counts them, and the evidence gate — reusing the
+    same predicate — agrees.
+
+    So this enumerates `EVENT_TYPES` independently and states the answer for
+    each, from docs/04 rather than from the predicate.
+    """
+
+    #: docs/04 §25 is the only section that writes `Completed Date`. §26
+    #: (CANCELLED) deliberately does not — a cancelled project is not a
+    #: completed one, and `projects_completed` is a KPI a COO reads.
+    COMPLETES = {"COMPLETED"}
+
+    #: §22 sets a Blocker; §23, §25 and §27 clear it (§27 only when the
+    #: Event's own status is no longer BLOCKED). Everything else leaves
+    #: blocker state alone.
+    SETS_A_BLOCKER = {"BLOCKED"}
+    CLEARS_A_BLOCKER = {"RESUMED", "COMPLETED", "ISSUE_RESOLVED"}
+
+    STATUS_FOR = {"COMPLETED": "COMPLETED", "CANCELLED": "CANCELLED", "BLOCKED": "BLOCKED"}
+
+    def _event(self, event_type):
+        return create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="SEARCH",
+            event_type=event_type,
+            status=self.STATUS_FOR.get(event_type, "IN_PROGRESS"),
+            summary="predicate guard",
+            milestone="M1" if event_type == "MILESTONE_COMPLETED" else None,
+            blocker="B" if event_type == "BLOCKED" else None,
+            history_candidate=True,
+            event_id=f"PRED-{event_type}",
+            timestamp="2026-08-05T09:00:00+09:00",
+        )
+
+    def test_this_guard_covers_every_event_type(self):
+        """The roster is the schema's, not one written here — a ninth Event
+        type has to be classified before this passes again."""
+        from events import EVENT_TYPES
+
+        self.assertEqual(
+            self.COMPLETES | self.SETS_A_BLOCKER | self.CLEARS_A_BLOCKER
+            | {"STARTED", "CANCELLED", "MILESTONE_COMPLETED", "DECISION_APPROVED"},
+            set(EVENT_TYPES),
+        )
+
+    def test_exactly_one_event_type_completes_a_project(self):
+        from controltower.rollup import _completes
+        from events import EVENT_TYPES
+
+        completing = {
+            event_type
+            for event_type in EVENT_TYPES
+            if _completes(self._event(event_type))
+        }
+        self.assertEqual(completing, self.COMPLETES)
+
+    def test_cancelled_is_not_completed(self):
+        """Stated on its own because it is the one a reader would guess wrong,
+        and because `projects_completed` is a number a COO acts on."""
+        from controltower.rollup import _completes
+        from events import EVENT_TYPES
+
+        self.assertFalse(_completes(self._event("CANCELLED")))
+        self.assertTrue(_completes(self._event("COMPLETED")))
+
+    def test_exactly_the_documented_types_change_blocker_state(self):
+        from controltower.rollup import _blocker_change
+        from events import EVENT_TYPES
+
+        sets_it, clears_it = set(), set()
+        for event_type in EVENT_TYPES:
+            changes, value = _blocker_change(self._event(event_type))
+            if not changes:
+                continue
+            (sets_it if value else clears_it).add(event_type)
+
+        self.assertEqual(sets_it, self.SETS_A_BLOCKER)
+        self.assertEqual(clears_it, self.CLEARS_A_BLOCKER)
+
+    def test_issue_resolved_still_blocked_does_not_clear_it(self):
+        """§27's own exception, and the one case where the Event's `status`
+        overrides its type. Kept here because `open_blockers` — and the
+        evidence gate that borrows this predicate — both depend on it."""
+        from controltower.rollup import _blocker_change
+
+        still_blocked = create_event(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="SEARCH",
+            event_type="ISSUE_RESOLVED",
+            status="BLOCKED",
+            summary="one of several issues",
+            history_candidate=True,
+            event_id="PRED-IR-BLOCKED",
+            timestamp="2026-08-05T09:00:00+09:00",
+        )
+
+        self.assertEqual(_blocker_change(still_blocked), (False, None))
+
+
 class TheRiskNamesTheTeamThatReportedItTests(ControlTowerTestCase):
     """C48: `Risk.team` was "whichever team logged the newest Event".
 
@@ -890,14 +1333,80 @@ class RollupBoundariesTests(ControlTowerTestCase):
         self.assertEqual(rollup.events_read, 1)
         self.assertEqual([name for name, _reason in rollup.unreadable], ["BROKEN.json"])
 
-    def test_staging_residue_is_not_an_event(self):
-        """`processed/` can hold a `.tmp-…json`: a staging file left in
-        `incoming/` is complete JSON often enough that the Collector accepts
-        it and moves it here under the staging name."""
-        self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)
-        shutil.copy(self.processed / "E1.json", self.processed / ".tmp-abc.json")
+    def test_a_staging_named_file_in_processed_is_an_event(self):
+        """C64. `processed/` is the one pipeline directory a writer never
+        stages into, so a `.tmp-…json` here is a collected Event under an
+        inherited name — parsed, validated, marked seen and given a History
+        Candidate by the Collector before it was moved.
 
-        self.assertEqual(self.rollup().events_read, 1)
+        Skipping it silently made the Control Tower short by one with
+        `unreadable` empty, which is the conversion C62 removed one loop
+        further into this same function.
+        """
+        self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)
+        self.put("E2", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)
+        shutil.move(
+            str(self.processed / "E2.json"), str(self.processed / ".tmp-abc.json")
+        )
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.events_read, 2)
+        self.assertEqual(rollup.unreadable, ())
+        self.assertEqual(rollup.duplicates, ())
+        self.assertIn(
+            ".tmp-abc.json",
+            [ref.path for ref in rollup.project("SEARCH").evidence],
+        )
+
+    def test_the_old_fixture_could_not_have_seen_the_skip(self):
+        """Why this went unexamined, pinned so it cannot recur.
+
+        `test_staging_residue_is_not_an_event` copied one Event to a second
+        name and asserted `events_read == 1`. Both files carried **one**
+        `event_id`, so the duplicate fold produced that 1 on its own — the
+        assertion held whether the skip ran or not, which is what a test that
+        names a behaviour and cannot observe it looks like (C57).
+
+        This states the fold's answer directly, so the number in that
+        assertion is attributed to the mechanism that actually produces it.
+        """
+        self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)
+        shutil.copy(self.processed / "E1.json", self.processed / "copy.json")
+
+        rollup = self.rollup()
+
+        self.assertEqual(rollup.events_read, 1)
+        self.assertEqual(len(rollup.duplicates), 1)
+        self.assertTrue(rollup.duplicates[0].identical)
+
+    def test_the_three_readers_of_processed_now_agree(self):
+        """The finding itself: one directory, three readers, two answers.
+
+        Measured on HEAD with two ordinary Events and one staging-named one —
+        Control Tower 2, the COMPANY block 3, reconciliation 3 — on one
+        `ops_status.py` screen, and only the Control Tower short.
+        """
+        from app.desktop_activity import _json_paths
+        from history.reconciliation import find_orphaned_events
+
+        self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)
+        self.put("E2", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)
+        shutil.move(
+            str(self.processed / "E2.json"), str(self.processed / ".tmp-abc.json")
+        )
+
+        control_tower = self.rollup().events_read
+        company_block = len(_json_paths(self.processed))
+        reconciliation = find_orphaned_events(
+            processed_dir=self.processed,
+            keep_dir=self.processed.parent / "keep",
+            review_dir=self.processed.parent / "review",
+        ).checked
+
+        self.assertEqual(
+            (control_tower, company_block, reconciliation), (2, 2, 2)
+        )
 
     def test_every_role_appears_even_when_silent(self):
         self.put("E1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 1)

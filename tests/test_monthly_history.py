@@ -21,7 +21,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -1532,6 +1532,24 @@ class MonthlyIsNotNotionTests(unittest.TestCase):
             with self.subTest(token=forbidden):
                 self.assertNotIn(forbidden, monthly_step)
 
+    def test_the_monthly_package_scan_finds_its_modules(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_the_monthly_package_cannot_reach_notion_at_all` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        root = Path(__file__).resolve().parents[1] / "src" / "monthly"
+        modules = sorted(root.glob("*.py"))
+        self.assertGreaterEqual(len(modules), 4, modules)
+
     def test_the_monthly_package_cannot_reach_notion_at_all(self):
         import ast
 
@@ -2524,6 +2542,256 @@ class MonthlyShortfallHasTwoCausesTests(MonthlyTestCase):
         self.assertIn("다시 만들어도 같은 결과", source)
         self.assertIn("복구된다", source)
         self.assertIn("둘 중 어느 쪽인지는", source)
+
+
+class NoMonthIsInventedFromBeforeTheSystemExistedTests(unittest.TestCase):
+    """docs/09 §86: "Company Ops 시작 이전의 과거 월을 자동 생성하려 하지 않는다."
+
+    `run_once()`'s dirty loop enforces that, and its comment says
+    "`pending_months()` applies this to the catch-up". `pending_months()` has
+    two branches and only one of them did:
+
+        no pointer yet   start at `history_start_date`'s month   §86 held
+        pointer in state start at the month after the pointer    §86 did not
+
+    So a pointer older than the start date — a state file restored from
+    another machine, or a start date corrected forward after a mis-set
+    initial value — enumerated every month in between.
+
+    Nothing downstream refused them, and the reason is a vacuous truth one
+    layer down. `DailyCoverage.is_complete` is `not missing_dates`; a month
+    entirely before the start date has **zero expected days**, so it has zero
+    missing days, so it is COMPLETE. `consolidate_month()` requires
+    completeness and got it.
+
+    Measured before the fix, pointer at `2026-01` and start date
+    `2026-06-01`, on an empty daily directory:
+
+        pending_months  -> 2026-02 .. 2026-07
+        consolidate 2026-03 -> MONTHLY_GENERATED, and `2026-03.md` written:
+
+            ## Executive Summary
+            No material company-level changes were recorded during this month.
+            - Daily Coverage: COMPLETE (0 days expected)
+
+    That document is an assertion about a month Company History does not
+    cover, in the voice of the system that does cover it, and it is
+    indistinguishable from a genuinely quiet month. The renderer even prints
+    "0 days expected" — the information was there and nothing acted on it.
+
+    **Clamped, not reported — the opposite of the dirty loop, on purpose.**
+    The dirty loop returns MONTHLY_PENDING for a pre-history month and leaves
+    the flag, because it is a separate pass that blocks nothing. The catch-up
+    loop `break`s on PENDING (§48: never consolidate a later month over an
+    earlier hole), so reporting here would trade one false document for a
+    Monthly pipeline that never advances again. `test_the_catch_up_still_advances`
+    is what holds that distinction in place.
+    """
+
+    KST = timezone(timedelta(hours=9))
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.now = datetime(2026, 8, 21, 9, 0, tzinfo=self.KST)
+        self.start = date(2026, 6, 1)
+
+    def test_a_pointer_older_than_the_start_date_invents_nothing(self):
+        months = pending_months(
+            last_successful_monthly_close="2026-01",
+            history_start_date=self.start,
+            now=self.now,
+        )
+        self.assertEqual(months, [(2026, 6), (2026, 7)])
+
+    def test_the_months_that_do_belong_are_still_enumerated(self):
+        """The over-correction guard. A clamp that dropped the start month
+        itself, or stopped early, would swap a false Monthly for a missing
+        one — and a missing month is the hole §48 exists to prevent."""
+        months = pending_months(
+            last_successful_monthly_close="2026-01",
+            history_start_date=self.start,
+            now=self.now,
+        )
+        self.assertIn((2026, 6), months, "the start date's own month is due")
+        self.assertIn((2026, 7), months, "the last closed month is due")
+
+    def test_a_healthy_pointer_is_untouched(self):
+        """The control. Every real deployment is on this path, and the fix
+        must be invisible to it."""
+        self.assertEqual(
+            pending_months(
+                last_successful_monthly_close="2026-06",
+                history_start_date=self.start,
+                now=self.now,
+            ),
+            [(2026, 7)],
+        )
+
+    def test_the_first_run_branch_is_untouched(self):
+        """The branch that already obeyed §86, including §85's mid-month
+        start — which must still yield its own month rather than skip it."""
+        self.assertEqual(
+            pending_months(
+                last_successful_monthly_close=None,
+                history_start_date=date(2026, 6, 15),
+                now=self.now,
+            ),
+            [(2026, 6), (2026, 7)],
+        )
+
+    def _complete_daily(self):
+        daily = self.root / "daily"
+        monthly = self.root / "monthly"
+        daily.mkdir()
+        monthly.mkdir()
+        for month, days in ((6, 30), (7, 31)):
+            for day in range(1, days + 1):
+                (daily / f"2026-{month:02d}-{day:02d}.md").write_text(
+                    "# day\n", encoding="utf-8"
+                )
+        return daily, monthly
+
+    def test_no_pre_history_monthly_is_written(self):
+        """The consequence, driven through `run_once()` rather than argued
+        from the month list."""
+        daily, monthly = self._complete_daily()
+        state_path = self.root / "monthly_state.json"
+        state_path.write_text(
+            json.dumps(
+                {"last_successful_monthly_close": "2026-01", "dirty_months": []}
+            ),
+            encoding="utf-8",
+        )
+
+        run_once(
+            daily_dir=daily,
+            monthly_dir=monthly,
+            history_start_date=self.start,
+            now=self.now,
+            state_path=state_path,
+        )
+
+        self.assertEqual(
+            sorted(path.name for path in monthly.iterdir()),
+            ["2026-06.md", "2026-07.md"],
+        )
+
+    def test_the_catch_up_still_advances(self):
+        """Why this is a clamp and not a PENDING.
+
+        A pre-history month reported as PENDING would `break` the catch-up
+        at the first one, and every later month would stay unconsolidated
+        for as long as the pointer stayed stale — which is forever, because
+        only a consolidated month moves it.
+        """
+        daily, monthly = self._complete_daily()
+        state_path = self.root / "monthly_state.json"
+        state_path.write_text(
+            json.dumps(
+                {"last_successful_monthly_close": "2026-01", "dirty_months": []}
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_once(
+            daily_dir=daily,
+            monthly_dir=monthly,
+            history_start_date=self.start,
+            now=self.now,
+            state_path=state_path,
+        )
+
+        self.assertEqual(
+            [(item.key, item.status.value) for item in result.results],
+            [("2026-06", "MONTHLY_GENERATED"), ("2026-07", "MONTHLY_GENERATED")],
+        )
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))[
+                "last_successful_monthly_close"
+            ],
+            "2026-07",
+        )
+
+    def test_the_decision_point_refuses_one_too(self):
+        """Defence in depth, and not a hypothetical: `consolidate_month` is
+        in `monthly.__all__`. With only the two enumerating callers guarded,
+        "nothing passes a pre-history month" is a fact about today's callers
+        rather than about the rule.
+        """
+        daily, monthly = self._complete_daily()
+
+        result = consolidate_month(
+            year=2026,
+            month=3,
+            daily_dir=daily,
+            monthly_dir=monthly,
+            history_start_date=self.start,
+            now=self.now,
+        )
+
+        self.assertEqual(result.status, MonthlyStatus.MONTHLY_PENDING)
+        self.assertIn("predates the history start date", result.error)
+        self.assertEqual(list(monthly.iterdir()), [])
+
+    def test_the_start_month_itself_is_not_refused(self):
+        """The boundary, from the other side. §85 says the start month is
+        consolidated *from the start date onward* — it is the first month the
+        system owns, not the last one it disowns."""
+        daily, monthly = self._complete_daily()
+
+        result = consolidate_month(
+            year=2026,
+            month=6,
+            daily_dir=daily,
+            monthly_dir=monthly,
+            history_start_date=self.start,
+            now=self.now,
+        )
+
+        self.assertEqual(result.status, MonthlyStatus.MONTHLY_GENERATED)
+        self.assertTrue((monthly / "2026-06.md").is_file())
+
+    def test_a_mid_month_start_still_owns_its_own_month(self):
+        """§85's case specifically: a start date of the 15th does not make
+        that month pre-history. The guard compares months, and a guard
+        written against dates would refuse the very first Monthly forever.
+        """
+        daily = self.root / "daily"
+        monthly = self.root / "monthly"
+        daily.mkdir()
+        monthly.mkdir()
+        for day in range(15, 31):
+            (daily / f"2026-06-{day:02d}.md").write_text("# day\n", encoding="utf-8")
+
+        result = consolidate_month(
+            year=2026,
+            month=6,
+            daily_dir=daily,
+            monthly_dir=monthly,
+            history_start_date=date(2026, 6, 15),
+            now=self.now,
+        )
+
+        self.assertEqual(result.status, MonthlyStatus.MONTHLY_GENERATED)
+
+    def test_the_vacuous_completeness_underneath_is_still_there(self):
+        """Characterisation, not an endorsement.
+
+        The clamp keeps the catch-up away from a zero-day month; it does not
+        make "0 of 0 days present" stop reading as COMPLETE. Pinned so the
+        reason the clamp is necessary stays visible, and so that a later
+        change to `is_complete` is a deliberate one that fails here first.
+        """
+        coverage = check_coverage(
+            self.root, 2026, 3, history_start_date=self.start
+        )
+
+        self.assertEqual(coverage.expected_dates, ())
+        self.assertEqual(coverage.missing_dates, ())
+        self.assertTrue(coverage.is_complete)
+        self.assertEqual(coverage.status, "COMPLETE")
 
 
 if __name__ == "__main__":

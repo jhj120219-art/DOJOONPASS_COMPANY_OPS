@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
 
 from oplog import bounded, one_line, redact
@@ -456,6 +457,24 @@ def _property(kind: PropertyType, value: Any) -> dict[str, Any]:
     return {"rich_text": [{"text": {"content": _text(value)}}]}
 
 
+def _is_iso_8601(text: str) -> bool:
+    """Whether Notion would read `text` as a date.
+
+    `datetime.fromisoformat()` rather than a regex: it is the same parser
+    `events.schema._timestamp_error()` validates an Event's timestamp with,
+    so "an Event timestamp is a valid Notion date" is true by construction
+    instead of by two patterns agreeing. On Python 3.9 it is the stricter of
+    the two — it refuses the trailing `Z` this project never emits — and
+    stricter is the safe direction for a check whose job is to refuse before
+    the API does.
+    """
+    try:
+        datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _evidence_text(evidence: Sequence[Mapping[str, Any]]) -> str:
     """The row's evidence refs as one line — `event_id@at -> path`, joined.
 
@@ -609,6 +628,9 @@ def validate_rows(rows: Iterable[ProjectedRow]) -> list[str]:
                                 is how "no value" is spelled
         comma in a select name  select and multi-select option names may not
                                 contain commas
+        a date that is not one   `date.start` must be ISO 8601; anything else
+                                is a 400, and `_property()` will put any
+                                string there
         duplicate row key       two rows with one title: the first write
                                 creates, the second finds it and overwrites,
                                 and one of the two subjects' state is simply
@@ -666,6 +688,29 @@ def validate_rows(rows: Iterable[ProjectedRow]) -> list[str]:
                         errors.append(
                             f"{row.database}.{name}: select name {option_name!r} "
                             "contains a comma, which Notion refuses"
+                        )
+            elif kind == "date":
+                # A `date` whose `start` is not ISO 8601 is an HTTP 400, and
+                # the docstring above claims to list **every** reason Notion
+                # would refuse a row. It did not list this one: measured, a
+                # row carrying `"not-a-date"` and `"2026-13-45T99:00:00"`
+                # came back clean.
+                #
+                # Nothing produces such a value today, and that is checked
+                # rather than asserted — `EveryDateThisProjectionEmitsIsISOTests`
+                # runs the real fold and reads the dates back out. This is
+                # here for the column that does not exist yet: `_property()`
+                # turns any string into a `date.start`, so the first DATE
+                # column fed by something other than an Event timestamp
+                # would reach Notion, 400, and be classified PERMANENT with
+                # nothing on this side having said why.
+                value = prop.get("date")
+                if value is not None:
+                    start = value.get("start")
+                    if not isinstance(start, str) or not _is_iso_8601(start):
+                        errors.append(
+                            f"{row.database}.{name}: {start!r} is not an "
+                            "ISO 8601 date, which Notion refuses"
                         )
 
         missing = sorted(set(schema) - set(row.properties))
@@ -741,17 +786,101 @@ class ProjectionResult:
     # reporting that a row it should have found was not there.
 
 
+def _row_key_of(page: Any) -> str:
+    """The `Row Key` title of one page **Notion returned**.
+
+    `plain_text`, never `text.content`, and that is the whole of the second
+    defect this function was rewritten for. Notion stores a title as one item
+    per run of identical formatting, and an item that is not literal text — a
+    mention, an equation — carries no `"text"` key at all.
+    `notion/properties._extract_rich_text()` measured exactly this shape
+    against `ExecutionPlanSync._update()` and reads `plain_text` because of
+    it, and `notion/dashboard._page_title()` does the same. This was the
+    third reader of the same Notion answer and the only one still reading the
+    key that can be absent.
+
+    What that cost, measured end to end: Notion's `title equals` filter
+    compares plain text, so `sync_control_tower()` **finds** the row and
+    refreshes it — and then this pass reads a key that is not the one it just
+    wrote, does not find it among the live keys, and retires the row. A live
+    `CT_PROJECTS` row went `Present = false` with `Retired At` stamped in the
+    same sync that had updated it, and every later run repeated it. An
+    operator's view filters on `Present`, so a live project leaves the
+    Control Tower and the only trace is `retired` counting one higher.
+
+    Raises `TypeError` on a shape Notion does not document rather than
+    answering `""`. The distinction is load-bearing: `""` is not a live row
+    key (`TheTitleColumnMayNeverBeNullTests` holds every projected row to a
+    non-empty one), so an unreadable page answered as `""` would be **retired
+    on the strength of not being understood**. The caller turns the exception
+    into "this listing could not be read" instead, which retires nothing.
+    """
+    if not isinstance(page, Mapping):
+        raise TypeError(f"page is {type(page).__name__}, not an object")
+    properties = page.get("properties") or {}
+    if not isinstance(properties, Mapping):
+        raise TypeError(f"properties is {type(properties).__name__}, not an object")
+    prop = properties.get(ROW_KEY_PROPERTY) or {}
+    if not isinstance(prop, Mapping):
+        raise TypeError(
+            f"{ROW_KEY_PROPERTY} is {type(prop).__name__}, not an object"
+        )
+    items = prop.get("title") or []
+    if not isinstance(items, (list, tuple)):
+        raise TypeError(
+            f"{ROW_KEY_PROPERTY}.title is {type(items).__name__}, not a list"
+        )
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"{ROW_KEY_PROPERTY}.title item is {type(item).__name__}, "
+                "not an object"
+            )
+        text = item.get("plain_text")
+        if text is None:
+            inner = item.get("text")
+            text = inner.get("content") if isinstance(inner, Mapping) else None
+        parts.append(text if isinstance(text, str) else "")
+    return "".join(parts)
+
+
+def _is_present(page: Mapping[str, Any]) -> bool:
+    """Whether Notion's copy of this row still says `Present`.
+
+    An **absent** property reads as True: a database created before the column
+    existed, or a row a person added by hand, is present until something says
+    otherwise, and the only thing False does here is skip the row.
+
+    A property that is there but is not shaped like a Notion property raises,
+    for `_row_key_of()`'s reason — that is the remote answering with something
+    that is not Notion, and the caller's answer to that is to reconcile
+    nothing rather than to guess per row.
+    """
+    properties = page.get("properties") or {}
+    if not isinstance(properties, Mapping):
+        raise TypeError(f"properties is {type(properties).__name__}, not an object")
+    present = properties.get("Present")
+    if present is None:
+        return True
+    if not isinstance(present, Mapping):
+        raise TypeError(f"Present is {type(present).__name__}, not an object")
+    return bool(present.get("checkbox", True))
+
+
 def _retire_absent_rows(
     client: NotionClient, live_keys: set, generated_at: str | None
 ) -> tuple[int, bool, list[str]]:
     """Mark every row of `client`'s database that this run did not produce.
 
     Returns `(retired, reconciled, errors)`. `reconciled` is False when the
-    transport cannot list the database, or listed it only partially — a
-    reconciliation over an incomplete listing would retire every row it did
-    not see, which is strictly worse than not reconciling at all. That is why
-    the truncation flag is consulted rather than trusted to be absent: the
-    failure it prevents is the loud one.
+    transport cannot list the database, listed it only partially, or answered
+    with something this code cannot read — a reconciliation over a listing it
+    does not understand would retire every row it did not recognise, which is
+    strictly worse than not reconciling at all. That is why the truncation
+    flag is consulted rather than trusted to be absent, and why the listing is
+    read through before the first write rather than row by row: the failure
+    all three prevent is the loud one.
 
     Already-retired rows are left alone rather than re-written. A projection
     that touched every historical row on every run would make `Retired At`
@@ -767,17 +896,34 @@ def _retire_absent_rows(
     if client.list_truncated:
         return 0, False, []
 
+    # The whole listing is read before anything is retired, and the read is
+    # guarded, because `list_pages()` hands back whatever the response body's
+    # `results` held. `_reason()` above already records what that can be — "a
+    # proxy or captive portal answering in Notion's place is free to echo
+    # request headers back" — and a body shaped `{"results": ["..."]}` or
+    # `{"results": {...}}` is the same actor answering.
+    #
+    # Measured on HEAD, twelve injected response shapes: **nine raised
+    # `AttributeError` out of this function**, out of `sync_control_tower()`
+    # — whose docstring says *Never raises* — and into the caller. That
+    # contract is CEO Decision ④ ("Dashboard 기록 실패는 Runtime을 절대
+    # 중단시키면 안 된다"), so the escape was not a rough edge; it was the one
+    # promise this module makes to the Runner it is meant to be wired into.
+    #
+    # An unreadable listing gets the answer truncation already gets, for the
+    # identical reason. Nothing has been written at this point, so refusing
+    # costs exactly the pass and no state.
+    try:
+        entries = [(page, _row_key_of(page), _is_present(page)) for page in pages]
+    except Exception as exc:  # noqa: BLE001  (CEO ④)
+        return 0, False, [f"unreadable listing: {_reason(exc)}"]
+
     retired = 0
     errors: list[str] = []
-    for page in pages:
-        properties = page.get("properties") or {}
-        key = "".join(
-            (item.get("text") or {}).get("content") or ""
-            for item in ((properties.get(ROW_KEY_PROPERTY) or {}).get("title") or [])
-        )
+    for page, key, present in entries:
         if key in live_keys:
             continue
-        if not (properties.get("Present") or {}).get("checkbox", True):
+        if not present:
             continue  # already retired; leave `Retired At` where it is
         try:
             client.update_project(

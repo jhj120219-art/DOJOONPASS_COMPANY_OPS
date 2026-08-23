@@ -102,6 +102,23 @@ if ($null -eq $python) {
     throw 'python was not found on PATH. Install Python or add it to PATH before registering the task.'
 }
 
+# A warning, not a throw: `transport.onedrive._write_atomic()` creates
+# whatever directory it is given (`mkdir(parents=True, exist_ok=True)`), so
+# a typo'd -SyncFolder does not fail the Agent's first run -- it silently
+# succeeds into a directory nothing actually syncs to Desktop 4. Every run
+# after that reports COLLECTED, the outbox stays empty, and nothing on this
+# machine is ever wrong-looking; only Desktop 4's generic "this Desktop has
+# been silent" alarm (app/desktop_activity.py) would eventually catch it,
+# days later, with no hint that the cause is a path typo rather than the
+# machine being off. Not requiring the folder to already exist on purpose:
+# OneDrive may not have created/synced it yet at install time, which is a
+# legitimate "install now, folder appears shortly after" sequence -- see
+# this script's own -DelayMinutes precedent for the same "warn, do not
+# block" stance toward timing the installer cannot control.
+if (-not (Test-Path -LiteralPath $SyncFolder)) {
+    Write-Warning "SyncFolder '$SyncFolder' does not exist yet. If this is a fresh OneDrive share still syncing, that is normal and this can be ignored. If it is a typo, the Agent will start writing Events into a folder Desktop 4 never sees, and every run will still report success."
+}
+
 # The Agent reads its configuration from the environment. A scheduled task
 # does not inherit an interactive shell's variables, so they are persisted
 # to the user's environment here. All three are non-secret by construction.

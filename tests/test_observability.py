@@ -6811,7 +6811,9 @@ class SecretAlreadyInHistoryTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        self.assertEqual(module._secrets_ever_committed(self.wc), ("notes/id_rsa",))
+        self.assertEqual(
+            module._secrets_ever_committed(self.wc), (("notes/id_rsa",), True)
+        )
 
     def test_a_case_variant_already_in_history_is_reported(self):
         """E-24. The gate's comparison is case-sensitive and Windows is not,
@@ -6848,7 +6850,7 @@ class SecretAlreadyInHistoryTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        self.assertEqual(module._secrets_ever_committed(self.wc), ())
+        self.assertEqual(module._secrets_ever_committed(self.wc), ((), True))
 
 
 class CaseFoldedScopeDirectoryTests(unittest.TestCase):
@@ -6897,14 +6899,16 @@ class CaseFoldedScopeDirectoryTests(unittest.TestCase):
         master = self._master("Daily", "monthly")
 
         self.assertEqual(
-            self._module()._misnamed_scope_directories(master), (("Daily", "daily"),)
+            self._module()._misnamed_scope_directories(master),
+            ((("Daily", "daily"),), True),
         )
 
     def test_it_covers_every_scope_directory_not_just_daily(self):
         master = self._master("daily", "MONTHLY")
 
         self.assertEqual(
-            self._module()._misnamed_scope_directories(master), (("MONTHLY", "monthly"),)
+            self._module()._misnamed_scope_directories(master),
+            ((("MONTHLY", "monthly"),), True),
         )
 
     def test_both_wrong_at_once_are_both_named(self):
@@ -6912,7 +6916,7 @@ class CaseFoldedScopeDirectoryTests(unittest.TestCase):
 
         self.assertEqual(
             self._module()._misnamed_scope_directories(master),
-            (("Daily", "daily"), ("Monthly", "monthly")),
+            ((("Daily", "daily"), ("Monthly", "monthly")), True),
         )
 
     # ---- the false-alarm guard -----------------------------------------
@@ -6920,19 +6924,25 @@ class CaseFoldedScopeDirectoryTests(unittest.TestCase):
     def test_correctly_named_directories_say_nothing(self):
         master = self._master("daily", "monthly")
 
-        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master), ((), True)
+        )
 
     def test_a_legitimately_out_of_scope_directory_is_not_flagged(self):
         """docs/08 §26 marks `decisions/` conditional, not required. Being
         out of scope is not the defect — *looking* in scope is."""
         master = self._master("daily", "monthly", "decisions")
 
-        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master), ((), True)
+        )
 
     def test_a_merely_similar_name_is_not_flagged(self):
         master = self._master("daily", "monthly", "dailies")
 
-        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master), ((), True)
+        )
 
     def test_a_file_with_a_scope_name_is_not_a_directory_problem(self):
         """Only directories can hold Company History, so only directories are
@@ -6942,15 +6952,88 @@ class CaseFoldedScopeDirectoryTests(unittest.TestCase):
         master = self._master("daily")
         (master / "Monthly").write_text("not a directory", encoding="utf-8")
 
-        self.assertEqual(self._module()._misnamed_scope_directories(master), ())
+        self.assertEqual(
+            self._module()._misnamed_scope_directories(master), ((), True)
+        )
 
     def test_an_empty_or_missing_master_says_nothing(self):
         module = self._module()
 
-        self.assertEqual(module._misnamed_scope_directories(self._master()), ())
         self.assertEqual(
-            module._misnamed_scope_directories(Path(tempfile.mkdtemp()) / "nope"), ()
+            module._misnamed_scope_directories(self._master()), ((), True)
         )
+        self.assertEqual(
+            module._misnamed_scope_directories(Path(tempfile.mkdtemp()) / "nope"),
+            ((), True),
+        )
+
+    def test_a_local_master_it_cannot_list_is_not_a_clean_one(self):
+        """C70. The detector used to answer `()` for both "listed it, nothing
+        misnamed" and "could not list it" — and the second is the state where
+        a `Monthly/` sitting outside the backup scope goes unannounced while
+        Backup keeps reporting SUCCESS (BUG-55).
+        """
+        master = self._master("daily", "Monthly")
+        module = self._module()
+        real = Path.iterdir
+
+        def refuse(self):
+            if self == master:
+                raise PermissionError(13, "Access is denied")
+            return real(self)
+
+        self.assertEqual(
+            module._misnamed_scope_directories(master),
+            ((("Monthly", "monthly"),), True),
+            "the premise: listable, and it really does find one",
+        )
+
+        Path.iterdir = refuse
+        try:
+            found, checked = module._misnamed_scope_directories(master)
+        finally:
+            Path.iterdir = real
+
+        self.assertEqual(found, ())
+        self.assertFalse(checked)
+
+    def test_the_screen_says_it_rather_than_shortening_the_list(self):
+        """Without the caller printing it, `checked=False` is invisible: the
+        list is the same length a healthy tree produces."""
+        import contextlib
+
+        runtime = Path(tempfile.mkdtemp()) / "runtime"
+        (runtime / "events" / "processed").mkdir(parents=True)
+        master = runtime / "local_master"
+        (master / "daily").mkdir(parents=True)
+        module = self._module()
+        real = Path.iterdir
+
+        def render(broken):
+            def refuse(self):
+                if self == master:
+                    raise PermissionError(13, "Access is denied")
+                return real(self)
+
+            previous = module.RUNTIME_DIR
+            module.RUNTIME_DIR = runtime
+            if broken:
+                Path.iterdir = refuse
+            buffer = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    try:
+                        module.main()
+                    except SystemExit:
+                        pass
+            finally:
+                Path.iterdir = real
+                module.RUNTIME_DIR = previous
+            return buffer.getvalue()
+
+        marker = "백업 범위 밖 디렉터리를 확인 못 함"
+        self.assertNotIn(marker, render(False))
+        self.assertIn(marker, render(True))
 
     # ---- it really is the backup gate's own set ------------------------
 
@@ -8979,14 +9062,25 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         if result.returncode != 0:
             self.skipTest("directory junctions are not available on this machine")
 
-    def _lines(self, runtime):
-        import contextlib
+    @staticmethod
+    def _ops_status():
+        """A fresh `ops_status` module object.
+
+        Loaded by path rather than imported so `RUNTIME_DIR` can be pointed
+        at a temporary tree without touching the one every other test sees.
+        """
         import importlib.util
 
         path = Path(__file__).resolve().parents[1] / "ops_status.py"
         spec = importlib.util.spec_from_file_location("ops_status_junction", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        return module
+
+    def _lines(self, runtime):
+        import contextlib
+
+        module = self._ops_status()
         module.RUNTIME_DIR = runtime
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
@@ -8995,12 +9089,6 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         return printed, [a for a in attention if "junction" in a]
 
     def test_a_junction_inside_daily_is_reported_with_its_target(self):
-        if not hasattr(os.path, "isjunction"):
-            self.skipTest(
-                "os.path.isjunction() is Python 3.12+; on this interpreter "
-                "_junctions_in_scope() correctly reports nothing (see "
-                "test_it_reports_nothing_when_the_platform_cannot_answer)"
-            )
         runtime, outside = self._runtime()
         daily = runtime / "local_master" / "daily"
         daily.mkdir()
@@ -9019,12 +9107,6 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         """The layout the record calls legitimate — redirecting `daily/` to
         another drive. Still stated, because the operator should be able to
         see it from the status view."""
-        if not hasattr(os.path, "isjunction"):
-            self.skipTest(
-                "os.path.isjunction() is Python 3.12+; on this interpreter "
-                "_junctions_in_scope() correctly reports nothing (see "
-                "test_it_reports_nothing_when_the_platform_cannot_answer)"
-            )
         runtime, outside = self._runtime()
         self._junction(runtime / "local_master" / "daily", outside)
 
@@ -9061,31 +9143,79 @@ class JunctionInBackupScopeTests(unittest.TestCase):
         result = sync_to_working_copy(master, wc)
 
         self.assertFalse(link.is_symlink(), "a junction is not a symlink")
-        # os.path.isjunction() is Python 3.12+ (see
-        # test_it_reports_nothing_when_the_platform_cannot_answer below);
-        # the sync behaviour under test does not depend on it, so only the
-        # extra confirmation is skipped on older interpreters.
-        if hasattr(os.path, "isjunction"):
-            self.assertTrue(os.path.isjunction(link))
+        # C70: confirmed on every interpreter now, through the detector's own
+        # predicate rather than the 3.12-only stdlib call this used to guard on.
+        self.assertTrue(self._ops_status()._is_junction(link))
         self.assertTrue(any("linked" in name for name in result.added), result.added)
         self.assertEqual(scan_for_secrets(master), (), "ordinary names are not flagged")
 
-    def test_it_reports_nothing_when_the_platform_cannot_answer(self):
-        """`os.path.isjunction()` is Python 3.12+. Older interpreters get
-        silence rather than a guess."""
-        import importlib.util
+    def test_an_older_interpreter_still_sees_the_junction(self):
+        """C70. **This test used to assert the opposite.**
 
-        runtime, _outside = self._runtime()
-        (runtime / "local_master" / "daily").mkdir()
-        path = Path(__file__).resolve().parents[1] / "ops_status.py"
-        spec = importlib.util.spec_from_file_location("ops_status_junction_old", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        It was called `test_it_reports_nothing_when_the_platform_cannot_answer`
+        and it pinned `found == ()` for an interpreter without
+        `os.path.isjunction` — which is every interpreter this project
+        actually runs on (Python 3.9.7, BACKLOG D). So the detector's
+        blindness on the deployment machine was not an oversight that slipped
+        through: it was **held in place by a passing test**, while the two
+        tests above skipped rather than catching it. Three tests, and the net
+        effect was that a security detector never ran here and nothing said so.
+
+        There was never a platform that could not be asked.
+        `os.lstat().st_reparse_tag` has carried the answer since 3.8.
+        """
+        runtime, outside = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        daily.mkdir()
+        link = daily / "linked"
+        self._junction(link, outside)
+        module = self._ops_status()
 
         with mock.patch.object(os.path, "isjunction", None, create=True):
-            self.assertEqual(
-                module._junctions_in_scope(runtime / "local_master"), ()
+            found, skipped = module._junctions_in_scope(
+                runtime / "local_master"
             )
+
+        self.assertEqual(skipped, 0, "nothing failed to read")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("linked", found[0][0])
+        self.assertEqual(found[0][1], os.path.realpath(link))
+
+    def test_a_symlink_is_not_called_a_junction(self):
+        """The over-correction guard, and the reason the fallback reads the
+        reparse **tag** and not the reparse-point bit.
+
+        Both set that bit. `backup/working_copy._relative_files()` already
+        excludes symlinks, so reporting one as a junction would put a
+        permanent exposure line on a machine that has no exposure — the
+        skim-training failure C26 named.
+        """
+        runtime, outside = self._runtime()
+        daily = runtime / "local_master" / "daily"
+        daily.mkdir()
+        try:
+            os.symlink(outside, daily / "linked", target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        module = self._ops_status()
+
+        with mock.patch.object(os.path, "isjunction", None, create=True):
+            found, skipped = module._junctions_in_scope(
+                runtime / "local_master"
+            )
+
+        self.assertEqual((found, skipped), ((), 0))
+
+    def test_an_absent_local_master_is_still_not_a_skipped_read(self):
+        """C68's asymmetry, kept. Removing the interpreter branch must not
+        turn "there is nothing to look at" into "I failed to look"."""
+        runtime, _outside = self._runtime()
+        module = self._ops_status()
+
+        self.assertEqual(
+            module._junctions_in_scope(runtime / "local_master" / "nope"),
+            ((), 0),
+        )
 
 
 class MonthlyShortfallSummaryForgeryTests(unittest.TestCase):
@@ -10335,6 +10465,223 @@ class DailyAndMonthlyCountsExcludeDirectoriesTests(unittest.TestCase):
         self.assertEqual(len(module._daily_dates(daily)), 3)
 
 
+class ADetectorSaysWhatItCouldNotCheckTests(unittest.TestCase):
+    """C68. Three detectors on this screen went quiet when a read failed.
+
+    C62 established the rule for evidence — an entry dropped in silence is
+    worse than one reported — and C68 §1 applied it to Company History
+    coverage. Counting the `except OSError: continue` handlers outside `src/`
+    afterwards found ten more in this file, and three of them are
+    **detectors**:
+
+        _history_newer_than_the_last_backup   a file missing from the
+                                              "not backed up" list
+        _junctions_in_scope                   a junction missing from the
+                                              exposure list
+        _monthly_lags_its_daily_source        a day whose mtime falls back to
+                                              0.0, which makes "the Daily is
+                                              newer than the Monthly" false
+
+    All three fail in the same direction: the list gets **shorter**. A
+    shorter list of problems is indistinguishable from a healthier machine,
+    which is the one failure mode a detector must not have.
+
+    Each now returns `(result, skipped)` and each caller says the count out
+    loud. Measured: the Monthly check went from `0 found` (silently assuming
+    the Monthly was current) to `0 found, 1 skipped`.
+
+    **What was already right, and is not changed here.** The candidate list
+    in `_history_newer_than_the_last_backup()` calls `is_file()` unguarded,
+    so a permission error there propagates — and `_block()` catches it and
+    prints "HISTORY 블록을 읽지 못했다 … 이 섹션의 상태는 이번 출력에 없다".
+    That is loud and correct; it was measured before assuming otherwise. The
+    guard added inside the loop covers the narrower case that survives it: a
+    file that passes `is_file()` and is gone by the time its mtime is read.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.local_master = self.root / "local_master"
+        self.daily = self.local_master / "daily"
+        self.monthly = self.local_master / "monthly"
+        self.daily.mkdir(parents=True)
+        self.monthly.mkdir(parents=True)
+        (self.daily / "2026-07-01.md").write_text("# H\n", encoding="utf-8")
+        (self.monthly / "2026-07.md").write_text("# M\n", encoding="utf-8")
+
+    def _module(self):
+        import ops_status
+
+        return ops_status
+
+    def test_the_monthly_check_counts_a_day_it_could_not_stat(self):
+        """The one measured end to end. Without the count, a day with no
+        mtime takes the `0.0` default and argues the Monthly is current."""
+        module = self._module()
+        real = os.scandir
+
+        class Refusing:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+
+            def stat(self, *args, **kwargs):
+                raise PermissionError(13, "Access is denied")
+
+            def is_file(self, *args, **kwargs):
+                return self._entry.is_file(*args, **kwargs)
+
+        def wrap(path, *args, **kwargs):
+            entries = real(path, *args, **kwargs)
+            if str(path) == str(self.daily):
+                return iter([Refusing(entry) for entry in entries])
+            return entries
+
+        os.scandir = wrap
+        try:
+            lagging, skipped = module._monthly_lags_its_daily_source(
+                self.daily, self.monthly, dirty_months=()
+            )
+        finally:
+            os.scandir = real
+
+        self.assertEqual(lagging, ())
+        self.assertEqual(skipped, 1)
+
+    def test_the_junction_check_counts_a_probe_that_refused(self):
+        """`os.path.isjunction` is 3.12+, so on this interpreter the real
+        probe is absent and the branch is reached with an injected one — the
+        same way `_junctions_in_scope`'s existing test injects `None`."""
+        module = self._module()
+
+        def refuse(path):
+            raise PermissionError(13, "Access is denied")
+
+        with mock.patch.object(os.path, "isjunction", refuse, create=True):
+            found, skipped = module._junctions_in_scope(self.local_master)
+
+        self.assertEqual(found, ())
+        self.assertGreater(skipped, 0)
+
+    def test_an_absent_subject_is_not_a_skipped_check(self):
+        """The asymmetry, and the reason `skipped` is a count rather than a
+        flag: "there is nothing to look at" must not read as "I failed to
+        look", or every undeployed machine grows three permanent caveats."""
+        module = self._module()
+        missing = self.root / "not_deployed"
+
+        found, skipped = module._junctions_in_scope(missing)
+        self.assertEqual((found, skipped), ((), 0))
+
+        lagging, skipped = module._monthly_lags_its_daily_source(
+            missing / "daily", missing / "monthly", dirty_months=()
+        )
+        self.assertEqual((lagging, skipped), ((), 0))
+
+        unbacked, skipped = module._history_newer_than_the_last_backup(missing, None)
+        self.assertEqual((list(unbacked), skipped), ([], 0))
+
+    def test_a_healthy_tree_reports_no_skips(self):
+        """The control. A guard that counted every entry would make all three
+        detectors permanently caveated, which is the standing alarm this file
+        keeps removing."""
+        module = self._module()
+
+        _found, junction_skips = module._junctions_in_scope(self.local_master)
+        _lagging, monthly_skips = module._monthly_lags_its_daily_source(
+            self.daily, self.monthly, dirty_months=()
+        )
+        _unbacked, backup_skips = module._history_newer_than_the_last_backup(
+            self.local_master, None
+        )
+
+        self.assertEqual((junction_skips, monthly_skips, backup_skips), (0, 0, 0))
+
+    def test_the_screen_says_it_rather_than_shortening_a_list_in_silence(self):
+        """The half a return value cannot do.
+
+        Each caller prints the count. Without that the fix is invisible: the
+        list is the same length it would have been, and the operator has no
+        way to know it is short.
+        """
+        module = self._module()
+        runtime = self.root / "runtime"
+        (runtime / "events" / "processed").mkdir(parents=True)
+        shutil.copytree(self.local_master, runtime / "local_master")
+
+        real = os.scandir
+
+        class Refusing:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+
+            def stat(self, *args, **kwargs):
+                raise PermissionError(13, "Access is denied")
+
+            def is_file(self, *args, **kwargs):
+                return self._entry.is_file(*args, **kwargs)
+
+        class RefusingScandir:
+            """Mimics `os.scandir`'s iterator, `close()` included.
+
+            The first draft returned a bare `iter([...])` and
+            `_company_history_older_than_the_evidence()`'s listability probe
+            called `.close()` on it. The double was the wrong shape, not the
+            code — the same lesson C64 recorded about the Notion double.
+            """
+
+            def __init__(self, entries):
+                self._entries = iter(entries)
+
+            def __iter__(self):
+                return self._entries
+
+            def __next__(self):
+                return next(self._entries)
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def wrap(path, *args, **kwargs):
+            entries = real(path, *args, **kwargs)
+            if str(path) == str(runtime / "local_master" / "daily"):
+                return RefusingScandir([Refusing(entry) for entry in entries])
+            return entries
+
+        def render():
+            buffer = io.StringIO()
+            previous = module.RUNTIME_DIR
+            module.RUNTIME_DIR = runtime
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    try:
+                        module.main()
+                    except SystemExit:
+                        pass
+            finally:
+                module.RUNTIME_DIR = previous
+            return buffer.getvalue()
+
+        healthy = render()
+        os.scandir = wrap
+        try:
+            broken = render()
+        finally:
+            os.scandir = real
+
+        self.assertNotIn("확인 못 함", healthy)
+        self.assertIn("확인 못 함", broken)
+
+
 class MonthlyLagsItsDailySourceTests(unittest.TestCase):
     """The third link in the chain, and the only one that crosses files.
 
@@ -10488,9 +10835,14 @@ No material company history recorded.
         return path
 
     def _lagging(self, dirty=()):
-        return self._module()._monthly_lags_its_daily_source(
+        # C68 made this a `(findings, skipped)` pair so an unreadable day
+        # stops arguing that the Monthly is up to date. These tests are about
+        # the findings; `MonthlyLagCountsWhatItCouldNotReadTests` covers the
+        # second element.
+        findings, _skipped = self._module()._monthly_lags_its_daily_source(
             self.daily, self.monthly, dirty_months=tuple(dirty)
         )
+        return findings
 
     def test_an_item_added_after_consolidation_is_reported(self):
         self._write_day("2026-07-01", "EVT-1")
@@ -11832,6 +12184,152 @@ class ReconciliationLockAwarenessTests(unittest.TestCase):
         self.assertNotIn("Runner 실행 중", alert)
 
 
+class AGitThatCannotAnswerIsNotACleanHistoryTests(unittest.TestCase):
+    """C70. The third option the pair above did not have.
+
+    `TheTwoSecretProbesFailInOppositeDirectionsTests` argues — correctly —
+    that the producer must not fail open, because "a producer that failed
+    open would cry leak on every machine without git, and the alert nobody
+    believes is the one nobody reads". This does not overturn that. It adds
+    the answer that is neither silence nor an invented leak: **the check did
+    not happen.**
+
+    The gap was measured on a repository that really had committed a key:
+
+        normal                     ('id_rsa',)
+        git raises OSError         ()            <- identical to clean
+        git exits 128              ()            <- identical to clean
+        not a repository at all    ()            <- correctly nothing
+
+    Three of those four printed nothing, and one of the three was a live
+    credential in the remote history. `_secrets_ever_committed()`'s own
+    docstring calls that outcome "the most dangerous possible answer" — it
+    was producing it.
+
+    **Why this does not become the alert nobody reads.** The `.git` check
+    runs first, so a Working Copy that was never initialised — the ordinary
+    state on any machine where Backup is not configured, and the stimulus
+    the class above uses — is `checked` with nothing found, and says nothing.
+    The caveat needs a repository that exists and a git that will not read
+    it, which is a broken state rather than an unconfigured one. Same
+    distinction C68 drew between an absent subject and a failed read.
+    """
+
+    def _load(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_leakcheck", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _repository_with_a_committed_key(self):
+        import subprocess
+
+        wc = Path(tempfile.mkdtemp()) / "wc"
+        wc.mkdir()
+        for args in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "ops@example.invalid"],
+            ["git", "config", "user.name", "ops"],
+        ):
+            subprocess.run(args, cwd=wc, capture_output=True)
+        (wc / "id_rsa").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=wc, capture_output=True)
+        result = subprocess.run(
+            ["git", "commit", "-qm", "x"], cwd=wc, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            self.skipTest(f"git could not commit here: {result.stderr.strip()}")
+        return wc
+
+    def test_the_premise_is_real(self):
+        """Guards the guard: if the fixture did not actually commit a key the
+        assertions below would pass against a genuinely clean history."""
+        module = self._load()
+        wc = self._repository_with_a_committed_key()
+
+        self.assertEqual(module._secrets_ever_committed(wc), (("id_rsa",), True))
+
+    def test_git_refusing_to_run_is_reported_as_unchecked(self):
+        import subprocess
+
+        module = self._load()
+        wc = self._repository_with_a_committed_key()
+
+        def refuse(*args, **kwargs):
+            raise OSError(2, "git not found")
+
+        with mock.patch.object(subprocess, "run", refuse):
+            found, checked = module._secrets_ever_committed(wc)
+
+        self.assertEqual(found, (), "it must still not invent a leak")
+        self.assertFalse(checked, "and it must not claim the history is clean")
+
+    def test_git_answering_non_zero_is_reported_as_unchecked(self):
+        import subprocess
+
+        module = self._load()
+        wc = self._repository_with_a_committed_key()
+
+        class Failed:
+            returncode = 128
+            stdout = ""
+            stderr = "fatal: bad object"
+
+        with mock.patch.object(subprocess, "run", lambda *a, **k: Failed()):
+            found, checked = module._secrets_ever_committed(wc)
+
+        self.assertEqual((found, checked), ((), False))
+
+    def test_a_working_copy_that_was_never_a_repository_stays_silent(self):
+        """The anti-noise half, and the reason the `.git` probe comes first."""
+        module = self._load()
+        wc = Path(tempfile.mkdtemp()) / "wc"
+        wc.mkdir()
+
+        self.assertEqual(module._secrets_ever_committed(wc), ((), True))
+
+    def test_the_screen_says_it_rather_than_staying_quiet(self):
+        """The half a return value cannot do. Without the caller printing it,
+        `checked=False` changes nothing an operator can see."""
+        import contextlib
+        import subprocess
+
+        module = self._load()
+        wc = self._repository_with_a_committed_key()
+        runtime = Path(tempfile.mkdtemp()) / "runtime"
+        (runtime / "events" / "processed").mkdir(parents=True)
+        shutil.copytree(wc, runtime / "backup_working_copy")
+
+        def render():
+            previous = module.RUNTIME_DIR
+            module.RUNTIME_DIR = runtime
+            buffer = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    try:
+                        module.main()
+                    except SystemExit:
+                        pass
+            finally:
+                module.RUNTIME_DIR = previous
+            return buffer.getvalue()
+
+        healthy = render()
+
+        def refuse(*args, **kwargs):
+            raise OSError(2, "git not found")
+
+        with mock.patch.object(subprocess, "run", refuse):
+            broken = render()
+
+        marker = "원격 history의 Secret 검사를 확인 못 함"
+        self.assertNotIn(marker, healthy)
+        self.assertIn(marker, broken)
+
+
 class TheTwoSecretProbesFailInOppositeDirectionsTests(unittest.TestCase):
     """When git cannot answer, one probe over-reports and the other goes
     silent — on purpose, and in the direction that keeps a real exposure
@@ -11896,7 +12394,9 @@ class TheTwoSecretProbesFailInOppositeDirectionsTests(unittest.TestCase):
     def test_the_producer_falls_silent_rather_than_inventing_a_leak(self):
         module = self._load()
 
-        self.assertEqual(module._secrets_ever_committed(self._not_a_repository()), ())
+        self.assertEqual(
+            module._secrets_ever_committed(self._not_a_repository()), ((), True)
+        )
 
     def test_a_missing_directory_is_handled_the_same_way_by_both(self):
         """The other unexercised guard, and the ordinary case on a machine
@@ -11907,7 +12407,7 @@ class TheTwoSecretProbesFailInOppositeDirectionsTests(unittest.TestCase):
         self.assertEqual(
             module._would_reach_the_commit(missing, (self.SECRET,)), (self.SECRET,)
         )
-        self.assertEqual(module._secrets_ever_committed(missing), ())
+        self.assertEqual(module._secrets_ever_committed(missing), ((), True))
 
     def test_the_directions_really_are_opposite(self):
         """Stated as one assertion, so the pair cannot drift into agreeing.
@@ -11917,10 +12417,14 @@ class TheTwoSecretProbesFailInOppositeDirectionsTests(unittest.TestCase):
         working_copy = self._not_a_repository()
 
         filtered = module._would_reach_the_commit(working_copy, (self.SECRET,))
-        produced = module._secrets_ever_committed(working_copy)
+        produced, produced_checked = module._secrets_ever_committed(working_copy)
 
         self.assertTrue(filtered, "the filter must fail open")
         self.assertFalse(produced, "the producer must fail closed")
+        # C70: and a directory that never was a repository is *checked* —
+        # there is no history in it to hold a secret, so this stays silent
+        # rather than growing the caveat added for a git that cannot answer.
+        self.assertTrue(produced_checked)
 
     def test_the_working_copy_really_is_unreadable_by_git(self):
         """Guards the guard: if the directory were a valid repository the
@@ -12272,6 +12776,326 @@ class SecretShapedEventContentTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
 
         self.assertEqual(module._secret_shaped_event_content(root / "nope"), ())
+
+
+class ThePrintedListsAboveAttentionAreBoundedTooTests(unittest.TestCase):
+    """The other half of `_RECENT_ON_SCREEN`'s rule.
+
+    Bounding ATTENTION itself is not enough: the rule is about a *section*
+    that pushes ATTENTION off the top, and three lists inside
+    `_print_history()` printed one line per finding with no bound while their
+    ATTENTION counterparts cut at five and said "외".
+
+        Daily 항목 불일치     one line per **day** of Company History
+        Monthly 원본 미반영   one line per month
+        Monthly 항목 누락     one line per month
+
+    The first is the one that moves fast. A renderer that wrote
+    `- Event Count:` wrong once wrote it wrong for every day it rendered, so
+    the list is as long as the affected stretch — 365 lines a year — and the
+    correctly-bounded ATTENTION line lands underneath all of them.
+
+    Same bound and the same "총 N건" disclosure the ATTENTION lines already
+    use, so nothing here decides a new display policy.
+    """
+
+    def _load(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_bounded", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _runtime(self, module):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+        return module.RUNTIME_DIR
+
+    @staticmethod
+    def _miscounted_day(runtime, day):
+        """A Daily whose own `- Event Count:` disagrees with the ids it carries."""
+        document = (
+            f"# DOJOONPASS Company History — 2026-08-{day:02d}\n"
+            "\n## Items\n"
+            "\n### Something happened\n"
+            "- Event ID: E1\n"
+            "- Owner: CTO Backend\n"
+            "\n## Metadata\n"
+            "\n"
+            f"- History Date: 2026-08-{day:02d}\n"
+            f"- Generated At: 2026-08-{day:02d}T20:00:00+09:00\n"
+            "- Source: DOJOONPASS Company Ops\n"
+            "- Event Count: 3\n"
+        )
+        (runtime / "local_master" / "daily" / f"2026-08-{day:02d}.md").write_text(
+            document, encoding="utf-8"
+        )
+
+    def _render(self, module):
+        import contextlib
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_history(
+                datetime(2026, 8, 21, 9, 0).astimezone()
+            )
+        return buffer.getvalue(), attention
+
+    def test_the_premise_is_real(self):
+        """Guards the guard: if the fixture were not miscounted the bound
+        below would be measuring an empty list."""
+        module = self._load()
+        runtime = self._runtime(module)
+        self._miscounted_day(runtime, 5)
+
+        printed, _attention = self._render(module)
+
+        self.assertIn("Daily 항목 불일치", printed)
+
+    def test_the_printed_list_does_not_grow_with_the_days(self):
+        module = self._load()
+        runtime = self._runtime(module)
+        for day in range(1, 9):
+            self._miscounted_day(runtime, day)
+
+        printed, _attention = self._render(module)
+        per_day = [
+            line for line in printed.splitlines()
+            if "Daily 항목 불일치" in line and "외" not in line
+        ]
+
+        self.assertEqual(len(per_day), module._RECENT_ON_SCREEN)
+
+    def test_the_cut_says_how_many_it_cut(self):
+        """A shorter list that does not say it is shorter is the failure this
+        file spends most of its length avoiding."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for day in range(1, 9):
+            self._miscounted_day(runtime, day)
+
+        printed, _attention = self._render(module)
+        overflow = [
+            line for line in printed.splitlines()
+            if "Daily 항목 불일치" in line and "외" in line
+        ]
+
+        self.assertEqual(len(overflow), 1, printed)
+        self.assertIn("총 8건", overflow[0])
+        self.assertIn("3건", overflow[0], "the omitted count")
+
+    def test_a_short_list_is_printed_in_full(self):
+        """The control. Below the bound nothing changes."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for day in range(1, 4):
+            self._miscounted_day(runtime, day)
+
+        printed, _attention = self._render(module)
+        lines = [line for line in printed.splitlines() if "Daily 항목 불일치" in line]
+
+        self.assertEqual(len(lines), 3)
+        self.assertNotIn("외", "\n".join(lines))
+
+    def test_the_attention_line_still_names_every_one_of_them(self):
+        """Bounding the screen must not shorten the count ATTENTION reports —
+        that line was already correct and is what the operator acts on."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for day in range(1, 9):
+            self._miscounted_day(runtime, day)
+
+        _printed, attention = self._render(module)
+        line = [a for a in attention if "자기 숫자가 어긋난 날" in a]
+
+        self.assertEqual(len(line), 1, attention)
+        self.assertIn("8건", line[0])
+
+
+class TheAttentionBlockCannotPushItselfOffTheTopTests(unittest.TestCase):
+    """`_RECENT_ON_SCREEN` bounds the ACTIVITY and COMPLETIONS lists, and its
+    note gives the reason: "a screen where one section can push the ATTENTION
+    block off the top is a screen nobody scrolls back up".
+
+    ATTENTION was the one list with no such bound. `_print_control_tower()`
+    appended one message per `RISKS` row, and RISKS carries one row per
+    role-mismatched **Event** — so the block written to say "사람이 지금 할 일"
+    grew linearly with the problem it was reporting.
+
+    Measured before the bound, mismatched Events against ATTENTION lines:
+
+          1 ->    3        60 ->   62
+         10 ->   12     1,000 -> ~1,002
+
+    The trigger is ordinary. One Desktop configured with the wrong `role`
+    makes every Event it sends a mismatch — `validate_event()` checks
+    `source` and `role` separately and never the pair — so this is a
+    misconfiguration, not an exotic input, and each of the thousand lines is
+    the same long paragraph with a different id in it.
+
+    Bounded per kind, with the true total named. The number and the "총 N건"
+    disclosure are the ones the loop above already uses; nothing here is a
+    new display policy.
+    """
+
+    def _load(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_attn", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _runtime(self, module):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+        return module.RUNTIME_DIR
+
+    @staticmethod
+    def _mismatch(runtime, index):
+        """One Event whose Desktop does not own the role it claims."""
+        payload = {
+            "schema_version": "1.0",
+            "event_id": f"MM{index}",
+            "timestamp": f"2026-08-{1 + index % 20:02d}T10:00:00+09:00",
+            "source": "DESKTOP_1",
+            "role": "CMO",
+            "project_id": f"PRJ{index}",
+            "event_type": "STARTED",
+            "status": "IN_PROGRESS",
+            "milestone": None,
+            "summary": "work",
+            "blocker": None,
+            "evidence": [],
+            "history_candidate": True,
+        }
+        (runtime / "events" / "processed" / f"MM{index}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _blocked(runtime, index):
+        payload = {
+            "schema_version": "1.0",
+            "event_id": f"BB{index}",
+            "timestamp": f"2026-08-{1 + index % 20:02d}T11:00:00+09:00",
+            "source": "DESKTOP_2",
+            "role": "CMO",
+            "project_id": f"BLK{index}",
+            "event_type": "BLOCKED",
+            "status": "BLOCKED",
+            "milestone": None,
+            "summary": "work",
+            "blocker": "waiting on someone",
+            "evidence": [],
+            "history_candidate": True,
+        }
+        (runtime / "events" / "processed" / f"BB{index}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def _attention(self, module):
+        import contextlib
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            return module._print_control_tower(
+                datetime(2026, 8, 21, 9, 0).astimezone()
+            )
+
+    def test_the_block_does_not_grow_with_the_event_count(self):
+        module = self._load()
+        runtime = self._runtime(module)
+        for index in range(60):
+            self._mismatch(runtime, index)
+
+        attention = self._attention(module)
+        per_event = [a for a in attention if "role이 어긋난 Event:" in a]
+
+        self.assertEqual(len(per_event), module._RISKS_IN_ATTENTION)
+        self.assertLess(len(attention), 10, attention)
+
+    def test_the_true_total_is_named_rather_than_dropped(self):
+        """A shorter list that does not say it is shorter is the failure this
+        whole file is about."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for index in range(60):
+            self._mismatch(runtime, index)
+
+        attention = self._attention(module)
+        summary = [a for a in attention if "총 60건" in a]
+
+        self.assertEqual(len(summary), 1, attention)
+        self.assertIn("55건", summary[0], "the omitted count is stated")
+
+    def test_a_short_list_is_not_truncated_and_says_no_total(self):
+        """The control. Below the bound the block is exactly what it was."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for index in range(3):
+            self._mismatch(runtime, index)
+
+        attention = self._attention(module)
+
+        self.assertEqual(len([a for a in attention if "role이 어긋난 Event:" in a]), 3)
+        self.assertEqual([a for a in attention if "총 3건" in a], [])
+
+    def test_one_flood_does_not_crowd_out_the_other_kind(self):
+        """Bounded per kind on purpose. A role-mismatch flood must not push
+        every open Blocker out of the block — they are different problems and
+        an operator needs to see that both exist."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for index in range(40):
+            self._mismatch(runtime, index)
+        for index in range(2):
+            self._blocked(runtime, index)
+
+        attention = self._attention(module)
+
+        self.assertEqual(
+            len([a for a in attention if "막혀 있는 Project:" in a]),
+            2,
+            "both blockers survive the mismatch flood",
+        )
+        self.assertEqual(
+            len([a for a in attention if "role이 어긋난 Event:" in a]),
+            module._RISKS_IN_ATTENTION,
+        )
+
+    def test_the_summary_line_points_at_the_likely_cause(self):
+        """The line replaces 55 paragraphs, so it has to be worth more than
+        the first of them: one misconfigured Desktop is what produces this
+        shape, and the screen says where to look."""
+        module = self._load()
+        runtime = self._runtime(module)
+        for index in range(60):
+            self._mismatch(runtime, index)
+
+        summary = [a for a in self._attention(module) if "총 60건" in a][0]
+
+        self.assertIn("role 설정", summary)
+        self.assertIn("source", summary)
 
 
 class AnIdIsAlsoAuthoredTextTests(unittest.TestCase):

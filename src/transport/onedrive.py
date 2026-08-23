@@ -33,6 +33,25 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 # See history/file_repository.py for the same bound and the reason for it.
 _MAX_FILENAME_STEM = 120
 
+# Windows resolves these to devices, not files, regardless of extension or
+# case — `NUL.json` and `NUL.anything.json` both name the NUL device, not a
+# file on disk. `_UNSAFE_FILENAME_CHARS` never touches them because every
+# character in "NUL" is on the whitelist. See `_has_reserved_windows_head()`.
+_RESERVED_WINDOWS_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{d}" for d in range(1, 10)}
+    | {f"LPT{d}" for d in range(1, 10)}
+)
+
+
+def _has_reserved_windows_head(name: str) -> bool:
+    """Whether the text before `name`'s first '.' is a Windows device name.
+
+    Byte-for-byte identical to `reporter.local_output._has_reserved_windows_head()`
+    — see there for the direct measurement this is built from.
+    """
+    return name.split(".", 1)[0].upper() in _RESERVED_WINDOWS_STEMS
+
 
 def safe_event_filename(event_id: str) -> str:
     """Derive a filesystem-safe filename from an `event_id`.
@@ -54,15 +73,36 @@ def safe_event_filename(event_id: str) -> str:
     seam, so importing back would be circular). This project already accepts
     exactly this trade — `ROLE_DISPLAY_NAMES` is duplicated between
     `daily/markdown.py` and `notion/properties.py` for the same reason.
-    Both copies must stay in step; a test asserts they agree.
+
+    What that precedent does **not** say, and this sentence used to (C67):
+    it does not say a test holds the two role tables equal. No test does,
+    and none should — `RoleDisplayTableCoverageTests` decided the opposite
+    in as many words: "they answer to different specs, so merging them would
+    invent a coupling neither doc asked for", and it guards *coverage* of
+    `events.ROLES` instead. Two documents in this repository contradicted
+    each other, and the wrong one was the sentence justifying a duplication.
+
+    The precedent that actually applies here is narrower and stronger: the
+    two copies of **this** function must agree, and
+    `DuplicatedRulesStayInStepTests` compares them over a shared corpus of
+    adversarial ids. That class exists because this docstring once claimed
+    such a check and there was none (C38) — which is the same shape as the
+    sentence just corrected, in the same docstring, about a different rule.
     """
     sanitized = _UNSAFE_FILENAME_CHARS.sub("_", event_id).strip("._")
-    if sanitized == event_id and len(event_id) <= _MAX_FILENAME_STEM:
+    if (
+        sanitized == event_id
+        and len(event_id) <= _MAX_FILENAME_STEM
+        and not _has_reserved_windows_head(event_id)
+    ):
         return f"{event_id}.json"
 
     digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:12]
     stem = sanitized[:_MAX_FILENAME_STEM] or "event"
-    return f"{stem}-{digest}.json"
+    name = f"{stem}-{digest}.json"
+    if _has_reserved_windows_head(name):
+        name = f"_{name}"
+    return name
 
 
 def _write_atomic(

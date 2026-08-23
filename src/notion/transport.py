@@ -220,6 +220,29 @@ class RealNotionTransport(NotionTransport):
             raise NotionAPIError(
                 f"Notion API returned a body that is not JSON: {exc}"
             ) from exc
+        except RecursionError as exc:
+            # The same actor, one step further. `json.loads()` answers deeply
+            # nested input with `RecursionError`, which is a `RuntimeError`
+            # and therefore outside the tuple above — measured, a body of
+            # 20,000 open brackets. This is the module's stated contract
+            # ("network problems become NotionAPIError") meeting BACKLOG F-6's
+            # rule for this exact exception: a function whose own text already
+            # answers "cannot parse" implements that answer rather than
+            # letting the caller meet a type it does not handle.
+            #
+            # It matters most where the body is least trusted. This is the one
+            # `json.loads()` in the tree reading bytes from off the machine,
+            # and `NotionClient.health_check()` and `notion/bootstrap.py`
+            # catch `NotionAPIError` only — a `RecursionError` walked straight
+            # through both.
+            #
+            # The reason is not interpolated. `RecursionError` carries the
+            # recursion-limit message rather than anything about the body, and
+            # `_error_detail()` above is the one place this class quotes a
+            # remote back at an operator.
+            raise NotionAPIError(
+                "Notion API returned a body too deeply nested to parse"
+            ) from exc
 
     def retrieve_database(self, database_id: str) -> Mapping[str, Any]:
         return self._request("GET", f"/databases/{database_id}")
@@ -331,13 +354,47 @@ def _text_value(prop: Mapping[str, Any] | None, kind: str) -> str | None:
     callers left once `query_database()` stopped hard-coding the type. Two
     readers that differ only in which key they hard-code is the shape that
     drifts.
+
+    **All items, `plain_text` first — because that is what Notion's filter
+    compares (C64).** This reader belongs to the double, and a double that is
+    easier to satisfy than the API is a blind spot rather than a convenience.
+    Notion stores one item per run of identical formatting and an item that is
+    not literal text — a mention, an equation — carries no `"text"` key at
+    all; `notion/properties._extract_rich_text()` records the measurement, and
+    `equals` on the live API matches the concatenated plain text.
+
+    Reading `items[0]["text"]["content"]` made the double answer "no rows" to
+    a filter Notion answers with the row, and that difference is exactly what
+    hid a live defect: `controltower/notion_projection` **found** such a row
+    through the real filter, refreshed it, and then retired it because its own
+    reader could not read the key back. No test using this double could have
+    produced that sequence — C64 had to hand-roll a client stand-in to state
+    it. `TheDoubleMatchesTheWayNotionMatchesTests` holds this side now.
     """
     if not prop:
         return None
     items = prop.get(kind) or []
     if not items:
         return None
-    return items[0].get("text", {}).get("content")
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        text = item.get("plain_text")
+        if text is None:
+            inner = item.get("text")
+            text = inner.get("content") if isinstance(inner, Mapping) else None
+        if isinstance(text, str):
+            parts.append(text)
+    if not parts:
+        # Nothing readable in any item. `None`, not `""`, because the two are
+        # different answers to the filter below and the old reader gave
+        # `None` here — an empty `project_id` is a real row key this
+        # repository has an open decision about (BACKLOG C54 §5), and
+        # silently turning "unreadable" into "the empty key" would put a row
+        # under it.
+        return None
+    return "".join(parts)
 
 
 class InMemoryNotionTransport(NotionTransport):

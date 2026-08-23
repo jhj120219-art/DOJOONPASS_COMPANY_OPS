@@ -365,7 +365,7 @@ class DashboardModel:
     schema_version: str = DASHBOARD_SCHEMA_VERSION
 
     def with_history_coverage(
-        self, history_uncovered_from: date_type | None
+        self, history_uncovered_from: date_type | None, *, checked: bool = True
     ) -> "DashboardModel":
         """This model, plus the one coverage fact it cannot derive itself.
 
@@ -378,6 +378,25 @@ class DashboardModel:
         worth calling: it is the difference between "asked and there is no
         gap" and "never asked", which is the same distinction the panels make
         between empty and unsourced.
+
+        `checked=False` is the **third** answer, and C68 added it because the
+        first two were being made to cover it. The caller derives this fact by
+        reading `local_master/daily/`, and that read can fail: a directory it
+        cannot list, a file it cannot open. Both used to come back as `None`
+        — the same value as "asked, and there is no gap" — so a tree whose
+        Company History could not be read reported `complete = True`.
+
+        Measured on one tree, 18-day-old history with work in it and evidence
+        starting later:
+
+            files readable      gap 2026-08-01, complete False, screen warns
+            files unreadable    gap None,       complete True,  screen silent
+
+        That is the same conversion `history_checked` was introduced to
+        remove one level up — "nobody asked" reported as "asked and fine" —
+        arriving in the input to the very field that fixed it. Keyword-only
+        and defaulted to True so that every caller that genuinely did read
+        the directory reads as it did before.
         """
         return replace(
             self,
@@ -391,7 +410,7 @@ class DashboardModel:
                 # The half that was missing. Without it, calling this with
                 # `None` left the model byte-identical to one nobody called
                 # it on, and `complete` said yes to both.
-                history_checked=True,
+                history_checked=checked,
             ),
         )
 

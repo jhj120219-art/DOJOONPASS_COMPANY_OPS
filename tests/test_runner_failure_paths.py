@@ -5597,6 +5597,24 @@ class UndecodableFileIsolationTests(unittest.TestCase):
 
     # ---------------------------------------------- the family itself
 
+    def test_the_decode_site_scan_finds_the_source_tree(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_no_decode_site_catches_oserror_alone` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        root = Path(__file__).resolve().parents[1] / "src"
+        modules = [p for p in root.rglob("*.py") if "__pycache__" not in p.parts]
+        self.assertGreater(len(modules), 50)
+
     def test_no_decode_site_catches_oserror_alone(self):
         """The scan that found these, kept as a guard.
 

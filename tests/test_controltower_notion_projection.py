@@ -712,6 +712,113 @@ class NotionWouldRefuseNothingTests(unittest.TestCase):
         self.assertTrue(any("no value for" in e for e in errors), errors)
 
 
+class EveryDateThisProjectionEmitsIsISOTests(unittest.TestCase):
+    """C65. `validate_rows()` claimed to list "every reason Notion would
+    refuse these rows" and did not check a date.
+
+    Measured before the fix: a row carrying `"not-a-date"` and
+    `"2026-13-45T99:00:00"` in two DATE properties came back **clean**, and
+    the in-memory double accepted it too. The live API answers both with
+    HTTP 400, which `sync.PERMANENTLY_REFUSING_STATUS_CODES` classifies as an
+    answer that will not change by retrying.
+
+    Nothing produces such a value today, and the second test here is what
+    establishes that rather than assuming it — it runs the real fold and
+    reads every date back out. So this is a **stale claim** closed, not a
+    live defect fixed, and the distinction is worth keeping: what the check
+    is actually for is the DATE column that does not exist yet.
+    `_property()` turns any string into a `date.start`, so the first one fed
+    by something other than an Event timestamp would reach Notion with
+    nothing on this side having said why.
+    """
+
+    def _one_row(self):
+        row = projection.ProjectedRow(
+            database="CT_PROJECTS", panel="PROJECTS", row_key="P", properties={}
+        )
+        for name, kind in projection.COMMON_PROPERTIES.items():
+            row.properties[name] = projection._property(kind, None)
+        mapping = projection.PANEL_PROJECTIONS["PROJECTS"]
+        for column, (name, kind) in mapping.columns.items():
+            if column != mapping.key_column:
+                row.properties[name] = projection._property(kind, None)
+        row.properties[projection.ROW_KEY_PROPERTY] = projection._property(
+            projection.PropertyType.TITLE, "P"
+        )
+        return row
+
+    def test_a_value_that_is_not_a_date_is_reported(self):
+        for bad in ("not-a-date", "2026-13-45T99:00:00", "21/08/2026", ""):
+            with self.subTest(value=bad):
+                row = self._one_row()
+                row.properties["First Seen"] = {"date": {"start": bad}}
+                errors = projection.validate_rows([row])
+                self.assertTrue(
+                    any("ISO 8601" in message for message in errors), errors
+                )
+
+    def test_a_null_date_is_not_an_error(self):
+        """Present-and-null is how this projection spells "no value", on
+        purpose and on most rows — a check that flagged it would fail every
+        ordinary run."""
+        row = self._one_row()
+        row.properties["Completed At"] = {"date": None}
+        self.assertEqual(projection.validate_rows([row]), [])
+
+    def test_every_date_the_real_fold_emits_is_accepted(self):
+        """The premise the fix rests on, measured rather than assumed. If a
+        panel ever carries a date this parser refuses, this fails here rather
+        than as a 400 against a live Workspace."""
+        rows = projection.project_panels(_model())
+        seen = []
+        for row in rows:
+            for name, prop in row.properties.items():
+                value = prop.get("date")
+                if value:
+                    seen.append((name, value["start"]))
+
+        self.assertTrue(seen, "the fixture produced no dates to check")
+        for name, start in seen:
+            with self.subTest(prop=name, value=start):
+                self.assertTrue(projection._is_iso_8601(start))
+        self.assertEqual(projection.validate_rows(rows), [])
+
+    def test_the_parser_is_the_one_that_validates_an_event(self):
+        """One parser, not two patterns that have to agree.
+
+        Stated as an **agreement** rather than as "both accept these": the
+        property that matters is that a value `validate_event()` lets into an
+        Event is a value this check lets out to Notion, for every value —
+        including the ones both refuse. Writing it the other way is how the
+        first draft of this test failed: it asserted that
+        `2026-08-21T10:00:00.5+09:00` is a valid timestamp, and on this
+        machine's Python 3.9 `fromisoformat()` refuses a one-digit fraction.
+        Both refused it, in step, which is the answer this test wanted and
+        not the one it was asking for.
+        """
+        from events.schema import _timestamp_error
+
+        corpus = (
+            "2026-08-21T10:00:00+09:00",       # the ordinary Event timestamp
+            "2026-08-21T10:00:00.500000+09:00",  # six-digit fraction
+            "2026-08-21T10:00:00.5+09:00",    # one digit: 3.9 refuses both
+            "2026-08-21T10:00:00Z",           # 3.9 refuses the Z form
+            "2026-08-21",                     # a date with no offset
+            "not-a-date",
+            "",
+        )
+        for value in corpus:
+            with self.subTest(value=value):
+                event_accepts = _timestamp_error(value) is None
+                notion_accepts = projection._is_iso_8601(value)
+                if event_accepts:
+                    self.assertTrue(
+                        notion_accepts,
+                        f"{value!r} validates as an Event timestamp and would"
+                        " be refused as a Notion date",
+                    )
+
+
 class AuthoredTextIsBoundedOnTheWayOutTests(unittest.TestCase):
     """The C50 defect, in the new payload.
 
@@ -1505,6 +1612,415 @@ class TheWriteNeverBreaksTheRunTests(unittest.TestCase):
         )
         self.assertIs(result.outcome, projection.ProjectionOutcome.FAILED)
         self.assertTrue(result.errors[0].startswith("RuntimeError"))
+
+
+class _ListingClient:
+    """A `NotionClient` stand-in whose `list_pages()` answer is the injection.
+
+    Not an `InMemoryNotionTransport` subclass on purpose: the double is a
+    *well-behaved* Notion, and these tests are about what arrives when the
+    thing answering is not Notion — a proxy, a captive portal, an error body.
+    Standing in at the client seam is the narrowest place to say that.
+    """
+
+    def __init__(self, pages, *, truncated: bool = False):
+        self._pages = pages
+        self.list_truncated = truncated
+        self.created: list = []
+        self.updates: list = []
+
+    def find_by_title(self, *, property_name, value):
+        return None
+
+    def create_project(self, properties):
+        self.created.append(properties)
+        return {"id": f"page-{len(self.created)}"}
+
+    def update_project(self, page_id, properties):
+        self.updates.append((page_id, properties))
+        return {"id": page_id}
+
+    def list_pages(self):
+        return self._pages
+
+    @property
+    def retirements(self):
+        """The updates that actually retired a row.
+
+        `"Retired At" in props` is not that test and getting it wrong made
+        this class fail on its own control: every ordinary refresh carries
+        `Retired At` too, as an explicit null — `project_panels()` writes it
+        on every row so that a row which comes back has the stamp cleared.
+        A retirement is `Present = false`.
+        """
+        return [
+            props
+            for _, props in self.updates
+            if props.get("Present", {}).get("checkbox") is False
+        ]
+
+
+class ARemoteThatIsNotNotionCannotBreakTheRunTests(unittest.TestCase):
+    """C64. `sync_control_tower()` says **Never raises** and did.
+
+    `_reason()` already records the threat model this module was written
+    against — "a proxy or captive portal answering in Notion's place is free
+    to echo request headers back". The write path was hardened for it. The
+    **reconciliation** path was not: `list_pages()` hands back whatever the
+    response body's `results` held, and `_retire_absent_rows()` walked it
+    assuming every element was a page-shaped mapping, outside any `try` in
+    `sync_control_tower()`.
+
+    Measured on HEAD over twelve injected response shapes: nine escaped as
+    `AttributeError` — one line, `page.get("properties")`, and everything
+    under it. CEO Decision ④ ("Dashboard 기록 실패는 Runtime을 절대
+    중단시키면 안 된다") is the contract that broke, and it is the only
+    promise this module makes to the Runner it is meant to be wired into.
+
+    Fixed by reading the listing through **before** the first retirement and
+    treating an unreadable answer the way a truncated one is already
+    treated — reconcile nothing, say so in `unreconciled`.
+    """
+
+    #: The nine shapes measured as escaping on HEAD, plus `results is not
+    #: iterable`. Listed in full rather than trimmed to one representative:
+    #: each names a different line of the walk, and a fix that guarded one
+    #: line would pass a one-shape test.
+    HOSTILE = {
+        "results is a list of strings": ["oops"],
+        "results is a list of nulls": [None],
+        "results is an error object": {"object": "error", "message": "x"},
+        "results is a bare string": "unauthorized",
+        "results is not iterable": 7,
+        "properties is a string": [{"id": "1", "properties": "nope"}],
+        "the row key property is a string": [
+            {"id": "1", "properties": {"Row Key": "nope"}}
+        ],
+        "the title is a string": [
+            {"id": "1", "properties": {"Row Key": {"title": "nope"}}}
+        ],
+        "a title item is a string": [
+            {"id": "1", "properties": {"Row Key": {"title": ["nope"]}}}
+        ],
+        "Present is a string": [
+            {"id": "1", "properties": {"Row Key": {"title": []}, "Present": "yes"}}
+        ],
+    }
+
+    #: Readable listing, one row this projection did not write. Kept separate
+    #: because the answer is different and should be: the listing **was**
+    #: understood, so reconciliation runs, and only this row fails.
+    ODD_BUT_READABLE = {
+        "a page has no id": [{"properties": {"Row Key": {"title": []}}}],
+    }
+
+    def _clients(self, injected):
+        """One database gets the hostile listing; the rest answer emptily."""
+        names = sorted(projection.control_tower_databases())
+        return {
+            name: _ListingClient(injected if name == names[0] else [])
+            for name in names
+        }
+
+    def test_no_response_shape_escapes_as_an_exception(self):
+        for label, pages in {**self.HOSTILE, **self.ODD_BUT_READABLE}.items():
+            with self.subTest(shape=label):
+                try:
+                    projection.sync_control_tower(self._clients(pages), _model())
+                except Exception as exc:  # noqa: BLE001
+                    self.fail(f"{label} raised {type(exc).__name__}: {exc}")
+
+    def test_an_unreadable_listing_retires_nothing(self):
+        """The direction that matters. Retiring on a listing this code does
+        not understand would mark live rows absent — the failure the
+        truncation branch already refuses for the same reason."""
+        for label, pages in self.HOSTILE.items():
+            with self.subTest(shape=label):
+                clients = self._clients(pages)
+                result = projection.sync_control_tower(clients, _model())
+                first = clients[sorted(clients)[0]]
+                self.assertEqual(first.retirements, [])
+                self.assertEqual(result.retired, 0)
+
+    def test_an_unreadable_listing_is_named_rather_than_counted(self):
+        """`retired = 0` is indistinguishable from "nothing needed retiring",
+        which is why `unreconciled` names the database instead."""
+        names = sorted(projection.control_tower_databases())
+        for label, pages in self.HOSTILE.items():
+            with self.subTest(shape=label):
+                result = projection.sync_control_tower(self._clients(pages), _model())
+                self.assertIn(names[0], result.unreconciled)
+                self.assertTrue(result.errors)
+
+    def test_a_readable_listing_with_one_bad_row_still_reconciles(self):
+        """The distinction the two corpora exist for. A page missing its `id`
+        is a row this pass cannot act on; it is not evidence that the listing
+        came from something other than Notion, so the other rows are still
+        reconciled and the database is not declared unreconciled."""
+        names = sorted(projection.control_tower_databases())
+        for label, pages in self.ODD_BUT_READABLE.items():
+            with self.subTest(shape=label):
+                result = projection.sync_control_tower(self._clients(pages), _model())
+                self.assertNotIn(names[0], result.unreconciled)
+                self.assertEqual(result.retired, 0)
+                self.assertTrue(result.errors)
+
+    def test_the_rows_are_still_written(self):
+        """A broken listing stops reconciliation and nothing else. The write
+        happens first and is unaffected — half a Control Tower is what this
+        function exists to still deliver."""
+        clients = self._clients(["oops"])
+        result = projection.sync_control_tower(clients, _model())
+        self.assertGreater(sum(len(c.created) for c in clients.values()), 0)
+        self.assertIs(result.outcome, projection.ProjectionOutcome.FAILED)
+
+    def test_a_well_formed_listing_still_reconciles(self):
+        """Guards the guard: a fix that refused every listing would pass every
+        test above."""
+        stale = {
+            "id": "page-stale",
+            "properties": {
+                "Row Key": {
+                    "title": [{"type": "text", "text": {"content": "GONE"},
+                               "plain_text": "GONE"}]
+                },
+                "Present": {"checkbox": True},
+            },
+        }
+        names = sorted(projection.control_tower_databases())
+        clients = {
+            name: _ListingClient([stale] if name == names[0] else [])
+            for name in names
+        }
+        result = projection.sync_control_tower(clients, _model())
+        self.assertEqual(result.unreconciled, ())
+        self.assertEqual(result.retired, 1)
+        self.assertEqual(clients[names[0]].updates[-1][0], "page-stale")
+
+
+class TheRowKeyReaderRefusesRatherThanAnswersEmptyTests(unittest.TestCase):
+    """`_row_key_of()`'s own contract, tested where it lives.
+
+    Written because a mutation survived the tests above: making the
+    `not isinstance(page, Mapping)` branch `return ""` instead of raising
+    changed nothing observable, since `_is_present()` happens to raise on the
+    same page a step later. That is a real property — but it is **coupling**,
+    not the rule, and a later edit to `_is_present()` would silently hand this
+    branch its old behaviour back.
+
+    The rule itself: a page this code cannot read must not answer `""`,
+    because `""` is not a live row key (`TheTitleColumnMayNeverBeNullTests`
+    holds every projected row to a non-empty one) and a row whose key reads
+    `""` is a row that gets **retired for not being understood**.
+    """
+
+    UNREADABLE = {
+        "not an object": "nope",
+        "null": None,
+        "properties is a string": {"id": "1", "properties": "nope"},
+        "the row key property is a string": {
+            "id": "1", "properties": {"Row Key": "nope"}
+        },
+        "the title is a string": {
+            "id": "1", "properties": {"Row Key": {"title": "nope"}}
+        },
+        "a title item is a string": {
+            "id": "1", "properties": {"Row Key": {"title": ["nope"]}}
+        },
+    }
+
+    def test_every_unreadable_shape_raises(self):
+        for label, page in self.UNREADABLE.items():
+            with self.subTest(shape=label):
+                with self.assertRaises(TypeError):
+                    projection._row_key_of(page)
+
+    def test_a_genuinely_empty_title_is_not_an_error(self):
+        """The distinction the raise exists to make. An empty title is a
+        readable answer — a row a person added by hand — and it is the
+        caller's business what to do with it, not this function's."""
+        self.assertEqual(
+            projection._row_key_of({"id": "1", "properties": {"Row Key": {"title": []}}}),
+            "",
+        )
+        self.assertEqual(projection._row_key_of({"id": "1", "properties": {}}), "")
+        self.assertEqual(projection._row_key_of({"id": "1"}), "")
+
+    def test_the_reason_names_what_was_wrong(self):
+        """A `TypeError` reaching an operator through `unreadable listing:`
+        has to say more than that something was not a mapping."""
+        with self.assertRaises(TypeError) as caught:
+            projection._row_key_of({"id": "1", "properties": {"Row Key": "nope"}})
+        self.assertIn("Row Key", str(caught.exception))
+        self.assertIn("str", str(caught.exception))
+
+
+class ThePresentReaderRefusesTheSameShapesTests(unittest.TestCase):
+    """`_is_present()`'s own contract, for `_row_key_of()`'s reason.
+
+    Written because a branch-coverage pass found the `properties is not a
+    Mapping` raise here **unreachable**: `_retire_absent_rows()` evaluates
+    `_row_key_of(page)` first in the same tuple, and that function rejects
+    the identical shape a step earlier. Unreachable-in-production is fine;
+    *untested* is not, because then the line is held up only by the order of
+    two calls in one expression, and reordering that expression is an edit
+    nobody would think twice about.
+
+    Same lesson as `TheRowKeyReaderRefusesRatherThanAnswersEmptyTests`, from
+    the other end: there a mutation survived, here coverage found the line
+    before a mutation could.
+    """
+
+    def test_an_unreadable_properties_object_raises(self):
+        with self.assertRaises(TypeError) as caught:
+            projection._is_present({"id": "1", "properties": "nope"})
+        self.assertIn("properties", str(caught.exception))
+
+    def test_an_unreadable_present_value_raises(self):
+        with self.assertRaises(TypeError) as caught:
+            projection._is_present(
+                {"id": "1", "properties": {"Present": "yes"}}
+            )
+        self.assertIn("Present", str(caught.exception))
+
+    def test_an_absent_property_reads_as_present(self):
+        """A database created before the column existed, or a row a person
+        added by hand. Present until something says otherwise — the only
+        thing False does is skip the row, and skipping a row that was never
+        retired leaves a solved blocker on the operator's view forever."""
+        self.assertTrue(projection._is_present({"id": "1", "properties": {}}))
+        self.assertTrue(projection._is_present({"id": "1"}))
+        self.assertTrue(
+            projection._is_present({"id": "1", "properties": {"Present": {}}})
+        )
+
+    def test_the_checkbox_is_read_when_it_is_there(self):
+        for value, expected in ((True, True), (False, False), (None, False)):
+            with self.subTest(checkbox=value):
+                self.assertEqual(
+                    projection._is_present(
+                        {"id": "1", "properties": {"Present": {"checkbox": value}}}
+                    ),
+                    expected,
+                )
+
+
+class ALiveRowIsNotRetiredBecauseOfHowNotionSpellsItsTitleTests(unittest.TestCase):
+    """C64. The same Notion shape this repository has already been bitten by,
+    at the one reader that had not learned it.
+
+    Notion returns a title as one item **per run of identical formatting**,
+    and an item that is not literal text — a mention, an equation — carries no
+    `"text"` key at all. `notion/properties._extract_rich_text()` records the
+    measurement that made it read `plain_text`; `notion/dashboard._page_title()`
+    reads `plain_text` too. `_retire_absent_rows()` read `text.content`.
+
+    Why that is worse here than a missed comparison: Notion's `title equals`
+    filter compares **plain text**, so the row is found and refreshed — and
+    then retired seconds later by the pass that could not read the key it had
+    just written. Measured: a live `CT_PROJECTS` row went `Present = false`
+    with `Retired At` stamped in the same sync, and every later run did it
+    again. The operator's view filters on `Present`.
+    """
+
+    KEY = "SEARCH_BACKEND"
+
+    SHAPES = {
+        "plain text, as the API writes it": [
+            {"type": "text", "text": {"content": KEY}, "plain_text": KEY},
+        ],
+        "two formatting runs": [
+            {"type": "text", "text": {"content": "SEARCH_"}, "plain_text": "SEARCH_"},
+            {"type": "text", "text": {"content": "BACKEND"}, "plain_text": "BACKEND"},
+        ],
+        "a mention run": [
+            {"type": "mention", "mention": {"type": "page", "page": {"id": "x"}},
+             "plain_text": KEY},
+        ],
+        "text and an equation": [
+            {"type": "text", "text": {"content": "SEARCH_"}, "plain_text": "SEARCH_"},
+            {"type": "equation", "equation": {"expression": "BACKEND"},
+             "plain_text": "BACKEND"},
+        ],
+    }
+
+    def _live_client(self, title_items):
+        page = {
+            "id": "page-live",
+            "properties": {
+                "Row Key": {"type": "title", "title": title_items},
+                "Present": {"checkbox": True},
+            },
+        }
+
+        class Live(_ListingClient):
+            def find_by_title(self, *, property_name, value):
+                # What Notion's filter does: compare the plain text.
+                plain = "".join(
+                    item.get("plain_text", "") for item in title_items
+                )
+                return page if plain == value else None
+
+        return Live([page])
+
+    def _model_for_one_project(self):
+        return _model((_event(event_id="E-1", project_id=self.KEY),))
+
+    def test_no_title_shape_retires_the_live_row(self):
+        for label, items in self.SHAPES.items():
+            with self.subTest(shape=label):
+                client = self._live_client(items)
+                names = sorted(projection.control_tower_databases())
+                clients = {
+                    name: (client if name == "CT_PROJECTS" else _ListingClient([]))
+                    for name in names
+                }
+                projection.sync_control_tower(clients, self._model_for_one_project())
+                self.assertEqual(
+                    client.retirements, [], f"{label}: a live row was retired"
+                )
+
+    def test_the_row_is_still_refreshed(self):
+        """Not vacuous: the row must be found and updated, which is what makes
+        the retirement above a contradiction rather than a no-op."""
+        for label, items in self.SHAPES.items():
+            with self.subTest(shape=label):
+                client = self._live_client(items)
+                names = sorted(projection.control_tower_databases())
+                clients = {
+                    name: (client if name == "CT_PROJECTS" else _ListingClient([]))
+                    for name in names
+                }
+                projection.sync_control_tower(clients, self._model_for_one_project())
+                self.assertEqual(client.created, [])
+                self.assertTrue(client.updates)
+
+    def test_a_row_that_really_is_gone_is_still_retired(self):
+        """The other direction, in the same shapes — a reader that answered
+        every title `""` would pass the two tests above and retire nothing
+        ever."""
+        gone = [{"type": "mention", "mention": {}, "plain_text": "RETIRED_PROJECT"}]
+        client = self._live_client(gone)
+        names = sorted(projection.control_tower_databases())
+        clients = {
+            name: (client if name == "CT_PROJECTS" else _ListingClient([]))
+            for name in names
+        }
+        result = projection.sync_control_tower(clients, self._model_for_one_project())
+        self.assertEqual(result.retired, 1)
+
+    def test_the_reader_is_the_one_the_rest_of_the_project_uses(self):
+        """The fix is a rule this repository already stated twice. Pinned
+        against both, so a change to the rule cannot leave one behind."""
+        from notion.properties import _extract_rich_text
+
+        item = {"type": "mention", "mention": {}, "plain_text": "X"}
+        self.assertEqual(
+            projection._row_key_of(
+                {"id": "1", "properties": {"Row Key": {"title": [item]}}}
+            ),
+            _extract_rich_text({"rich_text": [item]}),
+        )
 
 
 class TheRowIsRefreshedNotFrozenTests(unittest.TestCase):

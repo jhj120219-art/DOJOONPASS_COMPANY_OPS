@@ -157,6 +157,132 @@ class InMemoryTransportDatabaseIsolationTests(unittest.TestCase):
         self.assertEqual(found["properties"]["Status"]["select"]["name"], "BLOCKED")
 
 
+class TheDoubleMatchesTheWayNotionMatchesTests(unittest.TestCase):
+    """C64. A double that is easier to satisfy than the API is a blind spot.
+
+    `InMemoryNotionTransport.query_database()` answers a `title` / `rich_text`
+    `equals` filter, and it used to read the value as
+    `items[0]["text"]["content"]`. The live API compares the **concatenated
+    plain text** of every item, and Notion stores one item per run of
+    identical formatting — an item that is not literal text (a mention, an
+    equation) carries no `"text"` key at all.
+    `notion/properties._extract_rich_text()` records the measurement that
+    established this for the read side.
+
+    The gap is not academic and it is not symmetrical. The double answered
+    "no rows" where Notion answers with the row, so a test could only ever
+    reproduce the *loud* half of a mismatch — a lookup that misses and
+    creates a duplicate. It could not reproduce the quiet half, which is what
+    C64 found in `controltower/notion_projection`: the row **is** found
+    through the real filter and refreshed, and then retired seconds later by
+    a reader that could not read its key back. Stating that defect needed a
+    hand-rolled client stand-in because this double could not express it.
+
+    These tests are that expressiveness, held in place.
+    """
+
+    KEY = "SEARCH_BACKEND"
+
+    SHAPES = {
+        "one plain item, as the API writes it": [
+            {"type": "text", "text": {"content": KEY}, "plain_text": KEY},
+        ],
+        "two formatting runs": [
+            {"type": "text", "text": {"content": "SEARCH_"}, "plain_text": "SEARCH_"},
+            {"type": "text", "text": {"content": "BACKEND"}, "plain_text": "BACKEND"},
+        ],
+        "a mention run, which carries no text key": [
+            {"type": "mention", "mention": {"type": "page", "page": {"id": "p"}},
+             "plain_text": KEY},
+        ],
+        "text and an equation": [
+            {"type": "text", "text": {"content": "SEARCH_"}, "plain_text": "SEARCH_"},
+            {"type": "equation", "equation": {"expression": "BACKEND"},
+             "plain_text": "BACKEND"},
+        ],
+        "no plain_text at all (an older double's page)": [
+            {"text": {"content": "SEARCH_"}},
+            {"text": {"content": "BACKEND"}},
+        ],
+    }
+
+    def _transport_holding(self, items, kind):
+        transport = InMemoryNotionTransport()
+        page = transport.create_page("db-1", {"Project ID": {kind: items}})
+        return transport, page
+
+    def test_every_shape_notion_would_match_is_matched(self):
+        for label, items in self.SHAPES.items():
+            with self.subTest(shape=label):
+                transport, page = self._transport_holding(items, "rich_text")
+                response = transport.query_database(
+                    "db-1", {"property": "Project ID", "rich_text": {"equals": self.KEY}}
+                )
+                self.assertEqual(
+                    [row["id"] for row in response["results"]], [page["id"]], label
+                )
+
+    def test_the_same_holds_for_a_title_property(self):
+        """`find_by_title()` is the lookup the Control Tower projection uses,
+        and a title is the same array of items under a different key."""
+        for label, items in self.SHAPES.items():
+            with self.subTest(shape=label):
+                transport, page = self._transport_holding(items, "title")
+                response = transport.query_database(
+                    "db-1", {"property": "Project ID", "title": {"equals": self.KEY}}
+                )
+                self.assertEqual([row["id"] for row in response["results"]], [page["id"]])
+
+    def test_a_different_value_still_does_not_match(self):
+        """Precision. A reader that concatenated its way to a match on
+        everything would pass every test above."""
+        for label, items in self.SHAPES.items():
+            with self.subTest(shape=label):
+                transport, _ = self._transport_holding(items, "rich_text")
+                response = transport.query_database(
+                    "db-1",
+                    {"property": "Project ID", "rich_text": {"equals": "SOMETHING_ELSE"}},
+                )
+                self.assertEqual(response["results"], [])
+
+    def test_a_value_with_nothing_readable_is_not_the_empty_key(self):
+        """`None`, not `""`. The two are different answers to the filter, and
+        an empty `project_id` is a real row key with an open decision on it
+        (BACKLOG C54 §5) — turning "unreadable" into "the empty key" would
+        file a row under it."""
+        transport = InMemoryNotionTransport()
+        transport.create_page(
+            "db-1", {"Project ID": {"rich_text": [{"type": "mention", "mention": {}}]}}
+        )
+
+        response = transport.query_database(
+            "db-1", {"property": "Project ID", "rich_text": {"equals": ""}}
+        )
+
+        self.assertEqual(response["results"], [])
+
+    def test_the_sync_layer_sees_one_row_rather_than_two(self):
+        """The consequence at the layer that cares. `find_project()` missing a
+        row it wrote is a duplicated row on every run — the failure
+        `find_or_create_by_title()` exists to prevent, arriving through the
+        double instead of through Notion.
+        """
+        transport = InMemoryNotionTransport()
+        client = NotionClient(transport=transport, database_id="db-1")
+        transport.create_page(
+            "db-1",
+            {
+                "Project ID": {
+                    "rich_text": [
+                        {"type": "mention", "mention": {}, "plain_text": self.KEY}
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNotNone(client.find_project(self.KEY))
+
+
 class NotionClientTitleLookupTests(unittest.TestCase):
     """`find_by_title()` / `find_or_create_by_title()`.
 

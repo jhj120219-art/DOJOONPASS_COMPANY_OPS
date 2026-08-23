@@ -3,6 +3,7 @@
 Detection only — these tests also pin the "never repairs" contract.
 """
 
+import ast
 import json
 import sys
 import tempfile
@@ -40,6 +41,8 @@ from notion.retry_queue import (  # noqa: E402
     load_queue as load_retry_queue,
 )
 from runsummary import RunSummaryError, read_summary  # noqa: E402
+
+SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 class StateConsistencyTestCase(unittest.TestCase):
@@ -731,6 +734,215 @@ class NeverExercisedRejectionTests(unittest.TestCase):
         self.assertTrue(state.mark_dirty("2026-08"))
         self.assertFalse(state.mark_dirty("2026-08"))
         self.assertEqual(state.dirty_months, ["2026-08"])
+
+
+class ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests(unittest.TestCase):
+    """C65. Nine loaders converted a corrupt state file into a typed error and
+    let one input shape through untouched.
+
+    Every one of them is the same three lines:
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise <Module>StateError(f"... is corrupted: {path} ({exc})")
+
+    and that conversion is the whole of what each promises about a file it
+    cannot read. `json.loads()` answers a deeply nested file with
+    `RecursionError`, which is a `RuntimeError` and not in the tuple, so the
+    promise was kept for a truncated file and broken for a nested one.
+
+    BACKLOG F-6 already settled the rule for this exception — "함수 자신의
+    문서가 '파싱할 수 없음'의 답을 이미 갖고 있는가" — and fixed the six
+    call sites its sweep found. That sweep looked at readers of **untrusted
+    pipeline files**; the state loaders have the identical shape and were not
+    in its table. This is that sweep finished.
+
+    Measured before the fix, all twelve entry points below diverged:
+
+        garbage file    AgentStateError / BackupStateError / ... / returned
+        nested file     RecursionError, out of json/decoder.py
+
+    Reachability is the DR path this repository already names elsewhere —
+    `monthly/generator.py` says of its own unresolvable flag that the way in
+    is "손으로 고쳤거나 복원된 state 파일(DR 시나리오)". `agent/status.py`
+    is the sharpest case: its docstring says "Never raises for a damaged
+    state file. A corrupted `agent_state.json` is exactly when someone needs
+    this view most", and `ops_status.py` calls it.
+
+    Written as one gate over a roster rather than nine tests, because the
+    property is "no loader in this family diverges" and a per-module test
+    cannot fail when a **tenth** loader is added.
+    """
+
+    #: `(label, filename, callable)` — every reader that turns a state file
+    #: into a value or a typed error. Extended when a state file is added;
+    #: `test_the_roster_covers_every_loader_in_the_tree` is what notices.
+    def _loaders(self):
+        import agent.state
+        import backup.state
+        import monthly.state
+        import runsummary
+        import scheduler.state
+        from agent.status import read_status
+        from collector.state import PersistentSeenEventStore
+        from notion.dashboard_pending import load_pending
+        from notion.retry_queue import load_queue
+        from scheduler.lock import (
+            is_locked,
+            lock_held_since,
+            stale_lock_cannot_be_cleared,
+        )
+
+        return (
+            ("agent.state", "agent_state.json", agent.state.load_state),
+            ("backup.state", "backup_state.json", backup.state.load_state),
+            ("monthly.state", "monthly_state.json", monthly.state.load_state),
+            ("scheduler.state", "daily_history_state.json", scheduler.state.load_state),
+            ("collector.state", "collector_state.json",
+             lambda p: PersistentSeenEventStore(state_path=p).has_seen("X")),
+            ("notion.retry_queue", "notion_retry_queue.json", load_queue),
+            ("notion.dashboard_pending", "dashboard_pending.json", load_pending),
+            ("runsummary", "last_run.json", runsummary.read_summary),
+            ("scheduler.lock.is_locked", "run.lock", is_locked),
+            ("scheduler.lock.held_since", "run.lock", lock_held_since),
+            ("scheduler.lock.stale", "run.lock", stale_lock_cannot_be_cleared),
+            ("agent.status.read_status", "agent_state.json",
+             lambda p: read_status(state_path=p, outbox_dir=p.parent / "outbox",
+                                   sent_dir=p.parent / "sent",
+                                   rejected_signals_dir=p.parent / "rejected")),
+        )
+
+    #: Deep enough that `json.loads` gives up. The number is not tuned to the
+    #: interpreter's limit — a remote or a corrupt file picks the depth, not
+    #: this test — it is simply past any limit CPython ships with.
+    DEEP = ("[" * 20000) + ("]" * 20000)
+    GARBAGE = "{not json"
+
+    # Not `_outcome`: `unittest.TestCase` already owns that attribute for
+    # its own result bookkeeping, and shadowing it makes every subTest in
+    # this class die with `'_Outcome' object is not callable` — measured
+    # while writing this class, and a collision a reader would not guess.
+    def _reading(self, loader, payload, name):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_text(payload, encoding="utf-8")
+            try:
+                loader(path)
+            except Exception as exc:  # noqa: BLE001
+                return type(exc).__name__
+            return "returned"
+
+    def test_no_loader_answers_a_nested_file_differently(self):
+        """The property. Not "raises X" — that would pin nine different
+        exception types and say nothing about the ones added later. The claim
+        is that a nested file is **the same kind of event** as a garbage one
+        for every loader, whatever that kind is for each."""
+        for label, name, loader in self._loaders():
+            with self.subTest(loader=label):
+                self.assertEqual(
+                    self._reading(loader, self.DEEP, name),
+                    self._reading(loader, self.GARBAGE, name),
+                    f"{label} treats a deeply nested state file as a different"
+                    " kind of failure from a truncated one",
+                )
+
+    def test_no_loader_lets_a_recursion_error_out(self):
+        """Stated directly too, because the comparison above would also pass
+        if a future edit made *both* raise `RecursionError`."""
+        for label, name, loader in self._loaders():
+            with self.subTest(loader=label):
+                self.assertNotEqual(
+                    self._reading(loader, self.DEEP, name), "RecursionError"
+                )
+
+    def test_a_valid_state_file_is_still_read(self):
+        """Precision: a guard that refused everything would pass both tests
+        above. Only the loaders with a meaningful empty state are listed —
+        the point is that the added clause changed nothing on the happy
+        path."""
+        import agent.state
+        import backup.state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agent_state.json"
+            path.write_text('{"desktop_id": "DESKTOP_1"}', encoding="utf-8")
+            self.assertEqual(agent.state.load_state(path).desktop_id, "DESKTOP_1")
+
+            path = Path(tmp) / "backup_state.json"
+            path.write_text("{}", encoding="utf-8")
+            self.assertIsNotNone(backup.state.load_state(path))
+
+    def test_the_tree_scan_the_roster_check_uses_finds_modules(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_the_roster_covers_every_loader_in_the_tree` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        modules = [p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts]
+        self.assertGreater(len(modules), 50)
+
+    def test_the_roster_covers_every_loader_in_the_tree(self):
+        """Guards the guard, the way `_atomic_writers()` does for the writers.
+
+        A tenth state loader added with the old three-line shape would be
+        invisible to every test above, because those iterate this roster. So
+        the roster is checked against the tree: every `except` clause in
+        `src/` that catches `(OSError, ValueError)` around a `json.loads`
+        must also catch `RecursionError`.
+        """
+        offenders = []
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Try):
+                    continue
+                body = ast.Module(body=node.body, type_ignores=[])
+                loads = any(
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in ("load", "loads")
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "json"
+                    for call in ast.walk(body)
+                )
+                if not loads:
+                    continue
+                caught = set()
+                for handler in node.handlers:
+                    kind = handler.type
+                    if kind is None:
+                        caught.add("bare")
+                    elif isinstance(kind, ast.Name):
+                        caught.add(kind.id)
+                    elif isinstance(kind, ast.Tuple):
+                        caught.update(
+                            e.id for e in kind.elts if isinstance(e, ast.Name)
+                        )
+                if "ValueError" not in caught:
+                    # Catches something else, or nothing — a different
+                    # decision, and one this gate has no opinion about.
+                    continue
+                if not caught & {"RecursionError", "RuntimeError", "Exception",
+                                 "BaseException", "bare"}:
+                    offenders.append(f"{path.relative_to(SRC)}:{node.lineno}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a json.loads() guarded for ValueError and not for RecursionError:"
+            f" {offenders} — see BACKLOG F-6 and C65",
+        )
 
 
 if __name__ == "__main__":

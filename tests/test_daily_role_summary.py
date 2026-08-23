@@ -399,6 +399,22 @@ class NoProductionCallerTests(unittest.TestCase):
             if "__pycache__" not in str(p)
         ]
 
+    def test_the_production_scan_finds_the_repository(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_nothing_in_production_calls_the_role_summary` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        self.assertGreater(len(self._production_files()), 50)
+
     def test_nothing_in_production_calls_the_role_summary(self):
         import ast
 

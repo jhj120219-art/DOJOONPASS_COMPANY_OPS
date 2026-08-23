@@ -87,7 +87,39 @@ def validate_event(data: Mapping[str, Any]) -> list[str]:
         ("status", STATUSES),
     ):
         value = data.get(field_name)
-        if value is not None and value not in allowed:
+        if value is None:
+            continue
+        # `isinstance` before the membership test, not after. `data` is
+        # untrusted JSON from another Desktop, so `value` can be a list or a
+        # dict — a JSON array or object where a string was expected — and
+        # `value not in allowed` against a frozenset raises
+        # `TypeError: unhashable type` for either shape instead of returning
+        # an ordinary validation error.
+        #
+        # The three fields below (`event_id` / `project_id` / `summary`)
+        # already got an `isinstance` guard; these four did not, because they
+        # have an allowed set and the membership test *looked* like it was
+        # doing the type work. It is not: a frozenset lookup needs a hashable
+        # key before it can answer at all.
+        #
+        # Measured through the real Collector on this tree, one crafted Event
+        # (`"role": ["CTO_BACKEND"]`) beside one ordinary one:
+        #
+        #     accepted=1 failed=1
+        #     incoming/   bad.json      <- still there, every run, forever
+        #     rejected/   (empty)
+        #     collector.log  FAILED bad.json: unhashable type: 'list'
+        #
+        # Two things are wrong with that. docs/03 §7 sends an invalid Event to
+        # `rejected/` and lets the run continue; this one is FAILED instead,
+        # so the file stays in `incoming/` and fails identically on every
+        # retry. And the only trace is a bare Python message that names the
+        # exception rather than the field, so nothing tells an operator that
+        # the problem is the *shape* of `role`.
+        #
+        # Needs no crafted input beyond a hand-written or restored Event with
+        # one bracket too many.
+        if not isinstance(value, str) or value not in allowed:
             errors.append(f"invalid {field_name}: {value!r}")
 
     timestamp = data.get("timestamp")

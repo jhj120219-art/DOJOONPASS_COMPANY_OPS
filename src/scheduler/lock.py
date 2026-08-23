@@ -77,7 +77,13 @@ def _long_path(path: Path) -> Path:
 def _read_lock(lock_path: Path) -> dict[str, Any] | None:
     try:
         return json.loads(_long_path(lock_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    # `RecursionError` is what `json.loads()` answers a deeply nested file
+    # with, and it is a `RuntimeError` rather than a `ValueError` — so the
+    # conversion below, which is the whole of what this promises about a
+    # file it cannot read, used to be skipped for that one shape. One home
+    # for the reasoning: `ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests`
+    # (C65), which also holds the roster this is one of nine entries in.
+    except (OSError, ValueError, RecursionError):
         return None
 
 

@@ -26,6 +26,31 @@ _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 # See history/file_repository.py for the same bound and the reason for it.
 _MAX_FILENAME_STEM = 120
 
+# Windows resolves these to devices, not files, regardless of extension or
+# case — `NUL.json` and `NUL.anything.json` both name the NUL device, not a
+# file on disk. `_UNSAFE_FILENAME_CHARS` never touches them because every
+# character in "NUL" is on the whitelist. See `_has_reserved_windows_head()`.
+_RESERVED_WINDOWS_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{d}" for d in range(1, 10)}
+    | {f"LPT{d}" for d in range(1, 10)}
+)
+
+
+def _has_reserved_windows_head(name: str) -> bool:
+    """Whether the text before `name`'s first '.' is a Windows device name.
+
+    Measured directly on this project's own deployment target: a fresh,
+    empty directory already reports `Path("NUL.json").exists() == True`,
+    and `os.replace(tmp, "NUL.json")` raises `FileExistsError` (WinError
+    183) even though nothing was ever written there and `overwrite=True`
+    changes nothing — Windows refuses to replace a device path outright.
+    Every character in "NUL" is on `_UNSAFE_FILENAME_CHARS`'s whitelist, so
+    the sanitiser below passes such an `event_id` through unchanged, and
+    the untouched name is exactly the one Windows treats as the device.
+    """
+    return name.split(".", 1)[0].upper() in _RESERVED_WINDOWS_STEMS
+
 # Every atomic writer in this project stages through
 # `tempfile.mkstemp(dir=<the destination directory>, prefix=".tmp-")` and
 # commits with one `os.replace()`. That prefix is therefore not decoration:
@@ -71,12 +96,22 @@ def safe_event_filename(event_id: str) -> str:
     Sprints this sentence promised a check that nothing performed.
     """
     sanitized = _UNSAFE_FILENAME_CHARS.sub("_", event_id).strip("._")
-    if sanitized == event_id and len(event_id) <= _MAX_FILENAME_STEM:
+    if (
+        sanitized == event_id
+        and len(event_id) <= _MAX_FILENAME_STEM
+        and not _has_reserved_windows_head(event_id)
+    ):
         return f"{event_id}.json"
 
     digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:12]
     stem = sanitized[:_MAX_FILENAME_STEM] or "event"
-    return f"{stem}-{digest}.json"
+    name = f"{stem}-{digest}.json"
+    if _has_reserved_windows_head(name):
+        # The digest is joined with '-', not '.', so this only triggers when
+        # `stem` itself carries an embedded reserved head before a literal
+        # '.' the whitelist let through untouched (e.g. "NUL.txt").
+        name = f"_{name}"
+    return name
 
 
 def write_event_json(

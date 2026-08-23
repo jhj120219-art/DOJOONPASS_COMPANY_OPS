@@ -152,15 +152,45 @@ def _is_line_breaking(char: str) -> bool:
     return char < " " or char in ("\x7f", "\x85", "\u2028", "\u2029")
 
 
+#: The nine Unicode controls that reorder a line without ending one.
+#:
+#: `_is_line_breaking()` above closes forging a **second** line. These forge
+#: the content of the line they are on: an override or an isolate makes a run
+#: of text render in an order the bytes do not have, so the same
+#: `collector.log` line an operator reads as one verdict was recorded as
+#: another. That is CVE-2021-42574's shape aimed at an operator's log rather
+#: than at a compiler, and `event_id` — which docs/02 constrains only to
+#: "present and non-null" — is the field it arrives in.
+#:
+#: Measured on HEAD: all nine passed through `one_line()` untouched, so the
+#: bytes `REJECTED EVT-1<RLO>DETPECCA<LRO>` render as
+#: `REJECTED EVT-1ACCEPTED`. Escaping makes them visible instead, which is
+#: this module's stated posture — "escaped, not stripped ... keeps the real
+#: value recoverable".
+#:
+#: Written as escapes rather than as the characters themselves. A literal
+#: here would be nine invisible codepoints in a source file no reviewer can
+#: see — the defect this constant exists to expose, spelled in its own file.
+#:
+#: U+200E / U+200F (LRM / RLM) are deliberately absent. They are marks rather
+#: than overrides: they nudge the ordering of neighbouring runs and cannot by
+#: themselves reverse one, and escaping every directional hint would start
+#: mangling values merely written in a right-to-left script.
+_BIDI_CONTROL = frozenset(
+    "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
+
+
 def _escape(char: str) -> str:
-    """`char` unchanged unless it can end a line, else a Python-style escape.
+    """`char` unchanged unless it can end **or reorder** a line, else a
+    Python-style escape.
 
     `\\xNN` only for a byte-sized codepoint: `f"\\\\x{0x2028:02x}"` would
     render U+2028 as `\\x2028`, which reads as `\\x20` followed by the
     literal "28" — an escape that means something other than the character
     it stands for is worse than none.
     """
-    if not _is_line_breaking(char):
+    if not (_is_line_breaking(char) or char in _BIDI_CONTROL):
         return char
     code = ord(char)
     return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"

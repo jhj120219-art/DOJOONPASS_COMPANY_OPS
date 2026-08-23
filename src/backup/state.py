@@ -46,7 +46,13 @@ def load_state(state_path: Path) -> BackupState:
 
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    # `RecursionError` is what `json.loads()` answers a deeply nested file
+    # with, and it is a `RuntimeError` rather than a `ValueError` — so the
+    # conversion below, which is the whole of what this promises about a
+    # file it cannot read, used to be skipped for that one shape. One home
+    # for the reasoning: `ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests`
+    # (C65), which also holds the roster this is one of nine entries in.
+    except (OSError, ValueError, RecursionError) as exc:
         raise BackupStateError(
             f"backup state file is corrupted: {state_path} ({exc})"
         ) from exc

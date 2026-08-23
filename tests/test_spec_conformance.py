@@ -1965,6 +1965,202 @@ class RoleDisplayTableCoverageTests(unittest.TestCase):
                     self.assertTrue(display and display.strip())
 
 
+class CategoryTableCoverageTests(unittest.TestCase):
+    """`RoleDisplayTableCoverageTests`' rule, asked of the other vocabulary.
+
+    That class guards two role tables against falling behind `events.ROLES`,
+    and states why in as many words: *"That is a live risk rather than a
+    hypothetical: BACKLOG A-1 ... is an open request to add a fifth role ...
+    The failure is quiet."*
+
+    Categories are the same kind of vocabulary with the same kind of open
+    request (A-3 and A-12 both turn on how items are classified), and there
+    are **six** tables rather than two:
+
+        history/filter._CATEGORY_BY_EVENT_TYPE        the source
+        daily/markdown._CATEGORY_ORDER                Daily section order
+        daily/markdown._SECTION_TITLE_BY_CATEGORY     Daily section titles
+        daily/role_summary.CATEGORY_ORDER             role grouping
+        monthly/markdown.SECTION_ORDER                Monthly section order
+        monthly/markdown.SECTION_TITLE_BY_CATEGORY    Monthly section titles
+        monthly/parser.CATEGORY_BY_SECTION_TITLE      Monthly's reader
+
+    Measured (C67) by adding a fifth category to the source and running the
+    suite: the Daily side objected — `test_every_kept_category_can_be_rendered`
+    and its neighbours failed — and `test_daily_history.py` plus
+    `test_monthly_history.py` came back **163 passed**. Nothing on the
+    Monthly side noticed at all.
+
+    What that costs, measured through the real renderer rather than argued:
+
+        items in                                   2
+        rendered into the Monthly document         1
+        dropped, silently                          1  (the new category)
+
+    `render_monthly_markdown()` buckets by `SECTION_ORDER` and keeps only
+    `if item.category in by_category`, so an item whose category no Monthly
+    table knows is not rendered, not counted and not reported. It reached
+    Daily History and simply does not reach Monthly History.
+
+    Two tables already hold each other: `test_the_section_titles_match_the_daily_renderer`
+    ties `daily/markdown._SECTION_TITLE_BY_CATEGORY` to
+    `monthly/parser.CATEGORY_BY_SECTION_TITLE`. That pair is why the *reader*
+    would be updated. Nothing pointed at the Monthly **renderer**, which is
+    the half that decides whether an item is written down.
+
+    A table may be **wider** than the source and that is not a fault:
+    `LEARNING` appears in every table below and no event type produces it
+    today (docs/05 defines the category; the filter has no rule that assigns
+    it). The rule is one-directional — never narrower.
+    """
+
+    @staticmethod
+    def _source_categories():
+        from history.filter import _CATEGORY_BY_EVENT_TYPE
+
+        return {
+            category
+            for category in _CATEGORY_BY_EVENT_TYPE.values()
+            if category is not None
+        }
+
+    @staticmethod
+    def _tables():
+        import daily.markdown as daily_markdown
+        import daily.role_summary as role_summary
+        import monthly.markdown as monthly_markdown
+        from monthly.parser import CATEGORY_BY_SECTION_TITLE
+
+        return {
+            "daily/markdown._CATEGORY_ORDER": set(daily_markdown._CATEGORY_ORDER),
+            "daily/markdown._SECTION_TITLE_BY_CATEGORY": set(
+                daily_markdown._SECTION_TITLE_BY_CATEGORY
+            ),
+            "daily/role_summary.CATEGORY_ORDER": set(role_summary.CATEGORY_ORDER),
+            "monthly/markdown.SECTION_ORDER": set(monthly_markdown.SECTION_ORDER),
+            "monthly/markdown.SECTION_TITLE_BY_CATEGORY": set(
+                monthly_markdown.SECTION_TITLE_BY_CATEGORY
+            ),
+            "monthly/parser.CATEGORY_BY_SECTION_TITLE": set(
+                CATEGORY_BY_SECTION_TITLE.values()
+            ),
+        }
+
+    def test_the_source_vocabulary_is_not_empty(self):
+        """C66 §1: this class asserts a subset relation, and every subset of
+        the empty set is satisfied. The floor comes first."""
+        source = self._source_categories()
+
+        self.assertGreaterEqual(len(source), 3, sorted(source))
+        self.assertEqual(len(self._tables()), 6)
+
+    def test_every_table_covers_every_category_the_filter_produces(self):
+        source = self._source_categories()
+        missing = {
+            name: sorted(source - values)
+            for name, values in self._tables().items()
+            if source - values
+        }
+
+        self.assertEqual(
+            missing,
+            {},
+            "a category the History Filter assigns has no place in these "
+            f"tables, so items carrying it are rendered nowhere: {missing}",
+        )
+
+    def test_a_table_may_be_wider_than_the_source(self):
+        """The rule is one-directional, and saying so keeps someone from
+        'fixing' it the other way. `LEARNING` is defined by docs/05 and no
+        filter rule assigns it, so every table below is wider today."""
+        source = self._source_categories()
+        wider = {
+            name
+            for name, values in self._tables().items()
+            if values - source
+        }
+
+        self.assertTrue(
+            wider, "no table is wider than the source — has LEARNING gone?"
+        )
+
+    def test_monthly_can_render_everything_daily_can(self):
+        """The relation the source-coverage rule does not express.
+
+        A mutation exposed it: removing `LEARNING` from
+        `monthly/markdown.SECTION_ORDER` alone broke nothing above, because
+        `LEARNING` is not in the source and every rule so far is stated
+        against the source. But Monthly consolidates **Daily**, not the
+        filter — so the set that matters downstream is what Daily renders,
+        and anything Daily can write that Monthly cannot read back is an
+        item that reaches Company History for a day and not for the month.
+
+        Stated as a superset rather than as equality: Monthly having a
+        section Daily never fills is an empty heading nobody sees, while the
+        other direction loses records.
+        """
+        import daily.markdown as daily_markdown
+        import monthly.markdown as monthly_markdown
+
+        daily_categories = set(daily_markdown._CATEGORY_ORDER)
+        monthly_categories = set(monthly_markdown.SECTION_ORDER)
+
+        self.assertTrue(daily_categories, "the Daily section table is empty")
+        self.assertEqual(
+            daily_categories - monthly_categories,
+            set(),
+            "Daily renders a category Monthly has no section for — those "
+            "items reach Daily History and are dropped by "
+            "`render_monthly_markdown()` without a count or a warning",
+        )
+
+    def test_an_uncovered_category_is_dropped_by_the_monthly_renderer(self):
+        """The consequence the docstring quotes, kept executable.
+
+        Not a test of the renderer's correctness — bucketing by a known set
+        is the right thing for it to do. This pins **what the coverage rule
+        above is protecting**, so that if the renderer ever grows an
+        "unknown category" channel, this fails and the rule can be relaxed
+        deliberately rather than forgotten.
+        """
+        from datetime import date as date_type
+
+        from monthly import DailyCoverage, MonthlyItem
+        from monthly.markdown import render_monthly_markdown
+
+        day = date_type(2026, 8, 20)
+
+        def item(category, event_id):
+            return MonthlyItem(
+                event_id=event_id,
+                category=category,
+                project="P",
+                summary="something happened",
+                owner="CMO",
+                source_date=day,
+            )
+
+        known = sorted(self._source_categories())[0]
+        text = render_monthly_markdown(
+            year=2026,
+            month=8,
+            items=[item(known, "EVT-KNOWN"), item("NOT_A_CATEGORY", "EVT-LOST")],
+            source_dates=[day],
+            generated_at="2026-09-01T00:00:00+09:00",
+            coverage=DailyCoverage(
+                year=2026,
+                month=8,
+                expected_dates=(day,),
+                present_dates=(day,),
+                missing_dates=(),
+                starts_mid_month=False,
+            ),
+        )
+
+        self.assertIn("EVT-KNOWN", text)
+        self.assertNotIn("EVT-LOST", text)
+
+
 class RunContractSpecTableTests(unittest.TestCase):
     """docs/14 §7's Overall Status table, read from the spec and compared to
     the code that implements it.

@@ -1575,6 +1575,39 @@ class AtomicWriteLeavesNoResidueTests(unittest.TestCase):
                     f"{label} left staging residue behind: {residue}",
                 )
 
+    def test_the_structural_scan_finds_the_writers(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_the_idiom_is_present_in_every_atomic_writer` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        import ast
+
+        writers = []
+        for path in (REPO_ROOT / "src").glob("**/*.py"):
+            if "__pycache__" in str(path):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if any(
+                    getattr(inner.func, "attr", None) == "mkstemp"
+                    for inner in ast.walk(node)
+                    if isinstance(inner, ast.Call)
+                ):
+                    writers.append(f"{path.name}:{node.name}")
+
+        self.assertGreaterEqual(len(writers), 12, writers)
+
     def test_the_idiom_is_present_in_every_atomic_writer(self):
         """The structural half. A writer that grows a `mkstemp` without the
         cleanup would pass the behavioural test above only because it is not
@@ -2033,6 +2066,78 @@ class NoDocumentFreezesATestCountTests(unittest.TestCase):
 
         self.assertNotIn(REPO_ROOT / "BACKLOG.md", self._live_documents())
         self.assertTrue(self.COUNT.search(backlog))
+
+
+class TheRecordedRuntimeIsTheRunningOneTests(unittest.TestCase):
+    """BACKLOG section D declares the interpreter its numbers were taken on.
+    This checks that declaration against the interpreter actually running.
+
+    **Why a gate for a header (C70).** The header said "이 머신, Python 3.13,
+    Windows 11". The machine is Python 3.9.7 on Windows 10. C17 recorded that
+    same drift once and fixed only the instance, so it came back; the gate
+    built afterwards — `EveryTrackedModuleParsesOnThisInterpreterTests` —
+    covers the **syntax** consequence (a PEP 604 `|` evaluated at runtime) and
+    nothing else.
+
+    The face it does not cover is **capability**, and that is what C70 walked
+    into. `os.path.isjunction()` is 3.12+. A reader asking "is the junction
+    exposure detector live on this deployment?" consults section D, reads
+    3.13, and concludes yes. It had never fired here. A stale environment
+    record is what kept a security detector's blindness invisible — so the
+    record is a contract, not a caption.
+
+    Major.minor only. The patch level moves without changing what any
+    interpreter can do, and pinning it would make this fail for a reason
+    nobody needs to act on.
+    """
+
+    #: The one line section D publishes for this purpose. Historical figures
+    #: elsewhere in that section legitimately name other interpreters (they
+    #: were measured there), so the check reads this marker rather than
+    #: searching the prose — a scan would trip over its own history.
+    MARKER = re.compile(r"<!--\s*RUNTIME-DECLARATION:\s*Python\s+(\d+)\.(\d+)\s*-->")
+
+    def _declared(self):
+        backlog = (REPO_ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+        found = self.MARKER.findall(backlog)
+        self.assertEqual(
+            len(found), 1,
+            "BACKLOG.md must carry exactly one RUNTIME-DECLARATION marker; "
+            f"found {len(found)}",
+        )
+        return tuple(int(part) for part in found[0])
+
+    def test_the_declared_runtime_is_the_one_running(self):
+        declared = self._declared()
+        actual = (sys.version_info.major, sys.version_info.minor)
+
+        self.assertEqual(
+            declared,
+            actual,
+            "BACKLOG section D declares Python "
+            f"{declared[0]}.{declared[1]} but this interpreter is "
+            f"{actual[0]}.{actual[1]}. Update the RUNTIME-DECLARATION line "
+            "(and re-check anything that branches on interpreter capability "
+            "— C70's junction detector is the worked example).",
+        )
+
+    def test_the_marker_would_notice_a_wrong_version(self):
+        """Guards the guard: the pattern has to be able to disagree."""
+        sample = "<!-- RUNTIME-DECLARATION: Python 2.7 -->"
+        self.assertEqual(self.MARKER.findall(sample), [("2", "7")])
+        self.assertNotEqual(
+            (2, 7), (sys.version_info.major, sys.version_info.minor)
+        )
+
+    def test_the_capability_that_made_this_a_contract_is_stated(self):
+        """The declaration is only useful while a reader can tell what it
+        implies. C70's case is named in section D on purpose; without it the
+        line reads as trivia and the next drift is silent again."""
+        backlog = (REPO_ROOT / "BACKLOG.md").read_text(encoding="utf-8")
+        head = backlog[backlog.index("## D. 측정값"):][:3000]
+
+        self.assertIn("isjunction", head)
+        self.assertIn("capability", head)
 
 
 class DocumentPointersResolveTests(unittest.TestCase):

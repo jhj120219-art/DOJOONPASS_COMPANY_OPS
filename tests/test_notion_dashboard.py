@@ -1074,6 +1074,28 @@ class BootstrapDiagnosisTests(unittest.TestCase):
 
                 self.assertIn("NOTION_OPS_RUNS_DATABASE_ID", action)
 
+    def test_the_production_scan_finds_the_repository(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_nothing_in_production_creates_the_dashboard_databases` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        files = [
+            p
+            for p in list((repo_root / "src").glob("**/*.py")) + list(repo_root.glob("*.py"))
+            if "__pycache__" not in str(p)
+        ]
+        self.assertGreater(len(files), 50)
+
     def test_nothing_in_production_creates_the_dashboard_databases(self):
         """The fact the messages above now state. Pinned so that wiring it up
         (which needs approval — it writes to a real Workspace) forces those

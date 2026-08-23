@@ -7,6 +7,318 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
+마지막 갱신: 2026-08-23 (C75 — **스키마 셋 중 기계를 건너는 하나만 게이트가 없었다.**
+전용 Schema/Contract Audit 첫 수행. `runsummary`(1.1)와 `controltower`(1.2)는 버전별
+기록된 형태를 갖고 실제 payload와 대조되는데, **`events.SUPPORTED_SCHEMA_VERSION`(1.0)은
+테스트에 0회 등장**하고 `1.0` Event의 필드 집합을 말하는 단정도 없었다 — 이 머신을 벗어나지도
+않는 `retry_queue`/`dashboard_pending` payload조차 키 집합을 고정하는데. 두 형제는 이미 대가를
+치렀다(C31이 `failure.reason`을 더하는 동안 `SCHEMA_VERSION`은 1.0에 머물렀다).
+버전 비교는 **정확 일치**라 `1.1`도 거부되고, 그래서 bump는 전면 절체다 — docs/02에 호환
+정책은 없다. **결과를 실제 Collector로 쟀다**: 한 Desktop이 먼저 올라가면 그 Event는
+**REJECTED되어 `rejected/`로 가고** `incoming/`이 드레인되며 로그가 원인을 댄다(안전한 쪽 —
+FAILED였다면 C72처럼 끼었다). 어느 쪽인지 말하는 것이 아무 데도 없었다.
+형제 둘과 같은 모양의 게이트에 그 운영 절반을 더해 고정했다. Evidence: 신규 6건,
+mutation **4종 전부 DETECTS** — 그중 **M4(버전만 올리고 형태 미기록)가 6건 중 5건을 깨뜨린다.**
+전체 회귀 **3612 passed, skip 0**.
+아래는 C74 기록이다.)
+
+마지막 갱신: 2026-08-23 (C74 — **unreadable evidence를 원천에서 Notion까지 따라갔다. 체인은 정직하다.**
+A–F 여섯 상태를 각각 주입하고 rollup / model / Notion 행 / 화면의 값을 나란히 놓았다.
+**C(읽을 수 없음)가 요지다**: 앞선 측정에서 정상과 불량이 둘 다 `Coverage Complete=False`로
+보여 불일치를 의심했는데 **fixture가 history 미확인이었던 탓**이었다. history를 확인·빈틈없음으로
+두고 다시 재니 정상 True / 불량 **False**로 갈린다 — `Coverage.complete`가 `unreadable == 0`을
+명시적으로 포함한다. **B(읽은 뒤 삭제)도 결함이 아니다**: `EvidenceRef`는 출처 기록이지 살아
+있는 포인터가 아니라, 그 시점 읽기 기준 Value를 유지하는 것이 옳고 재독하면 줄어드는 것도 옳다.
+**F(적대적 파일명)는 이미 막혀 있다** — `ref.path`는 파일을 여는 데 쓰이지 않고 텍스트로만
+흐르며 `redact(one_line(...))`를 거친다(실측: secret 모양 파일명이 `[REDACTED].json`이 된다).
+남는 한계 하나는 Notion의 `Coverage Complete`가 세 사유 하나의 깃발이라는 점인데,
+`History Checked`가 셋째를 가르므로 실제로 뭉쳐 있는 것은 둘이고, 속성 추가는 docs/04 §53
+정책이라 **SKIP**(A-16과 함께 결정). 신규 결함 0건, 코드 변경 0건 — 측정만 남긴다.
+아래는 C73 기록이다.)
+
+마지막 갱신: 2026-08-23 (C73 — **술어를 빌려 쓴 게이트는 그 술어가 틀리면 함께 틀린다.**
+C71 §4의 evidence 게이트는 `_completes()`/`_blocker_change()`를 복사하지 않고 재사용한다 —
+드리프트는 못 하지만 독립성을 잃는다. 그것을 **실측했다**: 술어를 틀리게 만들자
+빌려 쓰는 게이트가 **두 변이 모두에서 MISSES**(5 passed)했고 새 게이트만 DETECTS했다.
+특히 `CANCELLED`도 Completed Date를 쓰게 만든 변이는 **취소된 Project가
+`projects_completed` KPI에 잡히는** 경우이고, evidence 게이트는 그 인용을 정확하다고
+확인해 준다 — 틀린 숫자에 citation이 붙는 C71 §4의 모양이 게이트 자신을 통해 생긴다.
+위험의 대부분은 이미 접지돼 있었다(`test_spec_conformance`가 `_type_specific_properties`를
+docs/04 §21-28에 event_type 전수로 고정한다). 남은 고리는 그 표에서 술어로 가는 **두 줄** —
+어느 키를 보는가 — 였고, `EVENT_TYPES`를 독립 열거해 각 답을 docs/04에서 적어 닫았다.
+C71이 남긴 여섯 질문도 전부 증거로 닫았다(§4 표). 손상된 evidence는 `unreadable` 채널로
+가고 화면이 세 곳에서 보고한다; **사후 삭제는 잡지 않으며 그것이 옳다** — `EvidenceRef`는
+출처 기록이지 살아 있는 포인터가 아니다. Evidence: 신규 5건, mutation 2종 DETECTS(같은
+변이에서 빌려 쓰는 게이트는 MISSES). 전체 회귀 **3601 passed, skip 0**.
+아래는 C72 기록이다.)
+
+마지막 갱신: 2026-08-23 (C72 — **검증 함수 자신이 예외를 던졌다. 그리고 그 수정은 stash에만 있었다.**
+읽기로 세 번 연속 헛짚은 뒤 퍼즈로 바꿨다 — `validate_event()`에 전 필드 × 적대적 타입 25종,
+369조합. **uncaught exception 29건**, 전부 같은 원인이다: 허용 집합이 있는 네 필드
+(`source`/`role`/`event_type`/`status`)에 `isinstance` 가드가 없다. frozenset 조회는
+hashable한 키가 없으면 답 자체를 못 하는데 membership 검사가 타입 일까지 해 주는 것처럼
+보였다. **실제 Collector 실측**: `"role": ["CTO_BACKEND"]` 하나가 FAILED로 잡혀
+`incoming/`에 **영구 잔류**하고(재시도마다 동일) 로그에는 필드가 아니라 예외 이름만 남는다 —
+docs/03 §7대로면 REJECTED로 `rejected/`에 갔어야 한다. 괄호 하나 더 있는 Event면 도달한다.
+**그리고 이 수정은 `stash@{0}`에 이미 있었다** — 내 메모의 "2026-08-15 수정됨"은 틀리지
+않았고, 다만 그 수정이 도달한 곳이 stash였다. Stash 적용은 금지라 읽어서 동등한 수정을
+넣되 **코드 줄은 글자 그대로** 같게 두어 병합 충돌을 피했고, 주석은 현재 트리에서 잰 값으로
+다시 썼다(stash 주석의 "uncaught로 빠져나간다"는 이 트리에서 사실이 아니다). 같은 stash
+블록의 `project_id` 절반은 이미 다른 형태로 트리에 있다. Evidence: 신규 6건, mutation
+3종 DETECTS + 동치 1종 기록. 전체 회귀 **3596 passed, skip 0**.
+규칙 하나를 남긴다 — **"고쳤다"는 기록은 어디에 고쳤는지까지 확인하기 전에는 사실이 아니다.**
+아래는 C71 기록이다.)
+
+마지막 갱신: 2026-08-23 (C71 — **규칙이 적혀 있고, 그 규칙이 지키려던 대상에만 적용되지 않았다.**
+(1) `_RECENT_ON_SCREEN`의 주석이 목록을 자르는 이유를 이렇게 적는다 — *"ATTENTION 블록을
+화면 위로 밀어낼 수 있는 섹션은 아무도 다시 스크롤하지 않는 화면"*. 그 규칙이 ACTIVITY와
+COMPLETIONS에는 있고 **ATTENTION 자신에는 없었다.** `RISKS`는 role이 어긋난 **Event 하나당
+한 행**이고 그 행마다 메시지가 하나씩 붙는다.
+(2) **실측**: mismatch 1건→3줄, 10건→12줄, 60건→62줄. 선형이고 트리거가 평범하다 —
+Desktop 하나의 role 설정이 틀리면 그 Desktop의 **모든** Event가 mismatch가 된다
+(`validate_event()`는 두 필드를 각각만 검사한다). "사람이 지금 할 일"을 말하는 블록이
+**할 일이 가장 많을 때 가장 못 읽게** 되고, 1,000줄이 전부 id만 다른 같은 문단이다.
+(3) 종류별로 자르고 진짜 총계를 말한다. 숫자도 "총 N건" 방식도 바로 위 루프가 쓰던 것이라
+새 정책이 아니다. 패널 전체에 상한 하나를 두면 mismatch 홍수가 Blocker를 전부 밀어내므로
+**종류별**로 나눴다. 잘린 줄은 55개 문단을 대체하므로 원인을 가리킨다("한 source에 몰려
+있는지 먼저 확인하라").
+(4) **KPI 추적 가능성을 손으로 쓴 목록 셋이 지키고 있었다.** `Metric`은 "추적 불가능한
+숫자는 소문"이라고 선언하는데, 그 속성을 지키는 테스트 둘은 key를 손으로 나열해 **9개 중
+5개**만 덮고, 셋째는 예외 둘을 수용하려고 **METRICS 패널을 통째로 건너뛴다.** 그래서
+`decisions_approved`와 `desktop_role_mismatches`는 파일을 제대로 달고도 무게이트였다.
+(5) **간극을 mutation으로 입증했다** — `decisions_approved`의 evidence를 지우고 전체 회귀를
+돌리니 **3,565건 중 정확히 1건**만 실패했고 그것이 새 게이트였다. 전수 sweep + 이유를 적은
+roster로 바꿨고, 공허한 통과(0==0)를 막는 fixture 검사와 인용 파일 실재 검사를 함께 넣었다.
+(6) **C70이 남긴 항목을 닫았다** — `_daily_dates`의 나열 실패는 조용하지 않다. C70의 주입이
+`os.scandir`만 막아 **불가능한 상태**를 만든 것이었고, 실제로 읽을 수 없는 디렉터리는
+"HISTORY — 읽지 못했다"로 블록 단위 보고된다.
+Evidence: 신규 11건, mutation **8종 전부 DETECTS**(전부 컨트롤 검증됨). 전체 회귀
+**3585 passed, skip 0**.
+아래는 C70 기록이다.)
+
+마지막 갱신: 2026-08-22 (C70 — **보안 detector가 이 시스템이 실제로 도는 인터프리터에서 눈이 멀어 있었다.**
+"2 skipped"를 물었다. 스위트가 여러 Sprint 동안 그 숫자를 찍었는데 어떤 2건인지 아무도
+확인한 적이 없다.
+(1) 그 2건이 **junction 노출 탐지**였다. `_junctions_in_scope()`는 이 화면에서 유일하게
+대상이 *노출*인 detector이고(Local Master 밖 트리가 Company History인 척 push되는 경로,
+A-19/BUG-57), 기존 가드 둘은 그것을 못 본다. 그런데 `os.path.isjunction()`이 3.12+이고
+**이 프로젝트 런타임은 3.9.7**이라 `return (), 0`으로 빠졌다.
+(2) **실측**: `daily/` 밑에 실제 junction을 만들고 Company History가 아닌 트리를 노출시킨
+뒤 — `found=(), skipped=0`, 화면은 **"junction 노출 : 0건 발견"**. caveat조차 없다. C68이
+`skipped`를 붙일 때 "없는 디렉터리 / 없는 Local Master / **없는 인터프리터 기능**"을
+한데 묶어 0으로 뒀는데, 앞의 둘은 "볼 것이 없다"라 옳고 세 번째는 **볼 것이 있는데
+볼 수가 없는 것**이다.
+(3) **"물어볼 방법이 없다"는 주석이 사실이 아니었다.** `st_reparse_tag`(3.8+)와
+`stat.IO_REPARSE_TAG_MOUNT_POINT`가 CPython 3.12의 `isjunction()` 구현 그대로다.
+**이 저장소는 이미 알고 있었다** — `test_runner_failure_paths._is_junction()`이 그 폴백을
+쓴다. 테스트는 알고 운영 detector만 몰랐다. 단, **bit가 아니라 tag로** 판정해야 한다
+(비트는 symlink에도 서고, symlink를 junction이라 부르면 없는 노출을 영구 표시한다).
+(4) **테스트 셋이 실명을 고정하고 있었다.** 둘은 skip이고 셋째
+`test_it_reports_nothing_when_the_platform_cannot_answer`는 3.9에서 `found == ()`를
+**적극적으로 주장**했다. 서로를 근거로 가리키는 세 테스트가 하나의 실명을 감쌌다.
+뒤집었고 **스위트 skip이 2 → 0**이 됐다.
+(5) **그 실명의 알리바이는 D절 헤더였다** — "이 머신, Python 3.13, Windows 11"인데 실제는
+3.9.7/Windows 10. 3.13이면 detector가 실제로 동작하므로, 기록을 믿은 독자는 살아 있다고
+결론짓는다. **세 번째 재발**이라(C17이 인스턴스만 고쳤고, 이후 게이트는 *구문* 면만 덮었다)
+이번엔 기계가 읽는 `RUNTIME-DECLARATION` 마커와 게이트로 닫았다. 과거 측정 숫자는
+재작성하지 않았다 — 잰 적 없는 수를 만드는 편이 틀린 헤더보다 나쁘다.
+(6) **자기 실수, 그리고 이 프로젝트의 주제 그대로**: 첫 mutation 실행이 네 변이 모두
+"DETECTS"를 냈는데 존재하지 않는 클래스명을 찍어 pytest가 **수집 오류**로 끝난 것이었다.
+하니스 자체가 공허하게 통과했다. **변이 없는 컨트롤을 먼저 돌리도록** 고치자 M4가
+MISSES로 바뀌었다(같은 줄이 파일에 3번 나와 다른 함수를 건드리고 있었다).
+Evidence: `JunctionInBackupScopeTests` 7건(신규 3) + `TheRecordedRuntimeIsTheRunningOneTests`
+3건, mutation **8종 전부 DETECTS**(컨트롤 검증됨), 동치 변이 1종 기록. 전체 회귀
+**3559 passed, skip 0**.
+아래는 C69 기록이다.)
+
+마지막 갱신: 2026-08-22 (C69 — **시스템이 존재하기 이전의 달에 대해 공식 Monthly를 썼다.**
+COO 질문을 하나 더 시험대에 올렸다 — "데이터가 없다는 것과 확인되지 않았다는 것을
+구분하는가." 이번엔 세 번째 경우가 나왔다: **애초에 덮을 대상이 없는 것**을 "완전하다"로
+읽었다.
+(1) `DailyCoverage.is_complete`는 `not missing_dates`다. `history_start_date`보다 완전히
+앞선 달은 **expected가 0일**이라 missing도 0일이고, 따라서 **공허하게 COMPLETE**다.
+(2) **실측**: pointer `2026-01` + start `2026-06-01`에서 `pending_months`가 2026-02…07을
+열거하고 `consolidate_month(2026,3)`이 **MONTHLY_GENERATED**로 `2026-03.md`를 썼다 —
+"No material company-level changes were recorded during this month" / "Daily Coverage:
+COMPLETE (0 days expected)". Company History가 덮지 않는 달에 대한 주장이고, **진짜로
+조용했던 달과 구별되지 않는다.**
+(3) **규칙은 이미 있었다. 두 분기 중 하나에만.** docs/09 §86이 이것을 금지하고,
+`run_once()`의 dirty 루프가 집행하며, 그 주석이 "`pending_months()` applies this to the
+catch-up"이라고 적고 있다 — **그것이 두 분기 중 하나에만 참이었다.** C58/C61이 계속
+찾아낸 모양: 고친 쪽의 주석이 형제도 안전하다고 틀리게 주장한다.
+(4) 수정 두 곳 — `pending_months()` clamp + `consolidate_month()` 직접 거부(공개 API다).
+**dirty 루프와 반대로 clamp를 골랐고 그게 이 항목의 핵심 판단이다**: catch-up은 PENDING에서
+`break`하므로, 보고했다면 거짓 문서 하나를 **영원히 전진하지 않는 파이프라인**과 맞바꿨다.
+(5) **내가 틀린 것도 둘 기록한다.** `is_incomplete_write()`의 writer 쪽이 무게이트라고
+판단해 게이트를 새로 썼는데, mutation을 돌려보니 `IncompleteWriteInvariantTests`가 이미
+잡고 있었다(grep으로 메서드 하나를 놓쳤다) — **새 클래스는 지웠다.** "Gap 3"(per-run 행이
+all-time이 되는 것)도 무게이트로 보였으나 `test_each_runs_row_counts_only_its_own_events`가
+이름이 아니라 성질로 걸어 두고 있었다. 방법 하나: **게이트가 없다고 결론 내리기 전에
+mutation을 먼저 돌려라.**
+(6) **A-24 신규(SKIP)** — `Z`로 끝나는 timestamp가 3.9에서는 REJECTED, 3.11+에서는
+ACCEPTED다. 규칙은 버전 독립인데 `fromisoformat`이 아니다. **한 곳만 고치면 더 나빠진다**
+(40곳 중 검증만 고치면 보이는 REJECTED가 조용한 `unreadable`이 된다) — 횡단 변경 + Spec 판단.
+Evidence: `NoMonthIsInventedFromBeforeTheSystemExistedTests` 10건, **mutation 7종 전부 DETECTS**
+(과잉교정 2종 포함). 전체 회귀 3545 passed.
+아래는 C68 기록이다.)
+
+마지막 갱신: 2026-08-22 (C68 — **읽지 못한 Company History가 "빈팀 없음"으로 보고됐다.**
+COO 질문 하나를 그대로 시험대에 올렸다 — "부분 데이터를 완전하다고 표시하지 않는가."
+(1) `_company_history_older_than_the_evidence()`가 **서로 다른 세 상황에 전부 `None`**을
+돌려줬다 — 확인했고 빈팀 없음 / 디렉터리를 나열할 수 없음 / 파일을 열 수 없음. 그중
+하나만 답이다.
+(2) **같은 트리에서 읽기만 실패시켜 실측**: 읽힐 때 gap 2026-08-01 / complete False /
+화면에 경고, 안 읽힐 때 gap None / **complete True** / 화면에 아무것도. 이 모델이 할 수 있는
+**가장 강한 거짓 주장**이고, 하필 그 qualifier가 존재하는 상황(복원된 머신)에서 나온다.
+(3) C56이 `history_checked`를 만든 이유와 **같은 변환**이 그 필드의 **입력**에 한 겹
+안쪽으로 남아 있었다. `(gap, checked)` 쌍으로 바꾸고, **없는 디렉터리는 checked=True**로
+가른다(`read_events()`가 같은 자리에서 하는 구분).
+(4) **화면에 한 줄을 더했다.** `complete`가 False로 바뀌는 것만으로는 터미널이 한 글자도
+달라지지 않는다 — 건강한 화면과 byte 단위로 같았다.
+(5) **그 결함이 있던 파일을 내 C66 게이트가 보지 않는다** — roster 게이트는 `SRC`만
+훑고 `ops_status.py`는 루트에 있다. 세었다: **조용한 `except OSError: continue` 10곳, 전부
+`ops_status.py`.** C68이 고친 것은 그중 하나다. 나머지 아홉을 한 자리씩 분류했고,
+그중 **셋(538 백업 누락 / 853 junction 노출 / 1806 Monthly 지연)은 전부 detector이며 다른
+reader가 없다** — detector가 조용해지는 쌄이다.
+(6) **그 셋을 같은 Sprint에서 고쳤다** — 셋 다 `(result, skipped)`를 돌려주고 호출자가
+그 수를 화면에 찍는다. 그리고 고치기 전에 재본 덕분에 **결함 하나를 지우기도 했다** —
+`_history_newer_than_the_last_backup()`의 무방비 `is_file()`은 `_block()`이 잡아
+"HISTORY 블록을 읽지 못했다"를 시끄럽게 찍고 있었다.
+아래는 C67 기록이다.)
+
+마지막 갱신: 2026-08-22 (C67 — **어휘 표는 둘이 아니라 여섯이었다.**
+C66이 복제된 *상수*를 게이트하고 복제된 *함수*를 다음으로 넘겼다. 거기서 이어갔다.
+(1) **내 지난 Sprint 게이트가 이름으로 묶고 있었다** — 같은 값이 다른 이름으로 복제된
+경우가 보이지 않는다. 값으로 다시 세어 세 쌍을 찾았고, 둘은 이미 처리되어 있었다.
+(2) 세 번째가 결함이다 — **Role 어휘에는 커버리지 게이트가 있고 Category 어휘에는 없다.**
+Category 표는 둘이 아니라 **여섯**이다. 원천에 다섯 번째 category를 넣고 스위트를
+돌렸더니 Daily 쪽은 항의했고 **Monthly 쪽은 163 passed** — 아무것도 알아채지 못한다.
+(3) 비용을 실제 렌더러로 재었다 — **item 2개 중 1개가 Monthly 문서에서 조용히 사라진다.**
+Daily History에는 도달하고 Monthly History에는 도달하지 않는다.
+(4) 반쪽만 지켜졌던 이유도 찾았다 — 기존 테스트가 Daily의 제목 표와 Monthly의 **reader**를
+엮어 둔다. 아무것도 Monthly의 **renderer**를 가리키지 않았고, 그쪽이 item이 적힐지를
+결정하는 절반이다.
+(5) 수정 — 여섯 표 전부의 원천 커버리지, 그리고 mutation이 그것만으로 부족함을 보여
+줌으로 **Monthly ⊇ Daily** 관계를 더했다. 비대칭성도 재서 고정했다(Daily에서만 줄이는 것은
+침묵해야 하며 침묵한다).
+(6) 결함이 아닌 것 둘과 **낙은 주장 하나**를 기록했다 — `transport/onedrive.py`가
+"a test asserts they agree"라고 적어 둔 것이 거짓이고, `RoleDisplayTableCoverageTests`가 그
+반대를 명시적으로 결정해 두었다. **저장소 안의 두 문서가 모순**했고, C38이 고친 것과
+같은 모양의 주장이 바로 그 복제를 정당화하는 자리에 남아 있었다.
+아래는 C66 기록이다.)
+
+마지막 갱신: 2026-08-22 (C66 — **게이트를 감사하는 규칙에도 적용 범위가 있었다.**
+C64는 stash를, C65는 F-6의 표를 보지 않았다. 두 번 같은 모양이 나왔으므로 이번엔
+그것을 **방법**으로 썼다 — 규칙을 감사하기 전에 **그 규칙이 적용되는 자리를 전부 세는 것**부터.
+(1) 첫 대상은 "빈 스캔은 공허하게 통과한다". `TheScansThisFileTrustsAreNotEmptyTests`가 그
+규칙을 이미 적어 두고 docstring이 스스로 범위를 말한다 — **"Every guard below"**, 즉 한 파일.
+(2) **측정했다.** `rglob`/`glob`이 빈 결과를 돌려주게 만든 뒤 게이트를 다시 돌려
+**트리를 읽고도 빈 트리에서 통과하는 테스트 11개 / 발견 지점 9곳**을 찾았다. 11개가
+전부 **부정문**이다 — 빈 집합에 대한 부정문은 참이다. 그중엔 "monthly는 notion에
+닿지 않는다", "프로덕션은 Dashboard DB를 만들지 않는다", 그리고 **C65가 지난 Sprint에
+만든 roster 게이트**가 있다.
+(3) 발견 지점 9곳에 **인구 하한**을 붙였다(새 관용구가 아니라
+`test_at_least_one_module_drives_the_runner`가 이미 쓰는 것이다). 같은 실험을 다시 돌려
+**12 → 3**으로 줄은 것을 확인했고, 하한 하나를 지우면 그 클래스가 즉시 VACUOUS로 돌아오는
+것까지 확인했다(인과).
+(4) 두 번째 대상: `BackupLogIsNeverPersistedTests`가 "Backup Log는 어디에도 쓰이지 않는다"를
+**정확한 문자열 둘**로 지키고 있었다. 경로 철자 8가지를 쏴더니 **5가지가 그대로
+통과**했고, 그중 첫 줄이 `LOGS_DIR / "backup"` — **이 저장소가 실제로 쓰는 유일한 철자**다.
+(5) 파서로 바꿈. 그리고 **내 detector가 같은 함정에 빠졌다** — 호출 이름을 물어
+`Path as _P` 별칭을 놓쳐다(C61의 결론이 C58을 고치려는 코드 안에서 재발). 이름을 물지
+않도록 바꾸고 그 넓힘의 비용을 측정했다 — 80개 파일에서 오탐 0건. Mutation 7종 중 6종
+DETECTS(수정 전 2종), 남은 1종은 **테스트로 고정한 잔여 항목**이다.
+(6) 같은 방법을 세 번째로 Monthly 경계 게이트에 던졌다 — 경로 철자 9가지 중 4가지가
+통과했고, 네 개 전부 `events/incoming`을 나누어 쓴 형태다. 토큰이 아니라 **경로 구성요소**로
+보도록 바꿨다 — 경계를 설명하는 docstring이 위반이 되지 않게(산문 정밀도도 테스트로 고정).
+(7) 네 번째로 **C62가 적어 둔 숫자**를 세었다 — "the three other `except OSError: continue`"가
+실제로는 **둘**이었다(둘 다 backup scope walk, 정당화는 여전히 유효). 산문을 **명부 게이트**로
+바꿨다 — 산문은 네 번째가 생기는 것을 알아채지 못한다. Mutation 중 하나는 **C62 회귀**다.
+(8) 같은 방법을 적용했으나 **결함이 없던 것 둘**도 적어 둔다 — `TestIsolationGuardTests`의
+발견(탐지 12 = 실제 12, 누락 0)과 Lock의 stale takeover(읽기 실패를 stale로 보지만
+쓰기 직후 확인 단계가 그 창을 닫는다).
+(9) 다섯 번째로 **복제된 계약의 명단**을 세었다 — 이름으로 묶고 보니 5개이고
+그중 하나가 **불일치**다. `LATE_SECTION_TITLE` — `daily/late_events`가 쓰는 `"## Late Events"`와
+`monthly/parser`가 읽는 `"Late Events"`. 오늘은 대응하고, **확인하는 것은 없었다.**
+실측 — Daily 제목만 이름을 바꾸면 Late Event가 Monthly 통합에서 **1 → 0**으로 조용히 사라진다.
+`_LABEL_BULLET` P0와 같은 계열이다. 명단을 AST로 발견하고, 일치해야 할 것은 일치를,
+아니어야 할 한 쌍은 **관계**를 확인하는 게이트를 넣었다(mutation 6종 전부 DETECTS).
+아래는 C65 기록이다.)
+
+마지막 갱신: 2026-08-22 (C65 — **F-6의 sweep이 절반만 돌았다.**
+C64 §6이 `notion/transport.py`의 `json.loads()` 하나를 고쳤고, 당연한 다음 질문을
+실제로 물었다 — **나머지 21곳은 어떤가.**
+(1) 트리 전체의 `json.load(s)` **22곳을 AST로 전수 조사**했다. 11곳은 `RecursionError`를
+덮는다(C22/F-6 + C64). 나머지 11곳 중 **9곳이 state loader**였고, 아홉 곳이 전부 똑같은 세 줄이다 —
+`except (OSError, ValueError) as exc: raise <Module>StateError(...)`. 그 변환이 각 함수가
+"읽을 수 없는 state 파일"에 대해 약속하는 전부인데, 깊게 중첩된 파일 하나에만 건너뛰었다.
+(2) **F-6의 표에 state loader가 없다.** 그 sweep은 *신뢰할 수 없는 파이프라인 파일을 읽는 곳*을
+봤고, 같은 모양을 가진 state loader는 보지 않았다. 판별 기준은 그대로 적용된다 —
+9곳 전부 자기 문서가 답을 가지고 있다.
+(3) **주입 12개 진입점 전부 divergence** — 쓰레기 파일은 typed error나 안전한 반환,
+깊은 파일은 `RecursionError`. 그중 `agent.status.read_status()`는 docstring이 **"Never raises
+for a damaged state file"**라고 적어 둔 함수다.
+(4) **운영자가 실제로 보는 차이를 반대로도 측정했다.** 수정을 되돌리고 `ops_status.py`를
+state 파일 10종에 대해 돌렸더니 **4개가 traceback으로 죽었다**(monthly / backup /
+retry_queue / dashboard_pending). 같은 자리의 쓰레기 파일은 10개 전부 정상 렌더된다.
+나머지 6개는 ops_status가 더 밖에서 감싸고 있어 살아남았다 — loader 계약은 9곳 전부
+깨져 있었고, 운영자에게 닿은 것은 4건이다.
+(5) Runner는 **어찌 됐든 중단된다** — BUG-3으로 기록된 의도된 동작이고, C34가 `begin()`으로
+그 중단을 단계에 귀속시켜 둔다. 이 수정이 바꾸는 것은 Runner가 아니라 **손상됐기 때문에
+여는 화면**이다.
+(6) 테스트는 9개가 아니라 **명부 하나에 대한 게이트**로 썼다. 모듈별 테스트는 **열 번째
+loader**가 생겼을 때 실패하지 못한다 — mutation으로 실제로 확인했고, roster 게이트가 잡는다.
+(7) 바뀐 코드에 branch coverage를 걸었다 — `oplog`/`local_output`/`onedrive`가 100%이고,
+**도달 불가능한 한 줄**이 나왔다(`_is_present()`의 가드 — 같은 튜플의 `_row_key_of()`가
+한 걸음 먼저 거부한다). 도달 불가능한 것 자체는 괜찮고, 그 줄을 **한 표현 안 두 호출의
+순서**가 받치고 있는 것이 문제라, 규칙을 사는 자리에서 고정했다.
+(8) `validate_rows()`가 "**every** reason Notion would refuse these rows"라고 적어 두고
+**날짜를 보지 않았다**. 살아 있는 결함은 아니고(모든 DATE 값이 검증된 Event
+timestamp라는 전제를 재어서 확인했다) **오래된 주장**이며, 검사가 쓰일 자리는 아직
+없는 DATE 컬럼이다. 판별은 Event timestamp를 검증하는 것과 **같은 parser**로 한다.
+아래는 C64 기록이다.)
+
+마지막 갱신: 2026-08-21 (C64 — **13 Sprint 동안 stash에 남아 있던 수정.**
+baseline을 다시 재는 것에서 시작했고 HEAD의 스위트가 빨갰다 — `3438 passed, 1 failed`.
+(1) **C31의 측정이 이 배포 머신에서 틀렸다.** `NUL.json`은 평범한 파일이 아니라 NUL
+**장치**다(Win32는 첫 마침표 앞 구간으로 판정하므로 확장자는 애초에 막은 적이 없다).
+빈 디렉터리에서 `exists()`가 True고, 쓰면 성공하면서 바이트가 사라지고, `os.replace()`는
+WinError 183과 함께 `.tmp-` 잔여물을 남긴다. 어떤 이름이 장치인지가 **머신마다 다르므로**
+(여기선 COM1은 장치, PRN·LPT1은 아니다) 관측한 집합이 아니라 문서화된 집합 전체를 거부한다.
+(2) **수정을 새로 쓰지 않았다.** 완성된 수정이 `stash@{0}`에 있었고 C50 §3이 "승인이 아니라
+중복"이라며 미뤄 둔 것이었다. stash의 본문을 stash의 위치에 **byte 단위로 동일하게** 넣어,
+언젠가의 병합이 충돌 없이 끝나게 했다(C50 §7이 이미 같은 판단을 했다).
+(3) **`sync_control_tower()`가 "Never raises"라고 적어 두고 raise했다** — `list_pages()`가
+돌려준 응답 본문을 검사 없이 걸었고, 주입 12종 중 **9종이 `AttributeError`로 빠져나갔다.**
+CEO Decision ④가 깨지는 자리다. 읽지 못한 목록은 잘린 목록과 똑같이 취급한다.
+(4) **살아 있는 행이 Notion의 제목 표기 때문에 은퇴하고 있었다.** `_retire_absent_rows()`가
+`text.content`를 읽어, mention/equation으로 적힌 Row Key를 못 읽는다 — 필터는 plain text를
+보므로 행은 **갱신된 뒤 같은 sync에서 은퇴한다.** `plain_text`를 읽는 것은 이 저장소가 이미
+두 번 내린 결론이고(`_extract_rich_text`, `_page_title`) 이곳이 세 번째 reader였다.
+(5) **`processed/`의 `.tmp-` 파일은 잔여물이 아니라 Event다** — 거기엔 아무도 staging하지
+않으므로, 그 이름은 Collector가 이미 검증한 파일이 `incoming/`에서 물려온 것이다. 건너뛰기 때문에
+한 화면의 두 블록이 한 디렉터리를 두고 **Control Tower 2 / COMPANY 3 / 정합성 3**으로 갈라져
+있었고, `unreadable`이 비어 있어 조용했다. 그 동작을 이름으로 단 테스트는 **그것을 볼 수 없었다** —
+같은 `event_id`를 복사한 fixture라 1은 중복 fold가 만들고 있었다(양쪽으로 실측, 둘 다 1).
+(6) 그 수정의 docstring이 게이트 둘을 오발시켰다(`"mkstemp" in source`). 파일 선택을 AST로
+바꿨다 — C61의 `Import` 결론을 `Call`에 적용한 것이고, 한 게이트의 주석은 자기가 갖지 못한
+정밀도를 주장하고 있었다.
+(7) `RealNotionTransport._request()`가 `json.loads()`의 **RecursionError**를 변환하지 않았다.
+트리에서 머신 밖 바이트를 읽는 유일한 `json.loads()`이고, `health_check()`와 `bootstrap`은
+`NotionAPIError`만 잡는다. F-6의 판별 기준("함수 자신의 문서가 답을 갖고 있는가")에 그대로 걸린다.
+(8) **이중이 Notion보다 만족시키기 쉬웠다** — `InMemoryNotionTransport`의 `equals` 필터가
+`items[0]`만 읽어, Notion이 행으로 답하는 질의에 "행 없음"이라고 답했다. 그래서 (4)의 조용한
+절반은 이 double로 재현할 수 없었다(손으로 stand-in을 만들어야 했다). 간극이 대칭이 아닌 것이
+요점이다.
+(9) **같은 stash의 나머지를 전수 대조했더니 하나가 더 살아 있었다** — `oplog.one_line()`이
+Unicode 방향 override 9종을 통과시켜, `REJECTED EVT-1<RLO>DETPECCA<LRO>`가 화면에
+`REJECTED EVT-1ACCEPTED`로 읽힌다(CVE-2021-42574의 모양, 대상은 컴파일러가 아니라 운영자의
+로그다). 나머지 6건은 C51이 포팅했거나 이미 main에 있다.
+(10) 요청이 지목한 화살표를 실제 증거로 끝까지 흘려 검증했다 — 9 파일 → Event 8 → panel 10 →
+payload 22,346 B → 5 database 24행, validation 0, 재실행 시 created 0/updated 24.
+`CT_*` 5종이 배선돼 있지 않은 것은 결함이 아니라 docs/14 §1 Spec 결정이다(SKIP).
+아래는 C63 기록이다.)
+
 마지막 갱신: 2026-08-21 (C63 — **아무것도 찾지 못한 감사도 결과다.**
 C62의 결함을 고친 뒤 같은 눈으로 여섯 영역을 더 훑었고, **신규 결함 0건**이다. 찾지 못했다는
 것을 근거와 함께 남긴다 — 다음 Sprint가 같은 곳을 다시 파지 않도록.
@@ -1601,8 +1913,14 @@ docstring이 담고 있다.
   것은 새 정책을 만들지 않고 우선순위를 바꾸지도 않는다"**(우선순위는 README
   §13이 정하며 손대지 않았다).
 - README 포함 **13개** 문서가 아직 `# D:\DOJOONPASS_COMPANY_OPS\...` 헤더를
-  달고 있으나 저장소는 `C:\Users\user\Desktop\...`에 있다 — **여전히 유효**
-  (C29 실측 13건). 이쪽은 명세 문서 본문 수정이므로 **SKIP.**
+  달고 있다 — **여전히 유효.** 이쪽은 명세 문서 본문 수정이므로 **SKIP.**
+
+  **C73 재측정 — 수는 맞고 정정 대상이 틀렸다.** 13건은 지금도 정확하다(`D:` 문자열을 가진 `.md`는 14개인데 그중 하나는 이 BACKLOG가 그 경로를 *인용*한 것이다).
+  그러나 이 기록이 적어 둔 올바른 경로 `C:\Users\user\Desktop\...`는 **이 머신의 것이 아니다** — 실제 저장소는
+  `C:\Users\Administrator\Desktop\DOJOONPASS_COMPANY_OPS`에 있다. 승인이 나서 이 항목을 실행하는 사람이
+  이 줄을 그대로 믿으면 **틀린 경로로 13개 문서를 고치게 된다.** 헤더 수정 자체는 여전히 SKIP이고,
+  고친 것은 기록 쪽이다. C72가 남긴 규칙의 같은 얼굴 — 기록은 어느 트리/어느 머신의 것인지까지
+  확인하기 전에는 사실이 아니다.
 
 즉 A-10은 이제 **한 항목짜리**다. 현재 상태는
 `tests/test_repository_hygiene.py::DocumentationGapCharacterizationTests`가
@@ -1973,6 +2291,46 @@ Daily 쪽 형제와 **같은 하나의 결정**이므로 함께 정하는 편이
 
 ---
 
+---
+
+### A-24. `Z`로 끝나는 timestamp가 인터프리터 버전에 따라 갈린다 (C69 신규, **Spec 판단 + 횡단 변경**)
+
+**측정된 사실.** `events.schema._timestamp_error()`가 세우는 규칙은 "유효한
+ISO-8601이고 timezone offset을 포함한다"이다. `Z`는 둘 다 만족한다. 그러나 집행자인
+`datetime.fromisoformat()`은 Python 3.11 미만에서 `Z`를 파싱하지 못한다. 이 머신
+(3.9.7) 실측:
+
+    2026-08-15T09:00:00+09:00   ->  파싱됨
+    2026-08-15T09:00:00Z        ->  ValueError
+    validate_event(...)         ->  "timestamp is not valid ISO-8601: '…Z'"
+
+3.11+에서는 같은 Event가 통과한다. **규칙은 버전 독립인데 집행은 아니다**, 그리고
+오류 메시지는 사실이 아니다(그 문자열은 유효한 ISO-8601이다).
+
+**오늘 도달하지 않는다.** 이 시스템의 Agent는 `+09:00`만 만든다(`.astimezone()`).
+손으로 쓴/복원된/외부 producer의 Event만 `Z`를 만든다.
+
+**왜 SKIP인가 — 두 가지.**
+
+1. **한 곳만 고치면 더 나빠진다.** `fromisoformat`은 `src/`와 루트 스크립트에서
+   **40곳** 불린다. 검증만 `Z`를 받으면 그 Event는 ACCEPTED가 된 뒤 rollup의
+   `_event_date()`/`event_instant_key()`, `notion/sync`의 Late Event 비교,
+   `daily/generator`, `ops_status` 화면에서 날짜를 못 읽는다 — **보이는 REJECTED가
+   조용한 `unreadable`로 바뀐다.** C62가 계속 없애 온 방향이다. 올바른 수정은
+   40곳이 공유하는 단일 파서를 세우는 횡단 변경이다.
+2. **"무엇을 유효한 timestamp로 볼 것인가"는 Spec 판단이다.** docs/02 §7과 그
+   예시는 전부 offset 표기다. `Z`를 받아들일지, 아니면 명시적으로 금지하고 오류
+   메시지를 사실에 맞게 고칠지는 정책 결정이다. 둘 다 정당하고, 고르는 것은
+   이 Sprint의 권한 밖이다.
+
+**결정에 필요한 것:** offset 표기만 허용(현재 3.9 동작을 명문화)인가, ISO-8601
+전체 허용(현재 3.11+ 동작)인가. 어느 쪽이든 40곳이 한 파서를 공유해야 한다.
+
+**부수 위험(방향이 바뀐다).** Runner의 Python을 3.9 → 3.11+로 올리면 전에
+REJECTED이던 Event가 통과하기 시작한다. 반대로 내리면 `processed/`에 이미 쌓인
+`Z` Event가 rollup에서 `unreadable`로 떨어진다. 배포 전 인터프리터 버전을
+고정하거나, 위 파서를 먼저 세워야 한다.
+
 ## B. 승인 없이 가능한 다음 작업
 
 순수 코드로 진행할 수 있는 항목은 이번 Sprint에서 사실상 소진했다.
@@ -2339,6 +2697,2070 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C75. 스키마 셋 중 기계를 건너는 하나만 게이트가 없었다
+
+전용 Schema / Contract Audit을 처음 수행했다. 이 프로젝트에는 내부 스키마 버전이
+셋 있다.
+
+    runsummary.SCHEMA_VERSION             "1.1"   기록된 형태 있음, 실제 payload와 대조됨
+    controltower.DASHBOARD_SCHEMA_VERSION "1.2"   기록된 형태 있음, 실제 payload와 대조됨
+    events.SUPPORTED_SCHEMA_VERSION       "1.0"   **테스트에 단 한 번도 등장하지 않음**
+
+### 1. 무게이트였던 것이 하필 유일하게 기계를 건너는 스키마다 (신규, 게이트)
+
+실측: `SUPPORTED_SCHEMA_VERSION`은 `tests/` 전체에서 0회 등장하고, `1.0` Event가
+어떤 필드 집합을 갖는지 말하는 단정도 없다. 반면 `notion/retry_queue`와
+`notion/dashboard_pending` — **이 머신을 벗어나지 않는** payload 둘 — 은 각각
+`sorted(...to_dict())`로 키 집합을 고정하고 있다.
+
+두 형제는 이미 대가를 치렀다. `test_runsummary.py`가 그 이력을 적어 둔다:
+**C31이 `failure.reason`을 payload에 더하는 동안 `SCHEMA_VERSION`은 "1.0"에
+머물러 있었다.** Event 쪽은 같은 사고의 비용이 더 크다 — Event는 DESKTOP_1/2/3의
+Agent가 쓰고 DESKTOP_4의 Runner가 읽으므로 **producer와 consumer가 서로 다른
+시점에 업그레이드되는 다른 기계**다.
+
+### 2. 버전 비교는 정확 일치다 — 그래서 bump는 전면 절체다 (측정)
+
+    schema_version='1.0'  -> ACCEPTED
+    schema_version='1.1'  -> unsupported        <- MINOR처럼 보여도 거부된다
+    '1' / '2.0' / '0.9' / '' -> unsupported
+
+docs/02 §5는 필드를 정의하지만 **호환·업그레이드 정책은 어디에도 없다.** 규칙
+자체는 방어적이고 정당하다. 문제는 그 운영적 결과가 기록도 검증도 되지 않았다는
+것이다.
+
+**그래서 결과를 실제 Collector로 쟀다** — 한 Desktop이 Runner보다 먼저 1.1로 올라간
+상황:
+
+    accepted=1 rejected=1 failed=0
+    incoming/   (비었다)
+    rejected/   newer.json
+    collector.log  REJECTED newer.json: unsupported schema_version: '1.1'
+
+**안전한 쪽이다.** REJECTED라 `incoming/`이 드레인되고 실행이 계속되며 파일이
+보이는 곳에 남아 Runner 업그레이드 후 재수집할 수 있다. FAILED였다면 매 실행
+동일하게 실패하며 끼었을 것이다 — C72가 다른 원인으로 측정한 그 모양이다.
+**어느 쪽인지 말하는 것이 아무 데도 없었다.**
+
+### 3. 게이트
+
+형제 둘과 같은 모양으로 맞췄다 — 버전별 기록된 키 집합, 그리고 **현재 버전의
+기록이 코드가 실제로 내는 것과 같은지** 대조. 여기에 운영 절반을 더했다:
+버전 불일치가 REJECTED로 가고 `rejected/`로 이동하며 로그가 원인을 대는 것을
+**실제 Collector로** 고정한다.
+
+**Evidence:** `test_events.py::TheEventSchemaVersionIsAContractAcrossDesktopsTests`
+6건. Mutation **4종 전부 DETECTS**(컨트롤 검증, 복원은 byte·EOL까지 확인):
+
+    M1 payload에 필드 추가, 버전 그대로        1 failed
+    M2 payload에서 필드 제거, 버전 그대로      2 failed
+    M3 정확 일치 비교 제거                     2 failed
+    M4 **버전만 올리고 형태를 기록하지 않음**   5 failed
+
+M4가 지시서가 지목한 *"schema version만 올리고 실제 계약을 검증하지 않는 문제"*를
+정확히 막는다 — 기록이 버전과 함께 움직이지 않으면 6건 중 5건이 깨진다.
+
+### 4. 남긴 것 (SKIP)
+
+docs/02에 버전 호환·업그레이드 정책을 적는 것은 **명세 문서 본문 수정**이라
+A-10과 같은 이유로 **SKIP.** 다만 그 결과가 무엇인지는 이제 테스트가 말한다 —
+문서가 비어 있어도 동작은 고정돼 있다.
+
+### 5. Data Integrity — 경로는 하나씩 다 덮여 있고, "전부 어딘가로 간다"는 없었다 (신규, 게이트)
+
+전용 Data Integrity Audit. Collector에는 결과가 넷이고 각각에 테스트가 있다 —
+정상→`processed/`, malformed→`rejected/`, 재수집→DUPLICATE, 목적지 충돌→FAILED.
+**각각이 "이 종류는 어디로 가는가"를 말한다.**
+
+어느 것도 **"모든 파일이 어딘가로 간다"**를 말하지 않는다.
+
+**실측으로 증명했다.** `for path in sorted(incoming_dir.glob("*.json")):` 바로 아래에
+한 파일을 건너뛰는 `continue`를 넣었다 — 옮기지도, 세지도, 로그에 남기지도 않는다:
+
+    기존 collector 테스트 17건   *** 전부 통과 ***
+    새 보존 게이트               1 failed
+
+정상 파일은 여전히 `processed/`에 가고 malformed는 여전히 `rejected/`에 가므로,
+건너뛴 파일은 **그냥 아무의 단정에도 없다.**
+
+**게이트는 사례 대신 불변식을 말한다:**
+
+    entered  ==  accepted + duplicate + rejected + failed
+    entered  ==  processed/ + rejected/ + incoming/에 남은 것
+
+둘 다 필요하다. 첫째는 옮겨졌으나 세지지 않은 파일을, 둘째는 옮겨지지 않고
+**지워진** 파일을 잡는다.
+
+`incoming/`을 비우라고 요구하지 않는다 — 목적지 충돌은 FAILED이고 **일부러 파일을
+남긴다**(다음 실행이 재시도하는 방식). 그래서 둘째 줄은 0을 주장하지 않고 남은 수를
+센다. DUPLICATE가 `processed/`에 두 파일을 남기는 것도 유실이 아니라 보존이다.
+
+**Evidence:** `test_collector_runtime.py::EveryFileThatEntersIsAccountedForExactlyOnceTests`
+5건(불변식이 실제로 어긋날 수 있는지 보이는 자기검증 1건 포함). Mutation 3종:
+
+    M1 파일 하나를 조용히 건너뜀   새 게이트 DETECTS / 기존 17건 *** MISSES ***
+    M2 DUPLICATE를 세지 않음       둘 다 DETECTS
+    M3 거부 파일을 지움            둘 다 DETECTS
+
+**M1만이 이 게이트 전용**이고, 그것이 정확히 이 항목이 닫는 구멍이다.
+
+**하니스 기록 하나.** 첫 시도에서 M2가 "DETECTS"로 나왔는데 실은 **수집 오류**였다
+(들여쓰기가 깨진 변이). C70에서 겪은 거짓 검출과 같은 모양이라, 이후 모든 변이에
+`ast.parse()`를 먼저 걸어 **문법이 성립하지 않는 변이는 판정에서 제외**했다.
+복원은 byte 수와 CRLF까지 확인했다.
+
+---
+
+## C74. unreadable evidence를 원천에서 Notion까지 따라갔다 — 체인은 정직하다
+
+C73이 남긴 마지막 의심을 실측으로 닫았다: **"내부는 정직한데 화면/모델/Notion까지
+같은 의미로 가는가."** 여섯 상태를 각각 주입하고 각 계층의 값을 나란히 놓았다.
+
+### 1. A–F 주입 행렬 (측정, 결함 없음)
+
+| 주입 | rollup | model | Notion 행 | 화면 |
+|---|---|---|---|---|
+| **A** 정상 | value 2, unreadable 0 | complete **True** | Value 2, Coverage Complete **True** | 조용 |
+| **B** 읽은 뒤 파일 삭제 | (그 시점 읽기 기준) | complete True | Value 2, Complete True | — |
+| **B'** 같은 디렉터리 재독 | value 1, unreadable 0 | — | — | — |
+| **C** 읽을 수 없음 | value 1, **unreadable 1** | complete **False** | Value 1, Coverage Complete **False** | `집계 대상 : Event 2건 (읽지 못한 파일 1건 — 아래 숫자는 그만큼 적다)` + ATTENTION 2줄 |
+| **D** 다른 metric의 파일을 인용 | — | — | — | C71 §4 게이트가 잡는다(그 전에는 480 passed) |
+| **E** 인용 파일의 내용이 다름 | — | — | — | 같은 게이트(파일을 다시 읽어 술어로 판정) |
+| **F** 적대적/malformed 파일명 | value 3 | — | `[REDACTED].json`로 걸러짐 | — |
+
+**B가 결함이 아닌 이유를 적어 둔다.** 읽은 뒤 삭제해도 투영은 Value 2를 유지한다.
+`EvidenceRef`는 **"이 수가 어느 파일에서 나왔는가"라는 출처 기록**이지 살아 있는
+포인터가 아니다. 같은 디렉터리를 다시 읽으면 1이 나오고 그것도 옳다 — 그 시점에는
+파일이 정말 없다. 두 답이 서로 다른 질문에 대한 것이다.
+
+**C가 이 항목의 요지다.** 앞선 측정에서 A와 C가 둘 다 `Coverage Complete=False`로
+보여 불일치를 의심했는데, **fixture가 history를 확인하지 않은 상태였던 탓**이다.
+history를 확인·빈틈없음으로 두고 다시 재니 A는 True, C는 False로 갈린다.
+`Coverage.complete`가 `unreadable == 0`을 **명시적으로 포함**하고, 그 docstring이
+세 가지 미달 사유를 나란히 적어 둔다. 체인이 정직하다:
+
+    rollup.unreadable 1 -> model.coverage.unreadable 1 -> complete False
+                        -> Notion `Coverage Complete` False
+
+**F도 이미 막혀 있다.** `ref.path`는 운영 코드에서 **파일을 여는 데 쓰이지 않고**
+텍스트로만 흐르며, `dashboard.py:508`이 `redact(one_line(ref.path))`를 건다. 실측:
+secret 모양 파일명(`ntn_AAAA…json`)이 payload에 닿기 전에 `[REDACTED].json`이
+되고, traversal 모양 이름은 무해한 텍스트이며 `validate_rows`도 이의가 없다.
+
+### 2. 남는 한계 하나 (SKIP, A-16에 붙임)
+
+Notion 쪽에서 `Coverage Complete=False`는 **세 사유 하나의 깃발**이다 —
+unreadable / history 빈틈 / 미확인. `History Checked`가 셋째를 갈라 주므로 실제로
+구분되지 않는 것은 **앞의 둘**이다. 모델은 셋을 다 들고 있다.
+
+Notion 행에 `Unreadable` 속성을 더하면 닫히지만, **Notion Database에 속성을 더하는
+것은 docs/04 §53("Notion 데이터 과잉 방지")의 정책 결정**이고 CT_* 5종은 애초에
+미연결이다(A-16). **SKIP** — A-16을 실행할 때 함께 결정할 항목으로 적어 둔다.
+`Coverage.complete`의 docstring이 이미 반대 근거를 대고 있다는 점도 함께 남긴다:
+*"소비자의 다음 질문은 셋 다 같다 — 내가 보는 것이 전체인가?"*
+
+### 3. 이어서 수행한 Audit (측정, 결함 없음)
+
+**성능 — 이 런타임의 첫 실측.** `ops_status.main()`을 합성 `processed/`에 대해 끝까지
+렌더한 결과 200/1,000/3,000건에서 0.21 / 0.98 / 2.90초, 건당 0.97~1.05 ms로 **선형**
+(5배에 4.7배, 3배에 3.0배). 초선형 구간 없음. D절에 표로 남겼고, C70이 요구한
+"어느 인터프리터에서 쟀는지"의 첫 적용이다.
+
+**Release / Production Readiness — 배포 Runbook 대조.** docs/11이 이름을 대는 경로
+14개를 트리에 대고 확인했다. 13개 실재. 남은 하나 `TEST_HISTORY.md`는 **오탐** —
+§26이 "Local Test History 생성"으로 **운영자에게 만들라고 지시하는 파일명**이지
+저장소 파일 인용이 아니다. Runbook이 쓰라고 하는 설치 파라미터 중 스크립트가
+정의하지 않는 것도 0건이다.
+
+**Production Readiness — 운영 화면의 exit code, 실측 정정.** 실제 `runtime/`
+(비어 있음)에 대해 파이프 없이 직접 실행한 결과 **exit 3**이고, ATTENTION이 정확히
+한 항목을 댄다 — `3일 이상 아무것도 오지 않은 Desktop: DESKTOP_1..4 (꺼져 있거나,
+보고할 일이 없었거나, Agent가 멈췄다 — 현재 데이터로는 여기까지만 말할 수 있다)`.
+docstring의 계약(`3 = 사람이 할 일이 있다`)대로이고 유보까지 정직하다.
+
+**C70의 보고를 여기서 정정한다.** 그때 "exit 0"이라 적었는데 `python ops_status.py |
+head -40; echo $?` 형태로 재어 **`$?`가 `head`의 종료 코드**였다. 화면 내용에 대한
+그때의 관찰은 유효하지만 종료 코드는 틀렸다. C72가 남긴 규칙의 세 번째 얼굴 —
+**측정값은 무엇을 통해 쟀는지까지 확인하기 전에는 사실이 아니다.**
+
+
+---
+
+## C73. 술어를 빌려 쓴 게이트는 그 술어가 틀리면 함께 틀린다
+
+C71 §4의 evidence 게이트는 `_completes()`와 `_blocker_change()`를 **복사하지 않고
+재사용**한다. 드리프트를 못 하게 만드는 대신 독립성을 잃는다 — 술어가 틀리면
+게이트가 동의한다. 이번에는 그것이 가정이 아니라 **실측**이다.
+
+### 1. 순환을 증명했다 (신규, 측정)
+
+술어를 틀리게 만들고 두 게이트를 나란히 돌렸다:
+
+    M1  _completes가 'Completed Date' 대신 'Blocker'를 읽는다
+        새 게이트        DETECTS
+        빌려 쓰는 게이트  *** MISSES ***   (5 passed)
+
+    M2  CANCELLED도 Completed Date를 쓴다
+        새 게이트        DETECTS
+        빌려 쓰는 게이트  *** MISSES ***   (5 passed)
+
+M2가 특히 값이 나간다. 취소된 Project가 `projects_completed`에 잡히고 — COO가
+읽고 행동하는 숫자다 — evidence 게이트는 그 인용을 **정확하다고 확인해 준다.**
+틀린 숫자에 citation이 붙는 C71 §4의 모양이, 이번에는 게이트 자신을 통해서 생긴다.
+
+### 2. 이미 접지돼 있던 부분과 남아 있던 고리
+
+위험의 대부분은 한 층 아래에서 이미 덮여 있다.
+`test_spec_conformance.py::…EXPECTED_EXTRA`가
+`notion/properties._type_specific_properties()`를 docs/04 §21-28에 대해
+event_type별로 고정하고, **`EVENT_TYPES` 전수를 덮는지까지** 주장한다. 그래서 두
+술어가 읽는 표는 조용히 행이 늘거나 줄 수 없다.
+
+고정되지 않은 것은 그 표에서 술어로 가는 **두 줄**이었다 — 어느 키를 보는가.
+`_completes()`는 `"Completed Date" in _type_specific_properties(event)`이고,
+`"Blocker"`로 바꾸면 BLOCKED가 전부 완료가 된다.
+
+### 3. 수정
+
+`EVENT_TYPES`를 **독립적으로 열거해** 각 타입의 답을 docs/04에서 적는다 — 술어에게
+묻지 않는다.
+
+    COMPLETES          {"COMPLETED"}                              §25만 Completed Date를 쓴다
+    SETS_A_BLOCKER     {"BLOCKED"}                                §22
+    CLEARS_A_BLOCKER   {"RESUMED","COMPLETED","ISSUE_RESOLVED"}   §23·§25·§27
+
+`test_this_guard_covers_every_event_type`이 이 분류의 합집합이 `EVENT_TYPES`와
+같은지 주장하므로, 아홉 번째 Event 타입은 분류되기 전에는 통과하지 못한다.
+
+`CANCELLED`는 따로 한 줄을 준다 — 독자가 가장 틀리기 쉬운 것이고
+(`test_cancelled_is_not_completed`), §27의 예외(status가 아직 BLOCKED면 Blocker를
+지우지 않는다)도 따로 고정한다.
+
+**Evidence:** `test_controltower.py::ThePredicatesTheEvidenceGateBorrowsAreThemselvesPinnedTests`
+5건. Mutation 2종 DETECTS, **같은 변이에서 빌려 쓰는 게이트는 둘 다 MISSES** —
+이 항목이 닫는 것이 정확히 그 차이다.
+
+### 4. C71의 여섯 질문, 이번에 전부 증거로 닫았다
+
+| 질문 | 답 | 증거 |
+|---|---|---|
+| 잘못된 evidence를 주입하면 반드시 실패하는가 | **그렇다** | C71 §4 mutation 4종. 게이트 이전에는 같은 주입이 480 passed였다 |
+| value ↔ evidence 대응을 검증할 수 있는가 | **그렇다** | 인용 파일을 다시 읽어 그 Event가 세는 대상인지 묻는다 |
+| 검증 로직이 운영 코드와 드리프트하지 않는가 | **하지 않는다** | 운영 술어를 재사용한다. 그 대가인 순환은 §1~§3이 닫았다 |
+| 정상 evidence는 계속 통과하는가 | **그렇다** | 컨트롤 + 과잉교정 변이 |
+| 존재하지만 내용상 다른 경우를 잡는가 | **잡는다** | C71 §4 M1(480 passed였던 그 주입) |
+| 누락/삭제/손상된 경우를 잡는가 | **손상은 잡는다** | 손상 파일은 `read_events`의 `unreadable` 채널로 가고, 화면이 세 곳에서 보고한다 — `집계 대상 : Event 2건 (읽지 못한 파일 1건 — 아래 숫자는 그만큼 적다)` + ATTENTION 2줄. **사후 삭제**는 잡지 않으며 그것이 옳다: `EvidenceRef`는 "이 수가 어느 파일에서 나왔는가"라는 **출처 기록**이지 살아 있는 포인터가 아니다 |
+
+**부수 확인 하나.** `build_company_rollup(events=…)`(Runner의 per-run 경로)에서는
+`unreadable`이 구조상 항상 0이다. 처음엔 결함으로 보였으나 — 그 경로의 Event는
+Collector가 방금 파싱해 ACCEPTED한 것들이라 **읽을 수 없는 파일이 있을 수 없다.**
+전 기간을 보는 `ops_status.py:3825`는 `processed_dir=` 형태로 불러 `unreadable`을
+채우고 화면에 낸다. 두 형태의 의미가 다르고 각각 옳다.
+
+---
+
+## C72. 검증 함수 자신이 예외를 던졌다 — 그리고 그 수정은 stash에만 있었다
+
+세 번 연속 가설이 오탐으로 끝난 뒤 방법을 바꿨다. 읽는 대신 **퍼즈했다** —
+`validate_event()`에 전 필드 × 적대적 타입 25종, 369조합.
+
+### 1. 열거형 네 필드가 JSON 배열/객체에서 죽는다 (신규, 수정, **가용성 · 데이터 무결성**)
+
+    369조합 검사 -> uncaught exception 29건
+
+전부 같은 원인이다.
+
+    source      ['x'] -> TypeError: unhashable type: 'list'
+    role        ['x'] -> TypeError: unhashable type: 'list'
+    event_type  ['x'] -> TypeError: unhashable type: 'list'
+    status      ['x'] -> TypeError: unhashable type: 'list'
+    event_id    ['x'] -> ['event_id must be a string']      <- 정상
+    project_id  ['x'] -> ['project_id must be a string']    <- 정상
+    summary     ['x'] -> ['summary must be a string']       <- 정상
+
+`event_id`/`project_id`/`summary`에는 `isinstance` 가드가 있고, **허용 집합이 있는
+네 필드에는 없다.** membership 검사가 타입 일까지 해 주는 것처럼 보이기 때문인데,
+frozenset 조회는 **hashable한 키가 없으면 답 자체를 못 한다.**
+
+**실제 Collector로 실측(현재 트리):** 정상 Event 하나 옆에 `"role": ["CTO_BACKEND"]`
+하나:
+
+    accepted=1 failed=1
+    incoming/   bad.json      <- 그대로 남는다. 매 실행마다, 영구히
+    rejected/   (비어 있음)
+    collector.log  FAILED bad.json: unhashable type: 'list'
+
+두 가지가 틀렸다. docs/03 §7은 invalid Event를 `rejected/`로 보내고 실행을 계속하게
+하는데 이건 **FAILED**라서 파일이 `incoming/`에 남고 재시도마다 똑같이 실패한다.
+그리고 유일한 흔적이 **필드가 아니라 예외 이름**을 말하는 줄이라, `role`의 *모양*이
+문제라는 것을 아무도 알 수 없다. 손으로 쓰거나 복원된 Event에 **괄호 하나가 더**
+있으면 도달한다.
+
+### 2. 이 수정은 stash에 있었고 working tree에는 없었다 (**방법**)
+
+`git show stash@{0}:src/events/schema.py`에 정확히 이 수정이 있다 — 같은 진단과
+같은 코드 줄까지. 그런데 HEAD와 working tree에는 없다.
+
+내 메모에 "Unhashable membership crash fix — 2026-08-15 수정됨"이 적혀 있었고,
+**그 메모는 틀리지 않았다 — 다만 그 수정이 도달한 곳이 stash였다.** 같은 메모 묶음에
+경고도 함께 있었다: *"stash에 적용되지 않은 Sprint가 있다. 여러 메모가 거기에만
+있는 수정을 서술하므로 HEAD로 확인하라."*
+
+**Stash 적용은 금지**이므로 읽어서 동등한 수정을 직접 넣었고, **코드 줄은 stash와
+글자 그대로 같게** 두어 나중 병합이 충돌하지 않게 했다(이전 Sprint가 reserved
+device name 수정에서 쓴 방식과 같다). 주석은 현재 트리에서 내가 잰 값으로 다시
+썼다 — stash의 주석은 "Collector.collect()를 통과해 uncaught로 빠져나간다"고 적는데
+현재 트리에서는 FAILED로 잡힌다. **틀린 문장을 옮겨 붙이지 않았다.**
+
+참고로 같은 stash 블록의 나머지 절반(`project_id` 문자열 검사)은 **이미 working
+tree에 있다** — 다른 형태로(`("event_id", "project_id", "summary")` 루프),
+2026-08-16 세션이 독립적으로 넣은 것이다. 그래서 이번에 옮긴 것은 열거형 네 필드
+하나뿐이다.
+
+### 3. 게이트
+
+**Evidence:** `test_untrusted_event_input.py::ValidationAnswersRatherThanRaisingTests`
+6건 — 이미 가드가 있던 세 필드를 대조군으로 두고, 네 필드 × 비문자열 8종을 훑고,
+오류가 **필드 이름을 말하는지** 확인하고, 과잉교정(정상 Event 거부·membership 검사
+소실)을 막고, **실제 Collector로** REJECTED·`rejected/`로 이동·로그에 `role` 등장·
+`unhashable` 부재까지 검증한다.
+
+Mutation **3종 DETECTS** — 맨 membership으로 되돌리기, 타입 검사가 membership을
+대체하기, `and`/`or` 오기.
+
+**동치 변이 1종 기록.** `str(value) not in allowed`로 강제 변환해도 6건이 전부
+통과한다. JSON이 낼 수 있는 타입(dict/list/str/int/float/bool/None) 전부에서
+`str()`이 안전하고 관측 동작이 동일하므로 **결함이 아니라 동치**다.
+
+### 5. 같은 방법으로 두 번째를 찾았다 — 오타 난 SyncFolder (신규, 수정, **조용한 전면 유실**)
+
+§2의 교훈을 규칙으로 돌렸다: **"고쳤다"는 기록 19건을 전부 working tree에 대고
+확인했다.** 18건은 실재했다(하나는 needle 오탐이었고 다시 보니 있었다). 한 건이
+없었다 — install script의 SyncFolder 경고다.
+
+**근본 문제를 먼저 쟀다**(주장하지 않고). 존재하지 않는 디렉터리로 `send()`:
+
+    target exists before   False
+    send()                 -> None      (성공)
+    target exists after    True
+    files written          ['E1.json']
+
+`_write_atomic()`이 `mkdir(parents=True, exist_ok=True)`로 무엇이든 만든다. 그래서
+오타 난 `-SyncFolder`는 **한 번도 실패하지 않는다.** Agent는 COLLECTED를 보고하고
+outbox는 비고 그 머신에서는 모든 것이 정상으로 보이는데, Event는 Desktop 4로
+동기화되지 않는 폴더에 쌓인다. 며칠 뒤 Desktop 4의 일반적인 "이 Desktop이 조용하다"
+경보만이 알아채고, **원인은 엉뚱하게 지목된다.**
+
+**throw가 아니라 warning인 것이 설계다.** 설치 시점에 OneDrive가 아직 폴더를
+만들지/동기화하지 않았을 수 있고 그것은 정당한 순서다 — 이 스크립트가
+`-DelayMinutes`에서 이미 취한 "막지 말고 경고하라"는 같은 태도다.
+`test_the_check_does_not_block_the_install`이 그 구분을 고정한다.
+
+stash에서 **글자 그대로** 포팅했다(병합 충돌 방지). 다만 §2와 달리 이번에는
+stash의 주석이 이 트리에서도 사실이라 그대로 두었다 — 포팅 전에 확인했다.
+
+**Evidence:** `test_install_agent_task_script.py::ATypoInTheSyncFolderIsSaidOutLoudTests`
+5건 — 검사 존재, throw가 아닌 warning, **경고가 "없다"가 아니라 결과를 말하는지**
+(`Desktop 4` / `report success` / `typo`), 정당한 경우를 막지 않는지
+(`normal` / `ignored`), 그리고 **전제 검증**(transport가 정말 폴더를 만드는지 —
+아니라면 이 클래스는 유지가 아니라 삭제 대상이다).
+
+Mutation **3종 전부 DETECTS**(컨트롤 검증됨) — 검사 제거, warning을 throw로,
+경고에서 결과 문구 제거.
+
+### 6. 이 두 건이 남기는 것
+
+한 Sprint에서 stash-only 수정 **둘**이 나왔다. 나머지 17건은 실재하므로 stash가
+통째로 미적용인 것은 아니고, **일부만 트리에 도달했다.** 그래서 규칙은 "stash를
+믿지 마라"가 아니라 더 좁다:
+
+**어떤 수정이든 그것이 어느 트리에 있는지 확인하기 전에는 "있다"고 말할 수 없다.**
+
+이번에 19건 전수 확인을 한 번 해 두었으므로, 다음 Sprint는 새로 추가되는 주장만
+확인하면 된다.
+
+### 8. 퍼즈로 재고 결함 없음으로 닫은 것 (측정)
+
+| 대상 | 입력 | 결과 |
+|---|---|---|
+| 상태 리더 7종(`read_summary`, agent/backup/monthly/scheduler `load_state`, `load_queue`, `load_pending`) | 적대적 JSON 20종 × 7 = 140 | **미선언 예외 0.** 전부 자기 `*Error`로 답한다 — C64의 하드닝이 유효하다 |
+| `Event.from_dict` | 비정상 dict 6종 | 예상 밖 예외 0 |
+| `monthly.parser.parse_daily_markdown` | 적대적 문서 12종(빈 문자열, NUL, 5,000자 `#`, 9,000자 id, 300블록, BOM, bidi) | uncaught 0 |
+| `notion_projection._is_present` | 비객체 page 4종 | **비대칭 발견, 도달 불가.** 형제 `_row_key_of`는 `page is NoneType, not an object`로 의도적으로 거부하는데 이쪽은 맨 `AttributeError`를 낸다(자기 docstring은 "`_row_key_of()`의 이유로 raise한다"고 적는다). 그러나 유일한 호출부가 `(page, _row_key_of(page), _is_present(page))`라 **왼쪽이 먼저 던진다** — 이 모양은 `_is_present`에 도달하지 않는다. C67/C69의 호출부-가드 판정과 동일 |
+
+### 7. 이 항목이 남기는 방법 하나
+
+읽기로 세 번 연속 헛짚은 뒤 퍼즈 한 번이 실제 결함을 냈다. 그리고 그 결함은
+**내 메모가 "고쳐졌다"고 적고 있던 것**이다. 규칙으로 적어 둔다 —
+**"고쳤다"는 기록은 어디에 고쳤는지까지 확인하기 전에는 사실이 아니다.**
+
+---
+
+## C71. 규칙이 적혀 있고, 그 규칙이 지키려던 대상에만 적용되지 않았다
+
+C70이 "확인 못 했다를 없다로 답하는" 자리를 닫았다. 이번엔 다른 축이다 —
+**규칙과 그 이유까지 주석에 적혀 있는데, 정작 그 규칙이 보호하려던 곳이 예외인**
+경우 둘.
+
+### 1. ATTENTION 블록이 자기 자신을 화면 밖으로 밀어낸다 (신규, 수정, **Observability**)
+
+`_RECENT_ON_SCREEN = 5`의 주석이 왜 목록을 자르는지 적어 두었다:
+
+    a screen where one section can push the ATTENTION block off the top
+    is a screen nobody scrolls back up
+
+그 규칙이 ACTIVITY와 COMPLETIONS에는 적용돼 있고 **ATTENTION 자신에는 없었다.**
+`_print_control_tower()`가 `RISKS` 행마다 메시지를 하나씩 append하는데, RISKS는
+role이 어긋난 **Event 하나당 한 행**이다.
+
+**실측 — mismatch Event 수 대 ATTENTION 줄 수:**
+
+    1건    ->    3줄          60건    ->   62줄
+    10건   ->   12줄       1,000건    -> ~1,002줄
+
+선형이고, **트리거가 평범하다.** Desktop 하나의 `role` 설정이 틀리면 그 Desktop이
+보내는 **모든** Event가 mismatch가 된다 — `validate_event()`는 `source`와 `role`을
+각각만 검사하고 짝은 검사하지 않는다(A-15 계열). 그러면 "사람이 지금 할 일"을
+말하려고 존재하는 블록이 **할 일이 가장 많을 때 가장 못 읽게** 되고, 1,000줄은
+전부 id만 다른 같은 문단이다.
+
+**수정.** 종류별로 경계를 두고 진짜 총계를 말한다. 숫자도 공개 방식("총 N건")도
+바로 위 루프가 이미 쓰는 것이라 **새 표시 정책이 아니다.**
+
+**종류별로 자른 이유.** 패널 전체에 하나의 상한을 두면 mismatch 홍수가 열려 있는
+Blocker를 전부 밀어낸다 — 오래된 실패를 더 미묘한 실패와 맞바꾸는 것이다.
+`test_one_flood_does_not_crowd_out_the_other_kind`가 그것을 고정한다.
+
+**잘린 줄이 대신 말하는 것.** 55개 문단을 대체하는 한 줄이므로 그 첫 문단보다
+값이 있어야 한다. 그래서 이 모양을 만드는 원인을 가리킨다 — "한 Desktop의 role
+설정이 잘못되면 그 Desktop의 모든 Event가 여기 들어오므로, 건별로 보기 전에
+Desktop 집계에서 한 source에 몰려 있는지 먼저 확인하라".
+
+**Evidence:** `test_observability.py::TheAttentionBlockCannotPushItselfOffTheTopTests`
+5건. Mutation **4종 전부 DETECTS**(컨트롤 검증됨) — 경계 되돌리기, 자르되 총계를
+말하지 않기, 종류 구분 없이 공유 상한, 상한 0(과잉교정).
+
+### 2. KPI의 추적 가능성을 손으로 쓴 목록 셋이 지키고 있었다 (신규, 게이트)
+
+`Metric`의 첫 문장이 계약이다 — *"A Control Tower number nobody can trace is a
+rumour"*, 그리고 `evidence`가 그것을 추적 가능하게 만든다. 이 속성을 지키는
+테스트가 셋인데 **셋 다 손으로 유지된다:**
+
+    rollup  test_the_counted_metrics_carry_the_files_they_counted
+            ("events", "milestones_completed", "issues_resolved", "open_blockers")
+    rollup  test_every_counted_metric_still_carries_as_many_files_as_it_counts
+            ("events", "projects_completed", "open_blockers")
+    dashboard  test_every_row_carries_the_evidence_it_was_built_from
+            if panel.key in ("METRICS",): continue      <- 패널 통째로
+
+두 목록의 합집합은 **9개 중 5개**다. 셋째는 좁히는 게 아니라 **패널 전체를
+건너뛴다** — evidence가 없는 게 정당한 둘을 수용하려고, 갖고 있는 일곱까지 함께
+검사를 멈춘다.
+
+**실측(하나씩 다 있는 rollup):**
+
+    events                   5/5     decisions_approved       1/1
+    projects_active          3/0     issues_resolved          1/1
+    projects_completed       1/1     open_blockers            1/1
+    milestones_completed     1/1     teams_silent             1/0
+                                     desktop_role_mismatches  1/1
+
+즉 `decisions_approved`와 `desktop_role_mismatches`는 파일을 제대로 달고 있는데
+**두 계층 어디에서도 그것을 확인하지 않는다.**
+
+**간극을 mutation으로 입증했다.** `decisions_approved`의 `evidence=`를 지우고
+**전체 회귀**를 돌렸다 — **3,565건 중 정확히 1건**만 실패했고 그것이 이번에 새로
+쓴 게이트다. 기존 테스트는 전부 통과했다.
+
+**수정.** 목록 대신 전수로 훑고, 예외 둘은 이유와 함께 roster에 적는다
+(`projects_active`는 Event가 아니라 project_id를 세므로 단위당 ref가 존재하지
+않고, `teams_silent`는 부재를 세므로 인용할 파일 자체가 없다 — 지어내는 것은
+이 모듈이 거부하는 것이라고 기존 주석이 이미 말한다).
+
+**공허한 통과도 막았다.** 어떤 metric이 fixture에서 0이면 `0 == 0`으로 통과하므로,
+`test_the_fixture_exercises_every_evidenced_metric`이 evidence 보유 metric 중
+값이 0인 것이 없음을 먼저 주장한다. `desktop_role_mismatches`를 0이 아니게
+만들려면 `put()`이 `role`에서 `source`를 파생시키므로 Event를 직접 써야 했다.
+
+**패널이 건너뛴 것 하나 더 되살렸다.** `Evidence Count`는 내부 값이 아니라
+`dashboard._metrics_panel()` → Notion `Evidence Count` 속성까지 간다. 그래서 인용된
+파일이 실제로 존재하는지도 검사한다 — 다른 패널에는 있고 METRICS에만 없던 검사다.
+
+**Evidence:** `test_controltower.py::EveryMetricIsClassifiedByHowItCitesItsFilesTests`
+6건.
+
+### 3. 같은 규칙의 나머지 절반 — ATTENTION 위의 목록들 (신규, 수정)
+
+§1을 고친 뒤 규칙을 다시 읽었다. `_RECENT_ON_SCREEN`의 문장은 ATTENTION을
+자르라는 것이 아니라 **어떤 섹션도 ATTENTION을 화면 밖으로 밀지 말라**는 것이다.
+그래서 `_print_history()`의 print 루프를 전수로 셌다.
+
+셋이 무경계였고, **셋 다 ATTENTION 쪽은 이미 `[:5]` + "외"로 올바르게 잘려 있었다.**
+경계가 없는 것은 그 위에 찍히는 화면 목록 쪽이었다.
+
+    Daily 항목 불일치     하루당 한 줄   <- Company History의 **일수**로 자란다
+    Monthly 원본 미반영   한 달당 한 줄
+    Monthly 항목 누락     한 달당 한 줄
+
+첫째가 빠르다. `- Event Count:`를 한 번 잘못 쓴 렌더러는 **자기가 렌더한 모든
+날에 대해** 잘못 썼으므로 목록 길이가 그 구간 전체다 — 연 365줄이고, 정확히
+잘려 있는 ATTENTION 줄이 그 아래에 깔린다.
+
+`junctions`는 함께 자르지 않았다 — 데이터 양이 아니라 **배포 선택**으로 늘고,
+확인 못 한 수는 이미 별도 줄로 나온다.
+
+**Evidence:** `test_observability.py::ThePrintedListsAboveAttentionAreBoundedTooTests`
+5건(전제 검증 1건 포함). Mutation **4종 전부 DETECTS**(컨트롤 검증됨) — 경계
+되돌리기, 자르되 수를 말하지 않기, off-by-one, **그리고 ATTENTION의 총계를 화면에
+보인 수로 줄이기**(화면을 자르면서 운영자가 행동하는 숫자까지 줄이는 것이 이
+수정에서 가장 하기 쉬운 실수다).
+
+### 4. evidence가 "N개의 실재하는 파일"이면 통과했다 — 어느 파일인지는 아무도 안 봤다 (신규, 수정, **추적성**)
+
+§2가 KPI마다 `len(evidence) == value`와 인용 파일의 실재를 요구하게 만들었다.
+**둘 다 성립하면서 인용이 틀릴 수 있다.** `milestones_completed`가 자기 파일 대신
+`ISSUE_RESOLVED` 파일을 인용하도록 바꾸고 재봤다:
+
+    개수 그대로 일치      인용 파일 전부 실재
+    Control Tower 스위트 4개 -> **480 passed**
+
+아무도 알아채지 못한다. `Metric`은 *"추적 불가능한 숫자는 소문"*이라고 여는데,
+**틀린 파일로 추적되는 숫자는 citation이 달린 소문**이라 더 나쁘다 — 검증 가능해
+보이고, `evidence_count`가 Notion까지 가서 확인된 것처럼 읽힌다.
+
+**수정.** 인용된 파일을 다시 읽어 **그 Event가 이 metric이 세는 대상인지** 묻는다.
+
+**술어는 운영 코드의 것을 그대로 쓴다.** `_completes()`와 `_blocker_change()`는
+`_roll_metrics()`/`_roll_projects()` 자신이 쓰는 함수다 — 복사본을 만들지 않고
+그것들에게 묻는다(C28 규칙). rollup이 `event_type` 리터럴로 비교하는 자리는
+테스트도 같은 리터럴로 비교한다: 그 비교가 **계약 자체**이지 계약의 구현이 아니다.
+
+**게이트 자신이 실패할 수 있는지 고정했다.** `test_the_check_would_notice_a_swapped_citation`이
+정직한 짝은 통과하고 뒤바뀐 짝은 실패함을 직접 주장한다 — 이것이 없으면 이 클래스도
+스위트가 이미 통과하던 이유와 같은 이유로 통과한다.
+
+**Evidence:** `test_controltower.py::EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests`
+5건. Mutation **4종 전부 DETECTS**(컨트롤 검증됨) — 그중 M1이 위에서 480건이
+놓쳤던 바로 그 주입이다.
+
+### 5. 같은 구멍이 패널 계층에도 있었다 (신규, 게이트)
+
+§4를 일반화했다. `test_every_row_carries_the_evidence_it_was_built_from`도
+모든 패널 행에 대해 **비어 있지 않음 + 파일 실재** 둘만 묻는다. 둘 다 성립하면서
+인용이 **다른 행의 것**일 수 있다.
+
+패널 쪽이 더 직접적이다. 운영자가 실제로 citation을 따라가는 곳이고, DESKTOPS
+행은 "Desktop 간 작업 상태"를 답하는 자리다 — 다른 Desktop의 Event를 인용하면
+**해결되는 파일 이름으로 틀린 Desktop을 가리킨다.**
+
+**로스터가 필요 없다.** 이 행들은 자기 Event가 들고 있어야 할 값으로 키가 정해져
+있기 때문이다:
+
+    TEAMS        키가 role         -> 인용 Event의 role
+    DESKTOPS     키가 source       -> 인용 Event의 source
+    PROJECTS     키가 project_id   -> 인용 Event의 project_id
+    RISKS        행이 자기 Event를 이름 짓는다 -> event_id
+    ACTIVITY / COMPLETIONS  행이 곧 Event      -> event_id
+
+`METRICS`만 제외한다 — 그 행은 Event가 들고 있는 값이 아니라 metric 이름으로
+키가 정해지고, §4가 그 모양을 담당한다. 일곱 번째 패널이 조용히 그 예외에
+얹히지 않도록 `test_every_panel_with_evidence_is_classified`가 분류의 전수성을
+따로 주장한다.
+
+**모호한 한 건을 일부러 고정했다.** `source=DESKTOP_1, role=CMO`인 Event는
+docs/02 §8상 mismatch인데, Desktop 계층은 `source`로 Team 계층은 `role`로 키를
+잡으므로 **같은 Event가 DESKTOP_1과 CMO 양쪽에 인용된다.** 그것이 RISKS 행이
+보고하려는 분기이지 인용 오류가 아니다 —
+`test_a_mismatched_event_is_filed_under_the_desktop_that_sent_it`이 그렇게 적어
+두어, 나중에 이것을 "고치려는" 변경은 rollup이 아니라 이 테스트와 논쟁하게 된다.
+
+**Evidence:** `test_controltower_dashboard.py::EveryRowCitesEventsThatBelongToItTests`
+5건(게이트 자신의 실패 가능성 검증 1건 포함). Mutation **3종 전부 DETECTS**
+(컨트롤 검증됨) — DESKTOPS·TEAMS·PROJECTS 행이 각각 회사 전체 Event를 인용하도록
+바꾼 경우.
+
+### 7. 나머지 KPI 무결성 질문 여섯 개, 측정으로 답했다
+
+| 질문 | 답 | 근거 |
+|---|---|---|
+| source 없는 Metric이 만들어질 수 있는가 | **아니다** | `source=""`와 `"   "` 주입 모두 DETECTS(465건 중 2건 실패) |
+| value가 evidence 없이 존재할 수 있는가 | 예외 둘뿐, 이유가 roster에 있다 | §2 |
+| evidence가 실제 value의 근거인지 검증되는가 | **아니었다 → 이제 그렇다** | §4 |
+| 형식만 있고 실질 추적성이 없는 경우가 통과하는가 | **통과했다 → 이제 막힌다** | §4의 480 passed |
+| 소비자가 검증 안 된 숫자를 완전한 사실로 쓸 수 있는가 | **아니다** | 한정자가 숫자와 함께 간다 — 미기술 `(false,false)`, 확인·빈틈없음 `(true,true)`, 빈틈 발견 `(false,true)`, 읽지 못함 `(false,false)`. `Coverage Complete=true`는 **실제 확인 없이는 나오지 않는다** |
+| Dashboard / Notion projection까지 의미가 보존되는가 | **보존된다** | CT_METRICS 행이 숫자만이 아니라 **파일 참조**를 들고 간다 — `Evidence: "E1@2026-08-05T09:00:00+09:00 -> E1.json"`, `Evidence Count`, `Evidence Truncated`, `Derived From` |
+
+마지막 줄이 §4를 중요하게 만든다: 인용이 틀리면 **Notion 행이 틀린 파일 이름을
+운영자에게 제시한다.**
+
+### 6. 재고 있고 결함 없음으로 닫은 것 (측정)
+
+| 대상 | 물어본 것 | 결과 |
+|---|---|---|
+| C70이 남긴 `_daily_dates` 나열 실패 | 조용히 실패하는가 | **아니다.** C70의 주입이 `os.scandir`만 막아 **불가능한 상태**(glob은 동작)를 만들었던 것. 실제로 읽을 수 없는 디렉터리는 **"HISTORY — 읽지 못했다"**로 블록 단위 보고된다 |
+| COMPANY 블록 vs CONTROL TOWER의 Desktop 침묵 | 한 화면의 두 블록이 다르게 말하는가 | 네 Desktop 모두 event 수·`days_silent` 일치 |
+| `COMPLETED` 뒤 `BLOCKED` | `is_complete`와 `is_blocked`가 동시에 참인 게 결함인가 | **아니다 — spec의 산물이다.** docs/04 §25는 COMPLETED가 Blocker를 비우게 하고, 역순은 금지하지 않으며 Completed Date를 지우는 규칙이 없다. `notion/properties._type_specific_properties()`도 똑같이 동작한다 — **두 투영이 일치**하므로 드리프트 아님 |
+| Daily Metadata 블록 ↔ Monthly 파서 | writer/reader가 어긋나는가 | Metadata에는 `- Event ID:`가 없고 `test_evidence_and_metadata_sections_contribute_nothing`이 경계를 고정한다 |
+| `OPS_READINESS` 등 빈 Database | 신규 결함인가 | **아니다 — A-16.** docs/04가 "자동 Launch Readiness 점수 / KPI Dashboard / VOC Dashboard / 자동 Critical Path"를 V1 제외로 명시하고, 어느 DB에 무엇을 쓸지는 정책 결정이라 SKIP 상태 |
+
+---
+
+## C70. 보안 detector가 이 시스템이 실제로 도는 인터프리터에서 눈이 멀어 있었다
+
+"2 skipped"를 물었다. 스위트가 여러 Sprint 동안 그 숫자를 찍어 왔는데 **어떤
+2건인지 아무도(나 포함) 확인한 적이 없다.** skip된 테스트는 실행되지 않은 코드다.
+
+### 1. 그 2건이 junction 노출 탐지였다 (신규, 수정, **보안 · 실명한 detector**)
+
+`_junctions_in_scope()`는 이 화면에서 **유일하게 대상이 노출(exposure)인 detector**다.
+junction은 Local Master 밖의 트리가 Company History인 척 커밋되고 push되는 경로이며
+(A-19/BUG-57), 기존 가드 둘은 그것을 못 본다 — `_relative_files()`는 symlink만
+제외하는데 junction은 symlink가 아니고, secret scan은 이름 모양만 본다. 이 함수의
+docstring이 그 유출을 **실측으로** 적어 두었다:
+
+    sync_to_working_copy() added daily/linked/notes.md, daily/linked/private.md
+    scan_for_secrets(master)     ()      <- 아무것도 안 걸림
+
+그런데 그 detector가 이 머신에서 **한 번도 발화한 적이 없다.**
+
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is None or not local_master.is_dir():
+        return (), 0
+
+`os.path.isjunction()`은 Python 3.12+다. **이 프로젝트의 런타임은 3.9.7이다(D절).**
+
+**실측 — 실제 junction을 `daily/` 밑에 만들고 Company History가 아닌 트리를 노출시켰다:**
+
+    os.path.isjunction 존재      False
+    junction 실제 생성           True   (내용도 실제로 읽힌다)
+    _junctions_in_scope(lm)      found=(), skipped=0
+    운영자 화면                  "junction 노출 : 0건 발견"
+
+**caveat조차 없다.** C68이 이 함수에 `skipped` 카운트를 붙일 때 세 경우를 한데
+묶어 `skipped = 0`으로 뒀다 — 없는 디렉터리, 없는 Local Master, 그리고 **없는
+인터프리터 기능.** 앞의 둘은 "볼 것이 없다"라 옳다. 세 번째는 **볼 것이 있는데
+볼 수가 없는 것**이고, 같은 답을 주면 화면이 건강한 머신과 byte 단위로 같아진다.
+C68 §1이 Company History 커버리지에서 고친 바로 그 모양이, C68 자신이 만든
+예외 안에 남아 있었다.
+
+### 2. "물어볼 방법이 없다"가 사실이 아니었다 (측정)
+
+주석은 이렇게 말한다 — *"on Python < 3.12 there is no way to ask"*. 재 보니 틀렸다.
+`os.lstat().st_reparse_tag`는 **3.8부터** 있고 `stat.IO_REPARSE_TAG_MOUNT_POINT`도
+그렇다. 둘을 합치면 CPython 3.12가 `isjunction()`을 구현한 그 방식 그대로다.
+3.9.7에서 실측:
+
+    junction            st_reparse_tag 0xa0000003  MOUNT_POINT  -> True
+    directory symlink   st_reparse_tag 0xa000000c  SYMLINK      -> False
+    file symlink        st_reparse_tag 0xa000000c  SYMLINK      -> False
+    보통 디렉터리/파일  tag 없음                                -> False
+
+**이 저장소는 이미 알고 있었다.** `tests/test_runner_failure_paths._is_junction()`이
+바로 그 폴백을 쓴다 — *테스트는 아는데 운영 detector만 몰랐다.*
+
+**bit가 아니라 tag로 판정한다.** 그 테스트 헬퍼는 REPARSE_POINT **비트**만 보는데,
+자기가 방금 만든 junction을 확인하는 용도로는 옳다. 그러나 그 비트는 symlink에도
+선다. detector가 symlink를 junction이라 부르면 **존재하지 않는 노출**을 영구
+표시하게 되고(`_relative_files()`가 symlink는 이미 제외한다), 그것이 C26이 말한
+"운영자가 그 섹션을 대충 넘기도록 훈련시키는" 실패다. 과다 보고가 여기서는
+안전한 방향이 아니다.
+
+**수정.** `ops_status._is_junction()` 신설 — 3.12+에서는 stdlib를 그대로 쓰고
+(두 번째 의견을 만들지 않는다), 그 아래에서는 reparse tag로 답한다.
+`_junctions_in_scope()`의 인터프리터 분기는 제거하고, 없는 Local Master 분기는
+`skipped = 0`으로 남긴다(C68의 비대칭은 그 경우엔 옳다).
+
+**수정 후 실측, 같은 트리:** `found=(('daily\\linked', '…\\OUTSIDE'),) skipped=0`,
+화면은 `junction 노출 : 1건 발견`. symlink는 함께 두어도 보고되지 않는다.
+
+### 3. 테스트 셋이 실명을 *고정*하고 있었다 (신규, 측정, **역방향 게이트**)
+
+이것이 이 항목에서 가장 불편한 부분이다. junction 탐지를 다루는 테스트는 셋이었고,
+셋의 순효과가 "detector가 여기서 절대 안 돈다 + 아무도 그 사실을 말하지 않는다"였다.
+
+    test_a_junction_inside_daily_is_reported_with_its_target   3.9에서 skip
+    test_a_whole_scope_directory_that_is_a_junction_...        3.9에서 skip
+    test_it_reports_nothing_when_the_platform_cannot_answer    **통과** —
+        `found == ()`를 3.9에서 적극적으로 주장한다
+
+세 번째가 결함을 **보증**하고 있었다. skip 둘은 그 세 번째를 근거로 자기를
+정당화했다("see test_it_reports_nothing_when_the_platform_cannot_answer"). 서로를
+가리키는 세 개의 테스트가 하나의 실명을 감쌌다.
+
+그 테스트를 `test_an_older_interpreter_still_sees_the_junction`으로 뒤집었고,
+skip 둘은 제거했다(이 머신에서 junction 생성은 실제로 가능하다 — 이미 확인하는
+`_junction()` 헬퍼가 있다). 스위트의 **skip이 2 → 0**이 됐다.
+
+**Evidence:** `test_observability.py::JunctionInBackupScopeTests` 7건(신규 3건 포함:
+뒤집은 것, symlink 오보고 가드, C68 비대칭 유지). Mutation **4종 DETECTS** —
+3.12 미만 재실명, bit로 판정(symlink 오보고), 전부 junction이라 답하기, 없는
+Local Master를 skip으로 세기.
+
+**동치 변이 하나 기록한다.** 없는 Local Master의 조기 반환을 통째로 지워도 7건이
+전부 통과한다. 결함이 아니라 **동치**다 — scope 디렉터리가 하나도 존재하지 않으므로
+루프가 그대로 `((), 0)`을 낸다. 조기 반환은 단축이지 동작 가드가 아니다.
+
+**부수 기록(자기 실수, 그리고 이 프로젝트의 주제 그대로).** 첫 mutation 실행에서
+네 변이가 전부 "DETECTS"로 나왔는데, 존재하지 않는 클래스명(실제 클래스는 `JunctionInBackupScopeTests`다)을
+찍어 pytest가 **수집 오류**로 끝난 것이었다. 즉 내 하니스 자체가 공허하게 통과했다.
+이후 **변이 없는 컨트롤 실행을 먼저 넣어** 하니스가 실제로 무언가를 재는지 확인한
+뒤에만 판정을 신뢰했고, 그러자 M4가 MISSES로 바뀌었다(같은 줄이 파일에 3번 나와
+`replace(...,1)`이 다른 함수를 건드리고 있었다). **게이트를 재는 하니스에도 게이트가
+필요하다.**
+
+### 4. 그 실명을 보이지 않게 만든 것은 D절 헤더였다 (신규, 수정, **문서 ↔ 현실**)
+
+§1을 고친 뒤 "왜 이게 여태 안 보였나"를 물었다. 답이 이 파일 안에 있었다.
+
+    ## D. 측정값 (이 머신, Python 3.13, Windows 11)      <- 기록
+    Python 3.9.7 / Windows-10-10.0.19042                <- 실제
+
+`os.path.isjunction()`은 3.12+다. **기록을 믿은 독자는 junction detector가
+동작한다고 결론짓는다.** 3.13이면 실제로 동작하기 때문이다. 틀린 환경 기록이
+보안 detector의 실명에 정확히 알리바이를 대주고 있었다.
+
+**세 번째 재발이다.** C17이 같은 드리프트를 기록했고("이전 Sprint 기록('이 머신,
+Python 3.13')과 달리 현재 기본 `python`은 Anaconda의 3.9.7") **인스턴스만
+고쳤다.** 이후 만들어진 `EveryTrackedModuleParsesOnThisInterpreterTests`는
+드리프트의 **구문** 결과(런타임에 평가되는 PEP 604 `|`)를 덮는다 — 좋은 게이트고,
+버전을 하드코딩하지 않아 머신이 올라가면 조용해진다. 덮지 않은 면이
+**capability**였고, C70이 그 면이다.
+
+**수정.** D절에 기계가 읽는 선언 한 줄을 두고 게이트를 붙였다:
+
+    <!-- RUNTIME-DECLARATION: Python X.Y -->
+
+(위 예시는 자리표시자다. 실제 선언은 D절 본문에 있고, 게이트는 **정확히
+하나**를 요구한다 — 이 문단이 처음에 진짜 마커를 그대로 적어 두 개가 되는
+바람에 그 테스트가 즉시 실패했다. 게이트가 제 일을 한 것이다.)
+
+`TheRecordedRuntimeIsTheRunningOneTests`가 이것을 지금 도는 인터프리터의
+major.minor와 대조한다. patch level은 보지 않는다 — 인터프리터가 할 수 있는 일이
+바뀌지 않는데 실패하면 아무도 행동할 수 없는 실패가 된다.
+
+**과거 숫자는 재작성하지 않았다.** D절의 상당수 측정은 실제로 3.13.14/Windows 11
+머신에서 잰 것이다. 그 표기를 현재 환경으로 바꾸는 것은 **잰 적 없는 수를 만드는
+것**이고, 틀린 헤더보다 나쁘다. 헤더가 현재를 말하고, 각 숫자가 자기 출처를
+말한다.
+
+**게이트가 산문이 아니라 마커를 읽는 이유.** BACKLOG에는 "Python 3.13.14"가
+여러 번 나오고 그것들은 **정당한 역사**다. 산문을 훑는 검사는 자기 역사에 걸려
+넘어진다.
+
+**Evidence:** `test_repository_hygiene.py::TheRecordedRuntimeIsTheRunningOneTests`
+3건. Mutation **4종 전부 DETECTS** — 3.13으로 되돌리기, 마커 삭제, 서로 모순되는
+마커 둘, 그리고 §1의 사례를 D절에서 빼기(선언만 남고 그것이 무엇을 함의하는지
+사라지면 다음 드리프트는 다시 조용해진다).
+
+### 6. 같은 모양 하나 더 — 유출 보고가 "못 봤다"를 "없다"로 답했다 (신규, 수정, **보안**)
+
+§1을 일반화했다: *예외에서 빈 컬렉션을 돌려주는 자리*를 전수로 세니 33곳이고,
+대부분은 파싱 실패의 `None`(호출자가 처리)이다. 보안 등급이 걸린 것은 하나였다.
+
+`_secrets_ever_committed()` — "이 Backup 원격 history에 Secret 형태 경로가 들어간
+적이 있는가". **키가 실제로 커밋된 저장소로 실측:**
+
+    정상                      ('id_rsa',)
+    git이 OSError             ()            <- 깨끗한 history와 동일
+    git이 128로 종료          ()            <- 깨끗한 history와 동일
+    애초에 저장소가 아님       ()            <- 이건 옳다
+
+호출자는 `leaked`가 비면 **아무 말도 하지 않는다.** 그리고 이 함수의 docstring이
+바로 그 결과를 이렇게 부른다 — *"the warning disappeared"가 "the most dangerous
+possible answer"*. 그것을 스스로 만들고 있었다.
+
+**기존 결정을 뒤집지 않았다.** `TheTwoSecretProbesFailInOppositeDirectionsTests`는
+이 producer가 **fail-open하면 안 된다**고 논증한다 — "git 없는 모든 머신에서 유출을
+외치면, 아무도 안 믿는 경보는 아무도 안 읽는다". 옳다. 이번 수정은 그 둘 사이의
+**셋째 답**을 더한다: *검사가 일어나지 않았다.*
+
+**소음이 되지 않는 이유가 설계의 핵심이다.** `.git` 존재 검사를 먼저 둔다. 초기화된
+적 없는 Working Copy는 — Backup 미구성 머신의 정상 상태이자 위 클래스가 쓰는 자극 —
+`checked`이고 조용하다. 캐비앳은 **저장소는 있는데 git이 읽지 못하는** 상태에만 뜬다.
+미구성이 아니라 고장이다. C68이 `FileNotFoundError`로 그은 것과 같은 선이다.
+
+    if not working_copy.is_dir():            return (), True   # 볼 것 없음
+    if not (working_copy / ".git").exists(): return (), True   # history 없음
+    except (OSError, SubprocessError):       return (), False  # 못 봤다
+    if result.returncode != 0:               return (), False  # 못 봤다
+
+`stdout`이 비었고 종료코드가 0인 경우는 **커밋이 없는 저장소**라 특례를 없앴다 —
+루프가 그대로 `()`를 내고 `checked=True`다.
+
+**Evidence:** `test_observability.py::AGitThatCannotAnswerIsNotACleanHistoryTests`
+5건(전제 검증 1건 포함 — fixture가 정말 키를 커밋했는지 먼저 고정한다).
+Mutation **4종 전부 DETECTS**(컨트롤 검증됨) — OSError를 깨끗함으로, 비정상 종료를
+깨끗함으로, `.git` 검사 제거(미구성 머신에 캐비앳이 생긴다 = 과잉교정),
+호출자의 출력 제거.
+
+기존 5개 assertion이 `(paths, checked)` 쌍으로 갱신됐고,
+`test_the_directions_really_are_opposite`에는 "저장소였던 적 없는 디렉터리는
+*checked*"라는 한 줄이 더해졌다 — 그 클래스의 자극이 캐비앳을 만들지 않는다는 것이
+이 수정이 그 논증과 공존하는 조건이기 때문이다.
+
+**같은 sweep이 남긴 둘.** `_misnamed_scope_directories()`도 같은 계열이었고 §7에서
+이어서 고쳤다. Run Summary 리더는 `[]`를 돌려주는데 **근거가 명시돼 있다** — 매니페스트
+리더가 LAST RUN에서 이미 보고하므로 두 번째 의견을 만들지 않는다(C62 규칙).
+
+### 7. 그 sweep이 남긴 셋째를 같은 Sprint에서 닫았다 (신규, 수정)
+
+§6의 전수 조사에서 같은 계열로 남겨 뒀던 `_misnamed_scope_directories()`를
+이어서 고쳤다. 같은 모양이고, 결과는 BUG-55가 이미 이름 붙인 상태다.
+
+**실측 — `daily/` 옆에 `Monthly/`가 있는 Local Master:**
+
+    나열 가능   (('Monthly', 'monthly'),)
+    나열 불가   ()                          <- 깨끗한 트리와 동일
+
+사라지는 것이 미관이 아니다. 이 함수가 먹이는 줄은 **"이 디렉터리의 Company
+History는 한 번도 백업되지 않으며 Backup은 계속 SUCCESS를 보고한다"**이다. 탐지가
+사라지면 정확히 그 상태가 아무 말 없이 남는다.
+
+`(found, checked)`로 바꾸고 호출자가 캐비앳을 찍는다. **없는 Local Master는
+`checked`로 남긴다** — 잘못 이름 붙을 트리 자체가 없으므로, Backup 미구성 머신에
+캐비앳이 생기지 않는다. C68이 그은 선이자 §6이 `.git`으로 그은 선과 같다.
+
+**Evidence:** `test_observability.py::CaseFoldedScopeDirectoryTests` 12건(신규 2건:
+나열 불가 판정, 화면 출력). Mutation **3종 전부 DETECTS**(컨트롤 검증됨) — 나열
+불가를 깨끗함으로, **없는 Local Master를 unchecked로(과잉교정)**, 호출자 출력 제거.
+기존 9개 assertion을 `(found, checked)` 쌍으로 갱신했다.
+
+**이 Sprint에서 같은 모양을 넷 고쳤다** — junction detector(§1), 유출 보고(§6),
+범위 밖 디렉터리(§7), 그리고 그것들을 안 보이게 만든 환경 기록(§4). 공통 규칙은
+하나다: **"확인했고 없다"와 "확인하지 못했다"를 같은 값으로 답하지 않는다.**
+C62가 evidence에, C68이 Company History 커버리지에 적용한 것이고, 이번에는
+**보안 detector 세 개**가 그 규칙 밖에 있었다.
+
+### 5. 재고 있고 결함 없음으로 닫은 것 (측정)
+
+| 대상 | 물어본 것 | 결과 |
+|---|---|---|
+| 운영 코드의 capability probe 전수 | 이 인터프리터에서 조용히 무력해지는 분기가 더 있는가 | 7건뿐이고 5건은 동일한 `sys.stdout.reconfigure`(3.7+, 여기서 동작), 2건은 §1이 넣은 것. **이 부류는 닫혔다** |
+| 없는 capability를 주입해 빈 결과를 옳다고 주장하는 테스트 | 다른 곳에도 있는가 | `create=True` 주입은 스위트 전체에 3건, 전부 `isjunction`(둘은 §3이 뒤집은 것, 하나는 C68의 skip-계수). **닫혔다** |
+| Collector의 크래시 창(`mark_seen` 후 사망) | 신규 결함인가 | **아니다 — A-20으로 이미 정밀 기록돼 있다.** `mark_seen()`은 즉시 영속화되므로 창은 실재하고, 다음 실행이 DUPLICATE를 만들어 Candidate가 유실된다. 닫으려면 원자성 결정이 필요해 SKIP 상태 |
+| Multi-Desktop 파일명 충돌 | 공유 sync 폴더에서 Desktop끼리 부딪히는가 | `derive_event_id(source=…)`가 Desktop을 파생에 넣는다. 세 Desktop·같은 signal·같은 날짜로 실측: id·파일명 모두 상이하고 **case-fold해도 상이하다** |
+| `agent/delivery.py`의 정합성 스캔 | 남의 Desktop 파일을 자기 것으로 세는가 | `sent_dir`는 Desktop 로컬이다. 교차 오염 없음 |
+| 운영 화면 실행 | 이 머신에서 실제로 도는가 | `python ops_status.py` exit 0. 그리고 정직하다 — **"자동화 안 함"(CRITICAL_PATH 등)과 "원천 없음"(COMPANY_GOAL/SPRINT/TASK)을 구분해서** 찍는다 |
+| 실제 `runtime/` | 라이브 노출이 있었는가 | processed Event 0, Company History 0, manifest 없음. **§1의 유출은 아직 일어나지 않았다** — 배포 시점에 드러났을 결함이다 |
+
+---
+
+## C69. 시스템이 존재하기 이전의 달에 대해 공식 Monthly를 썼다
+
+COO 질문 하나를 다시 시험대에 올렸다 — **"데이터가 없다는 것과 확인되지 않았다는
+것을 구분하는가."** 이번에는 세 번째 경우가 나왔다. **애초에 덮을 대상이 없다는
+것**을 시스템이 "완전하다"로 읽었다.
+
+### 1. 0일 중 0일이 있으면 COMPLETE다 (신규, 수정, **거짓 완전성**)
+
+`DailyCoverage.is_complete`는 `not missing_dates`다. `history_start_date`보다
+완전히 앞선 달은 **expected가 0일**이므로 missing도 0일이고, 따라서 COMPLETE다.
+`consolidate_month()`는 완전성을 요구하고, 그것을 받았다.
+
+**실측 — pointer가 `2026-01`, `history_start_date`가 `2026-06-01`, daily 디렉터리는 비어 있음:**
+
+    pending_months        -> 2026-02 … 2026-07
+    consolidate 2026-03   -> MONTHLY_GENERATED, `2026-03.md` 작성됨
+
+        ## Executive Summary
+        No material company-level changes were recorded during this month.
+        - Daily Coverage: COMPLETE (0 days expected)
+
+그 문서는 Company History가 덮지 않는 달에 대한 **주장**이고, 그것을 덮는 시스템의
+목소리로 쓰여 있으며, **진짜로 조용했던 달과 구별되지 않는다.** 렌더러는
+`0 days expected`를 찍기까지 한다 — 정보는 거기 있었고 아무도 그것으로 행동하지
+않았다.
+
+**docs/09 §86은 이것을 이미 금지한다** — "Company Ops 시작 이전의 과거 월을 자동
+생성하려 하지 않는다." 그러므로 이번 수정은 Spec 변경이 아니라 **이미 있는 Spec을
+집행하지 않던 자리를 집행하는 것**이다.
+
+### 2. 그 규칙은 이미 있었다. 두 분기 중 하나에만 (신규, 측정, **문서가 구현을 앞섬**)
+
+`run_once()`의 dirty 루프는 정확히 이것을 거부한다. 그 자리의 주석이 이렇게 말한다:
+
+    §85-86: never invent a month that predates the system.
+    `pending_months()` applies this to the catch-up; ...
+
+`pending_months()`에는 분기가 둘이고 **그중 하나만** 그렇게 했다:
+
+    pointer 없음(최초 실행)   history_start_date의 달에서 시작   §86 지켜짐
+    pointer 있음(state)       pointer 다음 달에서 시작           **§86 안 지켜짐**
+
+그래서 `history_start_date`보다 오래된 pointer — 다른 머신에서 복원된 state, 또는
+잘못 설정했다가 앞으로 고친 시작일 — 는 그 사이의 모든 달을 열거했다. C58/C61이
+계속 찾아낸 모양 그대로다: **한 계층에서 고친 결함이 형제 계층에 남아 있고, 고친
+쪽의 주석이 형제도 안전하다고 (틀리게) 주장한다.**
+
+### 3. 수정 두 곳, 그리고 형제와 일부러 다르게 한 것
+
+    pending_months()     current가 first_month보다 앞서면 clamp한다
+    consolidate_month()  결정이 내려지는 자리에서 직접 거부한다(MONTHLY_PENDING)
+
+**dirty 루프와 반대로 clamp를 골랐고, 그것이 이 항목에서 가장 신중했던 판단이다.**
+dirty 루프는 pre-history 달을 PENDING으로 **보고**하고 플래그를 남긴다 — 아무것도
+막지 않는 별도 pass라서 그럴 수 있다. catch-up 루프는 PENDING에서 `break`한다(§48:
+앞선 달에 구멍을 둔 채 뒷달을 닫지 않는다). 그러므로 여기서 보고했다면 **거짓 문서
+하나를 영원히 전진하지 않는 Monthly 파이프라인과 맞바꿨을 것이다.** 실측으로 확인:
+수정 후 stale pointer에서도 2026-06/2026-07이 정상 생성되고 pointer가 `2026-07`로
+전진한다.
+
+`consolidate_month()`의 가드는 방어적 중복이 아니라 **공개 API 표면**이다 — 이
+함수는 `monthly.__all__`에 있다. 열거하는 두 호출자를 다 막아도, "아무도
+pre-history 달을 넘기지 않는다"는 규칙의 성질이 아니라 오늘의 호출자들의 성질이다.
+그리고 coverage보다 **먼저** 검사한다: coverage는 이 질문에 답할 수 없다(0일이라
+COMPLETE다).
+
+**Evidence:** `test_monthly_history.py::NoMonthIsInventedFromBeforeTheSystemExistedTests`
+10건. Mutation **7종 전부 DETECTS** — clamp 제거, 가드 제거, 둘 동시 제거,
+**과잉교정 2종**(시작 월까지 건너뛰기 / 월이 아니라 날짜로 비교해 §85의 월중
+시작을 거부하기), 잘못된 기준점(now)으로 clamp, off-by-one.
+
+`test_the_vacuous_completeness_underneath_is_still_there`는 **고치지 않은 것을
+고정한다**: clamp는 catch-up을 0일짜리 달에서 떼어 놓을 뿐, "0일 중 0일"이
+COMPLETE로 읽히는 것 자체를 없애지 않는다. 왜 clamp가 필요한지가 보이게 남겨 두고,
+나중에 `is_complete`를 바꾸는 사람이 있으면 여기서 먼저 실패하게 한다.
+
+### 4. 내가 틀렸던 것 — 있다고 생각한 구멍이 없었다 (측정, 결함 없음)
+
+`is_incomplete_write()`의 **writer 쪽이 게이트되지 않았다**고 판단하고 게이트를
+하나 새로 썼다. 근거는 이랬다: reader는 `INCOMPLETE_WRITE_PREFIX` 4벌이고 writer는
+`tempfile.mkstemp(prefix=...)` 14곳인데 **12곳이 상수가 아니라 리터럴**이라,
+C67의 `EveryDuplicatedConstantIsHeldInStepTests`(이름 있는 상수만 본다)도
+`AtomicStateWriteInvariantTests`(`os.replace`/정리만 본다)도 볼 수 없다.
+
+**실측이 나를 반증했다.** writer 하나를 `.tmp-` → `.staging-`로 바꾸고 **전체
+회귀**를 돌렸다:
+
+    DETECTS  IncompleteWriteInvariantTests::test_every_writer_stages_with_the_prefix_the_readers_skip
+    DETECTS  CompanyHistoryReportsTheRealFailureNotTheCleanupsTests (2건)
+
+이미 있었다. 내가 그 클래스를 grep할 때 출력 앞부분만 보고 메서드 하나를 놓쳤다.
+그 게이트는 reader 상수에서 기대값을 **끌어오고**(테스트가 자기 자신과 비교하지
+않는다) writer를 전수로 훑는다 — 적절하다. **새로 쓴 클래스는 지웠다.** 중복
+커버리지는 숫자만 올리는 것이고, 이 파일이 계속 경계하는 바로 그것이다.
+
+기록해 두는 이유: 다음 Sprint가 같은 자리를 다시 파지 않도록. 그리고 방법 하나 —
+**게이트가 없다고 결론 내리기 전에 mutation을 먼저 돌려라.** grep으로 없다고 읽는
+것보다 깨뜨려서 아무도 안 우는지 보는 쪽이 싸고 정확했다.
+
+**부수 기록(자기 실수).** 테스트 파일을 `Path.write_text()`로 다시 써서 Windows
+기본 개행 변환이 걸렸고, 7,575줄이 전부 CRLF가 됐다. 회귀에서
+`SourceEncodingGuardTests`가 잡았다 — 그 게이트가 정확히 이것 때문에 있다. 이후
+모든 쓰기는 `write_bytes()`로 바꿨다.
+
+### 5. 재고 있고 결함 없음으로 닫은 것 (측정)
+
+| 대상 | 물어본 것 | 결과 |
+|---|---|---|
+| `_ARTIFACT_REFS` 17개 | Manifest가 가리키는 경로가 실재하는가 | 세 가지로 재봤다 — 실제 기본 경로, docs/14 §2 분류, 컴포넌트 대응. **전부 해소된다** |
+| `days_silent()` ×2 | 두 화면이 같은 수를 말하는가 | naive `now`에서 갈린다(6 vs None). 두 호출자 다 aware를 만든다(`ops_status.py:4321`, `runner.py:392`) — **도달 불가**, C67의 Notion property builder와 같은 판정 |
+| `days_silent()` 비문자열 timestamp | 한쪽이 죽는가 | `desktop_activity`는 TypeError, `rollup`은 None. 그러나 리더가 `isinstance(timestamp, str)`로 막는다(`desktop_activity.py:746`) — **도달 불가** |
+| `is_clean`/`is_clear`/`is_complete` 6개 | "읽지 못한 것"을 깨끗함에 포함시키는가 | `unreadable`을 전부 not-clean에 넣고 있다. **C62 규칙이 지켜져 있다** |
+
+| `push_result` → Notion rich_text | 2,000자 한도를 넘길 수 있는가 | **넘긴다** — `backup/runner.py:108`의 `", ".join(secret_matches)`는 무한정이고, `notion/dashboard.py`의 `_rich_text()`는 `fit_properties()`를 거치지 않는다(실측 2,067자). 그러나 `build_ops_backup_properties()`는 **호출자가 없다** — OPS_BACKUP은 docs/14 §1대로 미연결이다. C67의 property builder 판정과 동일: 실재하는 발산, 도달 불가 |
+| 연결된 OPS_RUNS 행 | 같은 한도를 넘길 수 있는가 | 값이 전부 number/select/date이고, 문자열 셋(`Run ID`, `Failed Steps`, `Desktops Reporting`)은 각각 run_id 형식·컴포넌트 9개·`events.SOURCES`로 **어휘가 유한하다**. 넘길 수 없다 |
+| Gap 3 (per-run 행이 all-time이 되는 것) | 게이트가 있는가 | **있다.** `runner.py:922`의 "processed_dir 재스캔이 아니라 이번 실행의 반환값만 사용한다 — Gap 3"는 테스트/문서에서 "Gap 3"으로 검색되지 않아 무게이트로 보였으나, `test_controltower_e2e.py::test_each_runs_row_counts_only_its_own_events`가 **둘째 날 배치를 실제로 흘려보내고 "행들이 증거를 분할한다"를 주장한다.** 이름이 아니라 성질로 걸려 있었다 |
+| `all(...)` 3곳 | 빈 입력에서 공허하게 참이 되는가 | 셋 다 리스트 원소의 타입 검사이고, 빈 리스트가 정당한 값이다(id 없음/evidence 없음/dirty 없음). 공허한 참이 아니라 올바른 참이다 |
+| `# pragma: no cover` 7곳 | 도달 불가 주장이 사실인가 | 전부 방어적이고 실패 방향이 무해하다(None 반환/그대로 통과). `event_instant_key`는 도달 불가임을 알면서도 **일부러 남긴** 이유까지 적어 두었다 — 정렬 키가 예외를 던지면 rollup 전체가 죽는다 |
+| `_split_reviewed()` | "승인 필요한 것"이 화면에 오르는가 | 오른다. 미검토/검토완료를 가르고, **읽지 못한 파일은 미검토 쪽으로 센다** — C62 규칙이 여기서도 지켜져 있다 |
+| 부분 실패한 Control Tower 투영 | 성공으로 보고하는가 | **아니다.** 17행 중 2번째 쓰기에서 transport를 죽였더니 `outcome=FAILED`, `created=14`, 그리고 **실패한 행마다 `database/row_key: 이유`**가 붙는다. 성공 수와 실패 목록을 둘 다 준다 |
+| `_retire_absent_rows()`의 truncation 가드 | 잘린 목록으로 살아 있는 행을 은퇴시키는가 | **아니다.** `list_truncated`면 0건 은퇴하고 `reconciled=False`를 돌려준다. 읽지 못한 목록도 같은 답을 받는다(C69 이전 작업) |
+| 그런데 `unreconciled`를 **아무도 읽지 않는다** | "대조하지 못했다"가 화면에 오르는가 | `ProjectionResult.unreconciled`는 채워지지만 `src/` 어디에서도, `ops_status.py`에서도 읽히지 않는다. **오늘은 무해하다** — `sync_control_tower()`는 Runner에 연결되어 있지 않다(docs/14 §1, CT_* 5개는 Spec 결정 대기). **연결하는 사람이 함께 해야 할 일로 적어 둔다**: 지금 연결하면 "이 데이터베이스는 대조하지 못했다"가 계산된 뒤 버려지고, 그것이 C68 §1이 고친 바로 그 모양이다 |
+
+### 6. 같은 Event가 인터프리터에 따라 ACCEPTED도 되고 REJECTED도 된다 (신규, 측정, **미수정 — 결정 필요**)
+
+COO 체크리스트의 **"다른 Desktop에서 실행해도 동일한가?"**를 그대로 물었다.
+답은 **아니다**이고, 원인은 코드가 아니라 코드가 서 있는 인터프리터다.
+
+`events.schema._timestamp_error()`가 세우는 규칙은 두 문장이다 — *"유효한
+ISO-8601"* 이고 *"timezone offset을 포함해야 한다"*. `Z`는 그 둘을 **모두**
+만족한다. UTC offset의 표준 표기이고, 대부분의 JSON API가 내보내는 형태다.
+
+그런데 규칙을 집행하는 것은 `datetime.fromisoformat()`이고, **그 함수의 문법은
+Python 버전마다 다르다.** 이 머신(3.9.7)에서 실측:
+
+    2026-08-15T09:00:00+09:00      파싱됨
+    2026-08-15T09:00:00Z           ValueError
+    2026-08-15T09:00:00.123456Z    ValueError
+
+    validate_event(… 'timestamp': '…Z')
+      -> "timestamp is not valid ISO-8601: '2026-08-15T09:00:00Z'"
+
+3.11+에서는 같은 Event가 **통과한다.** 즉 규칙은 버전 독립인데 집행은 아니다.
+그리고 그 오류 메시지는 **거짓이다** — 그 문자열은 유효한 ISO-8601이다. 운영자는
+사실이 아닌 이유로 REJECTED를 본다.
+
+**오늘 도달하지 않는다.** 이 시스템의 Agent는 timestamp를 스스로 만들고
+(`datetime.now().astimezone().isoformat()`), 그것은 언제나 `+09:00`이지 `Z`가
+아니다. docs/02의 예시도 전부 offset 표기다. 손으로 쓴 Event, 복원된 Event, 또는
+장래의 외부 producer만이 `Z`를 만든다.
+
+**그래서 이번에 고치지 않았고, 고치지 않은 이유가 이 항목의 요지다.**
+`_timestamp_error()` **한 곳만** 고치면 상황이 **더 나빠진다.** `fromisoformat`은
+`src/`와 루트 스크립트에 걸쳐 **40곳**에서 불린다 — rollup의 `_event_date()`,
+`event_instant_key()`, `_whole_days_between()`, `notion/sync`의 Late Event 비교,
+`daily/generator`, `ops_status`의 화면 전부. 검증만 `Z`를 받아들이면 그 Event는
+ACCEPTED가 된 뒤 **하류에서 날짜를 못 읽는다** — 즉 눈에 보이는 REJECTED가
+조용한 `unreadable`로 바뀐다. C62가 없애 온 방향으로 정확히 한 걸음이다.
+
+**올바른 수정은 40곳 전체에 걸친 하나의 파서를 세우는 것**이고(예: `Z`를
+`+00:00`으로 정규화하는 단일 진입점), 그것은 Event 수용 계약을 건드리는 횡단
+변경이다. 한 Sprint에 검증 없이 넣을 일이 아니고, "무엇을 유효한 timestamp로
+볼 것인가"는 Spec 판단이다. **A절로 올린다.**
+
+기록해 둘 것 하나 — 이 결함은 **버전이 올라갈 때** 방향이 바뀐다. Runner를 3.9에서
+3.11+로 올리면 전에 REJECTED이던 Event가 통과하기 시작하고, 반대로 내리면
+`processed/`에 이미 쌓인 `Z` Event들이 rollup에서 `unreadable`로 떨어진다.
+"이전 실행의 상태가 현재 실행을 오염시키지 않는가"의 인터프리터 판이다.
+
+---
+
+## C68. 읽지 못한 Company History가 "빈틈 없음"으로 보고됐다
+
+COO 질문 하나를 그대로 시험대에 올렸다 — **"부분 데이터를 완전하다고 표시하지
+않는가."** 여섯 가지 불완전한 runtime을 실제 `ops_status.py`로 렌더링하고,
+화면이 말하는 것과 `Coverage.complete`가 말하는 것을 나란히 놓았다.
+
+### 1. 같은 트리인데 답이 뒤집힌다 (신규, 수정, **거짓 완전성**)
+
+C56이 `history_checked`를 만든 이유는 **아무도 묻지 않은 질문에 대해 모델이
+`complete = True`라고 답했기** 때문이다. 같은 변환이 **그 필드의 입력**에 한 겹
+안쪽으로 남아 있었다.
+
+`_company_history_older_than_the_evidence()`는 서로 다른 세 상황에 **전부
+`None`**을 돌려줬고, 그중 하나만 답이다:
+
+    확인했고 빈틈 없음            None    진짜 답
+    디렉터리를 나열할 수 없다      None    답이 아니다
+    Daily 파일을 열 수 없다        None    답이 아니다
+
+**실측 — 같은 트리, 읽기만 실패시키고 나머지는 그대로:**
+
+    읽힘      gap 2026-08-01   complete False   화면에 '증거 범위 밖' 출력
+    안 읽힘   gap None         **complete True**   화면에 **아무것도 안 나옴**
+
+두 번째 줄이 이 모델이 할 수 있는 **가장 강한 거짓 주장**이고, 하필 그 qualifier가
+존재하는 바로 그 상황에서 나온다 — 복원된 머신이다. `local_master/`는 원격에서
+돌아오고 `processed/`는 돌아오지 않는다(docs/08 §26). 복원된 트리에 권한 문제가
+하나 있으면 "아래 숫자는 남은 증거만 덮는다"가 **침묵**이 된다.
+
+**수정 세 곳, 전부 최소 범위:**
+
+    ops_status.py   `(gap, checked)` 쌍을 돌려준다. 나열 불가/읽기 불가는
+                    checked=False. **없는 디렉터리는 checked=True** —
+                    `local_master/daily`가 없는 머신에는 증거가 덮지 못할
+                    Company History 자체가 없다. `FileNotFoundError`를 나머지
+                    OSError와 가르는 이유이고, `read_events()`가 같은 자리에서
+                    같은 구분을 한다.
+    dashboard.py    `with_history_coverage(gap, *, checked=True)` — 키워드
+                    전용에 기본값 True라, 실제로 디렉터리를 읽은 기존 호출자는
+                    전부 그대로다(테스트 호출 15곳 무수정).
+    ops_status.py   **화면에 한 줄.** `complete`가 False로 바뀌는 것만으로는
+                    터미널이 한 글자도 달라지지 않는다 — 화면이 건강한 것과
+                    byte 단위로 같았다는 점이 이 항목을 "기록할 만한 것"이 아니라
+                    "찾을 만한 것"으로 만든다.
+
+**Evidence:** `test_controltower_dashboard.py::
+HistoryThatCouldNotBeReadIsNotHistoryWithNoGapTests` 6건. Mutation 5종 전부
+DETECTS — 되돌리기 3종, **과잉교정(없는 디렉터리를 unchecked로)**, 그리고
+**화면 한 줄 제거**.
+
+### 2. 그 결함이 있던 파일을 내 C66 게이트는 보지 않았다 (신규, 수정, **범위 결함**)
+
+방금 고친 것은 `except OSError: continue` 하나가 조용히 넘어간 자리다. C66 §4가
+바로 그 모양을 위해 `ASilentlyDroppedEntryIsARosterNotAParagraphTests`를 만들었다 —
+**그런데 그 게이트는 `SRC`만 훑는다.** `ops_status.py`는 저장소 루트에 있고,
+219KB이며, **운영자가 실제로 보는 화면**이다.
+
+세었다:
+
+    src/ 밖의 `except OSError: continue`        11곳
+    그중 기록하는 것                            1곳 (분류기 오탐 — `waiting += 1`)
+    조용한 것                                  **10곳, 전부 ops_status.py**
+
+C68이 고친 것은 그중 **하나**다. 나머지 아홉을 한 자리씩 읽고 분류했다:
+
+| 자리 | 무엇이 사라지는가 | 다른 reader가 있는가 |
+|---|---|---|
+| 308, 410 | `_daily_dates` / 월간판의 `entry.is_file()` — stat 실패한 날짜가 목록에서 빠진다 | **있다** — 날짜 시퀀스의 구멍으로 나타나고 `_holes_in_the_daily_sequence`가 그것을 찾는다 |
+| 1248, 1369, 1820, 1832 | 렌더된 Daily/Monthly 한 편을 못 읽어 건너뛴다 | 부분적 — 그 문서에 대한 판정만 빠진다 |
+| **538** | `_history_newer_than_the_last_backup` — stat 실패한 파일이 "백업 안 된 History" 집계에서 빠진다 | **없다** |
+| **853** | `_junctions_in_scope` — 실패한 항목이 junction 노출 목록에서 빠진다(**보안 점검**) | **없다** |
+| **1806** | `_monthly_lags_its_daily_source` — mtime을 못 읽은 날이 `0.0`으로 떨어져 "Daily가 Monthly보다 새롭다"가 거짓이 된다 | **없다** |
+
+굵은 셋의 공통점이 이 항목의 요지다: **셋 다 detector다.** detector가 조용해지는
+것은 detector에게 있을 수 있는 가장 나쁜 고장이고, 셋 다 "덜 보고"하는 방향으로
+고장난다.
+
+**게이트 범위를 넓혔다(이번 Sprint에 한 것).**
+`ASilentlyDroppedEntryIsARosterNotAParagraphTests`가 이제 루트 entrypoint
+다섯 개를 함께 훑고, 명부를 **모듈이 아니라 개수**로 든다:
+
+    src/backup/working_copy.py    2
+    ops_status.py                11
+
+개수가 아니라 모듈로만 들면, 이미 허용된 모듈이 **열두 번째**를 받았을 때
+아무도 모른다 — 그리고 `ops_status.py`에는 **이미 틀린 것이 셋** 있으므로
+그 모듈은 신용으로 허용할 대상이 아니다. Mutation 4종 전부 DETECTS —
+**이미 명부에 있는 모듈의 12번째 handler**, 명부에 없는 루트 스크립트의 새 handler,
+`src/`의 새 handler, 그리고 **스캔을 다시 `src/`로 좁히는 것**.
+
+**그 셋은 §3에서 같은 Sprint 안에 처리했다.** 처음엔 다음 Sprint로 미룰려 했으나,
+측정과 분류가 이미 끝나 있었고 셋 다 §1과 같은 모양의 변경이라 묶어서 하는 편이
+정확했다.
+
+### 3. 조용해지던 detector 셋을 고쳤다 (신규, 수정, **덜 보고**)
+
+§2가 "다음 Sprint 1순위"로 올린 셋을 같은 Sprint 안에서 처리했다. 셋 다 같은
+방향으로 고장난다 — **목록이 짧아진다.** 문제 목록이 짧아진 것은 더 건강한
+머신과 구별되지 않고, 그것이 detector가 가져서는 안 되는 유일한 고장이다.
+
+    _history_newer_than_the_last_backup   백업 안 된 파일이 목록에서 빠진다
+    _junctions_in_scope                   junction 노출이 목록에서 빠진다
+    _monthly_lags_its_daily_source        mtime을 못 읽은 날이 0.0으로 떨어져
+                                          "Daily가 Monthly보다 새롭다"가 거짓이 된다
+
+**수정:** 셋 다 `(result, skipped)`를 돌려주고, 세 호출자가 그 수를 화면에
+출력한다. 실측 — Monthly 대조는 `0건 발견`(Monthly가 최신이라고 조용히 주장)에서
+**`0건 발견, 1건 확인 못 함`**으로 바뀌었다.
+
+**`skipped`를 bool이 아니라 개수로 둔 이유:** 운영자가 알아야 하는 것은 "확인이
+불완전했다"가 아니라 **목록이 몇 건만큼 짧은가**다. §1의 history reader는 답이
+하나뿐이라 bool이 맞았고, 여기는 목록이라 수가 맞다.
+
+**이미 옳았던 것 하나 — 고치기 전에 재 봤다.** `_history_newer_than_the_last_backup()`의
+후보 목록은 `is_file()`을 감싸지 않고 부른다. 처음엔 이것도 결함으로 보였는데,
+실제로 권한 오류를 주입해 보니 `_block()`이 잡아서
+**"HISTORY 블록을 읽지 못했다 … 이 섹션의 상태는 이번 출력에 없다"**를 찍는다.
+시끄럽고 정확하다(C55/C63이 만든 것). 그래서 손대지 않았고, 루프 안에 넣은 가드는
+그것을 통과한 뒤에 남는 좁은 경우 — `is_file()`은 통과했는데 mtime을 읽을 때는
+사라진 파일 — 만 덮는다. **추측하지 말고 재라**가 여기서 한 일은 결함 하나를
+지운 것이다.
+
+**비대칭도 고정했다.** 없는 디렉터리·없는 Local Master·`isjunction`이 없는
+인터프리터(3.12 미만)는 전부 `skipped = 0`이다. "볼 것이 없다"가 "보지 못했다"로
+읽히면 배포 안 된 머신마다 영구 경고가 셋 생기고, 그것이 이 파일이 계속 없애는
+지워지지 않는 경보다.
+
+**부수 기록(자기 실수, 두 번째).** 화면 테스트의 `os.scandir` 대역을 맨
+`iter([...])`로 만들었더니 §1이 넣은 나열 가능성 probe가 `.close()`를 부르며
+깨졌다. **대역이 틀린 것이지 코드가 틀린 것이 아니다** — C64 §7이 Notion 이중에
+대해 적은 것과 같은 교훈이라, 대역을 실제 `scandir` 모양(`close`/`__enter__`
+포함)으로 고쳤다.
+
+**Evidence:** `test_observability.py::ADetectorSaysWhatItCouldNotCheckTests` 5건.
+Mutation 4종 전부 DETECTS — 되돌리기 둘, **없는 대상을 skip으로 세는 과잉교정**,
+그리고 화면 출력 제거.
+
+### 4. COO 질문 여섯 개를 화면으로 확인했다 (검증)
+
+`ops_status.py`를 여섯 가지 불완전한 runtime에 대해 실제로 렌더링한 결과 —
+§1의 결함을 고친 뒤:
+
+    A 증거가 History를 덮는다                complete True   (올바름)
+    B 복원: History 있고 Event 전멸           complete False  '증거 범위 밖' 출력
+    C 복원: History가 남은 증거보다 오래됨     complete False  '증거 범위 밖' 출력
+    D Event 파일 하나 안 읽힘                 complete False  '읽지 못한 파일' 출력
+    E History 없음, Event 있음                complete True   (덮지 못할 History가 없다)
+    F 아무것도 없음                          complete True   (0건이라고 정직하게)
+
+**F를 결함으로 세지 않은 이유를 적어 둔다.** 빈 머신에서 "Event 0건 / 커버리지
+완전"은 공허하게 참이다. 그리고 그 화면이 조용한 것도 아니다 — COMPANY 블록이
+Desktop별 "수집된 Event 없음"을 찍고 ATTENTION이 "3일 이상 아무것도 오지 않은
+Desktop"을 올린다. 침묵을 침묵으로 보고하지 않는다.
+
+---
+
+## C67. 어휘 표는 둘이 아니라 여섯이었다
+
+C66이 다섯 번 연속으로 같은 순서에서 결함을 냈으므로 그대로 이어갔다 —
+**규칙을 감사하기 전에 적용 대상을 먼저 센다.** C66은 복제된 *상수*를 게이트했고
+복제된 *함수*는 다음 Sprint로 넘겼다. 거기서 시작했다.
+
+### 1. 내 지난 Sprint 게이트가 **이름으로** 묶고 있었다 (신규, 수정, 범위 결함)
+
+C66 §5의 `EveryDuplicatedConstantIsHeldInStepTests`는 모듈 최상위 상수를
+**이름으로** 묶는다. 그러면 같은 값이 **다른 이름**으로 복제된 경우가 보이지
+않는다. 값으로 다시 세어 세 쌍을 찾았다:
+
+    _ROLE_DISPLAY_NAMES  / ROLE_DISPLAY_NAMES         daily/markdown, notion/properties
+    ITEM_LABELS          / _ITEM_LABELS               daily/markdown, monthly/parser
+    _CATEGORY_ORDER / CATEGORY_ORDER / SECTION_ORDER  daily ×2, monthly
+
+셋 중 둘은 **이미 처리되어 있었다** — `ITEM_LABELS` 쌍은 `test_monthly_history.py`가
+직접 비교하고(`assertEqual(ITEM_LABELS, _ITEM_LABELS)`), role 표 둘은
+`RoleDisplayTableCoverageTests`가 **일치가 아니라 커버리지**를 보장한다(두 표는
+서로 다른 spec을 따르므로 같아야 할 이유가 없다 — 그 결정이 docstring에 적혀 있다).
+
+세 번째가 남았다(§2).
+
+**게이트도 고쳐놓았다.** 값으로 묶는 반쪽을 같은 클래스에 더해,
+**두 모듈이 같은 값을 다른 이름으로 들고 있으면 명부에 이유가 적혀 있어야 한다**로
+했다. 이름이 같은 복제는 여전히 일치를 요구하고, 이름이 다른 복제는 **누군가
+보았다는 것**만 요구한다 — 셋 중 둘은 같아야 하고 하나는 같아서는 안 되기 때문이다.
+사소한 리터럴은 명부가 아니라 스캔이 거른다 — 그런 것으로 찬 명부는 아무도 읽지 않는다.
+**Mutation 2종 DETECTS**: 새 값이 두 이름으로 복제되는 경우, 명부가 이미 없는 것을
+가리키는 경우.
+
+### 2. Role 어휘에는 있는 게이트가 Category 어휘에는 없었다 (신규, 수정, **유실**)
+
+`RoleDisplayTableCoverageTests`는 role 표 둘이 `events.ROLES`에 뒤처지지 않는지
+지키면서 이유를 적어 둔다 — *"BACKLOG A-1은 다섯 번째 role을 추가하라는 열린
+요청이고 ... 실패는 조용하다."*
+
+**Category는 같은 종류의 어휘이고, 표가 둘이 아니라 여섯이다:**
+
+    history/filter._CATEGORY_BY_EVENT_TYPE       원천
+    daily/markdown._CATEGORY_ORDER               Daily 섹션 순서
+    daily/markdown._SECTION_TITLE_BY_CATEGORY    Daily 섹션 제목
+    daily/role_summary.CATEGORY_ORDER            역할별 묶음
+    monthly/markdown.SECTION_ORDER               Monthly 섹션 순서
+    monthly/markdown.SECTION_TITLE_BY_CATEGORY   Monthly 섹션 제목
+    monthly/parser.CATEGORY_BY_SECTION_TITLE     Monthly의 reader
+
+**실측:** 원천에 다섯 번째 category를 넣고 스위트를 돌렸다.
+
+    test_spec_conformance.py                      4 failed   (Daily 쪽이 항의)
+    test_history_filter + test_daily_role_summary 1 failed
+    test_daily_history + test_monthly_history     **163 passed**
+
+Monthly 쪽은 아무것도 알아채지 못한다. 그 비용을 실제 렌더러로 쟀다:
+
+    들어간 item                          2
+    Monthly 문서에 렌더링된 것            1
+    조용히 사라진 것                     1
+
+`render_monthly_markdown()`은 `SECTION_ORDER`로 버킷을 만들고
+`if item.category in by_category`로 거른다. 어느 Monthly 표도 모르는 category를
+가진 item은 **쓰이지도, 세어지지도, 보고되지도 않는다.** Daily History에는
+도달하고 Monthly History에는 도달하지 않는다.
+
+**왜 반쪽만 지켜졌는가.** 이미 두 표는 서로를 붙잡고 있다 —
+`test_the_section_titles_match_the_daily_renderer`가 Daily의 제목 표와 Monthly의
+**reader**를 엮어 둔다. 아무것도 Monthly의 **renderer**를 가리키지 않았고,
+그쪽이 item이 적힐지 말지를 결정하는 절반이다.
+
+**수정:** `CategoryTableCoverageTests` — 여섯 표 전부가 원천을 덮는지. 그리고
+원천만으로는 부족하다는 것을 mutation이 보여 줬으므로 규칙을 하나 더 넣었다 —
+**Monthly는 Daily가 쓸 수 있는 것을 전부 렌더링할 수 있어야 한다.** Monthly가
+원천보다 넓은 것은 빈 제목일 뿐이고, 반대는 기록이 사라지는 것이라 관계를
+**등호가 아니라 포함관계**로 썼다.
+
+`LEARNING`이 모든 표에 있고 어떤 event type도 그것을 만들지 않는다 — 표가
+원천보다 **넓은** 것은 결함이 아니며, 그 일방향성도 테스트로 적어 두었다.
+
+**Mutation:** 원천에 다섯 번째 category / Monthly 순서에서 하나 제거 / Monthly 제목에서
+하나 제거 / role_summary에서 하나 제거 / **Monthly에서만 LEARNING 제거** — 전부 DETECTS.
+그리고 **Daily에서만 LEARNING 제거는 침묵해야 하며 침묵한다** — 비대칭성까지 쟀다.
+
+### 3. 결함이 아니었던 것과, 낡은 주장 하나 (기록)
+
+**(a) 복제된 함수 12쌍 중 계약인 것.** 본문이 같은 함수를 전수 조사해 하나씩 봤다.
+`_select`/`_date`가 `notion/dashboard`와 `notion/properties`에 각각 있고,
+`controltower/notion_projection._property()`가 **세 번째 구현**이다. 셋이 null을 다르게
+다룬다 — 앞의 둘은 `{"name": ""}`을 내는데 Notion이 거절하는 모양이다. **도달
+가능한가 지금은 아니다** — 그 자리에 들어가는 값은 전부 enum 값이거나
+`validate_event()`가 비어 있지 않음을 보장한 필드다(`scheduler_status`,
+`backup_status`까지 추적해 확인했다). 기록만 한다.
+
+**(b) `month_title` / `month_key`.** 같은 본문이지만 **계약이 아니다** — 전자는
+Monthly 문서의 H1과 `- History Month:` 줄에만 쓰이고, 그 둘 다 **다시 읽히지 않는다**
+(찾아봤다). 후자는 파일명과 state 키다. 갈라져도 제목과 파일명이 보기에 어긋날
+뿐이다.
+
+**(c) `transport/onedrive.py`의 주장이 틀렸다 (수정).** `safe_event_filename`을
+복제하는 것을 정당화하면서 이렇게 적어 두었다 — *"`ROLE_DISPLAY_NAMES` is
+duplicated ... Both copies must stay in step; **a test asserts they agree**."*
+그런 테스트는 없고, 있어서도 안 된다 — `RoleDisplayTableCoverageTests`가 그
+반대를 명시적으로 결정해 두었다(*"they answer to different specs, so merging them
+would invent a coupling neither doc asked for"*). **저장소 안의 두 문서가 서로
+모순된다.** C38이 `safe_event_filename`에 대해 고친 것과 **같은 모양**의 주장이,
+바로 그 복제를 정당화하는 자리에 남아 있었다. 정확한 선례로 고쳐 적었다.
+
+---
+
+## C66. 게이트를 감사하는 규칙에도 적용 범위가 있었다
+
+C64는 stash를 보지 않았고, C65는 F-6이 state loader를 보지 않았다는 것을 찾았다.
+두 번 같은 모양이 나왔으므로 이번에는 그것을 **방법으로** 썼다 — 규칙을 감사하기
+전에 **그 규칙이 실제로 적용되는 자리를 전부 세는 것**부터 한다.
+
+### 1. 첫 대상은 "빈 스캔은 공허하게 통과한다"였다 (신규, **감사 규칙 자신의 사각지대**)
+
+`TheScansThisFileTrustsAreNotEmptyTests`가 그 규칙을 이미 진술한다 — *"a scan
+that returns nothing makes its guard pass without checking anything"* — 그리고
+docstring이 스스로 범위를 적는다: **"Every guard below"**. 즉 **한 파일**이다.
+규칙이 적용되는 곳은 스위트 전체에서 **발견한 집합을 순회하는 모든 게이트**다.
+
+세었다. 트리를 훑는 게이트 클래스 196개 중, 소스 트리를 발견 수단으로 쓰는
+것 39개를 골라 **실제로 측정**했다 — `Path.rglob`/`Path.glob`이 `src/`·`tests/`의
+`*.py`·`*.md`에 대해 **빈 결과를 돌려주게 만든 뒤** 각 게이트를 다시 돌렸다.
+
+    통과 -> 통과   12 클래스   (빈 트리에서도 초록)
+
+클래스 단위는 너무 거칠어서(발견을 아예 안 하는 클래스도 섞인다) **테스트 메서드
+단위로 다시 쟀다**. "트리를 실제로 읽는가"와 "빈 트리에서 통과하는가"를 함께 물어:
+
+    트리를 읽고, 빈 트리에서 통과하는 테스트 = 11개 / 9개 발견 지점
+
+11개가 **전부 부정문**이라는 것이 요점이다 — "저장소의 무엇도 X하지 않는다",
+"어떤 writer도 Y하지 않는다", "offenders가 없다". 빈 집합에 대한 부정문은 참이다.
+반대로 "guarded"로 나온 게이트들은 발견한 집합에 대해 **긍정문**을 주장하므로
+(예: "writer가 13개 이상이고 각각 정리한다") 빈 집합에서 스스로 실패한다.
+
+무엇이 조용해지는가가 이 항목의 무게다. 11개 중에는
+`test_the_monthly_package_cannot_reach_notion_at_all`,
+`test_nothing_in_production_creates_the_dashboard_databases`,
+`test_no_decode_site_catches_oserror_alone`,
+`test_the_roster_covers_every_loader_in_the_tree`(C65가 지난 Sprint에 만든 것)가
+있다. 아키텍처·보안·승인 경계를 지키는 게이트들이다.
+
+**발화 조건은 이국적이지 않다.** `_tracked_files()`가 고쳐진 이유가 정확히 이것이었다
+— checkout이 아닌 곳에서 `git ls-files`가 빈 결과를 준다. `src/`의 이름이 바뀌거나
+자리를 옮기면 `rglob`이 같은 일을 하고, 이 프로젝트는 의도적으로 여러 머신에서
+작업된다(AGENT.md §1).
+
+**수정:** 발견 지점 9곳 각각에 **인구 하한**을 붙였다. 새 관용구가 아니라 이
+저장소가 이미 쓰는 것이다 — `TestIsolationGuardTests`의
+`test_at_least_one_module_drives_the_runner`("Guard against the guard silently
+matching nothing")와 `test_the_sweep_finds_the_writers_we_know_exist`가 같은
+모양이다.
+
+**측정으로 닫혔음을 확인했다:** 같은 blinding 실험을 다시 돌려 **12 → 3**.
+남은 3개는 트리를 읽는 테스트가 하나도 없는 클래스로, 내 클래스 단위 probe의
+아티팩트이지 결함이 아니다(메서드 단위 측정에서 한 줄도 나오지 않았다).
+인과도 확인했다 — 하한 하나를 지우면 그 클래스가 즉시 VACUOUS로 돌아온다.
+
+### 2. 두 번째 대상: 게이트가 자기 주제를 한 가지 철자로만 본다 (신규, 수정)
+
+같은 방법을 다음 규칙에 적용했다 — "docs/08 §68-69의 Backup Log는 어디에도
+쓰이지 않는다". `BackupLogIsNeverPersistedTests`가 그것을 지키는데, 지키는 방식이
+**정확한 문자열 두 개**였다:
+
+    assertNotIn('"backup" / ', text)
+    assertNotIn("logs/backup", text.replace("\\", "/"))
+
+경로를 쓰는 자연스러운 철자 8가지를 만들어 쏴 봤다. **5가지가 그대로 통과했다:**
+
+    LOGS_DIR / "backup"                 통과   <- 이 저장소가 실제로 쓰는 관용구
+    Path("runtime", "logs", "backup")   통과
+    f"{logs}/backup/{run_id}.json"      통과
+    os.path.join(logs, "backup")        통과
+    BACKUP_SUB = "backup"; LOGS / SUB   통과
+
+첫 줄이 핵심이다. `src/`의 경로 상수는 전부
+`PROJECT_ROOT / "runtime" / "events" / "incoming"` 모양으로 쓰여 있다 — 즉 게이트가
+못 보는 철자가 **이 저장소가 실제로 쓰는 유일한 철자**였다. C58의 모양 그대로다:
+검사는 돌고, 초록이고, 자기 주제를 보고 있지 않다.
+
+**수정:** 파서로 본다. `BinOp('/')`의 양쪽 피연산자, 호출의 위치 인자, 문자열
+리터럴, 그리고 f-string의 상수 부분.
+
+**그리고 내 detector가 같은 함정에 빠졌다 (기록).** 첫 판은 호출의 **이름**이
+`Path`나 `join`인지를 물었다. mutation을 돌리니 하나가 통과했다:
+
+    from pathlib import Path as _P
+    directory = _P("runtime", "logs", "backup")
+
+C61이 import 게이트에 대해 내린 결론이 — **이름 검사는 별칭을 보지 못한다** —
+C58을 고치려고 쓴 detector 안에서 그대로 재발한 것이다. 호출 이름을 묻지 않도록
+바꿨고, 그 넓힘의 비용은 추측이 아니라 **측정했다**: 이 게이트가 훑는 80개
+파일에서 오탐 0건.
+
+**Mutation 7종 중 6종 DETECTS**(수정 전 2종). 남은 1종은 이름 붙인 상수이며,
+**docstring에 홀로 적어 두는 대신 테스트로 고정했다**
+(`test_the_one_spelling_that_still_evades_is_named`) — 상수 전파가 생기는 날
+그 테스트가 깨지고 docstring의 주장이 함께 갱신된다.
+
+### 3. 같은 방법을 세 번째 게이트에 적용했다 — Monthly 경계 (신규, 수정)
+
+`MonthlyBoundaryInvariantTests.test_monthly_reads_no_event_or_repository_path`은
+docs/09 §13의 결합 금지를 지키는데, 지키는 방식이 **이은 문자열 세 개**였다 —
+`history_candidates` / `events/incoming` / `processed`.
+
+철자 9가지를 쏴고 **4가지가 통과**했다. 네 개 전부 `events/incoming` 쌍을
+**나누어 쓴** 경우다:
+
+    ROOT / "events" / "incoming"                통과
+    Path("runtime", "events", "incoming")       통과
+    os.path.join(root, "events", "incoming")    통과
+    "events\incoming"                          통과
+
+`src/`에는 **붙여 쓴 경로 리터럴이 하나도 없다.** 모든 경로 상수가
+`PROJECT_ROOT / "runtime" / "events" / "incoming"` 모양이다. 즉 게이트가 볼 수 있는
+유일한 형태가 **아무도 쓰지 않는 형태**였다 — 같은 날 §2에서 찾은 것과 같은 모양이다.
+
+**토큰이 아니라 경로 구성요소로 본다.** `"events"`를 그냥 금지 토큰으로 넣으면
+경계를 **설명하는 docstring**이 위반이 된다 — 그러면 그 게이트는 읽히기 전에
+지워진다. 그래서 `BinOp('/')`의 피연산자, 호출의 위치 인자, 구분자를 포함한
+리터럴만 본다. 오탐 비용은 측정했다 — `src/monthly/`에는 그 단어들이 코드에도
+산문에도 하나도 없다.
+
+**Mutation 8종:** 결합 7종 전부 DETECTS(별칭된 `Path` 포함), 그리고 **산문만 있는
+8번째에는 침묵한다** — 정밀도를 반대 방향으로도 재었다.
+
+**부수 기록(자기 실수, 두 번째).** 테스트 안의 fixture 문자열을 `chr(92) + "n"`으로
+만들어 실제 개행이 아닌 **글자 그대로의 `
+`**을 넣었고, `ast.parse()`가 SyntaxError를
+냈다. C64에서도 같은 실수를 한 번 했다. **fixture가 production 형태를 재현하는지**는
+감사 항목에 적혀 있는 것이고, 이번엔 내 fixture가 그러지 못했다.
+
+### 4. 네 번째: C62가 산문으로 적어 둔 **숫자**가 낡았다 (신규, 수정)
+
+같은 질문을 규칙이 아니라 **이미 고친 결함의 범위 진술**에 던졌다.
+C62가 `read_events()`에서 조용한 `continue`를 없앨 뒤 docstring에 이렇게 적었다:
+
+    "The three other `except OSError: continue` loops in this repository are
+     left alone deliberately: none of them has an `unreadable` channel to
+     report into..."
+
+**세었다. 둘이다.** AST로 `OSError`를 잡고 `continue`에 닿는 handler 9개를
+찾았고, 그중 기록하지 않는 것은 **2개**다(둘 다 `backup/working_copy.py`의
+scope walk). `transport/intake`와 `collector/runtime`는 그사이 기록하도록 바뀌었다.
+
+**논거는 살아있고 숫자만 죽었다.** 두 생존자의 정당화를 실제로 확인했다 —
+backup scope에서 빠진 파일은 "백업되지 않은 Company History"로 나타나고,
+`ops_status.py`가 그것을 이미 찾고 있다(`UnbackedCompanyHistoryTests`). 즉 **결함은
+없고 주장만 낙았다** — E-11의 모양 그대로다.
+
+**수정은 숫자를 고치는 것이 아니라 산문을 명부로 바꾸는 것이다.**
+`ASilentlyDroppedEntryIsARosterNotAParagraphTests`가 생존자를 열거하고, 각각에
+"그 침묵을 받아주는 reader"를 적어 둔다. 산문은 **네 번째가 생기는 것을 알아채지
+못한다.**
+
+명부에도 §1의 교훈을 적용했다 — 이 클래스 자체가 부정문을 주장하므로
+`test_the_sweep_finds_handlers_at_all`이 먼저 서 있다.
+
+**Mutation 3종 전부 DETECTS**: 명부에 없는 모듈에 새 침묵 handler가 생기는 경우,
+**`read_events()`가 다시 침묵하는 경우(C62 회귀)**, 그리고 명부가 이미 없는 것을
+가리키는 경우.
+
+### 5. 다섯 번째: 복제된 계약의 명단도 손으로 쓰여 있었다 (신규, 수정, **유실**)
+
+`DuplicatedRulesStayInStepTests`가 복제된 규칙 셋을 지키고 있고, 그 셋은 잘
+지킨다. 아무도 물지 않은 것은 **복제가 몇 개인가**였다.
+
+파서로 세었다. 모듈 최상위 할당만(enum 멤버는 공유 계약이 아니다 — 그 구분
+하나로 결과가 13개에서 5개로 줄었다), 그리고 **값이 아니라 이름으로 묶어서**
+— 값으로 묶으면 **이미 어긋난 쌍이 서로 모르는 단일 상수 둘로 보이기 때문이다.**
+
+    INCOMPLETE_WRITE_PREFIX   4개 모듈   일치   이미 게이트 있음
+    _MAX_FILENAME_STEM        3개 모듈   일치   직접 게이트 없음
+    METADATA_TITLE            2개 모듈   일치   게이트 없음
+    _EVENT_ID_LABEL           2개 모듈   일치   게이트 없음
+    LATE_SECTION_TITLE        2개 모듈   **불일치**
+
+마지막이 그 자체로 버그는 아니다. 둘은 **쓰는 쪽과 읽는 쪽**이 한 제목을 두 철자로
+가지고 있는 것이다:
+
+    daily/late_events.py   "## Late Events"   이 모듈이 **쓰는** 줄
+    monthly/parser.py      "Late Events"      그 줄에서 `##` 정규식이 **뽑아내는** 제목
+
+**오늘은 대응한다. 그것을 확인하는 것은 아무것도 없었다.** 어긋나는 순간의 비용을
+실측했다 — `daily/markdown`이 렌더링하는 모양의 문서를 실제 parser에 넘겨서:
+
+    양쪽이 일치                 -> 1 item 파싱, is_late=True
+    Daily 제목만 이름을 바꿈    -> **0 item**, 오류 없음, 경고 없음
+
+Daily History에는 도달한 Late Event가 Monthly 통합에는 **그냥 안 들어온다.** 이것은
+이 저장소가 이미 한 번 값을 치러본 모양이다 — `_LABEL_BULLET`에서 두 사본 중 하나의
+콜론 뒤 공백 하나가 빠져 Late Event가 무한히 중복됐다.
+
+**수정:** 복제를 **발견**하는 게이트를 넣었다. 명단을 손으로 적지 않고 AST로 세고,
+일치해야 하는 것은 일치를, 일치하지 **않아야** 하는 한 쌍은 **관계**를 확인한다 —
+`monthly`의 값이 `monthly` 자신의 `_HEADING2` 정규식이 `daily`의 값에서 뽑아낸 것과
+같은가. `##` 벗기는 코드를 테스트가 다시 쓰지 않는다 — 읽는 쪽의 정규식을 그대로 불러 쓴다.
+
+그리고 위 측정을 **실행 가능한 테스트로** 남겼다 — docstring의 숫자는 낡는다는 것이
+이번 Sprint가 네 번 배운 것이다.
+
+**Mutation 6종 전부 DETECTS**: Daily 제목만 변경 / Monthly 제목만 변경 /
+`_EVENT_ID_LABEL` 한 사본 drift / `METADATA_TITLE` drift / `_MAX_FILENAME_STEM` drift /
+**새로운 불일치 복제 상수가 생기는 경우**.
+
+**부수 기록(fixture).** 첫 측정 시도는 손으로 쓴 Daily 문서를 썼고 양쪽 모두 0 item이
+나왔다 — **fixture가 production 문서를 재현하지 못한 것**이지 결함이 아니었다.
+실제 렌더러가 내는 모양(항목 블록에 `Category`까지)으로 바꾸고 나서야 1 → 0이 보였다.
+
+### 6. 결함이 없던 것 셋 (기록)
+
+같은 방법을 적용했지만 **아무것도 나오지 않은** 두 규칙도 적어 둔다 —
+다음 Sprint가 같은 곳을 다시 파지 않도록(C63의 선례).
+
+**(a) `TestIsolationGuardTests`의 발견 술어.** 이 게이트는 Runner를 몰아대는 테스트
+모듈을 `"local_master_dir=" in text` 하나로 찾는다. 진짜 집합을 AST로 세어 비교했다 —
+**탐지 12개, 실제 12개, 누락 0.** `app.runner`를 import하고도 탐지되지 않는 6개를
+개별로 확인했고, 그 중 Runner의 `run_once`를 **호출하는 것은 하나도 없다**
+(상수를 가져오거나 `inspect.getsource`용으로 module을 묶을 뿐이다).
+
+**(c) Dashboard ↔ Notion 패널 계약 게이트가 빈 모델에서 공허하게 통과하는가.**
+아니다. `EveryColumnHasAPropertyTests`를 panel이 비어 있는 모델로 돌려 보니 9개 중 2개가
+실패해 클래스가 빨간색이 된다(`PANEL_PROJECTIONS`에만 있는 키가 남기 때문). 그리고
+fixture가 **SOURCED 패널을 하나도 비우지 않는다**는 것도 확인했다(행 0인 sourced 패널 0개) —
+패널별 단언이 공허하게 통과할 수 있는 자리가 없다. **결함 없음.**
+
+**(b) Lock의 stale takeover가 "읽지 못함"을 "없음"으로 취급하는가.** 취급한다 —
+그리고 의도된 것이며 안전하다. `_read_lock()`이 None이면 `pid`가 None이고
+`_is_process_running(None)`은 False라 잠금이 stale로 판정된다. 그러나 잠금 파일은
+`O_CREAT|O_EXCL` 직후 **비어 있는 창**이 있고, 바로 그 창을 위해 쓰기 직후
+**확인 단계**가 있다 — 내 lock이 아니면 False를 돌려준다. 읽기 자체가 권한 오류로
+실패하는 경우는 unlink도 같이 실패해 `_take_over_stale()`가 False를 돌린다.
+**결함 없음.**
+
+### 7. 이번 Sprint가 쓴 방법 (기록)
+
+세 Sprint 연속으로 같은 순서가 결함을 냈다:
+
+    규칙의 문장을 찾는다
+        -> 그 규칙이 적용되는 자리를 **센다** (읽지 말고 센다)
+        -> 규칙을 지키는 게이트의 **발견 술어**를 깨뜨린다
+        -> 깨진 채로 통과하는 것이 있으면 그것이 결함이다
+
+C64는 "stash에 있다"는 문장에, C65는 F-6의 표에, C66은 게이트의 docstring이 적어
+둔 "below"에 적용했다. 셋 다 **문장이 진실을 말하고 있었고 범위가 좁았다.**
+
+---
+
+## C65. F-6의 sweep이 절반만 돌았다
+
+C64 §6은 `notion/transport.py`의 `json.loads()` 하나를 고치면서 BACKLOG F-6의
+판별 기준을 인용했다 — **함수 자신의 문서가 "파싱할 수 없음"의 답을 이미 갖고
+있는가.** 인용해 놓고 물어보지 않은 질문이 남아 있었다: **그 기준으로 트리
+전체를 다시 보면 몇 곳이 걸리는가.**
+
+### 1. 22곳을 전수로 세었다 (신규, 방법)
+
+grep이 아니라 AST로 셌다 — C61이 정리한 이유 그대로이고, 이번에는 그것이
+실제로 필요했다(`json.loads`를 **언급만** 하는 docstring이 여러 개 있고, C64 §5가
+바로 그 오독으로 게이트 둘을 오발시켰다).
+
+    json.load(s) 호출부         22곳
+      RecursionError 처리 있음  11곳   (C22의 F-6 4곳 + 기존 + C64의 1곳)
+      없음                      11곳
+
+없는 11곳 중 **9곳이 state loader**였고, 아홉 곳이 **글자 그대로 같은 세 줄**이다:
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise <Module>StateError(f"... is corrupted: {path} ({exc})")
+
+나머지 2곳은 `Event.from_json()`과 `BackupLogEntry.from_json()`으로, **답을 갖고
+있지 않은** 얇은 역직렬화 함수다 — 판별 기준이 "호출자가 정한다"로 답하므로
+건드리지 않았다(그리고 `controltower/rollup.py`·`history/reconciliation.py`의
+호출부는 이미 `except Exception`이다).
+
+### 2. F-6의 표에 state loader가 한 줄도 없다 (신규, **sweep의 사각지대**)
+
+F-6이 훑은 6곳은 전부 **신뢰할 수 없는 파이프라인 파일을 읽는 곳**이다 —
+`agent/signals.py`, `transport.intake`, `app/desktop_activity`, `agent/delivery`,
+`collector.collect`, `history.list`. state loader는 그 렌즈에 아예 들어오지
+않았다. 모양이 같고 판별 기준의 답도 같은데, **찾는 방식이 그것들을 보지
+않았다.**
+
+이것이 C59~C61의 결론이 한 번 더 도착한 것이다: 그 Sprint들은 *게이트가
+지키는 것*이 아니라 *게이트가 보는 것*을 깨뜨렸다. 여기서는 게이트가 아니라
+**감사 자체의 발견 술어**가 좁았다.
+
+### 3. 진입점 12개 전부 갈라져 있었다 (실측)
+
+각 loader에 (a) 쓰레기 파일과 (b) 여는 괄호 20,000개짜리 파일을 넣고 답을
+비교했다. **12개 전부 DIVERGES**:
+
+    agent.state / backup.state / monthly.state / scheduler.state /
+    collector.state / notion.retry_queue / notion.dashboard_pending /
+    runsummary            쓰레기 -> 각자의 typed error,  깊음 -> RecursionError
+    scheduler.lock ×3     쓰레기 -> 정상 반환,           깊음 -> RecursionError
+    agent.status.read_status  쓰레기 -> 정상 반환,       깊음 -> RecursionError
+
+마지막 줄이 가장 날카롭다. `read_status()`의 docstring이 이렇게 적혀 있다 —
+**"Never raises for a damaged state file. A corrupted `agent_state.json` is
+exactly when someone needs this view most"**.
+
+### 4. 운영자가 실제로 보는 차이를 반대로도 쟀다 (실측, 범위 축소)
+
+"loader가 갈라진다"와 "운영자가 다친다"는 다른 문장이다. 그래서 수정을
+**되돌리고** `ops_status.py`를 state 파일 10종에 대해 실제로 돌렸다.
+
+    injected                        쓰레기      깊게 중첩
+    state/monthly_history_state     렌더링      RAISED RecursionError
+    state/backup_state              렌더링      RAISED RecursionError
+    state/notion_retry_queue        렌더링      RAISED RecursionError
+    state/dashboard_pending         렌더링      RAISED RecursionError
+    나머지 6종                       렌더링      렌더링
+
+**4건이다. 9건이 아니다.** 나머지는 `ops_status.py`가 더 바깥에서 감싸고 있어
+살아남았고(`agent_state`가 그 경우다 — loader는 raise했는데 화면은 살았다),
+그 사실을 적어 두는 편이 "9곳이 깨져 있었다"고 쓰는 것보다 정확하다.
+**계약은 9곳에서 깨져 있었고, 운영자에게 닿은 것은 4건이다.**
+
+### 5. Runner는 어차피 중단된다 (기록, 이 항목이 바꾸지 않는 것)
+
+state 파일이 손상되면 Runner는 예외 종류와 무관하게 중단한다 — BUG-3로 기록된
+**의도된 동작**이고, C34가 `begin()`을 앞당겨 그 중단이 Manifest에서 올바른
+단계에 귀속되게 만들어 두었다. 즉 이 수정이 Runner의 동작을 고치지 않는다.
+바꾸는 것은 **손상됐기 때문에 여는 화면** 쪽이다. 이 구분을 적어 두는 이유는,
+적어 두지 않으면 다음 사람이 "state 손상 = Runner 중단"을 이 Sprint가 고친
+것으로 읽기 때문이다.
+
+### 6. 테스트를 아홉 개가 아니라 명부 하나로 썼다 (설계)
+
+모듈마다 테스트를 붙이면 **열 번째 loader**가 같은 세 줄로 추가될 때 아무것도
+실패하지 않는다. 그래서 `_loaders()` 명부에 대한 게이트 하나로 쓰고, 명부
+자체를 트리와 대조한다 — `src/` 안에서 `json.loads`를 감싸며 `ValueError`를
+잡는 모든 `except`는 `RecursionError`도 잡아야 한다.
+
+`_atomic_writers()`가 손으로 관리하던 명단이 조용히 낡았던 것(C49)과 같은
+자리이고, 같은 해법이다.
+
+**Mutation 4종 전부 DETECTS**: 세 loader에서 각각 되돌리기, 그리고 **옛 세 줄로
+쓴 열 번째 loader 주입** — 마지막 것은 명부 기반 테스트 셋 다 통과하고 트리
+대조 게이트만 잡는다. 그것이 그 게이트가 있는 이유다.
+
+**부수 기록(자기 실수).** 이 클래스의 헬퍼를 `_outcome`이라고 이름 지었더니
+`unittest.TestCase`가 이미 쓰는 속성과 충돌해 모든 subTest가
+`'_Outcome' object is not callable`로 죽었다. 이름을 바꾸고, 주석에 그 충돌을
+적어 두었다 — 읽는 사람이 추측할 수 있는 종류의 충돌이 아니다.
+
+**Evidence:** `tests/test_state_consistency.py::
+ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests` 4건.
+
+### 7. staging 규칙의 **읽는 쪽**을 처음으로 전수 조사했다 (결함 0, 기록)
+
+C64 §4가 `processed/`에서 건너뛰기를 걷어내면서 당연한 반대 질문이 생겼다:
+**나머지 스캐너는 맞게 하고 있는가.** `IncompleteWriteInvariantTests`는 술어
+사본 4개가 일치하는지와 **writer가 접두어를 쓰는지**를 본다 — *reader가 그
+술어를 부르는지*는 아무것도 보지 않는다.
+
+양쪽을 AST로 셌다.
+
+    writer가 staging하는 디렉터리   13곳
+    확장자로 훑는 scanner          17곳
+      술어를 부른다                10곳
+      부르지 않는다                 7곳
+
+7곳을 하나씩 확인했고 **전부 이유가 있다**:
+
+| scanner | 왜 부르지 않아도 되는가 |
+|---|---|
+| `collector/runtime.py` (`incoming/`) | 이름이 아니라 **내용**으로 판정한다 — 잘린 파일은 파싱에 실패해 REJECTED로 `rejected/`에 간다. 문서화된 결정 |
+| `history/reconciliation.py` (`processed/`) | C64 §4 — `processed/`에는 아무도 staging하지 않는다 |
+| `app/desktop_activity.py` (`processed/` 외) | 같은 이유. `transport/`·`incoming/`에 대해서는 Collector가 곧 셀 것과 같은 수를 센다 |
+| `agent/delivery.py` (`sent/`) | `sent/`에 도착하는 유일한 경로가 `drain()`의 `os.replace`이고, 그 원본 목록인 `pending()`이 **이미 거른다** |
+| `agent/status.py` ×2 (`sent/`, rejected signals) | 같은 이유. 두 디렉터리 어느 쪽도 13개 writer의 목적지가 아니다 |
+| `agent/signals.py` (Signal 날짜 폴더) | Signal은 이 저장소가 쓰지 않는다 — 사람이 다른 Desktop에서 쓴다 |
+
+**게이트를 더하지 않았다.** staging 디렉터리가 전부 변수(`output_dir`,
+`target_dir`)라 writer의 목적지와 reader의 glob을 정적으로 이어 붙일 수 없고,
+행위로 거는 게이트는 이미 각 모듈의 테스트가 하고 있는 일이다. 없던 것은
+게이트가 아니라 **명단 자체**였고, 위 표가 그것이다 — 다음 sprint가 같은 곳을
+다시 세지 않도록.
+
+### 8. 바뀐 코드에 branch coverage를 걸었다 — 실행되지 않는 줄은 하나뿐이었다 (검증)
+
+C64/C65가 더한 코드가 **실제로 실행되는지**를 coverage.py로 확인했다
+(통과하는 것과 실행되는 것은 다른 문장이다).
+
+    oplog.py                    100%   (bidi 가드 전부)
+    reporter/local_output.py    100%   (예약 장치명 전부)
+    transport/onedrive.py       100%
+    controltower/rollup.py       99%   달린 2줄은 부분 실행 아티팩트 —
+                                       8개 파일만 돌려서였고, 따로 재언 결과
+                                       둘 다 실행된다
+    controltower/notion_projection.py  99%   — **한 줄이 진짜로 도달 불가능**
+
+그 한 줄은 `_is_present()`의 "properties가 Mapping이 아니다" raise다.
+`_retire_absent_rows()`가 같은 튜플에서 `_row_key_of(page)`를 **먼저** 평가하고,
+그쪽이 똑같은 모양을 한 걸음 먼저 거부한다.
+
+프로덕션에서 도달 불가능한 것 자체는 괜첂다. **테스트가 없는 것이 문제다** —
+그러면 그 줄을 받치고 있는 것이 **한 표현 안 두 호출의 순서**뿐이고, 그 순서를
+바꾸는 편집은 아무도 두 번 생각하지 않는다. C64 §3에서 mutation 하나가
+살아남았던 것과 **같은 결합**이고, 이번엔 mutation이 아니라 coverage가 먼저
+찾았다.
+
+`ThePresentReaderRefusesTheSameShapesTests` 4건으로 규칙을 사는 자리에서
+고정했다.
+
+### 9. `validate_rows()`가 "모든 이유"라고 적고 날짜를 보지 않았다 (신규, 수정, **오래된 주장**)
+
+그 함수의 docstring은 "**Every** reason Notion would refuse these rows"라고
+적어 둔다. 실측 — DATE property 둘에 `"not-a-date"`와 `"2026-13-45T99:00:00"`을
+넣은 행이 **clean로 나왔고**, 이중도 받아들였다. 실 API는 둘 다 HTTP 400이고,
+400은 `PERMANENTLY_REFUSING_STATUS_CODES`에 들어 있다.
+
+**오늘 그런 값을 만드는 곳은 없다** — 모든 DATE 값은 `validate_event()`가 검증한
+Event timestamp이거나 `model.generated_at`이다. 그것도 가정하지 않고 **재었다**:
+실제 fold를 돌려 나온 날짜를 전부 다시 읽는 테스트가 그 전제를 고정한다.
+즉 이것은 **살아 있는 결함을 고친 것이 아니라 오래된 주장을 닫은 것**이고,
+그 구분을 적어 둔다.
+
+검사가 실제로 쓰일 자리는 **아직 없는 DATE 컬럼**이다. `_property()`는 어떤
+문자열이든 `date.start`으로 넣으므로, Event timestamp가 아닌 원천을 가진 첫
+DATE 컬럼은 그대로 Notion까지 가서 400을 받고, 이쪽에는 이유를 말한 것이
+아무것도 없게 된다.
+
+판별은 정규식이 아니라 `datetime.fromisoformat()`으로 한다 —
+`events.schema._timestamp_error()`가 Event timestamp를 검증하는 **같은 parser**이므로,
+"Event timestamp는 유효한 Notion 날짜다"가 두 패턴의 합의가 아니라 **구성상**
+참이 된다.
+
+**부수 기록(자기 실수).** 그 동치를 처음엔 "둘 다 받아들인다"로 썼고,
+`2026-08-21T10:00:00.5+09:00`을 예로 들었다 — 이 머신의 3.9에서는 한 자리 소수를
+`fromisoformat()`이 거부한다. **둘 다 거부했고**, 그것이 이 테스트가 원한 답이지만
+묻고 있던 질문이 아니었다. 질문을 **합치**로 다시 썼다 — "Event가 받아들인 값은
+Notion으로 나갈 수 있다", 모든 값에 대해.
+
+**Evidence:** `EveryDateThisProjectionEmitsIsISOTests` 4건. Mutation 4종 전부 DETECTS
+(검사 제거 / 무엇이든 통과 / null까지 거부하는 과잉교정 / `_is_present`가 raise 대신
+False를 돌려주기).
+
+---
+
+## C64. 13 Sprint 동안 stash에 남아 있던 수정과, 그 옆에서 새로 찾은 둘
+
+**HEAD의 스위트가 빨갛다는 것에서 시작했다.** baseline 재측정 —
+`3438 passed, 1 failed, 2 skipped` (725.87s). C50 §3이 이 실패를 이미 기록해 두었고
+**프로덕션 결함**이라고 정확히 판정했으며, 고치지 않은 이유를 "승인이 아니라
+중복"이라고 적었다 — 완성된 수정이 `stash@{0}`에 있으니 손으로 다시 쓰면 병합만
+나빠진다는 것이었다. 13 Sprint 뒤에도 stash는 적용되지 않았고 스위트는 여전히
+빨갛다. **"나중에 병합한다"가 결함을 살려 두는 방식이 되어 있었다.**
+
+### 1. `NUL.json`은 파일이 아니다 — C31의 측정이 이 머신에서 틀렸다 (수정)
+
+C31은 다음을 재고 결론을 냈다.
+
+    NUL         쓰기 -> exists=True, size=0,  목록에 없음
+    NUL.json    쓰기 -> exists=True, size=10, 있음
+    "확장자가 막고 있다 ... 고칠 것은 없다"
+
+**두 번째 줄이 배포 머신에서 거짓이다.** 빈 임시 디렉터리에서, 아무것도 쓰기 전에
+다시 쟀다(Windows 10 19042, Python 3.9.7):
+
+    Path("NUL.json").exists()               -> True   (is_file() False)
+    Path("NUL.json").write_text('{"a":1}')  -> 성공
+    Path("NUL.json").read_text()            -> ""     (st_size 0)
+    list(directory.iterdir())               -> []
+    os.replace(tmp, "NUL.json")             -> WinError 183, 그리고
+                                               `.tmp-….json` staging 파일이 남는다
+
+Win32는 **첫 마침표 앞 구간**으로 장치 이름을 판정한다. 그래서 확장자는 애초에
+막은 적이 없다 — `NUL.json`도 `NUL.json.json`도 NUL 장치다. 뒤따르는 두 실패는
+이 저장소가 가장 두려워하는 두 가지다: 성공을 보고하고 아무것도 저장하지 않는
+쓰기(docs/11 §50 "History 손실"), 그리고 모든 `glob("*.json")` 스캐너가 완성된
+산출물로 읽는 `.tmp-` 잔여물.
+
+**C31의 측정이 그럴듯했던 이유가 곧 교훈이다.** 어떤 이름이 장치로 해석되는지는
+Windows가 열거한 장치에 달려 있어 **머신마다 다르다.** 여기서 실측:
+
+    장치다     CON, AUX, NUL, COM1, CONIN$, CONOUT$
+    아니다     PRN, LPT1-LPT9, COM2-COM9, COM0, LPT0, CLOCK$
+
+한 머신의 답에 맞춘 sanitiser는 그 머신에서 안전하고 **다음 머신에서 조용히
+위험하다.** 그래서 관측한 집합이 아니라 **문서화된 집합 전체**를 거부한다.
+
+**수정은 stash의 본문을 그대로 가져왔다.** 새로 쓰지 않은 것이 요점이다 — C50 §7이
+이미 같은 판단을 내렸다("stash와 겹치는 파일은 stash의 diff를 그대로 넣었다 —
+내용이 같으면 git이 충돌 없이 병합한다"). 세 저장 경계
+(`reporter/local_output.py` · `transport/onedrive.py` ·
+`history/file_repository.py`)에 `_RESERVED_WINDOWS_STEMS` /
+`_has_reserved_windows_head()`가 stash와 **byte 단위로 동일한 위치에 동일한
+본문으로** 들어가 있고, 검증했다. 독립적으로 먼저 쓴 판이 있었는데 규칙이
+수렴했다(같은 집합, 같은 `split(".", 1)[0].upper()`) — 다른 점은 dotted head를
+어떻게 중화하는가 하나였고, 병합 비용이 없는 쪽인 stash 판을 택했다.
+
+**기존 파일을 하나도 옮기지 않는다.** 이름이 바뀌는 id는 정확히 **성공적으로 쓰인
+적이 없는** id뿐이다 — 장치 경로에 대한 쓰기는 삼켜지거나 WinError 183이었으므로,
+`NUL.json`이라는 파일이 이 플랫폼에 존재할 수 없다.
+
+**Evidence:** `test_untrusted_event_input.py::ReservedDeviceNameTests` 10건
+(C31의 3건을 대체). 하나는 이 머신에서 실제로 확장자가 뚫린다는 것을 **사실로
+고정**하고(뒤집히면 알아야 한다), 하나는 이 머신이 장치로 해석하지 **않는**
+`PRN`/`LPT1`도 거부되는지 본다. Mutation 5종 전부 DETECTS
+(가드 제거 / 조립된 이름 재검사 제거 / 집합 축소 / 전체 이름 매칭 / 대소문자 구분).
+`DuplicatedRulesStayInStepTests.EVENT_IDS`에 5건을 더해, 두 사본이 이 규칙에서
+갈라지면 기존 게이트가 잡는다.
+
+### 2. `sync_control_tower()`는 "Never raises"라고 적어 두고 raise했다 (신규, 수정)
+
+같은 눈으로 Control Tower의 Notion 쪽을 봤다. `_reason()`의 docstring이 이 모듈이
+상대하는 위협을 이미 적어 두었다 — "a proxy or captive portal answering in Notion's
+place is free to echo request headers back". **쓰기 경로는 그것에 맞춰 단단하다.
+조정(reconciliation) 경로는 아니었다.**
+
+`RealNotionTransport.list_pages()`는 응답 본문의 `results`를 **그대로** 돌려준다.
+`_retire_absent_rows()`는 그 안의 모든 원소가 page 모양 mapping이라고 가정하고
+걸었고, `sync_control_tower()`에서 그 호출은 **어떤 try에도 들어 있지 않았다.**
+
+주입 12종 실측 — **9종이 `AttributeError`로 함수 밖으로 나갔다:**
+
+    results가 문자열 리스트 / null 리스트 / error 객체 / 문자열 / 순회 불가
+    properties가 문자열 / Row Key가 문자열 / title이 문자열 / title 항목이 문자열
+    Present가 문자열
+
+깨진 것은 CEO Decision ④ ("Dashboard 기록 실패는 Runtime을 절대 중단시키면 안
+된다")이고, 그것은 이 모듈이 **연결될 Runner에게 하는 유일한 약속**이다.
+
+**수정:** 첫 은퇴 전에 목록을 통째로 읽고, 읽지 못하면 잘린 목록과 **똑같이**
+취급한다 — 아무것도 은퇴시키지 않고 `unreconciled`에 데이터베이스 이름을 적는다.
+이해하지 못한 목록으로 조정하면 못 알아본 행을 전부 은퇴시키게 되고, 그것이 잘림
+분기가 이미 거부하는 바로 그 실패다. 이 시점에 쓰인 것은 없으므로 거부 비용은
+pass 하나다.
+
+**구분은 유지했다.** `id`가 없는 page 하나는 목록이 Notion이 아니라는 증거가
+아니므로, 나머지 행은 그대로 조정되고 그 행만 error가 된다.
+
+**Evidence:** `ARemoteThatIsNotNotionCannotBreakTheRunTests` 6건. 10종 corpus를
+대표 하나로 줄이지 않았다 — 각각이 walk의 다른 줄을 가리키고, 한 줄만 막은 수정은
+한 종짜리 테스트를 통과한다. 마지막 테스트가 게이트를 지킨다(모든 목록을 거부하는
+수정은 앞의 다섯을 전부 통과한다).
+
+### 3. 살아 있는 행이, Notion이 제목을 어떻게 적었는가 때문에 은퇴한다 (신규, 수정)
+
+같은 함수의 두 번째 결함이고, **이 저장소가 이미 두 번 물린 모양**이다.
+
+Notion은 title을 **서식이 같은 구간마다 항목 하나**로 저장하고, 문자 그대로의
+텍스트가 아닌 항목(mention, equation)은 `"text"` 키를 **아예 갖지 않는다.**
+`notion/properties._extract_rich_text()`가 `ExecutionPlanSync._update()`를 상대로
+정확히 이 모양을 실측하고 `plain_text`를 읽도록 고쳐져 있고,
+`notion/dashboard._page_title()`도 `plain_text`를 읽는다.
+`_retire_absent_rows()`는 `text.content`를 읽고 있었다 — **같은 Notion 답을 읽는 세
+번째 reader이자, 없을 수 있는 키를 아직 읽던 유일한 곳.**
+
+여기서는 결과가 "비교 실패"보다 나쁘다. Notion의 `title equals` 필터는 **plain
+text**를 비교하므로 행은 **찾아지고 갱신된다** — 그리고 방금 쓴 키를 읽지 못한
+같은 pass가 그 행을 은퇴시킨다. 실측:
+
+    title 모양                       갱신   은퇴
+    plain text (API가 쓴 것)          1      -
+    서식 구간 둘                       1      -
+    mention 구간                      2     Present=false, Retired At 찍힘
+    text + equation                   2     Present=false, Retired At 찍힘
+
+살아 있는 `CT_PROJECTS` 행이 **자신을 갱신한 바로 그 sync에서** 은퇴하고, 이후 모든
+실행이 그것을 반복한다. 운영자의 뷰는 `Present`로 거른다 — 살아 있는 Project가
+Control Tower에서 사라지고, 유일한 흔적은 `retired`가 1 더 높다는 것뿐이다.
+
+**수정:** `_row_key_of()` — `plain_text` 우선, `text.content`는 fallback. 규칙을
+새로 만들지 않았다: `_extract_rich_text()`가 이미 진술한 규칙이고, 테스트가 두
+reader가 같은 항목에 같은 답을 하는지 나란히 단언한다.
+
+**빈 문자열로 답하지 않고 raise한다.** 이 구분이 힘을 쓴다 — `""`는 살아 있는 row
+key가 아니므로(`TheTitleColumnMayNeverBeNullTests`), 읽지 못한 page를 `""`로
+답하면 그 행은 **이해받지 못했다는 이유로 은퇴한다.** §2의 가드가 그 예외를 "이
+목록은 읽을 수 없다"로 바꾼다.
+
+**Evidence:** `ALiveRowIsNotRetiredBecauseOfHowNotionSpellsItsTitleTests` 4건,
+`TheRowKeyReaderRefusesRatherThanAnswersEmptyTests` 3건. 두 번째 클래스는
+**mutation 하나가 살아남아서** 썼다 — `not isinstance(page, Mapping)` 분기를
+`return ""`로 바꿔도 관측되는 것이 없었는데, `_is_present()`가 같은 page에서 한 걸음
+뒤에 raise하기 때문이다. 그것은 규칙이 아니라 **결합**이고, `_is_present()`를
+나중에 손보면 이 분기가 조용히 옛 동작을 돌려받는다. 규칙이 사는 곳에서 규칙을
+고정했다. Mutation 7종 전부 DETECTS(과잉교정 — 진짜 빈 title에도 raise — 포함).
+
+### 4. `processed/`의 `.tmp-` 파일은 잔여물이 아니라 Event다 (신규, 수정)
+
+`is_incomplete_write()`는 저장소 전체를 가로지르는 규칙이다 — "모든 스캐너는
+staging 잔여물을 건너뛴다". `controltower/rollup.read_events()`도 건너뛰고
+있었고, 술어를 거치지 않고 `entry.name.startswith(".tmp-")`로 인라인으로
+건너뛰었다(그래서 `IncompleteWriteInvariantTests`의 사본 명단에 없는 **다섯
+번째 사본**이기도 했다).
+
+**`processed/`에는 아무도 staging하지 않는다.** `src/`의 모든
+`tempfile.mkstemp()`는 다른 디렉터리를 가리키고, 파일이 여기 도착하는 경로는
+정확히 하나다 — `collector/runtime.py`가 이미 파싱하고, 검증하고, seen으로
+기록하고, History Candidate까지 저장한 파일에 대해
+`os.replace(path, target_dir / path.name)`을 부른다. staging 이름은 Reporter가
+실제로 중간에 죽은 `incoming/`에서 물려받은 것이고, **Collector가 받아들였다는
+사실 자체가 그 내용이 완전한 Event라는 증거다.**
+
+즉 맞는 규칙을 틀린 디렉터리에 읽은 것이었고, 대가는 C62가 이 함수에서
+없애려던 바로 그 변환이었다. 실측 — `processed/`에 파일 3개, 그중 하나가
+staging 이름:
+
+    controltower.read_events()          Event 2건, unreadable 0
+    app.desktop_activity._json_paths()  3
+    history.reconciliation              checked 3
+
+**한 `ops_status.py` 화면의 두 블록이 한 디렉터리에 대해 다른 답을 하고**,
+Control Tower만 하나 모자란다 — 조용하게. `unreadable`이 비어 있으므로
+"읽지 못한 파일 N건 — 아래 숫자는 그만큼 적다" 줄이 아예 찍히지 않는다.
+`Event 2건`도 조용한 회사의 모습이다.
+
+**이것이 재검토되지 않은 이유는 테스트가 그 동작을 볼 수 없었기 때문이다.**
+`test_staging_residue_is_not_an_event`는 Event 하나를 두 번째 이름으로
+복사하고 `events_read == 1`을 단언했다. 두 파일의 `event_id`가 **같으므로**
+그 1은 중복 fold가 만든다 — 건너뛰기가 돌든 안 돌든 통과한다. 양쪽으로
+실측했고 둘 다 1이었다. C57이 이름 붙인 모양 그대로다.
+
+**Evidence:** `tests/test_controltower.py::RollupBoundariesTests` 3건
+(staging 이름 Event가 집계된다 / 옛 fixture의 1은 fold가 만든다 / 세 reader가
+같은 답을 한다), `tests/test_architecture_invariants.py::
+NoWriterStagesIntoProcessedTests` 2건 — 전제를 docstring이 아니라 게이트로
+고정한다(`mkstemp`가 `processed/`를 가리키면 실패, Collector가 검증한 파일을
+그 이름 그대로 옮기는지 실제 Collector로 확인). Mutation 4종 전부 DETECTS
+(건너뛰기 복원 / 건너뛰되 unreadable로 보고하는 절반짜리 수정 / 게이트를
+substring으로 되돌리기 / 실제로 `processed/`에 staging하는 writer 추가).
+
+### 5. 게이트 둘이 내 docstring을 writer로 읽었다 (신규, 수정, 자기 유발)
+
+§4의 docstring에 `tempfile.mkstemp()`라고 적었더니 `AtomicStateWriteInvariantTests`와
+`IncompleteWriteInvariantTests`가 즉시 `controltower/rollup.py`를 "정리 코드가
+없는 원자적 writer"로 신고했다. 둘 다 파일 선택을 `"mkstemp" in
+path.read_text()`로 하고 있었다.
+
+그중 하나는 **자기가 갖지 못한 정밀도를 주석으로 주장하고 있었다** —
+"`tempfile.` qualified on purpose ... keeps prose that merely *mentions*
+`mkstemp(...)` out of the scan". 호출을 그대로 적은 산문은 바로 그 정규식에
+걸린다. 한정어는 오탐을 줄였을 뿐 없애지 못했다.
+
+두 방향 중 시끄러운 쪽은 하나뿐이라 고칠 값어치가 있다. 오탐은 깨끗한 트리를
+빨갛게 만들고 한 시간 안에 누가 고친다. **오탐이 아니라 누락** — 이 게이트들이
+지나치는 writer — 은 조용하고, 애초에 이 sweep이 생긴 이유가 손으로 관리하던
+명단이 조용히 낡았기 때문이다(C49).
+
+**수정:** 파일 선택을 AST로 바꿨다(`_calls_mkstemp()`) — `tempfile.mkstemp`를
+수신자까지 확인한 `Call` 노드로 센다. C61의 결론이 한 층 위에 도착한 것이다:
+그 Sprint는 의존성 게이트가 텍스트가 아니라 `Import` 노드를 세야 한다고
+정리했고, 이것은 `Call`에 대한 같은 질문이다.
+
+### 6. Notion이 아닌 무엇이 응답하면 파싱이 raise한다 (신규, 수정)
+
+`RealNotionTransport._request()`는 자기 계약을 명시한다 — "network problems
+become NotionAPIError" — 그리고 HTTPError / URLError / TimeoutError / OSError /
+JSON 아님을 전부 변환한다. `json.loads()`의 **RecursionError**만 빠져 있었다.
+`RuntimeError` 서브클래스라 `(UnicodeDecodeError, ValueError)`가 덮지 못한다.
+실측: 여는 괄호 20,000개짜리 본문.
+
+BACKLOG F-6이 이 예외에 대한 판별 기준을 이미 세워 두었다 — **함수 자신의
+문서가 "파싱할 수 없음"의 답을 갖고 있는가.** 여기서는 갖고 있고, 바로 그
+분기의 주석에 적혀 있다("A 200 whose body is not JSON — a captive portal, a
+proxy error page ... neither of which any caller expects").
+
+**본문이 가장 덜 신뢰되는 곳이라서 더 중요하다.** 트리의 `json.loads()` 중
+머신 밖에서 온 바이트를 읽는 것은 이것 하나뿐이고,
+`NotionClient.health_check()`와 `notion/bootstrap.py`는 `NotionAPIError`만
+잡으므로 RecursionError가 둘 다 그대로 통과했다. (`app/runner.py`의
+`_sync_and_record()`는 `except Exception`이라 Sync 경로는 이미 견디고 있었다 —
+그래서 이 항목은 P0이 아니다.)
+
+이유 문자열에 예외를 넣지 않았다. `RecursionError`가 들고 있는 것은 재귀 한도
+메시지이지 본문에 대한 정보가 아니고, 원격의 말을 운영자에게 인용하는 자리는
+`_error_detail()` 하나로 정해져 있다.
+
+**Evidence:** `tests/test_notion_transport_failures.py` 3건 — 변환 자체,
+`health_check()`가 raise 대신 결과를 돌려준다는 것(공허하지 않게: 변환을
+없애면 이 테스트가 깨진다), 그리고 **평범한 중첩은 여전히 파싱된다**는 정밀도.
+Mutation 2종 DETECTS.
+
+### 7. 이중이 Notion보다 만족시키기 쉬웠다 (신규, 수정, 테스트 인프라)
+
+§3을 쓰면서 이 double로는 그 결함을 진술할 수 없다는 것이 드러났다 — 손으로
+client stand-in을 만들어야 했다. 이유를 찾았다.
+
+`InMemoryNotionTransport.query_database()`는 `title` / `rich_text`의 `equals`
+필터에 답하고, 값을 `items[0]["text"]["content"]`로 읽고 있었다. 실 API는 **모든
+항목의 plain text를 이어 붙여** 비교하고, Notion은 서식 구간마다 항목을 하나씩
+저장하며 mention·equation 항목에는 `"text"` 키가 없다.
+
+**간극이 대칭이 아니라는 것이 요점이다.** double은 Notion이 행으로 답하는
+질의에 "행 없음"이라고 답했다. 그래서 테스트는 불일치의 **시끄러운 절반**만
+재현할 수 있었다 — lookup이 빗나가 행이 중복되는 쪽. 조용한 절반, 즉 §3이 찾은
+"행은 찾아져서 갱신되고 몇 초 뒤 은퇴한다"는 이 double로는 만들어 낼 수 없었다.
+C50 §10이 이름 붙인 모양 그대로다.
+
+**수정:** 모든 항목을, `plain_text` 우선으로 이어 붙인다 — 읽기 쪽에서
+`_extract_rich_text()`가 이미 진술한 규칙과 같다. 읽을 것이 하나도 없으면 `""`가
+아니라 `None`을 그대로 유지했다: 둘은 필터에 대한 다른 답이고, 빈 `project_id`는
+결정이 열려 있는 실제 row key다(C54 §5).
+
+**Evidence:** `tests/test_notion_client.py::TheDoubleMatchesTheWayNotionMatchesTests`
+5건 — 5가지 title/rich_text 모양이 전부 매치되는지, title property에서도 같은지,
+**다른 값은 여전히 매치되지 않는지**(이어 붙이기만 하는 reader는 앞의 둘을 전부
+통과한다), 읽을 것이 없는 값이 빈 키가 되지 않는지, 그리고 `find_project()`가
+행을 하나로 보는지. Mutation 3종 DETECTS.
+
+### 8. 같은 stash에 아직 남아 있던 것을 전수로 확인했다 — 하나가 살아 있었다 (신규, 수정, **보안**)
+
+§1을 하고 나서 당연한 질문이 남았다: **그 stash의 나머지는 어떻게 됐는가.**
+C50 §7이 목록을 적어 두었으므로 main과 하나씩 대조했다.
+
+| stash 항목 | main 상태 |
+|---|---|
+| `oplog.redact()` ReDoS (P0) | C51이 포팅함 — `_NAMESPACE`가 `{0,40}`으로 묶여 있다 |
+| PEM 본문 redaction (P0) | C51이 포팅함 — END 마커까지 삼킨다 |
+| `extract_last_*()` null 방어 | 있다 (`or {}`) |
+| `scheduler/lock.py` UNC 경로 | 있다 (이미 접두어가 붙은 경로를 먼저 처리한다) |
+| `_LABEL_BULLET` 구분자 | 있다 (daily·monthly 양쪽) |
+| `project_id` 타입 강제 | 있다 (`schema.py`의 세 필드 루프) |
+| 예약 장치명 | **없었다** → §1에서 포팅 |
+| **bidi 로그 위조** | **없다 → 이번에 포팅** |
+
+**`one_line()`은 두 번째 줄을 위조하는 것만 막고 있었다.** 자기가 있는 줄의
+*내용*을 위조하는 것은 막지 않는다. Unicode의 방향 override / isolate 9종은
+줄을 끝내지 않으면서 렌더링 순서를 뒤집으므로, 바이트가 말하는 것과 사람이
+읽는 것이 달라진다. HEAD 실측 — 9종 전부 그대로 통과:
+
+    바이트   REJECTED EVT-1<RLO>DETPECCA<LRO>
+    화면     REJECTED EVT-1ACCEPTED
+
+CVE-2021-42574가 컴파일러를 상대로 이름 붙인 공격이고, 여기서 읽는 사람은
+파이프라인이 건강한지 판단하는 운영자다. 이 함수의 docstring이 이미 그 이유를
+적어 두었다 — "a forged line is not cosmetic — it is a false statement about
+what the system did". 도착하는 필드는 `event_id`이고, docs/02는 그것을 "present
+and non-null"로만 제약한다.
+
+**규칙은 stash의 것을 그대로 쓰되 상수만 escape로 적었다.** 리터럴로 적으면
+소스 파일에 **아무도 볼 수 없는 코드포인트 9개**가 들어가는데, 그것이 바로 이
+상수가 드러내려는 결함이다. 그래서 `oplog.py`와 테스트 파일 **둘 다** override를
+literal로 갖고 있지 않은지 테스트가 확인한다. 이 한 곳은 stash와 byte 단위로
+같지 않으므로 병합 시 충돌하고, 충돌이 나야 옳다.
+
+**U+200E / U+200F(LRM / RLM)는 일부러 뺐다.** override가 아니라 mark라서 이웃
+run의 순서를 밀 뿐 뒤집지 못하고, 방향 힌트를 전부 escape하면 오른쪽에서 왼쪽으로
+쓰는 문자열을 그냥 망가뜨리기 시작한다. 정밀도 테스트가 그 방향을 고정한다.
+
+**Evidence:** `tests/test_oplog.py::ALogLineCannotBeReorderedTests` 6건.
+Mutation 3종 DETECTS(가드의 bidi 절반 제거 / RLO만 덮기 / mark까지 덮는 과잉교정).
+
+### 9. 흐름은 끊기지 않는다 (검증, 결함 0)
+
+요청이 지목한 화살표를 실제 증거로 끝까지 흘렸다(9 파일, 4 Desktop, 중복 1건,
+깨진 파일 1건 포함):
+
+    read_events        9 파일 -> Event 8건, unreadable 1건
+    rollup             Desktop 4(3/0/3/1) · Team 4 · Project 3 · Risk 1 ·
+                       duplicate 1(identical) · mismatch 3 · events_read 7
+    dashboard          panel 10 (SOURCED 7 / UNSOURCED 3), coverage.complete=False
+    to_payload         22,346 B, schema_version 1.2
+    ops_runs_fields    "DESKTOP_1:3 DESKTOP_2:3 DESKTOP_4:1", role_mismatches=3
+    project_panels     5 database 24행, validate_rows() 오류 0
+    sync_control_tower 1회차 created=24 / 2회차 updated=24, retired=0, errors 0
+    전체               36.2 ms
+
+**Notion까지 실제로 닿는 것과 닿지 않는 것이 정확히 갈려 있다.** `PROJECTS`(Event
+1건씩 Current State)와 `OPS_RUNS`(실행 1건씩, Control Tower 열 2개 포함)는
+`app/runner.py`에 배선돼 있다. Company/Team panel을 담는 `CT_*` 5종은
+**의도적으로 배선돼 있지 않다** — docs/14 §1이 Operational Projection을
+`Notion (PROJECTS / OPS_RUNS)` 두 개로 고정하고, 다섯을 더하는 것은 Spec 결정이다
+(`ControlTowerDatabasesAreNotContractedYetTests`가 그 결정을 숨기지 않고 **이름
+짓는다**). **SKIP — 승인 필요.**
+
+원천이 없는 계층도 화면에서 실제로 드러난다. `ops_status.py`를 이 머신의 실제
+runtime에 대해 돌려 확인했다:
+
+    (자동화 안 함 : CRITICAL_PATH, COMPLETION_CRITERIA — 사람이 정한다)
+    (원천 없음    : COMPANY_GOAL, TEAM_GOAL, SPRINT, TASK — Event Schema에도
+                    Company Repository에도 이 계층이 없다)
+
+즉 요청의 7번("원천 데이터가 없는 경우 무엇이 부족한지 명확히 드러나는가")은
+**드러난다**가 답이고, 8번("지금 구현만으로 Notion에서 진행현황을 볼 수 있는가")은
+**Project 단위 Current State와 실행 단위 기록까지는 그렇고, 전사/팀 Dashboard는
+아니다** — 그리고 그 경계는 결함이 아니라 기록된 Spec 결정이다.
 
 ---
 
@@ -15226,7 +17648,43 @@ Company History는 계속 기록된다). 그런데 삼킨 실패가 **어디에�
 
 ---
 
-## D. 측정값 (이 머신, Python 3.13, Windows 11)
+## D. 측정값
+
+<!-- RUNTIME-DECLARATION: Python 3.9 -->
+**현재 런타임: Python 3.9.7 / Windows-10-10.0.19042.** 이 줄은
+`test_repository_hygiene.py::TheRecordedRuntimeIsTheRunningOneTests`가 지금 도는
+인터프리터와 대조한다. 올라가거나 내려가면 그 테스트가 실패하며, 고치는 방법은
+이 줄을 갱신하는 것이다.
+
+**이 절의 과거 숫자는 재작성하지 않는다.** 아래 측정 중 상당수는 Python 3.13.14 /
+Windows 11 머신에서 잰 것이고, 그 표기는 그대로 둔다 — 잰 적 없는 수를 현재
+환경의 수인 것처럼 만드는 편이 틀린 헤더보다 나쁘다. 숫자를 쓸 때 어느
+인터프리터에서 쟀는지 함께 적는다.
+
+**왜 헤더 하나가 이 정도 취급을 받는가(C70).** 이 헤더는 "이 머신, Python 3.13"
+이라고 적혀 있었고 실제 머신은 3.9.7이었다. C17이 같은 드리프트를 한 번
+기록했지만 인스턴스만 고쳤고, 이후 만들어진 게이트
+(`EveryTrackedModuleParsesOnThisInterpreterTests`)는 **구문** 결과(PEP 604 `|`)만
+덮었다. 남은 면은 **capability**였고, 그것이 C70이다:
+`os.path.isjunction()`은 3.12+이므로 3.13 기록을 믿은 독자는 junction 노출
+detector가 동작한다고 결론짓는다. 실제로는 이 머신에서 한 번도 발화한 적이 없다.
+**틀린 환경 기록이 보안 detector의 실명을 보이지 않게 만들고 있었다.**
+
+
+### COO 상태 조회 — **현재 런타임 실측 (C74, Python 3.9.7 / Windows 10, cpu_count 12)**
+
+`ops_status.main()` 전체를 합성 `processed/`에 대해 끝까지 렌더한 wall-clock:
+
+| Event 수 | wall | 건당 |
+|---|---|---|
+| 200 | 0.21초 | 1.05 ms |
+| 1,000 | 0.98초 | 0.98 ms |
+| 3,000 | 2.90초 | 0.97 ms |
+
+**선형이다** — 5배에 4.7배, 3배에 3.0배. 초선형 구간 없음. 아래 3.13 머신 수치와
+같은 자릿수이므로 이 런타임이 별도의 성능 문제를 만들지는 않는다. C70이 D절에
+요구한 "숫자를 쓸 때 어느 인터프리터에서 쟀는지 적는다"의 첫 적용이며, 이 절에서
+**현재 런타임에서 실제로 잰 유일한 표**다.
 
 ### COO 상태 조회 (`processed/` 스캔) — 이번 Sprint
 

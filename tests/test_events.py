@@ -12,6 +12,7 @@ from events import (  # noqa: E402
     generate_event_id,
     validate_event,
 )
+from events.schema import SUPPORTED_SCHEMA_VERSION  # noqa: E402
 
 
 def sample_data(**overrides):
@@ -345,6 +346,180 @@ class DeclaredStringFieldsAreEnforcedTests(unittest.TestCase):
                     data["event_type"] = "BLOCKED"
 
                 self.assertTrue(validate_event(data), f"{field_name} was accepted")
+
+class TheEventSchemaVersionIsAContractAcrossDesktopsTests(unittest.TestCase):
+    """This project has three internal schema versions. Two of them are
+    guarded the same way and the third — the only one that crosses machines —
+    was not guarded at all.
+
+        runsummary.SCHEMA_VERSION            "1.1"   recorded shape, pinned
+        controltower.DASHBOARD_SCHEMA_VERSION "1.2"  recorded shape, pinned
+        events.SUPPORTED_SCHEMA_VERSION      "1.0"   **no test named it**
+
+    Measured: `SUPPORTED_SCHEMA_VERSION` appeared in zero test files, and no
+    assertion anywhere stated the field set a `1.0` Event carries — while
+    `notion/retry_queue` and `notion/dashboard_pending`, whose payloads never
+    leave this machine, both pin theirs with `sorted(...to_dict())`.
+
+    The two pinned ones learned it the hard way: `test_runsummary.py`'s own
+    note records `SCHEMA_VERSION` sitting at "1.0" while C31 added
+    `failure.reason` to the payload. That is the failure this class exists to
+    make impossible for the Event, where the cost is higher — an Event is
+    written by an Agent on DESKTOP_1/2/3 and read by the Runner on DESKTOP_4,
+    so producer and consumer are **different machines upgraded at different
+    times**.
+
+    The version is compared for exact equality, so a bump is a fleet-wide
+    cutover. That is a defensible rule and this class does not argue with it;
+    it pins what actually happens, because "the Events pile up somewhere" and
+    "the Events are rejected and visible" are very different operational
+    days and only one of them was ever checked.
+    """
+
+    #: `version: the exact key set an Event of that version carries`.
+    #:
+    #: Add the next version's shape rather than editing this one — the whole
+    #: value of a record is that the previous shape is still readable after
+    #: the bump. `test_the_recorded_shape_is_the_one_the_code_emits` keeps
+    #: the current entry honest; nothing can keep a rewritten past entry
+    #: honest, which is why it must not be rewritten.
+    RECORDED = {
+        "1.0": {
+            "schema_version",
+            "event_id",
+            "timestamp",
+            "source",
+            "role",
+            "project_id",
+            "event_type",
+            "status",
+            "summary",
+            "history_candidate",
+            "milestone",
+            "blocker",
+            "evidence",
+        },
+    }
+
+    def _event(self, **overrides):
+        fields = dict(
+            source="DESKTOP_1",
+            role="CTO_BACKEND",
+            project_id="SEARCH",
+            event_type="STARTED",
+            status="IN_PROGRESS",
+            summary="schema guard",
+            history_candidate=True,
+            event_id="SCHEMA-1",
+            timestamp="2026-08-05T09:00:00+09:00",
+        )
+        fields.update(overrides)
+        return create_event(**fields)
+
+    def test_the_current_version_has_a_recorded_shape(self):
+        self.assertIn(SUPPORTED_SCHEMA_VERSION, self.RECORDED)
+
+    def test_the_recorded_shape_is_the_one_the_code_emits(self):
+        """The link that makes the record worth having. Without it the
+        entries below only agree with each other."""
+        self.assertEqual(
+            set(self._event().to_dict()),
+            self.RECORDED[SUPPORTED_SCHEMA_VERSION],
+            "the Event payload changed shape without the version moving — "
+            "an Agent on another Desktop still writes the old shape",
+        )
+
+    def test_the_check_would_notice_a_field_appearing_or_leaving(self):
+        """Guards the guard: the comparison has to be able to disagree."""
+        recorded = self.RECORDED[SUPPORTED_SCHEMA_VERSION]
+
+        self.assertNotEqual(recorded, recorded | {"owner"})
+        self.assertNotEqual(recorded, recorded - {"summary"})
+
+    def test_every_recorded_field_is_one_an_event_really_carries(self):
+        """The other direction: a record naming a field the code dropped
+        would make the pin describe a shape nobody emits."""
+        emitted = set(self._event().to_dict())
+        for version, shape in self.RECORDED.items():
+            with self.subTest(version=version):
+                self.assertTrue(
+                    shape <= emitted or version != SUPPORTED_SCHEMA_VERSION
+                )
+
+    def test_only_the_supported_version_validates(self):
+        """Exact equality, stated. A MINOR-looking bump is not accepted, so
+        `1.1` is as rejected as `2.0` — that is what makes a bump a cutover."""
+        payload = self._event().to_dict()
+
+        self.assertEqual(validate_event(payload), [])
+        for other in ("1.1", "1", "2.0", "0.9", ""):
+            with self.subTest(version=other):
+                errors = validate_event(dict(payload, schema_version=other))
+                self.assertTrue(errors, f"{other!r} was accepted")
+                self.assertTrue(any("schema_version" in e for e in errors), errors)
+
+    def test_a_desktop_that_upgraded_first_is_rejected_not_stuck(self):
+        """The operational half, driven through the real Collector.
+
+        When one Desktop's Agent is upgraded ahead of the Runner, its Events
+        carry a version this Runner does not support. Two outcomes are
+        possible and they are not close: REJECTED moves the file to
+        `rejected/`, drains `incoming/` and lets the run finish — the Events
+        are visible and can be re-collected after the Runner upgrades.
+        FAILED would leave the file in `incoming/` failing identically on
+        every run, which is the shape C72 measured for a different cause.
+
+        Pinned here because nothing else states which one this is.
+        """
+        import json
+        import shutil
+        import tempfile
+
+        from collector.collector import Collector
+        from collector.runtime import run_once
+        from collector.state import PersistentSeenEventStore
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        incoming, processed, rejected, logs, state = (
+            root / "incoming", root / "processed", root / "rejected",
+            root / "logs", root / "state",
+        )
+        for directory in (incoming, processed, rejected, logs, state):
+            directory.mkdir(parents=True)
+
+        payload = self._event().to_dict()
+        (incoming / "ok.json").write_text(
+            json.dumps(dict(payload, event_id="OK")), encoding="utf-8"
+        )
+        (incoming / "newer.json").write_text(
+            json.dumps(dict(payload, event_id="NEW", schema_version="1.1")),
+            encoding="utf-8",
+        )
+
+        summary = run_once(
+            collector=Collector(
+                seen_store=PersistentSeenEventStore(
+                    state_path=state / "collector_state.json"
+                )
+            ),
+            incoming_dir=incoming,
+            processed_dir=processed,
+            rejected_dir=rejected,
+            log_path=logs / "collector.log",
+        )
+
+        self.assertEqual(
+            (summary.accepted, summary.rejected, summary.failed), (1, 1, 0)
+        )
+        self.assertEqual([path.name for path in incoming.iterdir()], [])
+        self.assertEqual([path.name for path in rejected.iterdir()], ["newer.json"])
+        self.assertEqual([path.name for path in processed.iterdir()], ["ok.json"])
+
+        log = (logs / "collector.log").read_text(encoding="utf-8")
+        self.assertIn("REJECTED newer.json", log)
+        self.assertIn("schema_version", log, "the log names the cause")
+
 
 if __name__ == "__main__":
     unittest.main()

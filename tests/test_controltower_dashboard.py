@@ -29,7 +29,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -137,6 +137,222 @@ class DashboardTestCase(unittest.TestCase):
 
     def model(self, **kwargs) -> DashboardModel:
         return build_dashboard(self.rollup(**kwargs), now=NOW)
+
+
+class HistoryThatCouldNotBeReadIsNotHistoryWithNoGapTests(DashboardTestCase):
+    """C68. `Coverage.complete` said "this is the whole picture" about a tree
+    whose Company History nobody could read.
+
+    C56 introduced `history_checked` because a model nobody enriched answered
+    `complete = True` about a question nobody had asked. The same conversion
+    was sitting one level further in, in the **input** to that field:
+    `_company_history_older_than_the_evidence()` returned `None` for three
+    different situations, and only one of them was an answer.
+
+        checked, no gap                  None    a real answer
+        the directory cannot be listed   None    not an answer
+        a Daily file cannot be opened    None    not an answer
+
+    Measured on one tree — Company History with work in it, evidence starting
+    later — by failing the reads and changing nothing else:
+
+        readable      gap 2026-08-01   complete False   screen prints the qualifier
+        unreadable    gap None         complete True    screen prints nothing
+
+    The second line is the strongest false claim this model can make, and it
+    appears in exactly the situation the qualifier exists for: a restored
+    machine, whose `local_master/` came back from the remote and whose
+    `processed/` did not (docs/08 §26). A permissions problem on the restored
+    tree turns "the numbers below only cover what evidence is left" into
+    silence.
+
+    A **missing** directory stays an answer, and that asymmetry is deliberate:
+    a machine with no `local_master/daily/` has no Company History for the
+    evidence to fail to cover. `FileNotFoundError` is separated from the rest
+    for the reason `controltower.read_events()` separates it — "there is
+    nothing here" and "I could not look" are different, and only the second
+    invalidates the answer.
+    """
+
+    DAILY = (
+        "# DOJOONPASS Company History\n\n## Milestones\n\n### P\n\n"
+        "- did a thing.\n- Owner: CTO Backend\n- Event ID: EVT-H01\n"
+        "- Category: MILESTONE\n"
+    )
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.daily = self.root / "daily"
+        self.daily.mkdir(parents=True)
+        (self.daily / "2026-08-01.md").write_text(self.DAILY, encoding="utf-8")
+
+    @staticmethod
+    @contextmanager
+    def _reads_fail(suffix=".md"):
+        """Every read of `suffix` raises, and nothing else changes.
+
+        Injected at `Path.read_text` rather than on the filesystem because
+        the property under test is what the function does with an `OSError`,
+        and Windows ACLs are a slower way to produce the same exception.
+        """
+        real = Path.read_text
+
+        def refuse(self, *args, **kwargs):
+            if self.suffix == suffix:
+                raise PermissionError(13, "Access is denied")
+            return real(self, *args, **kwargs)
+
+        Path.read_text = refuse
+        try:
+            yield
+        finally:
+            Path.read_text = real
+
+    def test_a_readable_tree_still_finds_the_gap(self):
+        """The control. Without it this class could pass by breaking the scan
+        entirely."""
+        import ops_status
+        from datetime import date
+
+        gap, checked = ops_status._company_history_older_than_the_evidence(
+            self.daily, date(2026, 8, 15)
+        )
+
+        self.assertEqual(gap, date(2026, 8, 1))
+        self.assertTrue(checked)
+
+    def test_an_unreadable_daily_is_not_a_clean_answer(self):
+        import ops_status
+        from datetime import date
+
+        with self._reads_fail():
+            gap, checked = ops_status._company_history_older_than_the_evidence(
+                self.daily, date(2026, 8, 15)
+            )
+
+        self.assertIsNone(gap)
+        self.assertFalse(checked, "an unreadable Daily reported as 'no gap'")
+
+    def test_an_unlistable_directory_is_not_a_clean_answer(self):
+        import os
+        import ops_status
+        from datetime import date
+
+        real = os.scandir
+
+        def refuse(path, *args, **kwargs):
+            if str(path) == str(self.daily):
+                raise PermissionError(13, "Access is denied")
+            return real(path, *args, **kwargs)
+
+        os.scandir = refuse
+        try:
+            gap, checked = ops_status._company_history_older_than_the_evidence(
+                self.daily, date(2026, 8, 15)
+            )
+        finally:
+            os.scandir = real
+
+        self.assertIsNone(gap)
+        self.assertFalse(checked)
+
+    def test_a_missing_directory_is_an_answer(self):
+        """The asymmetry, pinned. Not the same as "could not look"."""
+        import ops_status
+        from datetime import date
+
+        gap, checked = ops_status._company_history_older_than_the_evidence(
+            self.root / "not_deployed", date(2026, 8, 15)
+        )
+
+        self.assertIsNone(gap)
+        self.assertTrue(checked)
+
+    def test_the_model_stops_calling_that_coverage_complete(self):
+        """The consequence, at the field the whole thing is about."""
+        import ops_status
+        from datetime import date
+
+        model = self.model()
+
+        with self._reads_fail():
+            gap, checked = ops_status._company_history_older_than_the_evidence(
+                self.daily, date(2026, 8, 15)
+            )
+        enriched = model.with_history_coverage(gap, checked=checked)
+
+        self.assertFalse(enriched.coverage.complete)
+        self.assertFalse(enriched.coverage.history_checked)
+
+        # And a readable tree is unaffected: the guard must not turn every
+        # coverage into "unchecked", which would be the same alarm nobody can
+        # clear that this file keeps removing.
+        gap, checked = ops_status._company_history_older_than_the_evidence(
+            self.daily, date(2026, 8, 1)
+        )
+        self.assertTrue(
+            model.with_history_coverage(gap, checked=checked).coverage.complete
+        )
+
+    def test_the_operator_is_told_rather_than_left_with_a_silent_screen(self):
+        """The half a coverage flag cannot do on its own.
+
+        `complete` going False changes no line on the terminal by itself —
+        the screen was byte-identical to a healthy one, which is what made
+        this worth finding rather than merely worth noting.
+        """
+        import json as json_module
+        import shutil
+
+        import ops_status
+
+        runtime = self.root / "runtime"
+        (runtime / "events" / "processed").mkdir(parents=True)
+        (runtime / "local_master").mkdir(parents=True)
+        shutil.copytree(self.daily, runtime / "local_master" / "daily")
+        (runtime / "events" / "processed" / "E.json").write_text(
+            json_module.dumps(
+                {
+                    "schema_version": "1.0",
+                    "event_id": "E",
+                    "timestamp": "2026-08-15T10:00:00+09:00",
+                    "source": "DESKTOP_1",
+                    "role": "CTO_BACKEND",
+                    "project_id": "P",
+                    "event_type": "MILESTONE_COMPLETED",
+                    "status": "IN_PROGRESS",
+                    "summary": "s",
+                    "history_candidate": True,
+                    "milestone": "m",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def render():
+            buffer = io.StringIO()
+            previous = ops_status.RUNTIME_DIR
+            ops_status.RUNTIME_DIR = runtime
+            try:
+                with redirect_stdout(buffer):
+                    try:
+                        ops_status.main()
+                    except SystemExit:
+                        pass
+            finally:
+                ops_status.RUNTIME_DIR = previous
+            return buffer.getvalue()
+
+        healthy = render()
+        with self._reads_fail():
+            broken = render()
+
+        self.assertNotIn("읽을 수 없다", healthy)
+        self.assertIn("읽을 수 없다", broken)
+        self.assertIn("local_master/daily", broken)
 
 
 class EveryUnsourcedLayerIsClaimedByExactlyOnePanelTests(DashboardTestCase):
@@ -284,6 +500,157 @@ class EveryRowFillsTheColumnsItsPanelDeclaresTests(DashboardTestCase):
                     self.assertTrue(row.evidence, f"{panel.key}/{row.key}")
                     for ref in row.evidence:
                         self.assertTrue((self.processed / ref.path).is_file())
+
+
+class EveryRowCitesEventsThatBelongToItTests(DashboardTestCase):
+    """`test_every_row_carries_the_evidence_it_was_built_from` asks two things
+    of every panel row: that `evidence` is non-empty, and that each cited path
+    is a file. Both hold while the citation belongs to a **different row**.
+
+    That is the same hole C71 measured one layer down, where
+    `milestones_completed` was made to cite the `ISSUE_RESOLVED` files and
+    four Control Tower suites reported 480 passed. The panels are where an
+    operator actually follows a citation — the DESKTOPS row is how
+    "Desktop 간 작업 상태" is answered — so a row pointing at another row's
+    Events sends them to the wrong Desktop with a resolvable filename.
+
+    The property needs no roster of what each panel means, because each of
+    these rows is **keyed by the thing its Events must carry**:
+
+        TEAMS        row key is a role          -> cited Event's `role`
+        DESKTOPS     row key is a source        -> cited Event's `source`
+        PROJECTS     row key is a project_id    -> cited Event's `project_id`
+        RISKS        row names its Event        -> cited Event's `event_id`
+        ACTIVITY     row *is* an Event          -> cited Event's `event_id`
+        COMPLETIONS  same
+    """
+
+    #: panel -> what makes a cited Event belong to that row.
+    #: `METRICS` is deliberately absent: its rows are keyed by a metric name
+    #: rather than by anything an Event carries, and
+    #: `EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests` is the check
+    #: for that shape. `test_every_panel_with_evidence_is_classified` is what
+    #: stops that absence from quietly covering a seventh panel too.
+    BELONGS = {
+        "TEAMS": lambda row, event: event.role == row.key,
+        "DESKTOPS": lambda row, event: event.source == row.key,
+        "PROJECTS": lambda row, event: event.project_id == row.key,
+        "RISKS": lambda row, event: event.event_id == row.values["event_id"],
+        "ACTIVITY": lambda row, event: event.event_id == row.values["event_id"],
+        "COMPLETIONS": lambda row, event: event.event_id == row.values["event_id"],
+    }
+
+    ELSEWHERE = ("METRICS",)
+
+    def _populate(self):
+        """One row in every panel that carries evidence, and more than one
+        Desktop and team, so a swapped citation has somewhere wrong to go."""
+        self.put("A1", "SEARCH", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 4)
+        self.put("A2", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5, milestone="M")
+        self.put("B1", "PAY", "CMO", "BLOCKED", "BLOCKED", 6, blocker="waiting on legal")
+        self.put("B2", "PAY", "CMO", "COMPLETED", "COMPLETED", 7)
+        # DESKTOP_1 owns CTO_BACKEND (docs/02 §8), so this is a pair mismatch
+        # and gives RISKS its second kind.
+        self.put("M1", "SEARCH", "CMO", "STARTED", "IN_PROGRESS", 3, source="DESKTOP_1")
+        return self.model()
+
+    def _event_at(self, ref):
+        from events import Event
+
+        return Event.from_json(
+            (self.processed / ref.path).read_text(encoding="utf-8")
+        )
+
+    def test_every_panel_with_evidence_is_classified(self):
+        """A seventh panel that starts carrying evidence must not slip past
+        by simply not being named — the roster failure C66 kept finding."""
+        model = self._populate()
+        carrying = {
+            panel.key
+            for panel in model.panels
+            for row in panel.rows
+            if row.evidence
+        }
+        unclassified = sorted(carrying - set(self.BELONGS) - set(self.ELSEWHERE))
+
+        self.assertEqual(unclassified, [], f"unclassified panels: {unclassified}")
+
+    def test_the_fixture_reaches_every_classified_panel(self):
+        """Vacuous-pass guard: a panel with no rows in the fixture has its
+        predicate applied to nothing."""
+        model = self._populate()
+        carrying = {
+            panel.key
+            for panel in model.panels
+            for row in panel.rows
+            if row.evidence
+        }
+        missing = sorted(set(self.BELONGS) - carrying)
+
+        self.assertEqual(missing, [], f"predicates never applied: {missing}")
+
+    def test_every_row_cites_only_its_own_events(self):
+        model = self._populate()
+        wrong = []
+
+        for panel in model.panels:
+            belongs = self.BELONGS.get(panel.key)
+            if belongs is None:
+                continue
+            for row in panel.rows:
+                for ref in row.evidence:
+                    event = self._event_at(ref)
+                    if not belongs(row, event):
+                        wrong.append(f"{panel.key}/{row.key} cites {ref.event_id}")
+
+        self.assertEqual(
+            wrong,
+            [],
+            "a row citing an Event that belongs to a different row — the "
+            f"citation resolves and points at the wrong place: {wrong}",
+        )
+
+    def test_the_check_would_notice_a_swapped_citation(self):
+        """Guards the guard. Without this the class passes for the same
+        reason the suite already did."""
+        model = self._populate()
+        desktops = {row.key: row for row in model.panel("DESKTOPS").rows if row.evidence}
+        teams = {row.key: row for row in model.panel("TEAMS").rows if row.evidence}
+
+        one = desktops["DESKTOP_1"]
+        other = desktops["DESKTOP_2"]
+
+        self.assertTrue(
+            self.BELONGS["DESKTOPS"](one, self._event_at(one.evidence[0])),
+            "the honest pairing must pass",
+        )
+        self.assertFalse(
+            self.BELONGS["DESKTOPS"](one, self._event_at(other.evidence[0])),
+            "another Desktop's Event must not satisfy this row",
+        )
+
+        backend = teams["CTO_BACKEND"]
+        self.assertFalse(
+            self.BELONGS["TEAMS"](backend, self._event_at(teams["CMO"].evidence[0])),
+            "another team's Event must not satisfy this row",
+        )
+
+    def test_a_mismatched_event_is_filed_under_the_desktop_that_sent_it(self):
+        """The one Event where "belongs to" is genuinely ambiguous, pinned.
+
+        `M1` says `source=DESKTOP_1, role=CMO` and docs/02 §8 gives DESKTOP_1
+        to CTO_BACKEND. The Desktop layer is keyed by `source` and the Team
+        layer by `role`, so the same Event is cited by DESKTOP_1 and by CMO —
+        and that is the split the RISKS row exists to report, not a citation
+        error. Stated here so a future change that "fixes" it has to argue
+        with this test rather than with the rollup.
+        """
+        model = self._populate()
+        desktop_1 = next(r for r in model.panel("DESKTOPS").rows if r.key == "DESKTOP_1")
+        cmo = next(r for r in model.panel("TEAMS").rows if r.key == "CMO")
+
+        self.assertIn("M1", [ref.event_id for ref in desktop_1.evidence])
+        self.assertIn("M1", [ref.event_id for ref in cmo.evidence])
 
 
 class TheScreenAndThePayloadCarryTheSameFactsTests(DashboardTestCase):

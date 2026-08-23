@@ -191,6 +191,63 @@ class FailureConversionTests(LocalServerTestCase):
         with self.assertRaises(NotionAPIError):
             transport.retrieve_database("db-1")
 
+    def test_a_body_too_deeply_nested_becomes_a_notion_api_error(self):
+        """C64. `json.loads()` answers deep nesting with `RecursionError`,
+        which is a `RuntimeError` — outside the `(UnicodeDecodeError,
+        ValueError)` the not-JSON branch above catches.
+
+        Same actor as the captive portal two tests up, one step further, and
+        this is the one `json.loads()` in the tree reading bytes from off the
+        machine. `NotionClient.health_check()` and `notion/bootstrap.py`
+        catch `NotionAPIError` only, so it walked straight through both.
+        """
+
+        class TooDeep(_Handler):
+            body = (b"[" * 20000) + (b"]" * 20000)
+
+        transport = self.serve(TooDeep)
+
+        with self.assertRaises(NotionAPIError) as ctx:
+            transport.retrieve_database("db-1")
+        self.assertIn("deeply nested", str(ctx.exception))
+        # No status code: the response was a 200, and inventing one would put
+        # this in `PERMANENTLY_REFUSING_STATUS_CODES`' way.
+        self.assertIsNone(ctx.exception.status_code)
+
+    def test_the_health_check_reports_a_deep_body_instead_of_raising(self):
+        """The caller the conversion is for. `health_check()` exists to hand
+        back a result rather than raise, and it catches `NotionAPIError`
+        alone — so this test fails, rather than passing vacuously, if the
+        conversion is ever removed."""
+        from notion import NotionClient
+
+        class TooDeep(_Handler):
+            body = (b"[" * 20000) + (b"]" * 20000)
+
+        client = NotionClient(transport=self.serve(TooDeep), database_id="db-1")
+
+        health = client.health_check()
+
+        self.assertFalse(health.ok)
+        self.assertIn("deeply nested", health.error)
+
+    def test_an_ordinary_nesting_depth_still_parses(self):
+        """Precision. A real Notion page is nested, and a guard that refused
+        anything nested would be a different defect."""
+        import json
+
+        class Nested(_Handler):
+            body = json.dumps(
+                {"properties": {"a": {"b": {"c": [{"d": [1, 2, {"e": "f"}]}]}}}}
+            ).encode("utf-8")
+
+        transport = self.serve(Nested)
+
+        self.assertEqual(
+            transport.retrieve_database("db-1")["properties"]["a"]["b"]["c"][0]["d"][2],
+            {"e": "f"},
+        )
+
     def test_a_refused_connection_becomes_a_notion_api_error(self):
         # Bind and immediately close, so the port is almost certainly free.
         probe = socket.socket()

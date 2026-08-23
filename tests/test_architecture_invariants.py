@@ -46,6 +46,46 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
+
+
+def _calls_mkstemp(source: str) -> bool:
+    """Whether `source` really calls `tempfile.mkstemp`, as the parser sees it.
+
+    Not `"tempfile.mkstemp" in source`. Two gates in this file discovered the
+    atomic writers by that substring, and a **docstring** naming the idiom is
+    indistinguishable from a call to it. Measured: C64 added one sentence to
+    `controltower/rollup.py` explaining why `processed/` has no stager, and
+    both gates immediately reported that module as a writer with no cleanup
+    and no staging prefix.
+
+    The comment beside one of them already claimed the precision it did not
+    have — "`tempfile.` qualified on purpose: every real call is written that
+    way, and requiring it keeps prose that merely *mentions* `mkstemp(...)`
+    out of the scan". Prose that spells the call out is caught by exactly
+    that regex; qualifying it narrowed the false positives without removing
+    them.
+
+    Both directions matter and only one of them is loud. A false positive
+    fails a green tree, which someone fixes within the hour. A false negative
+    — a writer these gates skip — is silent, and the sweep exists because a
+    hand-maintained roster had already gone silently stale once (C49). The
+    parser answers both, and it is C61's conclusion arriving one layer up:
+    that Sprint settled that dependency gates must count `Import` nodes
+    rather than text, and this is the same question about a `Call`.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover - everything under src/ parses
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "mkstemp"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tempfile"
+        for node in ast.walk(tree)
+    )
+
 sys.path.insert(0, str(SRC))
 
 import scheduler.scheduler as scheduler_module  # noqa: E402
@@ -898,7 +938,7 @@ class AtomicStateWriteInvariantTests(unittest.TestCase):
             path
             for path in SRC.rglob("*.py")
             if "__pycache__" not in str(path)
-            and "tempfile.mkstemp" in path.read_text(encoding="utf-8")
+            and _calls_mkstemp(path.read_text(encoding="utf-8"))
         )
 
     def test_the_sweep_finds_the_writers_we_know_exist(self):
@@ -3066,6 +3106,27 @@ class DashboardSchemaMappingTests(unittest.TestCase):
                        "def record_risk(", "def record_readiness("):
             self.assertNotIn(absent, source)
 
+    def test_the_caller_scan_finds_the_repository(self):
+        """Guard against the guard silently matching nothing.
+
+        `test_ops_backup_builder_has_no_caller` asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, it passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        files = [
+            path
+            for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in str(path)
+        ]
+        self.assertGreater(len(files), 50)
+
     def test_ops_backup_builder_has_no_caller(self):
         """It is built and exported, but nothing ever invokes it."""
         callers = 0
@@ -3747,6 +3808,23 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
                 found.add(node.module.split(".")[0])
         return found & self.LOCAL_PACKAGES
 
+    def test_the_monthly_package_scan_finds_its_modules(self):
+        """Guard against the guard silently matching nothing.
+
+        The two tests below each assert a negative over this scan, which asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, both of them passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        modules = sorted((SRC / "monthly").glob("*.py"))
+        self.assertGreaterEqual(len(modules), 4, modules)
+
     def test_monthly_imports_nothing_from_the_rest_of_the_project(self):
         for path in sorted((SRC / "monthly").glob("*.py")):
             with self.subTest(module=path.name):
@@ -3757,18 +3835,132 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
                     f"docs/09 §13 requires Monthly to consolidate Daily files only",
                 )
 
+    #: Directories Monthly may not reach for. Components, not joined strings:
+    #: see `_path_components()`.
+    FORBIDDEN_COMPONENTS = frozenset(
+        {"history_candidates", "events", "incoming", "processed", "rejected"}
+    )
+
+    @staticmethod
+    def _path_components(source: str):
+        """Every literal that this source uses as a **path component**.
+
+        Read by the parser rather than by substring, and the difference was
+        measured. The check this replaced looked for three joined strings —
+        `history_candidates`, `events/incoming`, `processed` — and nine
+        spellings were tried against it. Four went through, all of them the
+        `events/incoming` pair written the way this repository actually
+        writes paths:
+
+            ROOT / "events" / "incoming"            evaded
+            Path("runtime", "events", "incoming")   evaded
+            os.path.join(root, "events", "incoming") evaded
+            "events\\incoming"                       evaded
+
+        `src/` has no joined path literal anywhere; every path constant in
+        the tree is component-wise (`PROJECT_ROOT / "runtime" / "events" /
+        "incoming"`). So the one form the check could see was the one form
+        nobody writes — the C58 shape, and the same one C66 found in
+        `BackupLogIsNeverPersistedTests` an hour earlier.
+
+        Components rather than raw tokens, so that prose is not evidence: a
+        docstring saying "events" is not a coupling, and a token-level scan
+        would have to be edited away the first time someone explained the
+        boundary in words. Measured on HEAD — `src/monthly/` contains none
+        of these words at all, in code or in prose, so the precision costs
+        nothing today and is there for the day it does.
+        """
+        import ast
+
+        found = []
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+                for side in (node.left, node.right):
+                    if isinstance(side, ast.Constant) and isinstance(side.value, str):
+                        found.append((side.value, node.lineno))
+            elif isinstance(node, ast.Call):
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        found.append((arg.value, node.lineno))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                flat = node.value.replace("\\", "/")
+                if "/" in flat:
+                    for part in flat.split("/"):
+                        found.append((part, node.lineno))
+        return found
+
     def test_monthly_reads_no_event_or_repository_path(self):
         """The same rule from the other side: even without an import, a
         hardcoded path into `history_candidates/` or `events/` would
         reintroduce the coupling."""
+        offenders = []
         for path in sorted((SRC / "monthly").glob("*.py")):
-            text = path.read_text(encoding="utf-8")
-            code = "\n".join(
-                line for line in text.splitlines() if not line.strip().startswith("#")
-            )
-            for forbidden in ("history_candidates", "events/incoming", "processed"):
-                with self.subTest(module=path.name, path=forbidden):
-                    self.assertNotIn(forbidden, code)
+            for value, line in self._path_components(
+                path.read_text(encoding="utf-8")
+            ):
+                if value in self.FORBIDDEN_COMPONENTS:
+                    offenders.append(f"{path.name}:{line}: {value!r}")
+
+        self.assertEqual(offenders, [], offenders)
+
+    def test_the_detector_sees_every_way_a_path_is_written_here(self):
+        """Shoot at the gate. Four of these evaded the check this replaced."""
+        spellings = {
+            'ROOT / "events" / "incoming"': 'D = ROOT / "events" / "incoming"',
+            'Path("runtime", "events", "incoming")': 'D = Path("runtime", "events", "incoming")',
+            'os.path.join(root, "events", "incoming")': 'D = os.path.join(root, "events", "incoming")',
+            'the joined literal': 'D = ROOT / "events/incoming"',
+            'a backslash literal': "D = ROOT / 'events" + chr(92) + chr(92) + "incoming'",
+            'history_candidates as a component': 'D = ROOT / "history_candidates" / "keep"',
+            'processed as a component': 'D = ROOT / "processed"',
+            'an aliased Path': (
+                "from pathlib import Path as _P"
+                + chr(10)
+                + "D = _P('runtime', 'processed')"
+            ),
+        }
+        for label, snippet in spellings.items():
+            with self.subTest(spelling=label):
+                found = {
+                    value
+                    for value, _ in self._path_components(snippet)
+                    if value in self.FORBIDDEN_COMPONENTS
+                }
+                self.assertTrue(found, f"a path spelled {label} would not be seen")
+
+    def test_the_detector_is_silent_on_the_package_it_guards(self):
+        """Precision from the other side, and the reason components beat
+        tokens: Monthly's own literals (`runtime`, `state`, `monthly`,
+        section titles, regexes) must not read as a coupling."""
+        for path in sorted((SRC / "monthly").glob("*.py")):
+            with self.subTest(module=path.name):
+                found = [
+                    (value, line)
+                    for value, line in self._path_components(
+                        path.read_text(encoding="utf-8")
+                    )
+                    if value in self.FORBIDDEN_COMPONENTS
+                ]
+                self.assertEqual(found, [])
+
+    def test_prose_naming_the_boundary_is_not_a_violation(self):
+        """A docstring explaining what Monthly may not touch is documentation,
+        not coupling. The token-level alternative would have flagged this very
+        sentence."""
+        prose = chr(10).join(
+            [
+                "def f():",
+                '    """Monthly never reads events or history_candidates."""',
+                "    return 1",
+            ]
+        )
+        found = [
+            value
+            for value, _ in self._path_components(prose)
+            if value in self.FORBIDDEN_COMPONENTS
+        ]
+        self.assertEqual(found, [])
 
     def test_monthly_consolidation_runs_after_daily_and_before_backup(self):
         """docs/09 §50's order. Before Daily, the month would be consolidated
@@ -4231,6 +4423,22 @@ class BackupLogIsNeverPersistedTests(unittest.TestCase):
 
         self.assertEqual(BackupLogEntry.from_json(entry.to_json()), entry)
 
+    def test_the_file_scan_finds_the_repository(self):
+        """Guard against the guard silently matching nothing.
+
+        Both scanning tests below assert a negative over this scan, which asserts a **negative** over this scan — "nothing in the tree
+        does X" — and a negative over an empty set is true. Measured (C66):
+        with tree discovery neutered, both of them passed while checking nothing.
+
+        The trigger is ordinary rather than exotic, and this repository
+        already names it: `TheScansThisFileTrustsAreNotEmptyTests` was
+        written when `git ls-files` came back empty outside a checkout. A
+        renamed or moved `src/` does the same thing to `rglob`, and this
+        project is deliberately worked on from several machines
+        (AGENT.md §1).
+        """
+        self.assertGreater(len(list(self._python_files())), 50)
+
     def test_nothing_in_the_repository_serialises_a_backup_log_entry(self):
         callers = 0
         for path in self._python_files():
@@ -4249,13 +4457,138 @@ class BackupLogIsNeverPersistedTests(unittest.TestCase):
                         callers += 1
         self.assertEqual(callers, 0)
 
+    @staticmethod
+    def _backup_path_expressions(source: str):
+        """Every path expression in `source` naming a `backup` component.
+
+        Read by the parser, not by substring, and the difference is measured
+        rather than assumed. The two `assertNotIn`s this replaced looked for
+        exactly `"backup" / ` and `logs/backup`, which is **one** of the ways
+        this repository spells a path. Eight natural spellings were tried
+        against the old check and five went straight through — including
+        `LOGS_DIR / "backup"`, which is the idiom every other path constant
+        in `src/` is written in (`PROJECT_ROOT / "runtime" / "events" /
+        "incoming"` and eleven more like it).
+
+        A gate for "nothing writes this artifact" that only sees the
+        argument order nobody uses is the C58 shape: the check runs, stays
+        green, and is not looking at its own subject.
+
+        Same eight spellings against this: seven are caught. An aliased
+        `Path` makes nine, and it was a mutation rather than a guess that
+        added it — see the callee-agnostic note below.
+
+        **The one that still evades, named rather than left to be
+        discovered:** a component held in a variable —
+
+            BACKUP_SUB = "backup"
+            directory = LOGS_DIR / BACKUP_SUB
+
+        Following that needs constant propagation, which is a different
+        program. It is also not the shape a writer arrives in by accident,
+        and `test_nothing_in_the_repository_serialises_a_backup_log_entry`
+        is the half that does not depend on how a path is spelled at all.
+        """
+        import ast
+
+        hits = []
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            # `<anything> / "backup"` and `"backup" / <anything>`
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+                for side in (node.left, node.right):
+                    if isinstance(side, ast.Constant) and side.value == "backup":
+                        hits.append(f"line {node.lineno}: path join")
+            # `Path("runtime", "logs", "backup")`, `os.path.join(x, "backup")`
+            #
+            # Callee-agnostic on purpose. The first version of this check
+            # asked for the callee to be named `Path` or `join`, and a
+            # mutation went straight through it —
+            #
+            #     from pathlib import Path as _P
+            #     directory = _P("runtime", "logs", "backup")
+            #
+            # which is C61's finding arriving in the detector written to fix
+            # C58's: a name check does not see an alias. Any call taking
+            # `"backup"` as a bare positional argument is reported instead,
+            # and the cost of that breadth was measured rather than assumed
+            # — zero hits across the 80 files this scans.
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and arg.value == "backup":
+                        hits.append(f"line {node.lineno}: {name}() component")
+            # the directory spelled out in one literal
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "logs/backup" in node.value.replace("\\", "/"):
+                    hits.append(f"line {node.lineno}: literal path")
+            # an f-string whose constant part names it
+            if isinstance(node, ast.JoinedStr):
+                literal = "".join(
+                    part.value
+                    for part in node.values
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str)
+                ).replace("\\", "/")
+                if "/backup" in literal or literal.startswith("backup/"):
+                    hits.append(f"line {node.lineno}: f-string component")
+        return hits
+
     def test_no_backup_log_directory_is_ever_created(self):
         """§69's location. Nothing in the source names it."""
+        offenders = []
         for path in self._python_files():
-            text = path.read_text(encoding="utf-8")
+            for hit in self._backup_path_expressions(
+                path.read_text(encoding="utf-8")
+            ):
+                offenders.append(f"{path.name}: {hit}")
+
+        self.assertEqual(offenders, [], offenders)
+
+    def test_the_detector_sees_the_spellings_the_old_one_missed(self):
+        """Shoot at the gate, the way C58-C61 shot at theirs.
+
+        Five of these evaded the substring check this replaced. Written out
+        rather than reduced to one representative: each exercises a different
+        node type, and a detector that handled only `BinOp` would pass a
+        one-spelling test.
+        """
+        spellings = {
+            'LOGS_DIR / "backup"': 'D = LOGS_DIR / "backup"',
+            '"backup" / name': 'p = "backup" / run_id',
+            'Path("runtime", "logs", "backup")': 'd = Path("runtime", "logs", "backup")',
+            # The alias. A mutation proved the first draft could not see it.
+            'an aliased Path': 'from pathlib import Path as _P\nd = _P(\'runtime\', \'logs\', \'backup\')',
+            'logs_dir / "backup" / filename': 'p = logs_dir / "backup" / filename',
+            'f"{logs}/backup/{run_id}.json"': 'p = f"{logs}/backup/{run_id}.json"',
+            'Path("runtime/logs/backup")': 'd = Path("runtime/logs/backup")',
+            'os.path.join(logs, "backup")': 'd = os.path.join(logs, "backup")',
+        }
+        for label, snippet in spellings.items():
+            with self.subTest(spelling=label):
+                self.assertTrue(
+                    self._backup_path_expressions(snippet),
+                    f"a writer spelled {label} would not be seen",
+                )
+
+    def test_the_detector_is_silent_on_the_tree_it_guards(self):
+        """Precision, from the other side. A detector that fired on `backup`
+        anywhere would flag `src/backup/` — the package this project has had
+        since the beginning — and be edited away rather than read."""
+        for path in self._python_files():
             with self.subTest(path=path.name):
-                self.assertNotIn('"backup"' + " / ", text)
-                self.assertNotIn("logs/backup", text.replace("\\", "/"))
+                self.assertEqual(
+                    self._backup_path_expressions(path.read_text(encoding="utf-8")),
+                    [],
+                )
+
+    def test_the_one_spelling_that_still_evades_is_named(self):
+        """The residual, pinned as a fact rather than left in prose.
+
+        If this ever starts failing, constant propagation arrived and the
+        docstring above should stop claiming this hole.
+        """
+        computed = 'BACKUP_SUB = "backup"\nd = LOGS_DIR / BACKUP_SUB'
+        self.assertEqual(self._backup_path_expressions(computed), [])
 
     def test_the_run_manifest_carries_the_fields_an_operator_needs_meanwhile(self):
         """The mitigation, pinned: losing the log is not losing the facts."""
@@ -4540,6 +4873,17 @@ class DuplicatedRulesStayInStepTests(unittest.TestCase):
         "with\ttab",
         "trailing.",
         "_leading",
+        # Win32 device names (C64). Not a generic fuzz addition: `NUL.json`
+        # is the NUL device on the deployment machine, so an id reaching a
+        # copy that had not learned this rule would be written to a device
+        # by one code path and to a file by the other — the exact drift this
+        # class exists to catch, on the one input where the consequence is a
+        # silent loss rather than a mismatch.
+        "NUL",
+        "com1",
+        "NUL.json",
+        "COM1." + "x" * 200,
+        "NULx",                          # near-miss: must NOT be renamed
     )
 
     def test_both_safe_event_filename_copies_return_the_same_name(self):
@@ -4621,6 +4965,387 @@ class DuplicatedRulesStayInStepTests(unittest.TestCase):
         self.assertTrue(differing)
         self.assertIn("E" * 250, differing)
 
+
+
+class NoWriterStagesIntoProcessedTests(unittest.TestCase):
+    """The premise `controltower.read_events()` counts a `.tmp-…json` on.
+
+    `is_incomplete_write()` is right about every directory a writer stages
+    into, and `processed/` is not one of them. C64 removed the skip there and
+    the removal is only correct while that stays true — so it is a gate
+    rather than a sentence in a docstring.
+
+    Two halves, because two different edits would break it: a new
+    `tempfile.mkstemp(dir=...)` aimed at the processed directory, and a
+    Collector that stopped arriving by `os.replace` of the file it validated.
+
+    If this ever fails, `read_events()` has to skip staging names again — and
+    then the divergence C64 measured (`control tower 2, company block 3,
+    reconciliation 3`) comes back and needs a different answer.
+    """
+
+    def test_no_mkstemp_in_the_tree_stages_into_a_processed_directory(self):
+        calls = []
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for call in re.findall(
+                r"tempfile\.mkstemp\((?:[^()]|\([^()]*\))*\)", source
+            ):
+                calls.append((path.relative_to(SRC), call))
+
+        self.assertGreaterEqual(len(calls), 12, "expected the full writer set")
+        offenders = [
+            (str(module), call) for module, call in calls if "processed" in call
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_the_collector_arrives_by_replacing_the_file_it_validated(self):
+        """The other half, measured rather than read: the destination name is
+        the source name, so whatever `incoming/` was carrying — staging name
+        included — is what lands in `processed/`, already validated."""
+        from collector import Collector, InMemorySeenEventStore, run_once
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        incoming = root / "incoming"
+        processed = root / "processed"
+        rejected = root / "rejected"
+        for directory in (incoming, processed, rejected):
+            directory.mkdir(parents=True)
+
+        event = {
+            "schema_version": "1.0",
+            "event_id": "EVT-STAGED",
+            "timestamp": "2026-08-20T10:00:00+09:00",
+            "source": "DESKTOP_1",
+            "role": "CTO_BACKEND",
+            "project_id": "SEARCH",
+            "event_type": "STARTED",
+            "status": "IN_PROGRESS",
+            "summary": "s",
+            "history_candidate": True,
+        }
+        # The exact file a Reporter killed between `mkstemp` and `os.replace`
+        # leaves behind: complete JSON under the staging name.
+        (incoming / ".tmp-abc123.json").write_text(
+            json.dumps(event), encoding="utf-8"
+        )
+
+        summary = run_once(
+            collector=Collector(seen_store=InMemorySeenEventStore()),
+            incoming_dir=incoming,
+            processed_dir=processed,
+            rejected_dir=rejected,
+            log_path=root / "collector.log",
+        )
+
+        self.assertEqual(summary.accepted, 1)
+        self.assertEqual(
+            [path.name for path in processed.iterdir()], [".tmp-abc123.json"]
+        )
+
+
+class EveryDuplicatedConstantIsHeldInStepTests(unittest.TestCase):
+    """`DuplicatedRulesStayInStepTests` names three duplicated rules. The tree
+    has more, and one of them was drifting with nothing watching it.
+
+    That class opens by listing what it covers — `INCOMPLETE_WRITE_PREFIX`,
+    `safe_event_filename`, `_is_sole_identifier` — and it covers those three
+    well. What nothing did was ask **how many duplications there are**, which
+    is the question C66 kept finding underneath a stale answer: the rule was
+    right and its roster was hand-written.
+
+    Counted by the parser, module-level assignments only (an enum member is
+    not a duplicated contract, and grouping by value rather than by name
+    would hide the interesting case — a pair that has already drifted looks
+    like two unrelated singletons):
+
+        INCOMPLETE_WRITE_PREFIX   4 modules   agree   already gated
+        _MAX_FILENAME_STEM        3 modules   agree   not gated directly
+        METADATA_TITLE            2 modules   agree   not gated
+        _EVENT_ID_LABEL           2 modules   agree   not gated
+        LATE_SECTION_TITLE        2 modules   **DIFFER**
+
+    The last one is not a bug in itself — the two are a writer and a reader
+    holding two spellings of one heading:
+
+        daily/late_events.py   "## Late Events"   the line it writes
+        monthly/parser.py      "Late Events"      the title its `##` regex
+                                                  captures out of that line
+
+    They correspond today. Nothing checked that they do, and the cost of
+    their falling out of step is silent. Measured through the real parser,
+    on a document shaped the way `daily/markdown` renders one:
+
+        both sides agree           -> 1 item parsed, is_late=True
+        Daily heading renamed only -> 0 items, no error, no warning
+
+    A Late Event that reached Daily History would simply not reach Monthly
+    consolidation. That is the shape this repository has already paid for
+    once — `_LABEL_BULLET`, where a missing space after a colon in one of two
+    copies produced unbounded Late Event duplication — and the reason the
+    fix there was recorded as "keep the two copies in step" rather than as a
+    one-line correction.
+    """
+
+    #: Duplicated names whose copies are **not** meant to be equal, with the
+    #: relationship that replaces equality. A name that starts disagreeing
+    #: without an entry here fails `test_every_other_duplicate_agrees`.
+    KNOWN_DIFFERENT = {
+        "LATE_SECTION_TITLE": (
+            "daily/late_events.py writes the whole `## ` heading line; "
+            "monthly/parser.py holds the title its _HEADING2 regex captures "
+            "out of it. Checked as a relationship by "
+            "test_the_late_events_heading_and_its_reader_correspond."
+        ),
+    }
+
+    @staticmethod
+    def _module_level_constants():
+        """`{NAME: {module: repr(value)}}` for literal module-level constants.
+
+        Module level only, so an enum member (`FAILED = "FAILED"` inside a
+        `class`) is not mistaken for a shared contract — measured, that alone
+        was the difference between 13 apparent duplicates and 5 real ones.
+        """
+        import ast
+        from collections import defaultdict
+
+        found = defaultdict(dict)
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    continue
+                target = node.targets[0]
+                if not isinstance(target, ast.Name):
+                    continue
+                if not target.id.lstrip("_").isupper():
+                    continue
+                try:
+                    value = ast.literal_eval(node.value)
+                except Exception:  # noqa: BLE001 - not a literal, not a constant
+                    continue
+                found[target.id][path.relative_to(SRC).as_posix()] = repr(value)
+        return {
+            name: modules
+            for name, modules in found.items()
+            if len(modules) > 1
+        }
+
+    def test_the_scan_finds_the_duplications_we_know_about(self):
+        """C66 §1: this class asserts negatives over a scan, so the scan is
+        checked first. Naming them also makes a *disappearance* visible — a
+        duplication that got refactored away should retire its entry here
+        rather than silently leave the roster describing nothing."""
+        duplicated = self._module_level_constants()
+
+        self.assertGreaterEqual(len(duplicated), 5, sorted(duplicated))
+        for name in (
+            "INCOMPLETE_WRITE_PREFIX",
+            "_MAX_FILENAME_STEM",
+            "METADATA_TITLE",
+            "_EVENT_ID_LABEL",
+            "LATE_SECTION_TITLE",
+        ):
+            with self.subTest(constant=name):
+                self.assertIn(name, duplicated)
+
+    def test_every_other_duplicate_agrees(self):
+        """The property. Every copy of one name holds one value, unless the
+        pair is on `KNOWN_DIFFERENT` with the relationship that replaces
+        equality."""
+        offenders = []
+        for name, modules in sorted(self._module_level_constants().items()):
+            if name in self.KNOWN_DIFFERENT:
+                continue
+            if len(set(modules.values())) != 1:
+                offenders.append(f"{name}: {modules}")
+
+        self.assertEqual(offenders, [], offenders)
+
+    def test_nothing_on_the_different_roster_secretly_agrees(self):
+        """The other direction. An entry that has become equal is an entry
+        whose explanation is now wrong, and the pair should go back to being
+        checked by plain equality."""
+        duplicated = self._module_level_constants()
+        for name in self.KNOWN_DIFFERENT:
+            with self.subTest(constant=name):
+                self.assertIn(name, duplicated)
+                self.assertNotEqual(
+                    len(set(duplicated[name].values())),
+                    1,
+                    f"{name} now agrees across modules — drop it from "
+                    "KNOWN_DIFFERENT and let equality check it",
+                )
+
+    #: Values duplicated across modules under **different names**, with what
+    #: holds each pair together. Grouping by name cannot see these, which is
+    #: the gap C67 found in this class one Sprint after it was written.
+    #:
+    #: Trivial literals are excluded by `_duplicated_values()` rather than
+    #: listed here — `""`, `"w"`, `0`, `1` and friends are coincidence, not
+    #: contract, and a roster full of them is a roster nobody reads.
+    KNOWN_ALIASED = {
+        "('DECISION', 'MILESTONE', 'ISSUE', 'LEARNING')": (
+            "daily/markdown._CATEGORY_ORDER, daily/role_summary.CATEGORY_ORDER "
+            "and monthly/markdown.SECTION_ORDER. Not held equal — they answer "
+            "to docs/06 and docs/09 and may order sections differently. Held "
+            "by CategoryTableCoverageTests instead: each must cover the "
+            "category vocabulary, and Monthly must cover everything Daily "
+            "renders."
+        ),
+        "('Owner', 'Event ID', 'Category', 'Decision Context', "
+        "'Expected Outcome', 'Actual Outcome', 'Lessons Learned')": (
+            "daily/markdown.ITEM_LABELS writes them, monthly/parser._ITEM_LABELS "
+            "reads them. Held equal by test_monthly_history.py::"
+            "test_the_two_readers_of_this_format_agree."
+        ),
+        "{'CTO_BACKEND': 'CTO Backend', 'CTO_FRONTEND': 'CTO Frontend', "
+        "'CMO': 'CMO', 'COO': 'COO'}": (
+            "daily/markdown._ROLE_DISPLAY_NAMES and "
+            "notion/properties.ROLE_DISPLAY_NAMES. Deliberately **not** held "
+            "equal — RoleDisplayTableCoverageTests records why (different "
+            "specs) and guards coverage of events.ROLES instead."
+        ),
+    }
+
+    #: Literals too small or too common to be evidence of anything.
+    _TRIVIAL = frozenset(
+        {"''", "'w'", "'/'", "'.'", "'-'", "0", "1", "-1", "2",
+         "()", "[]", "{}", "True", "False", "None"}
+    )
+
+    @classmethod
+    def _duplicated_values(cls):
+        """`{repr(value): {(module, name), ...}}` for values that appear as a
+        module-level constant in more than one module."""
+        import ast
+        from collections import defaultdict
+
+        found = defaultdict(set)
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    continue
+                target = node.targets[0]
+                if not isinstance(target, ast.Name):
+                    continue
+                if not target.id.lstrip("_").isupper():
+                    continue
+                try:
+                    value = ast.literal_eval(node.value)
+                except Exception:  # noqa: BLE001
+                    continue
+                rendered = repr(value)
+                if rendered in cls._TRIVIAL or len(rendered) < 4:
+                    continue
+                found[rendered].add(
+                    (path.relative_to(SRC).as_posix(), target.id)
+                )
+        return {
+            value: where
+            for value, where in found.items()
+            if len({module for module, _name in where}) > 1
+        }
+
+    def test_the_value_scan_finds_the_duplications_we_know_about(self):
+        """C66 §1 again: a negative over a scan, so the scan comes first."""
+        self.assertGreaterEqual(len(self._duplicated_values()), 5)
+
+    def test_every_value_duplicated_under_another_name_is_accounted_for(self):
+        """The gap this class had for one Sprint.
+
+        Grouping by name answers "do the copies of `X` agree". It cannot ask
+        "is this value already written down somewhere else under a different
+        name", and three pairs were: the category order, the item labels, and
+        the role display table. Two of the three already had a keeper; the
+        third did not, and an item in a new category was being dropped from
+        Monthly History because of it (C67 §2).
+
+        Same-name duplications are checked for equality by
+        `test_every_other_duplicate_agrees`; this asks only that a value
+        living under two different names is one somebody has looked at.
+        """
+        unaccounted = []
+        for value, where in sorted(self._duplicated_values().items()):
+            names = {name for _module, name in where}
+            if len(names) == 1:
+                continue  # same name in several modules: checked above
+            if value in self.KNOWN_ALIASED:
+                continue
+            unaccounted.append(f"{value[:60]} :: {sorted(where)}")
+
+        self.assertEqual(
+            unaccounted,
+            [],
+            "a value is a module-level constant in two modules under two "
+            "different names, and nothing says whether they must agree: "
+            f"{unaccounted}",
+        )
+
+    def test_the_aliased_roster_names_nothing_that_is_gone(self):
+        """The other direction, as for `KNOWN_DIFFERENT`."""
+        present = set(self._duplicated_values())
+        self.assertEqual(sorted(set(self.KNOWN_ALIASED) - present), [])
+
+    def test_the_late_events_heading_and_its_reader_correspond(self):
+        """The relationship equality cannot express, and the one this class
+        was written for.
+
+        `monthly/parser` recognises the section by the text its `##` regex
+        captures. So the contract is not "the two constants are equal", it is
+        "the reader's value is what the reader's own regex gets out of the
+        writer's value" — checked with that regex, not with a second copy of
+        the `##` stripping.
+        """
+        from daily.late_events import LATE_SECTION_TITLE as WRITTEN
+        from monthly.parser import _HEADING2
+        from monthly.parser import LATE_SECTION_TITLE as EXPECTED
+
+        match = _HEADING2.match(WRITTEN)
+        self.assertIsNotNone(
+            match, f"{WRITTEN!r} is no longer a `##` heading the reader parses"
+        )
+        self.assertEqual(
+            match.group(1),
+            EXPECTED,
+            "daily/late_events writes a heading monthly/parser no longer "
+            "recognises — the Late Events section would be skipped whole "
+            "during consolidation, silently",
+        )
+
+    def test_the_consequence_of_that_pair_drifting_is_what_it_says(self):
+        """Not a re-test of the parser: the measurement the docstring quotes,
+        kept executable so the claim cannot become folklore."""
+        from datetime import date as date_type
+
+        from daily.late_events import LATE_SECTION_TITLE as WRITTEN
+        from monthly.parser import parse_daily_markdown
+
+        body = (
+            "# Title\n\n{heading}\n\n### Content Os\n\n- Campaign shipped.\n"
+            "- Owner: CMO\n- Event ID: EVT-LATE\n- Category: DECISION\n"
+        )
+        target = date_type(2026, 8, 20)
+
+        in_step = parse_daily_markdown(
+            body.format(heading=WRITTEN), target_date=target
+        )
+        self.assertEqual([item.event_id for item in in_step.items], ["EVT-LATE"])
+        self.assertTrue(in_step.items[0].is_late)
+
+        drifted = parse_daily_markdown(
+            body.format(heading="## Late Arrivals"), target_date=target
+        )
+        self.assertEqual(drifted.items, ())
 
 
 class CompanyHistoryWritersCleanUpTooTests(unittest.TestCase):
@@ -5061,7 +5786,7 @@ class IncompleteWriteInvariantTests(unittest.TestCase):
             path
             for path in SRC.rglob("*.py")
             if "__pycache__" not in path.parts
-            and "mkstemp" in path.read_text(encoding="utf-8")
+            and _calls_mkstemp(path.read_text(encoding="utf-8"))
         )
         self.assertGreaterEqual(len(writers), 12, "expected the full writer set")
         for path in writers:
@@ -5637,6 +6362,215 @@ class BackupLogFieldsThatReachAnArtifactTests(unittest.TestCase):
 
         self.assertIn("if component.status is ComponentStatus.SUCCESS:", ops_status)
         self.assertIn("continue", ops_status)
+
+
+class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
+    """C62's rule, with the count it stated turned into something checkable.
+
+    C62 removed one conversion from `controltower/rollup.read_events()` — an
+    entry whose `stat` failed used to `continue` in silence, so a real Event
+    file left no trace anywhere. The fix routed it to the `unreadable`
+    channel, and the docstring explained why the rest were left alone:
+
+        "The three other `except OSError: continue` loops in this repository
+         are left alone deliberately: none of them has an `unreadable`
+         channel to report into, and in each the dropped entry surfaces as a
+         *gap* in a sequence the view is already looking for holes in."
+
+    **Counted (C66): there are two, not three.** The reasoning survived; the
+    number did not, because the tree moved underneath it — `transport/intake`
+    and `collector/runtime` both record now. That is E-11's shape exactly, a
+    claim outliving the code it described, and the reason this is a roster
+    rather than a sentence: a paragraph cannot notice a fourth one arriving.
+
+    What the roster is for. A silent `continue` is only acceptable while the
+    dropped entry shows up somewhere else. For both entries below that
+    somewhere is `ops_status.py`'s Company-History-versus-backup comparison
+    (`UnbackedCompanyHistoryTests`): a file dropped from the backup scope
+    makes the two counts disagree, and the view is already looking for that
+    disagreement. A new silent handler elsewhere would have no such reader,
+    which is what this gate exists to make someone say out loud.
+    """
+
+    #: `module: (how many, why silence is acceptable there)`.
+    #:
+    #: **A count, not a permit (C68).** Keying by module alone would let a
+    #: module that already has an allowed silent handler grow a tenth one
+    #: unnoticed, which is the roster failing at the one job it has. The
+    #: number is the roster; a new handler moves it and this fails.
+    ALLOWED_SILENT = {
+        "src/backup/working_copy.py": (
+            2,
+            "the backup scope walk; a dropped file surfaces as Company "
+            "History that is not backed up, which ops_status.py reports",
+        ),
+        "ops_status.py": (
+            11,
+            "read one at a time in C68 and split three ways. Six surface "
+            "elsewhere: 308/410 drop a date that then shows up as a hole in "
+            "the daily sequence, and 1248/1369/1820/1832 skip one rendered "
+            "document. One (935) records by counting rather than by calling, "
+            "so the classifier above reads it as silent and it is not. "
+            "**Three are open** — 538 (a file missing from the unbacked-"
+            "History count), 853 (a junction missing from the exposure "
+            "list), 1806 (a day whose mtime defaults to 0.0, hiding a stale "
+            "Monthly). All three are detectors, all three fail quiet, and "
+            "none has a second reader. They need the same treatment C68 gave "
+            "`_company_history_older_than_the_evidence()` — somewhere to say "
+            "'could not check' — and that is the next Sprint's first item, "
+            "not a permit to add a twelfth.",
+        ),
+    }
+
+    #: Scanned in addition to `src/`. C68 found a real defect in
+    #: `ops_status.py` — an unreadable Company History reported as "no gap" —
+    #: of exactly the shape this class guards, in a file this class was not
+    #: looking at. The operator-facing view is 219 KB and was outside every
+    #: sweep that walks `SRC`.
+    ALSO_SCANNED = (
+        "ops_status.py",
+        "run_company_ops.py",
+        "run_agent.py",
+        "init_notion.py",
+        "review_cli.py",
+    )
+
+    @staticmethod
+    def _oserror_continue_handlers():
+        """`(module, line, records_anything)` for every OSError handler in
+        `src/` that reaches a `continue`."""
+        import ast
+
+        found = []
+        roots = [
+            REPO_ROOT / name
+            for name in ASilentlyDroppedEntryIsARosterNotAParagraphTests.ALSO_SCANNED
+            if (REPO_ROOT / name).exists()
+        ]
+        for path in sorted(SRC.rglob("*.py")) + roots:
+            if "__pycache__" in path.parts:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Try):
+                    continue
+                for handler in node.handlers:
+                    kind = handler.type
+                    if isinstance(kind, ast.Name):
+                        names = {kind.id}
+                    elif isinstance(kind, ast.Tuple):
+                        names = {
+                            e.id for e in kind.elts if isinstance(e, ast.Name)
+                        }
+                    else:
+                        names = set()
+                    if "OSError" not in names:
+                        continue
+                    if not any(
+                        isinstance(inner, ast.Continue)
+                        for inner in ast.walk(handler)
+                    ):
+                        continue
+                    records = any(
+                        isinstance(inner, ast.Call)
+                        and (
+                            getattr(inner.func, "attr", None)
+                            in ("append", "add", "setdefault")
+                            or getattr(inner.func, "id", None) == "_log"
+                        )
+                        for inner in ast.walk(handler)
+                    )
+                    try:
+                        name = path.relative_to(REPO_ROOT).as_posix()
+                    except ValueError:  # pragma: no cover - both are absolute
+                        name = path.name
+                    found.append((name, handler.lineno, records))
+        return found
+
+    def test_the_sweep_finds_handlers_at_all(self):
+        """C66 §1's own lesson, applied here: this class asserts a negative
+        over a scan, and a scan that finds nothing would make it green."""
+        self.assertGreaterEqual(len(self._oserror_continue_handlers()), 6)
+
+    def test_the_sweep_reaches_outside_src(self):
+        """C68. The defect that prompted this widening was in `ops_status.py`,
+        and a scan that quietly stopped at `src/` would have gone on missing
+        it while every other test here stayed green."""
+        modules = {module for module, _line, _records in
+                   self._oserror_continue_handlers()}
+
+        self.assertTrue(
+            any(not module.startswith("src/") for module in modules),
+            f"the sweep found nothing outside src/: {sorted(modules)}",
+        )
+
+    def test_every_silent_handler_is_on_the_roster(self):
+        offenders = sorted(
+            f"{module}:{line}"
+            for module, line, records in self._oserror_continue_handlers()
+            if not records and module not in self.ALLOWED_SILENT
+        )
+        self.assertEqual(
+            offenders,
+            [],
+            "an `except OSError: continue` that records nothing, in a module "
+            "the roster does not cover — see C62: the dropped entry has to "
+            f"surface somewhere, and this one has nowhere: {offenders}",
+        )
+
+    def test_no_rostered_module_grew_another_silent_handler(self):
+        """C68. The half a module-keyed roster cannot do.
+
+        `ops_status.py` is on the roster with eleven, three of which are open
+        (see the roster note). Without a count, a twelfth would inherit the
+        permission the eleven were granted — and the three that are already
+        wrong are the argument for counting rather than trusting the module.
+        """
+        from collections import Counter
+
+        actual = Counter(
+            module
+            for module, _line, records in self._oserror_continue_handlers()
+            if not records
+        )
+        recorded = {
+            module: count for module, (count, _why) in self.ALLOWED_SILENT.items()
+        }
+
+        self.assertEqual(dict(actual), recorded)
+
+    def test_the_roster_names_nothing_that_is_gone(self):
+        """The other direction. A roster entry for a module that no longer
+        has a silent handler is the stale claim this class replaced."""
+        silent_modules = {
+            module
+            for module, _line, records in self._oserror_continue_handlers()
+            if not records
+        }
+        self.assertEqual(set(self.ALLOWED_SILENT) - silent_modules, set())
+
+    def test_every_roster_entry_says_why(self):
+        """A count with no reason is a number nobody can act on, and the
+        three open handlers in `ops_status.py` are only findable because the
+        note names them."""
+        for module, (count, why) in self.ALLOWED_SILENT.items():
+            with self.subTest(module=module):
+                self.assertGreater(count, 0)
+                self.assertGreater(len(why), 60, "a reason, not a label")
+
+    def test_the_channel_that_started_this_still_reports(self):
+        """`read_events()` is the one C62 converted. Not a re-test of C62 —
+        a check that the conversion it made is still the reason this roster
+        is short."""
+        handlers = [
+            (module, line, records)
+            for module, line, records in self._oserror_continue_handlers()
+            if module == "src/controltower/rollup.py"
+        ]
+        self.assertTrue(handlers, "rollup.py no longer has the handler at all")
+        for module, line, records in handlers:
+            with self.subTest(line=line):
+                self.assertTrue(records, f"{module}:{line} went silent again")
 
 
 class OneLogWriterInvariantTests(unittest.TestCase):

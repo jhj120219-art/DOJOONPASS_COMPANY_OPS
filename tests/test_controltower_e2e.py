@@ -924,9 +924,10 @@ class ThreeDesktopsReachNotionTests(_ThreeDesktopPipeline, unittest.TestCase):
             if model.coverage.evidence_from
             else None
         )
-        return ops_status._company_history_older_than_the_evidence(
+        gap, _checked = ops_status._company_history_older_than_the_evidence(
             self.local_master / "daily", earliest
         )
+        return gap
 
     def test_the_run_manifest_and_the_dashboard_agree(self):
         self._run_the_agents()
