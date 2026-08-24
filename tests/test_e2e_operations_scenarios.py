@@ -59,10 +59,14 @@ def _rmtree_ignoring_readonly(target) -> None:
     Needed **here**, once, because the keyword that does it changed name:
     `onexc=` (callback takes the exception) is Python 3.12+, and `onerror=`
     (callback takes an `exc_info` triple) is what every earlier version has.
-    On this project's actual interpreter — Anaconda 3.9.7, see
-    `EveryTrackedModuleParsesOnThisInterpreterTests` — `onexc=` is not an
-    ignored keyword but a `TypeError`, raised inside `tearDownClass`, which
-    pytest reports as an ERROR against **every test in the class**.
+    On the interpreter this was written for — Anaconda 3.9.7, the
+    deployment runtime at the time — `onexc=` is not an ignored keyword but
+    a `TypeError`, raised inside `tearDownClass`, which pytest reports as an
+    ERROR against **every test in the class**. (The current runtime is
+    3.13.14, BACKLOG D, so it is the `onerror=` half that would now be the
+    `TypeError`. The dispatch below is written for both and needs no edit;
+    this note exists so the paragraph is not read as a claim about today's
+    machine.)
 
     Measured at HEAD 43771a9: three teardowns, ten errors, not one of them
     about the code under test. Three copies of the callback existed and all

@@ -426,5 +426,180 @@ class RetentionErasesTheEvidenceOfALossTests(unittest.TestCase):
         self.assertIs(first, HistoryDecision.KEEP)
 
 
+class TwoIdsThatDifferOnlyInCaseTests(unittest.TestCase):
+    """E-22, the same-batch path — and the correction it forces.
+
+    E-22 records the *cross-batch* case: `EVT-A` already downstream, `EVT-a`
+    arrives, `run_intake()` calls it `skipped_already_present`, it is never
+    collected, and — in E-22's words — there is *"no failed step, no
+    abnormal exit code"*.
+
+    **Both ids arriving in one batch is a different path, and that sentence
+    is false for it.** Measured through the real `run_company_ops.py`, three
+    Events in one batch (`twin`, `TWIN`, `ORDINARY`):
+
+        run 1   process exit 2, manifest FAILED
+                history_filter STEP_ABORTED / CRITICAL
+                  FileExistsError: history candidate already stored: HIST-TWIN.json
+                keep/   HIST-twin.json only
+                daily/  empty — no Company History written at all
+                remote  .gitkeep only
+        run 2   process exit 0, manifest SUCCESS, Company History rendered
+                and pushed
+
+    Three facts E-22 does not carry:
+
+    1. It is a **CRITICAL abort with exit 2**, not a silent skip.
+    2. The abort happens *inside* step 5's loop, so **every Event after the
+       collision in that batch loses its Candidate permanently** while being
+       marked seen. `ORDINARY` had nothing to do with the collision.
+    3. `find_orphaned_events()` **could not see the collided Event.**
+       `safe_candidate_filename("HIST-TWIN")` resolves to the path
+       `HIST-twin.json` already occupies, `is_file()` says yes, and the one
+       detector for this loss reported clean. Measured before C89:
+       `orphaned=['ORDINARY']` — `TWIN` missing from a list whose entire
+       job is to name what Company History lost.
+
+    **C89 fixed (3) and nothing else.** Making the ids collision-proof is
+    E-22's decision and still SKIPped — every candidate change breaks an
+    approved contract. What needed no decision was the detector: at most one
+    of a colliding group can own that file, so the others are orphaned no
+    matter what the filesystem says, and that is answerable from the Events
+    alone.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.processed = self.root / "processed"
+        self.keep = self.root / "keep"
+        self.review = self.root / "review"
+        for directory in (self.processed, self.keep, self.review):
+            directory.mkdir(parents=True)
+        self._files: dict[str, str] = {}
+
+    def _event(self, event_id, **overrides):
+        payload = {
+            "schema_version": "1.0",
+            "event_id": event_id,
+            "timestamp": "2026-08-18T10:00:00+09:00",
+            "source": "DESKTOP_1",
+            "role": "CTO_BACKEND",
+            "project_id": "PRJ-A",
+            "event_type": "MILESTONE_COMPLETED",
+            "status": "IN_PROGRESS",
+            "summary": f"work {event_id}",
+            "milestone": "M",
+            "blocker": None,
+            "evidence": [],
+            "history_candidate": True,
+        }
+        payload.update(overrides)
+        # The *file* name must be distinct even when the ids differ only in
+        # case -- a first draft used `event_id.lower()` and the two Events
+        # folded into one file before the collision under test could happen.
+        # A fixture the filesystem folds cannot demonstrate a fold.
+        self._files[event_id] = f"evt{len(self._files):02d}.json"
+        (self.processed / self._files[event_id]).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def _candidate_for(self, event_id):
+        """Write the Candidate the pipeline would write for `event_id`."""
+        from history import FileHistoryRepository, HistoryFilter
+        from events import Event
+
+        payload = json.loads(
+            (self.processed / self._files[event_id]).read_text(encoding="utf-8")
+        )
+        candidate = HistoryFilter().evaluate(Event.from_dict(payload)).candidate
+        FileHistoryRepository(
+            keep_dir=self.keep, review_dir=self.review
+        ).save(candidate, overwrite=True)
+
+    def _run(self):
+        return find_orphaned_events(
+            processed_dir=self.processed,
+            keep_dir=self.keep,
+            review_dir=self.review,
+        )
+
+    def test_the_filesystem_really_does_fold_the_two_names(self):
+        """The premise. On a case-sensitive filesystem this whole class is
+        about nothing, so it says so rather than failing obscurely."""
+        (self.keep / "HIST-twin.json").write_text("{}", encoding="utf-8")
+        if not (self.keep / "HIST-TWIN.json").exists():
+            self.skipTest("case-sensitive filesystem; E-22 does not arise here")
+        (self.keep / "HIST-twin.json").unlink()
+
+    def test_the_collided_event_is_reported_even_though_the_file_is_there(self):
+        """C89. Before it, this returned `['ORDINARY']` and `TWIN` — the
+        Event that actually lost its Candidate to the collision — was
+        absent."""
+        self._event("twin")
+        self._event("TWIN")
+        self._candidate_for("twin")
+        if not (self.keep / "HIST-TWIN.json").exists():
+            self.skipTest("case-sensitive filesystem; E-22 does not arise here")
+
+        result = self._run()
+
+        self.assertEqual(
+            sorted(o.event_id for o in result.orphaned), ["TWIN"],
+            "the Event whose Candidate the collision took is not reported",
+        )
+        self.assertEqual(result.checked, 2)
+
+    def test_the_survivor_is_not_reported(self):
+        """Precision. One of the two does own that file, and calling it
+        orphaned would be a false alarm on a correct state."""
+        self._event("twin")
+        self._event("TWIN")
+        self._candidate_for("twin")
+        if not (self.keep / "HIST-TWIN.json").exists():
+            self.skipTest("case-sensitive filesystem")
+
+        reported = {o.event_id for o in self._run().orphaned}
+
+        self.assertNotIn("twin", reported)
+
+    def test_two_files_carrying_one_id_are_not_a_collision(self):
+        """The same `event_id` twice is a duplicate *file*, which
+        `rollup.DuplicateEvent` reports and which is not a lost Event. This
+        must not start firing on it."""
+        self._event("solo")
+        self._candidate_for("solo")
+        # a second file, same id, different filename
+        payload = (self.processed / self._files["solo"]).read_text(encoding="utf-8")
+        (self.processed / "solo-copy.json").write_text(payload, encoding="utf-8")
+
+        self.assertEqual(self._run().orphaned, ())
+
+    def test_an_ordinary_orphan_is_still_reported(self):
+        """The pre-existing behaviour, unchanged — and the Event that the
+        measured abort orphaned as collateral."""
+        self._event("ordinary")
+
+        self.assertEqual(
+            [o.event_id for o in self._run().orphaned], ["ordinary"]
+        )
+
+    def test_a_three_way_collision_reports_two(self):
+        """At most one member of a colliding group can own the file, so a
+        group of three loses two."""
+        for event_id in ("trip", "TRIP", "TriP"):
+            self._event(event_id)
+        self._candidate_for("trip")
+        if not (self.keep / "HIST-TRIP.json").exists():
+            self.skipTest("case-sensitive filesystem")
+
+        reported = sorted(o.event_id for o in self._run().orphaned)
+
+        self.assertEqual(len(reported), 2, reported)
+        self.assertNotIn("trip", reported)
+
+
+
 if __name__ == "__main__":
     unittest.main()

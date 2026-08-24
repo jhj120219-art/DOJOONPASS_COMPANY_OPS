@@ -2428,17 +2428,54 @@ class ExitCodeContractTests(unittest.TestCase):
 
         # It still exits nonzero and still explains itself...
         self.assertIn("is_authentication_failure", reporter)
-        self.assertIn("return 2", reporter)
-        # ...but 2 is now only the FALLBACK. The code the process actually
+        # ...and 2 is only the FALLBACK. The code the process actually
         # returns comes from the Run Manifest, which `run_once()` writes in
         # its `finally` and which has already classified this failure.
         #
-        # Measured before this change, against a real broken git remote: the
+        # Measured before that change, against a real broken git remote: the
         # manifest said DEGRADED/exit 3 while the process exited 2. Two
         # answers to "how bad was this run", and the scheduled task only
         # ever sees the process one.
-        self.assertIn("summary.exit_code", reporter)
-        self.assertIn("read_summary", reporter)
+        #
+        # **Where those two assertions live moved in C78, and this class is
+        # where that has to be said.** They used to match `return 2` and
+        # `read_summary` inside this function. C78 found the same
+        # disagreement on every OTHER abort path — the process exited 1
+        # while the manifest said 2 — and the fix was to give that path
+        # the same answer, which meant the rule could not stay a private
+        # detail of the Backup reporter. It moved to
+        # `_exit_code_from_manifest()`, unchanged, and both callers use it.
+        #
+        # Asserted as *delegation plus the rule*, not as "the literal is
+        # somewhere in the file": a copy of the body pasted back into this
+        # function would satisfy a file-wide search and would be exactly the
+        # regression C78 closed.
+        #
+        # And asserted structurally rather than as call text, because the
+        # first draft of this line was `assertIn("_exit_code_from_manifest(
+        # run_summary_path)", reporter)` and C82 broke it by adding a keyword
+        # argument — a change that did not touch delegation at all. That is
+        # the third time this Sprint that a source-string assertion failed on
+        # an axis it had no opinion about, and `EncodingSafetyTests` had
+        # already written down why: *a test that breaks on the wrong axis
+        # stops being evidence about its own subject.*
+        reporter_tree = self._function("_report_backup_failure")
+        calls = {
+            getattr(node.func, "id", None)
+            for node in ast.walk(reporter_tree)
+            if isinstance(node, ast.Call)
+        }
+        self.assertIn("_exit_code_from_manifest", calls, "it stopped delegating")
+        self.assertNotIn(
+            "read_summary", calls,
+            "the reporter reads the manifest itself again — that is the "
+            "second copy of the rule C78 removed",
+        )
+
+        helper = ast.unparse(self._function("_exit_code_from_manifest"))
+        self.assertIn("return 2", helper)
+        self.assertIn("summary.exit_code", helper)
+        self.assertIn("read_summary", helper)
 
     def test_a_backup_failure_is_reachable_and_would_exit_zero(self):
         """The failure really happens — the Secret Scan gate produces it."""
@@ -4207,7 +4244,10 @@ class LayeringInvariantTests(unittest.TestCase):
         "monthly": set(),
         "backup": set(),
         "agent": {"events", "oplog", "reporter", "scheduler", "transport"},
-        "review_cli": {"history"},
+        # `cli` joined in C79, when this became the fifth entrypoint to
+        # refuse a command-line argument. A leaf, like `oplog` and
+        # `runsummary`, so it closes no cycle.
+        "review_cli": {"history", "cli"},
         # Read-only rollups over Execution Evidence. Three edges, each for
         # exactly one thing it must not restate (C28):
         #   events    parse the Event files
@@ -4241,7 +4281,33 @@ class LayeringInvariantTests(unittest.TestCase):
         return sorted(target.rglob("*.py")) if target.is_dir() else [SRC / f"{package}.py"]
 
     def _edges(self):
-        """package -> set of sibling packages it imports."""
+        """package -> set of sibling packages it imports.
+
+        `ast.walk`, so a function-local import counts exactly like a
+        top-level one -- this codebase uses them freely and a late import is
+        the same edge in the graph.
+
+        **Relative imports are resolved, not skipped (C97).** This read
+        `node.level == 0` and dropped every relative import, which is right
+        for `level == 1` (a sibling module inside the same package cannot
+        cross a package boundary) and wrong for `level >= 2`, which can:
+
+            src/agent/status.py:  from ..events import Event
+
+        resolves to the top-level `events` package and is an ordinary
+        `agent -> events` edge that this table would never have seen. The
+        class docstring says why that matters more here than elsewhere --
+        `ALLOWED` is deliberately a permit-list rather than a deny-list
+        *because* "a forbidden-list silently permits anything nobody thought
+        to forbid", and a permit-list with a shape it cannot parse has the
+        same hole by a different route.
+
+        Measured: `level >= 2` imports in `src/` today: **0**. So this
+        changes no edge in the current tree -- which is the point. The gate
+        is for the import nobody has written yet, and it was blind to one of
+        the two ways of writing it. Injected on `src/scheduler/lock.py`, the
+        layering test goes from PASS to FAIL.
+        """
         packages = self._packages()
         edges = {}
         for package in packages:
@@ -4251,13 +4317,32 @@ class LayeringInvariantTests(unittest.TestCase):
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
                         names = [a.name.split(".")[0] for a in node.names]
-                    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                        names = [node.module.split(".")[0]]
+                    elif isinstance(node, ast.ImportFrom):
+                        names = self._relative_target(path, node)
                     else:
                         continue
                     imported |= {n for n in names if n in packages and n != package}
             edges[package] = imported
         return edges
+
+    @staticmethod
+    def _relative_target(path, node):
+        """The top-level package an `ImportFrom` names, absolute or not.
+
+        Returned as a list so the caller treats every import shape the same
+        way. An import that resolves to nothing -- `from . import x` inside
+        a top-level module, which is not legal anyway -- returns empty
+        rather than guessing.
+        """
+        if node.level == 0:
+            return [node.module.split(".")[0]] if node.module else []
+        # `path` is `src/<package>/.../<module>.py`; drop the filename to get
+        # the package the import is written from, then climb `level - 1`.
+        here = list(path.relative_to(SRC).parts[:-1])
+        base = here[: len(here) - (node.level - 1)]
+        if node.module:
+            base = base + node.module.split(".")
+        return base[:1]
 
     def test_every_package_on_disk_has_a_declared_layer(self):
         """The completeness property. A package added without a row here
@@ -4338,6 +4423,150 @@ class LayeringInvariantTests(unittest.TestCase):
         for consumer in ("collector", "agent", "app"):
             with self.subTest(consumer=consumer):
                 self.assertIn("oplog", edges[consumer])
+
+
+class TheLayeringTableSeesBothWaysOfWritingAnImportTests(unittest.TestCase):
+    """C97. The predicate behind `LayeringInvariantTests`, on its own inputs.
+
+    That class states its own thesis: `ALLOWED` is a permit-list rather than
+    a deny-list *because* "a forbidden-list silently permits anything nobody
+    thought to forbid". Its edge extractor then dropped every relative
+    import:
+
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 ...
+
+    For `level == 1` that is right -- a sibling module inside the same
+    package cannot cross a package boundary. For `level >= 2` it is not:
+
+        src/scheduler/lock.py:  from ..events import Event
+
+    is an ordinary `scheduler -> events` edge, and the table could not see
+    it. A permit-list with a shape it cannot parse has the same hole as the
+    deny-list it was chosen over.
+
+    **Measured, both directions, on that exact injection:**
+
+        scheduler edges, clean tree        daily, history
+        ALLOWED['scheduler']               daily, history
+        after injecting the import         daily, events, history
+        outside the declared layer         events        <- the gate fires
+
+        pre-C97 extractor sees             json, os      <- no edge at all
+        post-C97 extractor sees            events, json, os, scheduler
+
+    **And it changes nothing today**, which is the point rather than a
+    caveat: `level >= 2` imports in `src/` right now number **0**. The gate
+    is for the import nobody has written yet, and it was blind to one of the
+    two ways of writing it. `test_the_tree_has_none_of_these_today` keeps
+    that measurement honest -- if the count stops being 0, this class is
+    where the reason gets written down.
+
+    Same shape as C93, one layer up: a gate that reads one spelling of the
+    thing it exists to catch.
+    """
+
+    def _node(self, source):
+        """The single `ImportFrom` in `source`."""
+        return next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom)
+        )
+
+    def _target(self, source, module_path):
+        return LayeringInvariantTests._relative_target(
+            SRC / module_path, self._node(source)
+        )
+
+    def test_an_absolute_import_names_its_top_level_package(self):
+        self.assertEqual(
+            self._target("from events.schema import Event", "scheduler/lock.py"),
+            ["events"],
+        )
+
+    def test_a_sibling_relative_import_stays_inside_its_package(self):
+        """`level == 1` resolves to the package it is written in, which the
+        caller then discards as `n != package`. It was never the problem and
+        must not become one."""
+        self.assertEqual(
+            self._target("from .state import load_state", "scheduler/lock.py"),
+            ["scheduler"],
+        )
+
+    def test_a_bare_relative_import_resolves_too(self):
+        """`from . import x` carries no module name at all."""
+        self.assertEqual(
+            self._target("from . import state", "scheduler/lock.py"), ["scheduler"]
+        )
+
+    def test_a_relative_import_that_climbs_out_is_the_edge_it_looks_like(self):
+        """The defect. Without this the import above is invisible to the
+        table that exists to permit or refuse exactly it."""
+        self.assertEqual(
+            self._target("from ..events import Event", "scheduler/lock.py"),
+            ["events"],
+        )
+
+    def test_climbing_out_of_a_nested_package_resolves_to_the_package(self):
+        """Two levels of package, one level of climb -- the base is the
+        package, not the tree root."""
+        self.assertEqual(
+            self._target("from ..other import thing", "scheduler/sub/mod.py"),
+            ["scheduler"],
+        )
+
+    def test_an_import_that_resolves_to_nothing_is_not_guessed(self):
+        """A relative import in a top-level module is not legal Python, and
+        the honest answer to an illegal shape is nothing rather than a
+        plausible package name."""
+        self.assertEqual(self._target("from . import x", "oplog.py"), [])
+
+    @staticmethod
+    def _climbing_imports(source, label):
+        return [
+            f"{label}:{node.lineno}"
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom) and node.level >= 2
+        ]
+
+    def test_the_tree_has_none_of_these_today(self):
+        """Anti-vacuity in the other direction. The change above is a no-op
+        on the current tree, and that has to be a measured claim rather than
+        an assumption -- if it stops being true, the new edge needs a row in
+        `ALLOWED` and a sentence here.
+
+        The scan is checked against an input that *does* contain one before
+        it is trusted to report zero. A mutation that emptied the scan
+        passed the tree assertion alone, for the reason every `== []` test
+        has: nothing distinguishes "looked and found none" from "did not
+        look". The synthetic case is what distinguishes them.
+
+        What this still cannot catch is a mutation of the final assertion
+        itself -- `assertEqual(found, found)` passes and no other test
+        covers it. That is inherent to asserting a negative over a scan, and
+        it is why the scan, not the assertion, is where the teeth are.
+        """
+        self.assertEqual(
+            self._climbing_imports("from ..events import Event\n", "probe.py"),
+            ["probe.py:1"],
+            "the scan cannot see the thing it is scanning for",
+        )
+        self.assertEqual(
+            self._climbing_imports("from .state import x\nimport os\n", "probe.py"),
+            [],
+            "the scan fires on imports that do not climb out",
+        )
+
+        found = []
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            found += self._climbing_imports(
+                path.read_text(encoding="utf-8"),
+                path.relative_to(SRC).as_posix(),
+            )
+
+        self.assertEqual(found, [], "a cross-package relative import appeared")
 
 
 class BackupLogIsNeverPersistedTests(unittest.TestCase):
@@ -4984,22 +5213,171 @@ class NoWriterStagesIntoProcessedTests(unittest.TestCase):
     reconciliation 3`) comes back and needs a different answer.
     """
 
-    def test_no_mkstemp_in_the_tree_stages_into_a_processed_directory(self):
-        calls = []
+    @staticmethod
+    def _mkstemp_calls():
+        """`(module, lineno, the call as source)` for every staging write.
+
+        **By AST, not by matching `tempfile.mkstemp(...)` in the file text
+        (C98).** The regex form counted prose as code: two of its sixteen
+        matches were a docstring and a comment *describing* the idiom --
+
+            controltower/rollup.py   "Every `tempfile.mkstemp()` in ..."
+            reporter/local_output.py "# `tempfile.mkstemp(dir=<the ...>)` and"
+
+        -- so the real number of staging writers is **14**, and the
+        `>= 12` guard below was being padded by two sentences. Worse in the
+        other direction: the offender test asks whether `"processed"` appears
+        in the matched text, so a docstring explaining *why nothing may stage
+        into `processed/`* would be reported as a writer that does. The
+        sentence in `controltower/rollup.py` is one edit away from saying
+        exactly that.
+
+        Fifth correction of this shape in this Sprint (C86, C88, C90, C92,
+        here): a claim about what the code *does* has to be read from the
+        code, and prose in the same file is not the code.
+
+        Bare `mkstemp` counts too. Nothing writes `from tempfile import
+        mkstemp` today, but the regex required the dotted spelling, and a
+        gate that only recognises one way of writing a call is the shape
+        C93 and C97 each found one layer up.
+        """
+        found = []
         for path in sorted(SRC.rglob("*.py")):
             if "__pycache__" in path.parts:
                 continue
-            source = path.read_text(encoding="utf-8")
-            for call in re.findall(
-                r"tempfile\.mkstemp\((?:[^()]|\([^()]*\))*\)", source
-            ):
-                calls.append((path.relative_to(SRC), call))
+            found += NoWriterStagesIntoProcessedTests._mkstemp_calls_in(
+                path.read_text(encoding="utf-8"),
+                path.relative_to(SRC).as_posix(),
+            )
+        return found
+
+    @staticmethod
+    def _mkstemp_calls_in(source, module):
+        """The predicate itself, over one source text.
+
+        Split out so it can be given inputs that are not in the tree --
+        `test_the_sweep_reads_calls_rather_than_sentences` fed a *copy* of
+        this logic at first, so a mutation that dropped the bare `mkstemp`
+        spelling from the real one passed. A test of a copy is a second
+        opinion, which is the thing this repository keeps removing.
+        """
+        import ast
+
+        found = []
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name) else None
+            )
+            if name != "mkstemp":
+                continue
+            found.append(
+                (module, node.lineno,
+                 ast.get_source_segment(source, node) or ast.unparse(node))
+            )
+        return found
+
+    @staticmethod
+    def _offenders(calls):
+        """The rule, in one place.
+
+        Both the tree sweep and the synthetic case below call this. They
+        each had their own copy of `"processed" in call` at first, so a
+        mutation that deleted the real one passed on the strength of the
+        copy -- a second opinion, which is the thing this repository keeps
+        removing, appearing inside a test written to remove one.
+        """
+        return [
+            (module, lineno, call)
+            for module, lineno, call in calls
+            if "processed" in call
+        ]
+
+    def test_no_mkstemp_in_the_tree_stages_into_a_processed_directory(self):
+        calls = self._mkstemp_calls()
 
         self.assertGreaterEqual(len(calls), 12, "expected the full writer set")
-        offenders = [
-            (str(module), call) for module, call in calls if "processed" in call
-        ]
-        self.assertEqual(offenders, [])
+        self.assertEqual(self._offenders(calls), [])
+
+    def test_the_sweep_reads_calls_rather_than_sentences(self):
+        """The correction, pinned so it cannot drift back.
+
+        A file whose *prose* names the idiom must contribute nothing, and a
+        file that calls it must contribute one -- including through the bare
+        `from tempfile import mkstemp` spelling the regex could not see.
+        """
+        calls_in = lambda source: self._mkstemp_calls_in(source, "probe.py")
+
+        prose = (
+            "def f():\n"
+            '    """Every `tempfile.mkstemp(dir=processed_dir)` is refused."""\n'
+            "    # `tempfile.mkstemp(dir=processed_dir)` would be wrong here\n"
+            "    return 1\n"
+        )
+        self.assertEqual(calls_in(prose), [], "a sentence counted as a call")
+
+        dotted = "import tempfile\nfd, p = tempfile.mkstemp(dir=d)\n"
+        bare = "from tempfile import mkstemp\nfd, p = mkstemp(dir=d)\n"
+        self.assertEqual(len(calls_in(dotted)), 1)
+        self.assertEqual(len(calls_in(bare)), 1, "the bare spelling was invisible")
+
+    def test_the_offender_rule_fires_on_a_writer_that_does_stage(self):
+        """The rule itself, on an input that breaks it.
+
+        The tree has no offender -- that is the whole point of the class --
+        so nothing here exercised the `"processed" in call` filter, and a
+        mutation deleting it passed. A negative asserted over a clean tree
+        needs a positive case somewhere or it is indistinguishable from no
+        rule at all.
+        """
+        staging = self._mkstemp_calls_in(
+            "import tempfile\n"
+            "fd, path = tempfile.mkstemp(dir=processed_dir, prefix='.tmp-')\n",
+            "probe.py",
+        )
+        self.assertEqual(len(staging), 1)
+        self.assertTrue(
+            self._offenders(staging),
+            "the offender rule does not recognise a writer staging into processed/",
+        )
+
+        elsewhere = self._mkstemp_calls_in(
+            "import tempfile\n"
+            "fd, path = tempfile.mkstemp(dir=incoming_dir, prefix='.tmp-')\n",
+            "probe.py",
+        )
+        self.assertFalse(
+            self._offenders(elsewhere),
+            "the offender rule fires on a writer that stages somewhere else",
+        )
+
+    def test_the_real_count_is_the_one_without_the_sentences(self):
+        """The measurement, kept as a number so a future reader does not
+        have to re-derive it: 16 text matches, 14 actual calls."""
+        import re as _re
+
+        text_matches = 0
+        for path in sorted(SRC.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            text_matches += len(
+                _re.findall(
+                    r"tempfile\.mkstemp\((?:[^()]|\([^()]*\))*\)",
+                    path.read_text(encoding="utf-8"),
+                )
+            )
+
+        self.assertEqual(len(self._mkstemp_calls()), 14)
+        self.assertGreater(
+            text_matches,
+            len(self._mkstemp_calls()),
+            "the regex no longer over-counts -- if the prose went away, say so here",
+        )
 
     def test_the_collector_arrives_by_replacing_the_file_it_validated(self):
         """The other half, measured rather than read: the destination name is
@@ -6399,26 +6777,124 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
     #: unnoticed, which is the roster failing at the one job it has. The
     #: number is the roster; a new handler moves it and this fails.
     ALLOWED_SILENT = {
+        # C93 widened the sweep from `continue` to `pass`, and these five
+        # modules appeared with it. None is a new handler; all five have been
+        # there the whole time, invisible because of how they were spelled.
+        "src/agent/agent.py": (
+            2,
+            "**Neither is comfortable, and saying so is the point of a "
+            "roster.** `_reject_signal()` swallows the failure of the "
+            "`os.replace()` that moves a rejected Signal into "
+            "`rejected/<date>/` and then returns the name as if it had "
+            "moved, so the agent log records REJECTED_SIGNAL for a file "
+            "still sitting where it was; the next run rejects it again. "
+            "Nothing is lost -- the Signal stays and is re-read -- and "
+            "nothing converges either. "
+            "**C95 changed what an operator can see about it, and this "
+            "entry said otherwise until then.** It read \"nothing "
+            "accumulates anywhere an operator counts\"; measured after "
+            "C95, with an invalid Signal whose move into "
+            "`signals_rejected/` failed: `rejected_signal_count` 0 -- the "
+            "counter that ought to see it -- but "
+            "`undelivered_closed_signal_count` **1**. The handler is "
+            "still silent; its consequence is not, though it surfaces "
+            "under a name about delivery rather than about rejection. "
+            "`_record_run()` is the settled one: its own "
+            "comment states the trade, losing `last_run` costs a human one "
+            "line of visibility while the run's actual result is already "
+            "durable in `outbox/`.",
+        ),
+        "src/app/desktop_activity.py": (
+            1,
+            "An entry whose `stat()` refuses is not counted as "
+            "`future_dated`, so that one anomaly check is skipped. Narrow on "
+            "purpose and narrow in fact: the same entry is parsed and "
+            "counted by the line immediately below, so it does not fall out "
+            "of the tally -- only out of the future-date question.",
+        ),
+        "src/oplog.py": (
+            1,
+            "The append to the operations log itself. The function's own "
+            "docstring states the trade before the handler reaches it: a "
+            "failed log write costs visibility, never data. A handler that "
+            "re-raised here would let a full disk take down the run it was "
+            "only trying to describe.",
+        ),
+        "src/runsummary.py": (
+            1,
+            "The Run Manifest write. This one is only acceptable because "
+            "two other things hold: `ops_status.py` reports a manifest it "
+            "cannot read (\"Run Manifest를 읽을 수 없다\"), and C82 made a "
+            "*stale* manifest unable to decide the exit code -- without "
+            "that second guard a manifest that failed to write would have "
+            "left the previous run's exit code standing, which is the "
+            "defect C82 measured as `exit 0` for a crashed run.",
+        ),
+        "src/scheduler/lock.py": (
+            1,
+            "`release_lock()`'s unlink. A lock that cannot be released is "
+            "left behind, and a left-behind lock is exactly the stale lock "
+            "docs/07 section 27's takeover exists for -- the next run reads "
+            "the recorded pid, finds it not running, and takes it over. The "
+            "one shape that is NOT recovered (a stale lock whose file is "
+            "read-only) has its own detector, `stale_lock_cannot_be_"
+            "cleared()`, precisely because this handler cannot see it.",
+        ),
         "src/backup/working_copy.py": (
             2,
             "the backup scope walk; a dropped file surfaces as Company "
             "History that is not backed up, which ops_status.py reports",
         ),
         "ops_status.py": (
-            11,
-            "read one at a time in C68 and split three ways. Six surface "
-            "elsewhere: 308/410 drop a date that then shows up as a hole in "
-            "the daily sequence, and 1248/1369/1820/1832 skip one rendered "
-            "document. One (935) records by counting rather than by calling, "
-            "so the classifier above reads it as silent and it is not. "
-            "**Three are open** — 538 (a file missing from the unbacked-"
-            "History count), 853 (a junction missing from the exposure "
-            "list), 1806 (a day whose mtime defaults to 0.0, hiding a stale "
-            "Monthly). All three are detectors, all three fail quiet, and "
-            "none has a second reader. They need the same treatment C68 gave "
-            "`_company_history_older_than_the_evidence()` — somewhere to say "
-            "'could not check' — and that is the next Sprint's first item, "
-            "not a permit to add a twelfth.",
+            3,
+            "read one at a time in C68 and split three ways. All three "
+            "surface elsewhere: two drop a date that then shows up as a hole "
+            "in the daily sequence, and one skips a Secret-name comparison "
+            "the screen reports as 'could not check'. "
+            "**C88 removed four from this count and fixed none of them.** "
+            "They already counted (`skipped += 1`); the classifier above "
+            "could not read that spelling, so it called them silent, and "
+            "this roster inherited the mistake — carrying three of them as "
+            "*open* under a to-do (\"the next Sprint's first item\") that "
+            "C68 had completed in the same Sprint. Traced to the line that "
+            "prints each one: `_history_newer_than_the_last_backup`, "
+            "`_junctions_in_scope`, `_monthly_lags_its_daily_source`, "
+            "`_split_reviewed`. The lesson belongs to the classifier, not to "
+            "them: a gate that reads one spelling of 'recorded' manufactures "
+            "work that is already done. "
+            "**C91 took it from seven to five, and this time by fixing "
+            "them.** Both were inside `_monthly_lags_its_daily_source()` — "
+            "the Monthly's `stat()` and its `read_text()` — and each let a "
+            "month go uncompared while the screen still said the check had "
+            "run. Measured on a tree whose 2026-07 Monthly genuinely lacks "
+            "an Event its Daily carries: `finding () skipped 0`, which is "
+            "the screen a healthy machine prints. "
+            "**And the third handler C91 fixed was never in this count.** "
+            "It is the per-day `read_daily_document()` call in the same "
+            "function, written `except Exception`, and the classifier keys "
+            "on `OSError` — so the one handler of the three that shortened "
+            "the *finding itself* rather than skipping a month was the one "
+            "this roster could not see. The number is a forcing function "
+            "over the handlers it recognises, which is not the same set as "
+            "the handlers that can lose a detection. "
+            "**C92 took it from five to three**, closing the pair C91 "
+            "recorded but did not fix: `_kept_but_not_rendered()` (E-17's "
+            "detector) and `_reviewed_but_not_rendered()` (Decision "
+            "Context). Both answered an unreadable Daily with a bare "
+            "`continue`, so every Candidate of that date was treated exactly "
+            "like one that IS in its file and the stranded list came back "
+            "shorter by the ones nobody could check. They now return "
+            "`(stranded, unreadable_dates)` and the caller prints **one** "
+            "line for both -- a union, not a sum, because the two walk the "
+            "same dates over the same directory and adding the counts would "
+            "report one unreadable file as two. "
+            "Line numbers are deliberately gone from the sentence above: "
+            "they were stale twice over in the same Sprint (308/410 became "
+            "319/421 and 1248/1369 became 1468/1589 through edits that "
+            "changed none of them), and a number that drifts silently is "
+            "what this class exists to object to. "
+            "The three that remain are still not a permit to add a "
+            "fourth: the count is the forcing function.",
         ),
     }
 
@@ -6427,77 +6903,231 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
     #: of exactly the shape this class guards, in a file this class was not
     #: looking at. The operator-facing view is 219 KB and was outside every
     #: sweep that walks `SRC`.
+    #:
+    #: **"In addition to `src/`" is the whole rule, and C81 is what happens
+    #: when an entry forgets it.** This tuple carried `"review_cli.py"`, and
+    #: the file is `src/review_cli.py`. `_oserror_handlers_that_discard()` filters
+    #: the roster through `.exists()`, so the entry resolved to nothing and
+    #: was **dropped without a word** — the roster claimed five files and
+    #: scanned four. Measured:
+    #:
+    #:     ops_status.py       exists=True
+    #:     run_company_ops.py  exists=True
+    #:     run_agent.py        exists=True
+    #:     init_notion.py      exists=True
+    #:     review_cli.py       exists=False   <- silently dropped
+    #:
+    #: No coverage was lost — `src/review_cli.py` is under `SRC` and the
+    #: `SRC.rglob()` half was already reading it, which is also why the entry
+    #: never belonged here. What was lost is the roster's honesty, in the one
+    #: class whose entire thesis is that a silently dropped entry has to be a
+    #: roster rather than a paragraph. `test_every_entry_here_resolves`
+    #: is that thesis applied to this tuple.
     ALSO_SCANNED = (
         "ops_status.py",
         "run_company_ops.py",
         "run_agent.py",
         "init_notion.py",
-        "review_cli.py",
     )
 
+    def test_every_entry_here_resolves(self):
+        """The roster must not be able to shrink quietly (C81).
+
+        `_oserror_handlers_that_discard()` drops what does not exist, which is
+        the right thing to do with a path and the wrong thing to do with a
+        *declaration*: the filter cannot tell "this tool was removed" from
+        "somebody wrote the path wrong", and it answered both by scanning
+        less and saying nothing.
+        """
+        for name in self.ALSO_SCANNED:
+            with self.subTest(entry=name):
+                self.assertTrue(
+                    (REPO_ROOT / name).is_file(),
+                    f"{name} is declared here and is not there — the "
+                    "`.exists()` filter in `_oserror_handlers_that_discard()` "
+                    "would drop it and scan one file fewer in silence",
+                )
+
+    def test_the_src_half_still_covers_the_tool_this_roster_gave_up(self):
+        """Why removing the entry was the fix rather than correcting it.
+
+        `src/review_cli.py` belongs to the `SRC.rglob()` half. Naming it here
+        too would scan it twice and re-state where it lives in a tuple whose
+        contract is "files that `SRC` does not reach".
+        """
+        scanned = {
+            str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+            for path in sorted(SRC.rglob("*.py"))
+            if "__pycache__" not in path.parts
+        }
+
+        self.assertIn("src/review_cli.py", scanned)
+
+        # The contract, not the one string. A first draft asserted
+        # `"review_cli.py" not in ALSO_SCANNED`, and a mutation that re-added
+        # it as `"src/review_cli.py"` passed -- a different string, the same
+        # mistake, and the file scanned twice. What the tuple means is
+        # "files `SRC.rglob()` does not reach", so that is what is checked.
+        for entry in self.ALSO_SCANNED:
+            with self.subTest(entry=entry):
+                self.assertFalse(
+                    (REPO_ROOT / entry).resolve().is_relative_to(SRC.resolve()),
+                    f"{entry} is inside src/ and is already swept by the "
+                    "SRC.rglob() half -- naming it here scans it twice and "
+                    "restates where it lives",
+                )
+
     @staticmethod
-    def _oserror_continue_handlers():
+    def _handlers_that_discard(source, module):
         """`(module, line, records_anything)` for every OSError handler in
-        `src/` that reaches a `continue`."""
+        `source` that **discards** the failure.
+
+        Discarding has two spellings and this used to read one of them:
+
+            except OSError:
+                continue        <- seen
+            except OSError:
+                pass            <- not seen
+
+        `continue` was the whole predicate, so `pass` was invisible.
+        **C88's lesson in a second position.** There, a gate that recognised
+        one spelling of *recorded* manufactured work that was already done;
+        here, a gate that recognises one spelling of *silent* granted a
+        standing exemption to whichever handlers happened to be written the
+        other way. Measured when the predicate was widened: 3 silent
+        handlers became 11, in seven modules rather than two, and five of
+        those modules had never carried a line of rationale.
+
+        **The cleanup idiom is excluded, and that is not a loophole.** This
+        shape is in every writer in the tree:
+
+            try:
+                ...write, fsync, os.replace...
+            except BaseException:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass          <- discarded on purpose
+                raise             <- the real failure still propagates
+
+        The inner `pass` drops a *cleanup* error while the original
+        exception is re-raised one line later, so the caller is told. 16 of
+        the 24 `pass` handlers in `src/` are this. Counting them would put 16
+        permanently-justified entries on a roster whose entire value is that
+        every entry needs a reason -- the standing-alarm failure this
+        repository keeps removing. The exclusion is structural (an ancestor
+        handler containing a `raise`), not a list of blessed files.
+
+        Takes source text rather than a path so the predicate can be tested
+        on inputs that need not exist in the tree
+        (`TheSweepReadsBothSpellingsOfSilentTests`). Before that it could
+        only be run against the real repository, which is how a predicate
+        that saw half the handlers stayed green.
+        """
         import ast
 
+        tree = ast.parse(source)
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def is_cleanup_for_a_reraise(handler):
+            """Is this handler cleaning up inside a handler that re-raises?"""
+            node = handler
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.ExceptHandler) and any(
+                    isinstance(inner, ast.Raise) for inner in ast.walk(node)
+                ):
+                    return True
+                if isinstance(node, ast.FunctionDef):
+                    return False
+            return False
+
         found = []
+        for handler in [
+            node for node in ast.walk(tree) if isinstance(node, ast.ExceptHandler)
+        ]:
+            kind = handler.type
+            if isinstance(kind, ast.Name):
+                names = {kind.id}
+            elif isinstance(kind, ast.Tuple):
+                names = {e.id for e in kind.elts if isinstance(e, ast.Name)}
+            else:
+                names = set()
+            if "OSError" not in names:
+                continue
+            discards = any(
+                isinstance(inner, ast.Continue) for inner in ast.walk(handler)
+            ) or all(isinstance(stmt, ast.Pass) for stmt in handler.body)
+            if not discards:
+                continue
+            if is_cleanup_for_a_reraise(handler):
+                continue
+            # What counts as "the dropped entry surfaced".
+            #
+            # **C88 added the AugAssign line, and the reason is the
+            # rest of this class.** Recording by *calling* something
+            # was the only spelling this saw — and the spelling
+            # C68's own fixes used was `skipped += 1`. Four handlers
+            # that count, and whose counts are read and printed,
+            # were therefore classified `records=False`, and the
+            # roster below carried three of them as "open" with a
+            # to-do C68 had already finished.
+            #
+            # An augmented assignment is recording only while the
+            # name it increments leaves the function. That is checked
+            # rather than assumed:
+            # `test_every_counted_handler_reaches_the_operator`.
+            records = any(
+                (
+                    isinstance(inner, ast.Call)
+                    and (
+                        getattr(inner.func, "attr", None)
+                        in ("append", "add", "setdefault")
+                        or getattr(inner.func, "id", None) == "_log"
+                    )
+                )
+                or isinstance(inner, ast.AugAssign)
+                for inner in ast.walk(handler)
+            )
+            found.append((module, handler.lineno, records))
+        return found
+
+    @staticmethod
+    def _oserror_handlers_that_discard():
+        """The whole sweep: `src/` plus the tools `SRC.rglob()` cannot reach."""
+        cls = ASilentlyDroppedEntryIsARosterNotAParagraphTests
         roots = [
             REPO_ROOT / name
-            for name in ASilentlyDroppedEntryIsARosterNotAParagraphTests.ALSO_SCANNED
+            for name in cls.ALSO_SCANNED
             if (REPO_ROOT / name).exists()
         ]
+        found = []
         for path in sorted(SRC.rglob("*.py")) + roots:
             if "__pycache__" in path.parts:
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Try):
-                    continue
-                for handler in node.handlers:
-                    kind = handler.type
-                    if isinstance(kind, ast.Name):
-                        names = {kind.id}
-                    elif isinstance(kind, ast.Tuple):
-                        names = {
-                            e.id for e in kind.elts if isinstance(e, ast.Name)
-                        }
-                    else:
-                        names = set()
-                    if "OSError" not in names:
-                        continue
-                    if not any(
-                        isinstance(inner, ast.Continue)
-                        for inner in ast.walk(handler)
-                    ):
-                        continue
-                    records = any(
-                        isinstance(inner, ast.Call)
-                        and (
-                            getattr(inner.func, "attr", None)
-                            in ("append", "add", "setdefault")
-                            or getattr(inner.func, "id", None) == "_log"
-                        )
-                        for inner in ast.walk(handler)
-                    )
-                    try:
-                        name = path.relative_to(REPO_ROOT).as_posix()
-                    except ValueError:  # pragma: no cover - both are absolute
-                        name = path.name
-                    found.append((name, handler.lineno, records))
+            try:
+                name = path.relative_to(REPO_ROOT).as_posix()
+            except ValueError:  # pragma: no cover - both are absolute
+                name = path.name
+            found += cls._handlers_that_discard(
+                path.read_text(encoding="utf-8"), name
+            )
         return found
 
     def test_the_sweep_finds_handlers_at_all(self):
         """C66 §1's own lesson, applied here: this class asserts a negative
         over a scan, and a scan that finds nothing would make it green."""
-        self.assertGreaterEqual(len(self._oserror_continue_handlers()), 6)
+        self.assertGreaterEqual(len(self._oserror_handlers_that_discard()), 6)
 
     def test_the_sweep_reaches_outside_src(self):
         """C68. The defect that prompted this widening was in `ops_status.py`,
         and a scan that quietly stopped at `src/` would have gone on missing
         it while every other test here stayed green."""
         modules = {module for module, _line, _records in
-                   self._oserror_continue_handlers()}
+                   self._oserror_handlers_that_discard()}
 
         self.assertTrue(
             any(not module.startswith("src/") for module in modules),
@@ -6507,7 +7137,7 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
     def test_every_silent_handler_is_on_the_roster(self):
         offenders = sorted(
             f"{module}:{line}"
-            for module, line, records in self._oserror_continue_handlers()
+            for module, line, records in self._oserror_handlers_that_discard()
             if not records and module not in self.ALLOWED_SILENT
         )
         self.assertEqual(
@@ -6530,7 +7160,7 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
 
         actual = Counter(
             module
-            for module, _line, records in self._oserror_continue_handlers()
+            for module, _line, records in self._oserror_handlers_that_discard()
             if not records
         )
         recorded = {
@@ -6539,12 +7169,66 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
 
         self.assertEqual(dict(actual), recorded)
 
+    def test_every_counted_handler_reaches_the_operator(self):
+        """C88. The classifier now treats `skipped += 1` as recording, and
+        that is only true while the number is *read*.
+
+        A counter incremented in a handler and then dropped on the floor is
+        exactly the silence this class exists to catch, wearing the shape of
+        a fix. So every function whose `OSError` handler counts has to return
+        what it counted.
+        """
+        source = (REPO_ROOT / "ops_status.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        counting = {}
+        for func in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Try):
+                    continue
+                for handler in node.handlers:
+                    kind = handler.type
+                    if isinstance(kind, ast.Name):
+                        names = {kind.id}
+                    elif isinstance(kind, ast.Tuple):
+                        names = {e.id for e in kind.elts if isinstance(e, ast.Name)}
+                    else:
+                        names = set()
+                    if "OSError" not in names:
+                        continue
+                    if not any(isinstance(i, ast.Continue) for i in ast.walk(handler)):
+                        continue
+                    for inner in ast.walk(handler):
+                        if isinstance(inner, ast.AugAssign) and isinstance(
+                            inner.target, ast.Name
+                        ):
+                            counting.setdefault(func, set()).add(inner.target.id)
+
+        self.assertTrue(
+            counting,
+            "no counting handler found, so the check below passes over nothing",
+        )
+        for func, counters in sorted(counting.items(), key=lambda kv: kv[0].name):
+            with self.subTest(function=func.name):
+                returned = {
+                    counter
+                    for node in ast.walk(func)
+                    if isinstance(node, ast.Return) and node.value is not None
+                    for counter in counters
+                    if counter in ast.unparse(node.value)
+                }
+                self.assertEqual(
+                    returned, counters,
+                    f"{func.name} counts a dropped entry and does not return "
+                    f"the count: {sorted(counters - returned)}",
+                )
+
     def test_the_roster_names_nothing_that_is_gone(self):
         """The other direction. A roster entry for a module that no longer
         has a silent handler is the stale claim this class replaced."""
         silent_modules = {
             module
-            for module, _line, records in self._oserror_continue_handlers()
+            for module, _line, records in self._oserror_handlers_that_discard()
             if not records
         }
         self.assertEqual(set(self.ALLOWED_SILENT) - silent_modules, set())
@@ -6564,13 +7248,183 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
         is short."""
         handlers = [
             (module, line, records)
-            for module, line, records in self._oserror_continue_handlers()
+            for module, line, records in self._oserror_handlers_that_discard()
             if module == "src/controltower/rollup.py"
         ]
         self.assertTrue(handlers, "rollup.py no longer has the handler at all")
         for module, line, records in handlers:
             with self.subTest(line=line):
                 self.assertTrue(records, f"{module}:{line} went silent again")
+
+
+class TheSweepReadsBothSpellingsOfSilentTests(unittest.TestCase):
+    """C93. The predicate behind the roster, tested on its own inputs.
+
+    `ASilentlyDroppedEntryIsARosterNotAParagraphTests` guards a count of
+    silent handlers, and its predicate had never been run on anything but
+    the real tree. So the one thing nothing could ask it was whether it
+    recognises a silent handler at all -- and it did not recognise half of
+    them:
+
+        except OSError:
+            continue        <- counted
+        except OSError:
+            pass            <- not counted
+
+    Both discard the failure. `pass` is the spelling 24 of the handlers in
+    `src/` use, and every one of them was outside the roster's reach while
+    every test in that class stayed green. Widening the predicate moved the
+    sweep from 3 silent handlers in 2 modules to 11 in 7.
+
+    **This is C88's finding in a second position, and the pair is the
+    point.** C88: a gate that read one spelling of *recorded* classified
+    four handlers that do count as silent, and manufactured a to-do that was
+    already finished. C93: a gate that reads one spelling of *silent*
+    exempted five modules that had never been looked at. Same gate, opposite
+    error, both invisible from inside the class that owns it -- because the
+    only input it was ever given was the tree it was passing on.
+    """
+
+    def _handlers(self, source):
+        return ASilentlyDroppedEntryIsARosterNotAParagraphTests._handlers_that_discard(
+            textwrap.dedent(source), "probe.py"
+        )
+
+    def test_pass_and_continue_are_both_read_as_discarding(self):
+        """The defect, stated as the two inputs that must agree."""
+        with_pass = self._handlers(
+            """
+            def f(path):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            """
+        )
+        with_continue = self._handlers(
+            """
+            def f(paths):
+                for path in paths:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        continue
+            """
+        )
+
+        self.assertEqual(len(with_pass), 1, "the `pass` spelling was invisible")
+        self.assertEqual(len(with_continue), 1)
+        self.assertFalse(with_pass[0][2])  # records nothing
+        self.assertFalse(with_continue[0][2])
+
+    def test_a_handler_that_records_is_not_silent(self):
+        """C88's half, kept: three spellings of "the dropped entry
+        surfaced", and a handler using any of them is not silent."""
+        for body in ("skipped += 1", "found.append(name)", '_log(path, "x")'):
+            with self.subTest(body=body):
+                handlers = self._handlers(
+                    f"""
+                    def f(paths):
+                        skipped = 0
+                        found = []
+                        for path in paths:
+                            try:
+                                path.unlink()
+                            except OSError:
+                                {body}
+                                continue
+                        return skipped, found
+                    """
+                )
+
+                self.assertEqual(len(handlers), 1)
+                self.assertTrue(handlers[0][2], f"{body} is recording")
+
+    def test_cleanup_inside_a_re_raising_handler_is_not_silent(self):
+        """The atomic-write idiom. The inner `pass` drops a *cleanup* error
+        while the original exception is re-raised one line below, so the
+        caller is told and nothing is swallowed."""
+        handlers = self._handlers(
+            """
+            def write(path, tmp_path):
+                try:
+                    path.write_text("x")
+                except BaseException:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise
+            """
+        )
+
+        self.assertEqual(handlers, [])
+
+    def test_the_exclusion_is_the_raise_and_not_the_nesting(self):
+        """The same shape with the `raise` removed is silent again.
+
+        Without this, "nested" and "cleans up for something that re-raises"
+        are indistinguishable, and any handler could be exempted by wrapping
+        it in another one.
+        """
+        handlers = self._handlers(
+            """
+            def write(path, tmp_path):
+                try:
+                    path.write_text("x")
+                except BaseException:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+            """
+        )
+
+        self.assertEqual(len(handlers), 1)
+
+    def test_a_handler_that_is_not_about_OSError_is_not_the_subject(self):
+        handlers = self._handlers(
+            """
+            def f(raw):
+                try:
+                    return int(raw)
+                except ValueError:
+                    pass
+            """
+        )
+
+        self.assertEqual(handlers, [])
+
+    def test_the_real_sweep_actually_contains_the_widened_spelling(self):
+        """Anti-vacuity, and the reason the widening was worth doing.
+
+        If every silent handler in the tree happened to use `continue`, the
+        change above would be a no-op dressed as a fix. It is not: the sweep
+        finds `pass`-shaped silent handlers, and they are in modules the
+        roster had never named.
+        """
+        import ast
+
+        by_spelling = {"pass": 0, "continue": 0}
+        for module, line, records in (
+            ASilentlyDroppedEntryIsARosterNotAParagraphTests
+            ._oserror_handlers_that_discard()
+        ):
+            if records:
+                continue
+            source = (REPO_ROOT / module).read_text(encoding="utf-8")
+            handler = next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.ExceptHandler) and node.lineno == line
+            )
+            key = "pass" if all(
+                isinstance(stmt, ast.Pass) for stmt in handler.body
+            ) else "continue"
+            by_spelling[key] += 1
+
+        self.assertGreater(by_spelling["pass"], 0, "the widening changed nothing")
+        self.assertGreater(by_spelling["continue"], 0, "the original half is gone")
 
 
 class OneLogWriterInvariantTests(unittest.TestCase):
@@ -7352,6 +8206,152 @@ class OneRuntimeRootOrRefuseTests(unittest.TestCase):
 
         self.assertIn("def _agent_dir()", source)
         self.assertIn("return RUNTIME_DIR /", source)
+
+
+class EveryFinallyKnowsWhatRunsBeforeItTests(unittest.TestCase):
+    """A `finally` promises "this happens on every exit path". It promises it
+    only for paths that reach the `try:`.
+
+    **C82 is what that costs.** `app.runner.run_once()` writes the Run
+    Manifest in its `finally`, and `run_company_ops.py` was changed to read
+    the exit code out of that manifest — correct for every abort *inside*
+    the `try:`, and wrong for one before it. A run that died at lock
+    acquisition wrote no manifest, so the process returned the **previous**
+    run's exit code: measured, a crashed run reported 0.
+
+    C83 then swept production code for the same shape and found three
+    function-level `try/finally` blocks, all releasing a lock, only one with
+    statements between the acquire and the `try:`. That count is the kind of
+    number C66 section 4 says not to leave in prose — so it lives here.
+
+    **What this class actually asks of a new entry.** Not "do not add a
+    `finally`". Only: when one appears, someone has answered *"what runs
+    before it, and what does the `finally` promise that a caller may already
+    be relying on?"* The roster is the forcing function; a fourth entry
+    fails until it is listed with that answer.
+    """
+
+    #: `module:function` -> why the statements before its `try:` are safe.
+    KNOWN = {
+        "agent/agent.py:run_once": (
+            "`try_acquire_lock()` is the last statement before the `try:`, so "
+            "nothing can raise between acquiring the lock and entering the "
+            "block that releases it."
+        ),
+        "scheduler/scheduler.py:run_once": (
+            "Same shape. The `already_locked` branch returns before the "
+            "`try:` on purpose — the caller holds the lock and releases it."
+        ),
+        "app/runner.py:run_once": (
+            "The one with statements between the acquire and the `try:` "
+            "(`_Recorder()`, two `Path()` calls, `now_iso()`), none of which "
+            "raise on anything but caller error. Its `finally` also writes "
+            "the Run Manifest, and C82 is the record of what that promise "
+            "was read to mean: `run_company_ops.py` now passes the pre-run "
+            "`run_id` so a manifest this run did not write cannot decide its "
+            "exit code."
+        ),
+    }
+
+    @staticmethod
+    def _blocks():
+        """`{module:function: [statements before the try]}` for every
+        function-body-level `try/finally` in production code."""
+        found = {}
+        for path in sorted(SRC.rglob("*.py")) + sorted(REPO_ROOT.glob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            rel = str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+            rel = rel[4:] if rel.startswith("src/") else rel
+            tree = ast.parse(path.read_text(encoding="utf-8"), rel)
+            for func in [
+                n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]:
+                for index, stmt in enumerate(func.body):
+                    if isinstance(stmt, ast.Try) and stmt.finalbody:
+                        found[f"{rel}:{func.name}"] = func.body[:index]
+        return found
+
+    def test_the_scan_finds_the_blocks_it_is_about(self):
+        """Guards the guard: an AST walk that matched nothing would make the
+        roster check below pass over an empty set."""
+        blocks = self._blocks()
+
+        self.assertGreaterEqual(len(blocks), 3)
+        self.assertIn("app/runner.py:run_once", blocks)
+
+    def test_every_finally_in_production_code_is_on_the_roster(self):
+        """A fourth one is not forbidden — it is unlisted, and listing it
+        means answering C82's question for it."""
+        found = set(self._blocks())
+
+        self.assertEqual(
+            found - set(self.KNOWN), set(),
+            "a production `try/finally` is not on this roster. Add it with "
+            "the answer to: what runs before the `try:`, can it raise, and "
+            "does anything outside this function rely on what the `finally` "
+            "promises? (C82 is what happens when it does.)",
+        )
+
+    def test_the_roster_names_nothing_that_is_gone(self):
+        """The other direction. A stale entry is an explanation for code that
+        no longer exists, and the next reader would trust it."""
+        found = set(self._blocks())
+
+        self.assertEqual(set(self.KNOWN) - found, set())
+
+    def test_only_one_of_them_acts_after_taking_the_lock(self):
+        """The fact C82 turned on, kept as a check rather than as prose.
+
+        **The first draft of this test was named right and measured the wrong
+        thing.** It asked which blocks have *any* statement before the
+        `try:` — all three do, since the lock acquisition itself is one — so
+        it listed all three and a mutation that added a statement to one of
+        them passed. Found by that mutation, which is the whole reason the
+        mutation existed.
+
+        The property that matters is narrower: statements between **taking
+        the lock** and entering the block that releases it. Before the lock
+        there is nothing to leak; after it, a raise leaks the lock and skips
+        whatever else the `finally` promised — which for `app/runner.py` is
+        the Run Manifest, and that is C82.
+        """
+        offenders = {}
+        for name, before in self._blocks().items():
+            acquired = None
+            for index, stmt in enumerate(before):
+                if "try_acquire_lock" in ast.unparse(stmt):
+                    acquired = index
+            if acquired is None:
+                continue
+            after = [
+                stmt for stmt in before[acquired + 1:]
+                if not isinstance(stmt, (ast.Expr, ast.Pass))
+            ]
+            if after:
+                offenders[name] = [ast.unparse(s).splitlines()[0] for s in after]
+
+        self.assertEqual(
+            sorted(offenders), ["app/runner.py:run_once"],
+            "the set of `finally` blocks that do work after taking the lock "
+            f"changed — a raise there leaks the lock and skips everything "
+            f"the `finally` promised (C82): {offenders}",
+        )
+
+    def test_every_block_here_actually_takes_a_lock(self):
+        """The premise of the test above. All three of these are lock
+        blocks; if one ever is not, `try_acquire_lock` will not be found in
+        its preamble and it would be skipped silently rather than checked."""
+        for name, before in self._blocks().items():
+            with self.subTest(block=name):
+                self.assertTrue(
+                    any("try_acquire_lock" in ast.unparse(stmt) for stmt in before),
+                    f"{name} has a `finally` but takes no lock before it — "
+                    "the check above cannot see it, so say here what its "
+                    "`finally` is for",
+                )
+
 
 
 if __name__ == "__main__":

@@ -463,10 +463,14 @@ def _is_iso_8601(text: str) -> bool:
     `datetime.fromisoformat()` rather than a regex: it is the same parser
     `events.schema._timestamp_error()` validates an Event's timestamp with,
     so "an Event timestamp is a valid Notion date" is true by construction
-    instead of by two patterns agreeing. On Python 3.9 it is the stricter of
-    the two — it refuses the trailing `Z` this project never emits — and
-    stricter is the safe direction for a check whose job is to refuse before
-    the API does.
+    instead of by two patterns agreeing — on any interpreter, which is the
+    point. What that parser accepts is version-dependent (A-24): on 3.9 it
+    refused a trailing `Z` and on the current 3.13.14 runtime it takes one,
+    so an external producer's `Z` timestamp can now be validated as an Event
+    and reach this column. Because both sides are the *same* function, they
+    moved together and this check needed no edit —
+    `EveryTimestampTheSchemaAcceptsIsReadableDownstreamTests` is what holds
+    them together if either side is ever changed alone.
     """
     try:
         datetime.fromisoformat(text)

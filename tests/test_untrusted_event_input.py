@@ -24,6 +24,7 @@ Audit findings referenced below:
 import inspect
 import io
 import json
+import re
 import subprocess
 import shutil
 import sys
@@ -319,12 +320,34 @@ class ReservedDeviceNameTests(unittest.TestCase):
                                                    `.tmp-….json` staging file
                                                    is left behind
 
-    Win32 matches a device name on the segment **before the first period**,
-    so the extension never mattered: `NUL.json` is the NUL device and so is
-    `NUL.json.json`. The two failures that follow are the two this repository
-    cares most about — a write that reports success and stores nothing
-    (docs/11 §50 "History 손실"), and a `.tmp-` residue that every
+    Win32 matched the device name on the segment **before the first period**
+    there, so the extension bought nothing: `NUL.json` was the NUL device and
+    so was `NUL.json.json`. The two failures that follow are the two this
+    repository cares most about — a write that reports success and stores
+    nothing (docs/11 §50 "History 손실"), and a `.tmp-` residue that every
     `glob("*.json")` scanner reads as a finished artifact.
+
+    **C76 — re-measured on the machine the project moved to, and it answers
+    differently.** Windows 11 26200 / Python 3.13.14, same empty temporary
+    directory, same questions:
+
+        NUL           exists=True   write ok, read "", st_size 0,
+                      absent from iterdir(), os.replace -> WinError 183
+                      and the `.tmp-….json` staging file left behind
+        NUL.json      exists=False  write ok, read '{"a":1}', st_size 7,
+                      present in iterdir(), os.replace ok
+        CON AUX PRN COM1 LPT1 CONIN$ CONOUT$   do not resolve at all
+        CON.json AUX.json NUL.json.json nul.json   ordinary files
+
+    So on this machine the extension **does** save the name, and all but one
+    of the stems the previous machine resolved are inert. Neither machine is
+    wrong and neither answer is the rule — that is the paragraph above,
+    demonstrated a second time and in the opposite direction. What survives
+    both is the bare device (`NUL` on both) and therefore the guard, which
+    rewrites every documented stem regardless of what this machine happens to
+    enumerate. `test_the_device_namespace_is_live_so_the_checks_above_mean_
+    something` is what stops the negatives below from quietly checking
+    nothing when a future machine answers less again.
 
     Why the original measurement was believable, and why that is the lesson:
     **which** names resolve depends on the devices Windows has enumerated, so
@@ -389,25 +412,58 @@ class ReservedDeviceNameTests(unittest.TestCase):
                     name = safe_candidate_filename(history_id)
                     self.assertFalse((directory / name).exists(), name)
 
-    def test_the_extension_alone_would_not_have_been_enough(self):
-        """The refuted claim, pinned as a fact about the platform.
+    def test_the_device_namespace_is_live_so_the_checks_above_mean_something(self):
+        """The anti-vacuity anchor, and it used to anchor the wrong thing.
 
-        If this ever fails, Win32 stopped matching devices through an
-        extension and the guard above became belt-and-braces — worth knowing,
-        and not worth removing the guard over, since it would only be true of
-        the machine the test ran on.
+        **What it asserted, and why that broke (C76).** It required a name to
+        resolve *through its extension* -- `NUL.json` and friends -- because
+        that is what the deployment machine did when C64 measured it. Two
+        Sprints of machine drift later the suite went red on a green tree:
+
+            Windows 10 19042 / Python 3.9.7 (C64)
+                bare        NUL CON AUX COM1 CONIN$ CONOUT$   resolve
+                .json       NUL.json CON.json AUX.json ...     resolve
+
+            Windows 11 26200 / Python 3.13.14 (C76, re-measured here)
+                bare        NUL                                resolves
+                .json       (none)                             resolve
+
+        Nothing regressed. The class docstring above already says which names
+        resolve "varies per machine", and then this test pinned one machine's
+        answer as a rule -- the exact mistake the paragraph warns against,
+        made one line further down.
+
+        **What it asserts now.** The property the class actually needs is
+        weaker and true on both machines: *some* reserved name resolves in
+        *some* spelling. Every other test here is an `assertFalse(...exists())`
+        over the guard's output, and on a machine whose device namespace
+        answers nothing those all pass while checking nothing -- which is what
+        this test is here to prevent. Whether the extension is part of the
+        answer is a fact about the machine and is recorded, not required.
+
+        Skipped off Windows rather than asserted: a device namespace is an
+        NT construct, and the `assertFalse` siblings are vacuous there by
+        nature, not by drift.
         """
+        if sys.platform != "win32":
+            self.skipTest("reserved device names are a Windows construct")
+
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            resolving = [
+            bare = [name for name in self.RESERVED if (directory / name).exists()]
+            through_extension = [
                 name
-                for name in ("NUL.json", "CON.json", "AUX.json", "NUL.json.json")
-                if (directory / name).exists()
+                for name in self.RESERVED
+                if (directory / f"{name}.json").exists()
             ]
-            self.assertTrue(
-                resolving,
-                "no reserved name resolved through its extension on this machine",
-            )
+
+        self.assertTrue(
+            bare or through_extension,
+            "no reserved name resolved in any spelling on this machine, so "
+            "every assertFalse(...exists()) in this class is checking nothing. "
+            "Either Win32 stopped enumerating devices entirely, or these "
+            "tests are no longer running against a real filesystem.",
+        )
 
     def test_a_device_name_is_changed_the_way_every_other_unsafe_id_is(self):
         """Routed to the existing digest branch, not to a new one.
@@ -852,6 +908,154 @@ class TransportSanitisationAsymmetryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("import reporter", source)
         self.assertNotIn("from reporter", source)
+
+
+class EverySecretNameTheSpecWritesDownIsDetectedTests(unittest.TestCase):
+    """docs/08 section 29 is the list, and until C83 nothing read it.
+
+    **This defect has already happened once.** C20 section 3 measured it:
+    section 29 named `credentials.json` and `token.json`, `_SECRET_EXACT_NAMES`
+    had neither, and a `credentials.json` under `daily/` — which docs/08
+    section 26 puts *in* backup scope — was synced to the Working Copy and
+    would have been pushed to the remote. It was found by reading the two
+    documents side by side, fixed by hand, and **nothing was left behind that
+    would fail the next time.**
+
+    What was left behind instead was a second hand-written copy of the names.
+    `test_known_secret_filenames_are_detected` lists five and
+    `test_every_name_section_29_writes_down_is_detected` lists three; between
+    them, four of the names section 29 actually writes down are asserted by
+    nothing at all. Measured by deleting each name from `_SECRET_EXACT_NAMES`
+    one at a time and running the pre-existing tests:
+
+        .env  .env.local  id_rsa  credentials.json  token.json   DETECT
+        .env.production  .env.development  id_ed25519            MISS
+        the `.p12` suffix                                        MISS
+
+    A name added to section 29 tomorrow is in exactly the position
+    `credentials.json` was in, and three of the names already there are in
+    it today.
+
+    So this reads the section. The names come off the document, the verdict
+    comes from the real `scan_for_secrets()`, and the file is placed under
+    `daily/` because that is the directory the Spec puts in scope — the
+    same fixture C20 used to measure the leak.
+
+    Measured when this was written: section 29 writes down 11 names and
+    `scan_for_secrets()` catches all 11. The gate is what was missing, not
+    the behaviour.
+    """
+
+    #: An indented single-token line inside section 29. Both of the section's
+    #: blocks are written that way (the `예:` examples and the authoritative
+    #: list), and its prose and numbered steps are not indented, so this
+    #: reaches the names and nothing else. Verified by
+    #: `test_the_parse_finds_the_list_and_only_the_list`.
+    NAME_LINE = re.compile(r"^ {4,}([A-Za-z0-9_.*-]+)\s*$", re.M)
+
+    @classmethod
+    def _section_29(cls):
+        spec = (
+            Path(__file__).resolve().parents[1] / "docs" / "08_BACKUP_SPEC.md"
+        ).read_text(encoding="utf-8")
+        start = spec.index("## 29. Secret Scan")
+        end = spec.index("\n## ", start + 10)
+        return spec[start:end]
+
+    @classmethod
+    def _spec_names(cls):
+        names = []
+        for raw in cls.NAME_LINE.findall(cls._section_29()):
+            if raw not in names:
+                names.append(raw)
+        return names
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.master = Path(tmp.name) / "local_master"
+        (self.master / "daily").mkdir(parents=True, exist_ok=True)
+
+    def test_the_parse_finds_the_list_and_only_the_list(self):
+        """Guards the guard. Every assertion below is quantified over this
+        parse, so a regex that matched nothing — or that swept in a line of
+        Korean prose — would leave them passing over the wrong set."""
+        names = self._spec_names()
+
+        self.assertGreaterEqual(
+            len(names), 9,
+            "the section 29 parse came back nearly empty; the checks below "
+            "would be quantified over almost nothing",
+        )
+        for expected in (".env", "credentials.json", "id_rsa", "*.pem"):
+            with self.subTest(name=expected):
+                self.assertIn(expected, names)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertRegex(
+                    name, r"^\*?[A-Za-z0-9_.-]+$",
+                    "the parse picked up something that is not a filename",
+                )
+
+    def test_every_name_the_section_writes_down_is_caught(self):
+        """The guarantee, through the real scanner, one name at a time.
+
+        A `*.ext` entry is a glob, so it is probed with a concrete file that
+        matches it — `_looks_like_secret()` compares suffixes, and the
+        question is whether a file an operator could actually create is
+        caught.
+        """
+        for raw in self._spec_names():
+            with self.subTest(name=raw):
+                concrete = ("secret" + raw[1:]) if raw.startswith("*.") else raw
+                target = self.master / "daily" / concrete
+                target.write_text("NOTION_API_TOKEN=ntn_real", encoding="utf-8")
+                try:
+                    detected = scan_for_secrets(self.master)
+                    self.assertIn(
+                        str(Path("daily") / concrete), detected,
+                        f"docs/08 section 29 writes down {raw!r} and the Secret "
+                        "Scan does not catch it — that file reaches the backup "
+                        "remote (C20 section 3 measured exactly this)",
+                    )
+                finally:
+                    target.unlink()
+
+    def test_the_implementation_covers_the_spec_and_is_not_wider_by_accident(self):
+        """The structural half, in both directions.
+
+        **Superset** is the security direction: the code may never be missing
+        a name the Spec lists.
+
+        **Equality** is a characterization, not a rule. C20 drew the line
+        explicitly — `secrets.json` / `credentials.yml` / `token.txt` are
+        names the module docstring has *measured* as undetected, and adding
+        them "is a policy decision" rather than implementing section 29. So
+        the two sets being equal today is a fact worth pinning: the day
+        somebody widens the list, this fails and the decision becomes
+        visible instead of arriving as a silent behaviour change.
+        """
+        from backup.working_copy import _SECRET_EXACT_NAMES, _SECRET_SUFFIXES
+
+        spec = self._spec_names()
+        spec_globs = {name[1:] for name in spec if name.startswith("*.")}
+        spec_exact = {name for name in spec if not name.startswith("*.")}
+
+        self.assertEqual(
+            spec_exact - set(_SECRET_EXACT_NAMES), set(),
+            "section 29 names a file the Secret Scan does not know",
+        )
+        self.assertEqual(
+            spec_globs - set(_SECRET_SUFFIXES), set(),
+            "section 29 names a suffix the Secret Scan does not know",
+        )
+        self.assertEqual(
+            set(_SECRET_EXACT_NAMES) - spec_exact, set(),
+            "the Secret Scan blocks a name section 29 does not list -- that is "
+            "a policy decision (C20), and it should be recorded rather than "
+            "discovered",
+        )
+        self.assertEqual(set(_SECRET_SUFFIXES) - spec_globs, set())
 
 
 class SecretScanCoverageTests(unittest.TestCase):

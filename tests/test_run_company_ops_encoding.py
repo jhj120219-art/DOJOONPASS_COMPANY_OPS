@@ -67,9 +67,22 @@ class EncodingSafetyTests(unittest.TestCase):
         """init_notion.py prints real Notion API error text (health.error /
         exc) to stdout — the same risk class, same fix applied for
         consistency, even though no concrete crash was reproduced for it
-        (its own output can't be driven without a real Notion connection)."""
+        (its own output can't be driven without a real Notion connection).
+
+        Matched on the encoding argument rather than the whole call, for the
+        reason the test above already gives — and C80 is what made that
+        matter here: `line_buffering=True` joined the same call, for an
+        unrelated operator-facing defect, and this assertion broke on an axis
+        it has no opinion about. The rule was written once and applied to one
+        of the three tests in this class; this is the other two.
+
+        The property itself is now also covered for **every** entrypoint by
+        `test_repository_hygiene.EntrypointOutputOrderingTests`, whose roster
+        is derived rather than named. These three stay as the named,
+        per-tool statement of why each got the fix.
+        """
         source = (REPO_ROOT / "init_notion.py").read_text(encoding="utf-8")
-        self.assertIn('sys.stdout.reconfigure(encoding="utf-8")', source)
+        self.assertIn('sys.stdout.reconfigure(encoding="utf-8"', source)
         self.assertIn('sys.stderr.reconfigure(encoding="utf-8")', source)
 
     def test_review_cli_also_reconfigures_stdout_and_stderr_to_utf8(self):
@@ -78,9 +91,12 @@ class EncodingSafetyTests(unittest.TestCase):
         characters sit in docstrings/comments that are never printed, so no
         crash is reproducible today. Same fix applied anyway for consistency
         across all three CLI entry points, closing the latent risk that a
-        future print_fn() call adds a non-cp949 character."""
+        future print_fn() call adds a non-cp949 character.
+
+        Same match-on-the-argument rule as the two tests above (C80).
+        """
         source = (REPO_ROOT / "src" / "review_cli.py").read_text(encoding="utf-8")
-        self.assertIn('sys.stdout.reconfigure(encoding="utf-8")', source)
+        self.assertIn('sys.stdout.reconfigure(encoding="utf-8"', source)
         self.assertIn('sys.stderr.reconfigure(encoding="utf-8")', source)
 
 

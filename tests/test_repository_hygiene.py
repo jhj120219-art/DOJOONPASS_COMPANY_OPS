@@ -62,6 +62,33 @@ def _git(*args) -> subprocess.CompletedProcess:
     )
 
 
+def _entrypoint_files() -> tuple[str, ...]:
+    """Every operator-facing tool in this repository, read off disk.
+
+    Two classes here need this list and each used to carry its own
+    hand-written tuple. They disagreed, and both were wrong in a different
+    place:
+
+        AnEntrypointRefusesArgumentsItCannotHonourTests   4 of 5, missing
+            `src/review_cli.py` — which then accepted `--help` and opened an
+            edit session over live Decision Context (C79)
+        EntrypointOutputOrderingTests                     3 of 5, missing
+            `init_notion.py` and `src/review_cli.py` — and `init_notion.py`
+            really did block-buffer stdout (C80)
+
+    The `__main__` guard is the derivation because it is what makes a file a
+    tool rather than a module: `cli.py`, `oplog.py` and `runsummary.py` sit
+    in the same directory and have none. Paths are repo-relative with forward
+    slashes so a name reads the same on every machine this is worked on.
+    """
+    files = sorted(REPO_ROOT.glob("*.py")) + sorted(SRC.glob("*.py"))
+    return tuple(
+        str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+        for path in files
+        if '__name__ == "__main__"' in path.read_text(encoding="utf-8")
+    )
+
+
 def _tracked_files() -> list[Path]:
     """Every file that would be in the repository after `git add -A`.
 
@@ -956,11 +983,31 @@ class EntrypointOutputOrderingTests(unittest.TestCase):
     reading an operator gets from a captured log, and it makes a report
     describe the wrong event.
 
-    All three entrypoints already reconfigure stdout for UTF-8 (a separate
+    Every entrypoint already reconfigures stdout for UTF-8 (a separate
     defect, also operator-facing); line buffering belongs on the same call.
+
+    **C80: this class covered three of the five.** Its roster was a
+    hand-written tuple of the tools at the repository root that the Sprint
+    happened to be looking at, and `init_notion.py` and `src/review_cli.py`
+    were outside it — with the fix genuinely absent from both, not merely
+    unchecked. `init_notion.py` reaches the mixed-stream case for real:
+
+        print(f"Health Check: PASS (database_id=...)")            -> stdout
+        ...bootstrap_database() raises NotionAPIError...
+        print(f"[FAILED] Notion API error: ...", file=sys.stderr)  -> stderr
+
+    Measured with that file's own prologue, captured as `> log 2>&1`:
+
+        0: [FAILED] Notion API error: 429 rate limited
+        1: Health Check: PASS (database_id=abc)
+
+    the failure above the line it follows, which is this class's whole
+    subject. The roster is now `_entrypoint_files()`.
     """
 
-    ENTRYPOINTS = ("run_company_ops.py", "run_agent.py", "ops_status.py")
+    @property
+    def ENTRYPOINTS(self):
+        return _entrypoint_files()
 
     def test_every_entrypoint_line_buffers_stdout(self):
         for name in self.ENTRYPOINTS:
@@ -972,6 +1019,36 @@ class EntrypointOutputOrderingTests(unittest.TestCase):
                     f"{name} block-buffers stdout; stderr will overtake it in a "
                     f"captured log",
                 )
+
+    def test_every_entrypoint_reconfigures_stderr_too(self):
+        """The other half of the same call, and the reason it is asserted
+        here rather than only in `EncodingSafetyTests`: that class names
+        three files by hand, which is the shape that produced this Sprint.
+        Both halves, one derived roster, every tool.
+        """
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                text = (REPO_ROOT / name).read_text(encoding="utf-8")
+                self.assertIn('sys.stderr.reconfigure(encoding="utf-8")', text)
+
+    def test_the_roster_covers_every_tool_and_no_module(self):
+        """Guards the guard (C80). Both tests above loop over it, so an empty
+        or shrunken derivation would leave them passing over nothing."""
+        found = set(self.ENTRYPOINTS)
+
+        self.assertEqual(
+            found,
+            {
+                "run_company_ops.py",
+                "run_agent.py",
+                "init_notion.py",
+                "ops_status.py",
+                "src/review_cli.py",
+            },
+        )
+        for library in ("src/cli.py", "src/oplog.py", "src/runsummary.py"):
+            with self.subTest(module=library):
+                self.assertNotIn(library, found)
 
     def test_the_ordering_actually_holds_when_redirected(self):
         """Asserted by running it, because the property only appears when
@@ -2073,11 +2150,19 @@ class TheRecordedRuntimeIsTheRunningOneTests(unittest.TestCase):
     This checks that declaration against the interpreter actually running.
 
     **Why a gate for a header (C70).** The header said "이 머신, Python 3.13,
-    Windows 11". The machine is Python 3.9.7 on Windows 10. C17 recorded that
-    same drift once and fixed only the instance, so it came back; the gate
-    built afterwards — `EveryTrackedModuleParsesOnThisInterpreterTests` —
-    covers the **syntax** consequence (a PEP 604 `|` evaluated at runtime) and
-    nothing else.
+    Windows 11" while the machine was Python 3.9.7 on Windows 10. C17 recorded
+    that same drift once and fixed only the instance, so it came back; the
+    gate built afterwards — `EveryTrackedModuleParsesOnThisInterpreterTests`
+    — covers the **syntax** consequence (a PEP 604 `|` evaluated at runtime)
+    and nothing else.
+
+    **It fired for real in C76**, in the other direction: the deployment
+    machine moved to Python 3.13.14 on Windows 11 and this test went red on a
+    tree with nothing wrong with it. That is the gate working. Updating the
+    line is half the fix; the other half is the capability re-check the
+    failure message asks for, and BACKLOG D now carries it — `isjunction`
+    (blind then, live now), `sys.stdlib_module_names`, and
+    `fromisoformat('...Z')`, which flipped A-24 on this machine.
 
     The face it does not cover is **capability**, and that is what C70 walked
     into. `os.path.isjunction()` is 3.12+. A reader asking "is the junction
@@ -2493,12 +2578,51 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
     person types the command.
     """
 
-    ENTRYPOINTS = (
-        "run_company_ops.py",
-        "run_agent.py",
-        "init_notion.py",
-        "ops_status.py",
-    )
+    @property
+    def ENTRYPOINTS(self):
+        """Every operator-facing tool, read off disk.
+
+        This was a hand-written tuple of the four at the repository root,
+        and it missed `src/review_cli.py` — which is an entrypoint by every
+        other measure this repository applies: it has a `__main__` guard, it
+        is one of the CLI entry points `EncodingSafetyTests` names, and
+        AGENT.md tells an operator to run it. Measured before the fix (C79):
+
+            python src/review_cli.py --help
+
+        printed a real KEEP Candidate out of the live `history_candidates/`
+        and stopped at the edit prompt, waiting. The argument was not
+        rejected, not warned about, not read — the exact defect this class
+        was written for, on the one tool its roster could not see.
+
+        C80 moved the derivation to `_entrypoint_files()`, because a second
+        class in this file had the same tuple and the same kind of gap.
+        """
+        return _entrypoint_files()
+
+    def test_the_roster_is_derived_and_finds_every_tool(self):
+        """Guards the guard, both ways (C79).
+
+        Every test below loops over `ENTRYPOINTS`, so a derivation that came
+        back empty — or that quietly stopped seeing one file — would leave
+        them all passing over nothing. And a derivation that swept in a
+        library module would fail confusingly somewhere else.
+        """
+        found = set(self.ENTRYPOINTS)
+
+        self.assertEqual(
+            found,
+            {
+                "run_company_ops.py",
+                "run_agent.py",
+                "init_notion.py",
+                "ops_status.py",
+                "src/review_cli.py",
+            },
+        )
+        for library in ("src/cli.py", "src/oplog.py", "src/runsummary.py"):
+            with self.subTest(module=library):
+                self.assertNotIn(library, found)
 
     def _run(self, name, *arguments):
         return subprocess.run(
@@ -2586,24 +2710,54 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
         self.assertIn("COMPANY_OPS_PROFILE", known)      # via a *_ENV_VAR constant
         self.assertIn("NOTION_API_TOKEN", known)         # via `source.get()`
 
+        naming = 0
         for name in self.ENTRYPOINTS:
             with self.subTest(entrypoint=name):
+                source = (REPO_ROOT / name).read_text(encoding="utf-8")
                 message = self._run(name, "--dry-run").stderr
                 named = set(
                     re.findall(r"(?:COMPANY_OPS|NOTION)_[A-Z0-9_]+", message)
                 )
 
-                self.assertTrue(named, f"{name} names no variable at all")
+                if "configured_by=()" in source:
+                    # C79: `src/review_cli.py` reads no environment variable
+                    # at all — `FileHistoryRepository()` uses its own
+                    # defaults. Naming one anyway would be precisely the
+                    # failure this test exists to stop, from the other
+                    # direction: sending an operator to set something nothing
+                    # looks at. `unexpected_arguments()` already spells this
+                    # case, so the check is that the tool uses it rather than
+                    # borrowing a neighbour's list.
+                    self.assertEqual(
+                        named, set(),
+                        f"{name} declares no configuration but names one",
+                    )
+                    self.assertIn("(없음)", message)
+                else:
+                    naming += 1
+                    self.assertTrue(named, f"{name} names no variable at all")
+
                 self.assertEqual(
                     named - known,
                     set(),
                     f"{name} tells an operator to set a variable nothing reads",
                 )
 
+        self.assertGreaterEqual(
+            naming, 3,
+            "no entrypoint named a variable — the subset check above just "
+            "compared two empty sets",
+        )
+
     def test_the_rule_lives_in_one_place(self):
-        """Four copies of "reject unknown arguments" is four chances for one
-        of them to keep running. Each entrypoint imports the shared helper
-        rather than restating the check."""
+        """One copy per entrypoint of "reject unknown arguments" is one
+        chance each for one of them to keep running. Each imports the shared
+        helper rather than restating the check.
+
+        The count is not written down here on purpose (C66's rule about
+        numbers in prose): `ENTRYPOINTS` is derived, so this covers whatever
+        is on disk.
+        """
         for name in self.ENTRYPOINTS:
             with self.subTest(entrypoint=name):
                 source = (REPO_ROOT / name).read_text(encoding="utf-8")
@@ -2649,9 +2803,36 @@ class EveryTrackedModuleParsesOnThisInterpreterTests(unittest.TestCase):
     behind that would fail the next time, so the next time it came back.
 
     This is that thing. It checks the interpreter that is actually running,
-    not a version this repository believes it is on, so the gate stays
-    correct if the machine is upgraded (the check simply stops finding
-    anything) and correct if it is downgraded again.
+    not a version this repository believes it is on, so it cannot go stale
+    the way a hardcoded version would.
+
+    **What an upgrade does to it, stated properly (C76).** The two halves
+    below age differently, and the earlier wording ("the check simply stops
+    finding anything") described only the harmless one.
+
+        test_no_module_evaluates_a_pep604_annotation_without_the_future_import
+            an AST rule. Version-independent: it gives the same verdict on
+            3.9 and on 3.13, and an upgrade costs it nothing.
+
+        test_every_tracked_python_file_compiles
+            `compile()` on **this** interpreter. On 3.9 it also enforced
+            3.9. On 3.13 it enforces 3.13 and says nothing about 3.9, so a
+            `match` statement or an `except*` would pass here and abort
+            collection on a Desktop that has not moved -- the same
+            whole-suite failure described above, one machine over.
+
+    That is a live gap rather than a theoretical one, because the Agents run
+    on DESKTOP_1/2/3 and this file's own `_tracked_files()` docstring notes
+    the project is moved between them. Measured in C76, so the size of it is
+    on the record rather than assumed: across all 139 tracked `.py` files,
+    **zero** post-3.9 AST constructs (`Match`, `TryStar`, PEP 695
+    `TypeAlias`/`TypeVar`). Nothing has drifted; nothing would notice if it
+    did.
+
+    Closing it needs a **declared minimum interpreter**, which this
+    repository does not have anywhere -- no `python_requires`, no line in
+    README or docs/11. Picking one is a decision, so it is recorded in
+    BACKLOG A rather than chosen here.
     """
 
     def _python_files(self):
@@ -2773,6 +2954,187 @@ class EveryTrackedModuleParsesOnThisInterpreterTests(unittest.TestCase):
         self.assertFalse(_offends(fixed))
         self.assertFalse(_offends("def f(a: int) -> str:\n    return ''\n"))
         self.assertFalse(_offends("x = 1 | 2\n"))
+
+
+class NoPatchPlaceholderSurvivesIntoTheSourceTests(unittest.TestCase):
+    """C94. A substitution token that never got substituted.
+
+    Source in this repository is edited by patch scripts, and one of them
+    builds a line with a placeholder and calls `.replace()` to fill it in.
+    When the `.replace()` is forgotten, the token ships -- a brace-wrapped
+    ALL-CAPS word sitting where an em dash belongs, in the middle of a
+    sentence.
+
+    Five reached `src/agent/status.py`, in the docstrings of
+    `_is_date_directory_name()` and `_count_unreachable_signals()` -- the
+    latter being the paragraph that explains what a misfiled Signal means,
+    which is what a person reads when deciding whether work they typed is
+    gone. They survived three full regressions. Nothing reads a docstring
+    for spelling, and no test ever will.
+
+    **This guard exists because the obvious one does not work.** The same
+    Sprint measured a "flag any Hangul syllable that appears nowhere else in
+    the repository" check against the three garbled-text bugs it had
+    actually produced, and it caught one of three -- both real typos used
+    syllables that occur elsewhere. A test with that hit rate is the false
+    comfort this Sprint exists to remove, so it was not written. This one is
+    different in kind: it is not looking for a *typo*, it is looking for a
+    token that **cannot be correct in the position it is in**, and that is
+    decidable.
+
+    The rule is narrow for a measured reason. A brace-wrapped ALL-CAPS name
+    inside an **f-string** is an ordinary interpolation of a module
+    constant, and there are 45 of them here. The same token inside a plain
+    string or a comment is never substituted by anything. Measured across
+    every `.py` file after the five were repaired: **0**.
+
+    **This file obeys the rule it defines.** Every token below is assembled
+    at runtime rather than written out, and the docstring above names them
+    in prose. Exempting the file that owns a check is how a check stops
+    being true of itself -- and there would be no way to notice, because the
+    only thing that could notice is the check.
+    """
+
+    TOKEN = re.compile(r"\{[A-Z][A-Z0-9_]{2,}\}")
+
+    @staticmethod
+    def _token(name):
+        """A placeholder, built rather than written. See the docstring."""
+        return "{" + name + "}"
+
+    @staticmethod
+    def _unsubstitutable_text(source):
+        """Every plain string and comment -- everything an f-string is not.
+
+        An f-string's braces are filled in at runtime, so a token there is a
+        value. A docstring's are not filled in by anything, so a token there
+        is a leak. That distinction is the whole test, which is why it is
+        drawn from the AST rather than by pattern.
+        """
+        import io
+        import tokenize
+
+        tree = ast.parse(source)
+        interpolated = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                for part in ast.walk(node):
+                    interpolated.add(id(part))
+
+        found = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in interpolated
+            ):
+                found.append((node.lineno, node.value))
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                found.append((token.start[0], token.string))
+        return found
+
+    def _leaks_in(self, source):
+        return [
+            (line, match.group(0))
+            for line, text in self._unsubstitutable_text(source)
+            for match in self.TOKEN.finditer(text)
+        ]
+
+    def _python_files(self):
+        for path in sorted(REPO_ROOT.glob("**/*.py")):
+            if "__pycache__" in path.parts or ".git" in path.parts:
+                continue
+            yield path
+
+    def test_no_placeholder_reached_the_tree(self):
+        offenders = []
+        for path in self._python_files():
+            try:
+                source = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):  # pragma: no cover
+                continue
+            for line, token in self._leaks_in(source):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT).as_posix()}:{line} {token}"
+                )
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a patch-script placeholder was never substituted and shipped "
+            f"into the source: {offenders}",
+        )
+
+    def test_the_check_catches_the_shape_that_actually_happened(self):
+        """Fault injection, in the exact form the five leaks took: a token
+        inside a docstring, standing where an em dash belongs."""
+        token = self._token("DASH")
+        source = 'def f():\n    """A sentence ' + token + ' and its continuation."""\n'
+
+        self.assertEqual(self._leaks_in(source), [(2, token)])
+
+    def test_a_comment_is_read_too(self):
+        """The idiom that produced the five writes comments as often as it
+        writes docstrings."""
+        token = self._token("DASH")
+
+        self.assertEqual(
+            self._leaks_in("x = 1  # a note " + token + " and more\n"), [(1, token)]
+        )
+
+    def test_an_f_string_interpolation_is_not_a_leak(self):
+        """The 45 real ones. Without this the check is unusable and would be
+        deleted rather than obeyed, which is worse than not having it.
+
+        Note *why* it passes, because it is not the `JoinedStr` exclusion
+        below: `ast` turns an interpolation into a `FormattedValue`, so a
+        braced constant name never exists as a string constant to be
+        searched at all.
+        The exclusion earns its place on the next test instead -- which is
+        how it was found to be doing nothing here, by a mutation that
+        removed it and broke no test.
+        """
+        source = 'SECRET = "s"\nx = f"token=' + self._token("SECRET") + ' rest"\n'
+
+        self.assertEqual(self._leaks_in(source), [])
+
+    def test_an_escaped_brace_inside_an_f_string_is_not_a_leak(self):
+        """What the `JoinedStr` exclusion is actually for.
+
+        A **doubled** brace inside an f-string is a deliberate escape: it
+        renders the literal single-braced text, and `ast` hands that back
+        as one string constant whose value is exactly what a leak looks
+        like. Nothing else distinguishes
+        the two, so without the exclusion this legitimate line would be
+        reported and the check would start costing more than it catches.
+
+        A first draft of this class asserted the exclusion with the test
+        above, which passes with or without it -- a mutation that deleted
+        the exclusion outright was MISSED. This is the input that separates
+        them.
+        """
+        token = self._token("DASH")
+        escaped = 'x = f"see {{' + "DASH" + '}} here"\n'
+
+        self.assertNotIn(token, [found for _line, found in self._leaks_in(escaped)])
+        # ...and the same text outside an f-string still is a leak, so the
+        # exclusion is narrow rather than a blanket amnesty for braces.
+        self.assertEqual(
+            self._leaks_in('x = "see ' + token + ' here"\n'), [(1, token)]
+        )
+
+    def test_the_scan_actually_reads_files(self):
+        """`TheScansThisFileTrustsAreNotEmptyTests`' rule applied here: a
+        scan that found no files would make the assertion above green
+        forever."""
+        self.assertGreater(len(list(self._python_files())), 50)
+
+    def test_this_file_is_not_exempt_from_its_own_rule(self):
+        """The claim the docstring makes, checked rather than asserted."""
+        self.assertIn(
+            Path(__file__).resolve(), set(self._python_files())
+        )
 
 
 if __name__ == "__main__":

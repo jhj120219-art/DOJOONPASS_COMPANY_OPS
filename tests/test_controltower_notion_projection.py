@@ -791,18 +791,23 @@ class EveryDateThisProjectionEmitsIsISOTests(unittest.TestCase):
         Event is a value this check lets out to Notion, for every value —
         including the ones both refuse. Writing it the other way is how the
         first draft of this test failed: it asserted that
-        `2026-08-21T10:00:00.5+09:00` is a valid timestamp, and on this
-        machine's Python 3.9 `fromisoformat()` refuses a one-digit fraction.
-        Both refused it, in step, which is the answer this test wanted and
-        not the one it was asking for.
+        `2026-08-21T10:00:00.5+09:00` is a valid timestamp, and the Python
+        3.9 `fromisoformat()` the project ran on then refuses a one-digit
+        fraction. Both refused it, in step, which is the answer this test
+        wanted and not the one it was asking for.
+
+        C76 is why the labels below say "3.9" rather than "refused": the
+        deployment runtime is 3.13.14 now and it takes both the one-digit
+        fraction and the `Z`. The implication is unchanged and still passes,
+        which is the whole argument for writing it this way.
         """
         from events.schema import _timestamp_error
 
         corpus = (
             "2026-08-21T10:00:00+09:00",       # the ordinary Event timestamp
             "2026-08-21T10:00:00.500000+09:00",  # six-digit fraction
-            "2026-08-21T10:00:00.5+09:00",    # one digit: 3.9 refuses both
-            "2026-08-21T10:00:00Z",           # 3.9 refuses the Z form
+            "2026-08-21T10:00:00.5+09:00",    # one digit: 3.9 refused, 3.13 takes it
+            "2026-08-21T10:00:00Z",           # 3.9 refused the Z form, 3.13 takes it
             "2026-08-21",                     # a date with no offset
             "not-a-date",
             "",

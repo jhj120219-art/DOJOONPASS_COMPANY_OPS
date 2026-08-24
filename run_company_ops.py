@@ -248,6 +248,11 @@ def main(argv: Sequence[str] = ()) -> int:
     local_master_dir = RUNTIME_DIR / "local_master"
     local_master_dir.mkdir(parents=True, exist_ok=True)
 
+    # What the manifest said BEFORE this run. See `_exit_code_from_manifest()`
+    # — an aborted run's exit code may only come from a manifest that this
+    # run actually wrote.
+    manifest_before = _manifest_run_id(DEFAULT_RUN_SUMMARY_PATH)
+
     try:
         result = run_once(
             local_master_dir=local_master_dir,
@@ -268,13 +273,133 @@ def main(argv: Sequence[str] = ()) -> int:
         # traceback for an expected condition reads like the system broke,
         # when in fact Backup runs last and everything before it is already
         # durable on disk.
-        return _report_backup_failure(exc, DEFAULT_RUN_SUMMARY_PATH)
+        return _report_backup_failure(
+            exc, DEFAULT_RUN_SUMMARY_PATH, superseding=manifest_before
+        )
+    except Exception as exc:  # noqa: BLE001 — see below
+        # Every OTHER way `run_once()` can abort, and the reason this clause
+        # exists is the one `_report_backup_failure()` already wrote down:
+        # *"Two answers to 'how bad was this run' is one too many, and the
+        # scheduled task only ever sees this one."*
+        #
+        # That fix was applied to `GitOperationError` and to nothing else.
+        # `run_once()` writes the manifest in its `finally`, so an aborted
+        # run classifies itself correctly — and then the exception kept
+        # travelling, out of `main()`, out of `raise SystemExit(main(...))`,
+        # and Python exited **1**.
+        #
+        # docs/14 section 4 does not leave 1 free for that:
+        #
+        #     SUCCESS 0 | DEGRADED 3 | FAILED 2
+        #     "1 is for configuration errors only (the run never started)"
+        #
+        # Measured as a real process, isolated copy of this entrypoint:
+        #
+        #     ordinary run                  process 0   manifest SUCCESS/0
+        #     duplicate Candidate (abort)   process 1   manifest FAILED/2
+        #     corrupt scheduler state       process 1   manifest FAILED/2
+        #
+        # Both aborted runs had started, taken the lock, collected an Event
+        # and written a manifest. Task Scheduler's Last Run Result — the
+        # only signal an unattended deployment has (BACKLOG F-7) — read
+        # "configuration error, the run never started" for a CRITICAL
+        # failure mid-pipeline.
+        #
+        # The traceback is NOT swallowed: it is printed first, because it
+        # names the file and the line and nothing else does. What changes is
+        # the number the process leaves behind.
+        import traceback
+
+        print(f"[FAILED] {redact(one_line(exc))}", file=sys.stderr)
+        print(file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(
+            "\n이 실행은 시작된 뒤 중단됐습니다. Run Manifest가 어느 단계에서\n"
+            "멈췄는지를 기록했습니다 — `python ops_status.py`로 확인하세요.",
+            file=sys.stderr,
+        )
+        return _exit_code_from_manifest(
+            DEFAULT_RUN_SUMMARY_PATH, superseding=manifest_before
+        )
 
     return _print_result(result)
 
 
+def _manifest_run_id(run_summary_path: "Path | None") -> "str | None":
+    """The `run_id` recorded at `run_summary_path` right now, or None.
+
+    Unreadable and absent collapse to None on purpose: both mean "there is no
+    identity here to compare against", and the caller treats that the same
+    way — by not trusting the file.
+    """
+    if run_summary_path is None:
+        return None
+    try:
+        summary = read_summary(run_summary_path)
+    except RunSummaryError:
+        return None
+    return summary.run_id if summary is not None else None
+
+
+def _exit_code_from_manifest(
+    run_summary_path: "Path | None", *, superseding: "str | None" = None
+) -> int:
+    """The exit code this run already classified for itself.
+
+    Extracted from `_report_backup_failure()` rather than restated: that
+    function reached this answer first, for one exception type, and a second
+    copy of the rule is how the two would come to disagree. Its own comment
+    is the argument for reading the manifest instead of hardcoding, and it
+    applies unchanged to every other abort.
+
+    Falls back to 2 for the same stated reason: an abort with no readable
+    manifest is genuinely unclassified, and 2 is the conservative reading of
+    an unclassified failure. Never 1 — docs/14 section 4 reserves that for a
+    run that never started, and by the time anything here is reached, it did.
+
+    **`superseding` is C82, and it is the fix for a defect C78 introduced.**
+    `run_once()` writes the manifest in its `finally` — but that `finally`
+    belongs to a `try:` that begins *after* the lock is acquired. A run that
+    dies before it (an unusable `locks/` directory is the reachable case)
+    writes nothing, and the file on disk still describes the **previous**
+    run. Measured, isolated tree, real subprocess:
+
+        run 1 (clean)        process 0   manifest SUCCESS/0
+        run 2 (dies early)   process 0   manifest SUCCESS/0   <- run 1's
+
+    A crashed run reporting success to Task Scheduler, which is worse than
+    the wrong-but-loud 1 it did before C78. `_report_backup_failure()`'s own
+    docstring records the same shape from a different cause — "a test
+    calling it directly picked up the repository's own live manifest, which
+    said SUCCESS, and got exit 0 for a Backup failure" — and its fix
+    (passing the path in) does nothing about staleness.
+
+    So the caller passes the `run_id` the manifest carried before the run
+    started, and a manifest still carrying it is not this run's. Identity,
+    not a timestamp comparison: two runs in the same second would collide on
+    a clock, and the direction that collision breaks in matters. Here it
+    breaks toward 2 — the conservative answer — rather than toward the
+    other run's verdict.
+    """
+    if run_summary_path is None:
+        return 2
+    try:
+        summary = read_summary(run_summary_path)
+    except RunSummaryError:
+        return 2
+    if summary is None:
+        return 2
+    if superseding is not None and summary.run_id == superseding:
+        # This run never wrote a manifest. The one on disk is not about it.
+        return 2
+    return summary.exit_code
+
+
 def _report_backup_failure(
-    exc: "GitOperationError", run_summary_path: Path | None = None
+    exc: "GitOperationError",
+    run_summary_path: Path | None = None,
+    *,
+    superseding: "str | None" = None,
 ) -> int:
     """Explain a failed Backup in terms of what is and is not at risk.
 
@@ -336,13 +461,10 @@ def _report_backup_failure(
     # Falls back to 2 if the manifest cannot be read: a Backup failure with
     # no manifest is genuinely unclassified, and 2 is the conservative
     # reading of an unclassified failure.
-    if run_summary_path is None:
-        return 2
-    try:
-        summary = read_summary(run_summary_path)
-    except RunSummaryError:
-        return 2
-    return summary.exit_code if summary is not None else 2
+    # C78 moved the body of this to `_exit_code_from_manifest()`, unchanged,
+    # when a second abort path needed the same answer. The reasoning above is
+    # left here because this is where it was worked out.
+    return _exit_code_from_manifest(run_summary_path, superseding=superseding)
 
 
 # How many dates `_dates()` spells out before it starts counting instead.

@@ -278,16 +278,57 @@ class MainWiresTheRealRepositoryToTheRealReviewerTests(unittest.TestCase):
         )
         self.assertIsInstance(repository, FileHistoryRepository)
 
-    def test_the_module_guard_calls_main_and_nothing_else(self):
+    def test_the_module_guard_raises_the_code_main_returns(self):
         """Line-for-line the one statement no import can execute. Asserted as
         source rather than run, because running it means running the whole
         module as `__main__` — a second import of a module that reconfigures
-        `sys.stdout` at import time."""
+        `sys.stdout` at import time.
+
+        **It used to be a bare `main()` (C79).** That is what made this the
+        one entrypoint whose refusal could not reach the operating system:
+        `main()` returning 1 and the process exiting 0 is the defect wearing
+        the fix's clothes. The four siblings all spell it
+        `raise SystemExit(main(sys.argv))`, and `sys.argv` is passed here for
+        their reason too — `cli.py`'s docstring records that reading the
+        global inside `main()` made twenty-five tests fail by refusing
+        pytest's own flags, so the command line belongs at the boundary.
+        """
         source = (
             Path(__file__).resolve().parents[1] / "src" / "review_cli.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('if __name__ == "__main__":\n    main()\n', source)
+        self.assertIn(
+            'if __name__ == "__main__":\n    raise SystemExit(main(sys.argv))\n',
+            source,
+        )
+        self.assertNotIn('if __name__ == "__main__":\n    main()\n', source)
+
+    def test_an_unexpected_argument_is_refused_before_any_candidate_is_shown(self):
+        """C79, in-process. The subprocess half lives in
+        `AnEntrypointRefusesArgumentsItCannotHonourTests`; this one states
+        the property that matters here — the refusal happens before
+        `list_reviewable()`, so nothing about the operator's Decision Context
+        is read, printed, or prompted for.
+
+        Measured before the fix: `python src/review_cli.py --help` printed a
+        real KEEP Candidate and stopped at the edit prompt.
+        """
+        code = review_cli.main(["review_cli.py", "--help"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.captured, [],
+            "a reviewer was built for an invocation that should have been "
+            "refused",
+        )
+
+    def test_no_arguments_still_runs_the_review(self):
+        """The other side of the boundary: the ordinary invocation is
+        untouched, and still returns 0."""
+        code = review_cli.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.captured), 1)
 
 
 class SaveFailureIsolationTests(unittest.TestCase):

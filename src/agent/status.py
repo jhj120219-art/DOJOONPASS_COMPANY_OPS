@@ -8,6 +8,7 @@ using only files the Agent already writes:
     아직 안 한 날짜가 있나            catchup.pending_dates()
     보내지 못한 Event가 쌓여 있나     outbox/
     사람이 봐야 할 Signal이 있나      signals_rejected/
+    어느 날짜도 읽지 못할 Signal이 있나   signals/ 의 날짜 디렉토리 밖
     한참 안 돌았나                    now - last_run
 
 Nothing here writes, moves, deletes, locks, or sends. It can be called
@@ -25,14 +26,16 @@ report Signals it has not validated.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
 
-from .agent import DEFAULT_REJECTED_SIGNALS_DIR
+from .agent import DEFAULT_REJECTED_SIGNALS_DIR, derive_event_id
+from .signals import DEFAULT_SIGNALS_DIR
 from .catchup import pending_dates
-from .outbox import DEFAULT_OUTBOX_DIR, DEFAULT_SENT_DIR, pending
+from .outbox import DEFAULT_OUTBOX_DIR, DEFAULT_SENT_DIR, pending, safe_event_filename
 from .state import DEFAULT_STATE_PATH, AgentStateError, load_state
 
 
@@ -45,6 +48,15 @@ class AgentStatusSnapshot:
     outbox_count: int
     sent_count: int
     rejected_signal_count: int
+    #: Signal files no target date can ever read — see
+    #: `_count_unreachable_signals()`. Defaulted so an existing caller that
+    #: does not pass `signals_dir` keeps working and simply reports 0.
+    unreachable_signal_count: int = 0
+    #: Signal files in a correctly named date directory that the
+    #: watermark has already passed, and that were never delivered --
+    #: see `_count_undelivered_signals_in_closed_dates()`. Defaulted for
+    #: the same reason as the field above.
+    undelivered_closed_signal_count: int = 0
     state_error: str | None = None
 
     @property
@@ -192,6 +204,301 @@ def _count_rejected_signals(rejected_dir: Path) -> int:
     return sum(1 for _ in path.rglob("*.json"))
 
 
+def _is_date_directory_name(name: str) -> bool:
+    """Whether `name` is what `date.isoformat()` produces.
+
+    `date.fromisoformat()` alone is too generous here: on this interpreter it
+    accepts `20260821` and `2026-W34-5`, and neither is a name
+    `load_signals()` will ever look for — it builds the directory it reads
+    with `target_date.isoformat()`, which is always `YYYY-MM-DD`. So the
+    round trip is the test, not the parse.
+    """
+    try:
+        return date_type.fromisoformat(name).isoformat() == name
+    except ValueError:
+        return False
+
+
+def _count_unreachable_signals(signals_dir: Path) -> int:
+    """Signal files that no target date can ever read.
+
+    `load_signals()` reads exactly `signals_dir/<target_date>/*.json`, and
+    `target_date` is stamped `YYYY-MM-DD`. A `*.json` anywhere else under
+    `signals_dir` is therefore not "waiting" — it is unreachable. Measured
+    with the real entrypoint, one Signal filed each way:
+
+        signals/2026-08-21/s.json   COLLECTED and delivered
+        signals/toplevel.json       never read
+        signals/2026-8-21/s.json    never read   (unpadded month/day)
+        signals/august-21/s.json    never read
+
+    and for the three that were never read: not moved, not rejected, not
+    logged, `rejected_signal_count=0`, `outbox_count=0`, `pending_dates=()`,
+    run reported COMPLETED with exit 0 — and the watermark advanced **past**
+    the date the work belonged to, so no later run reconsiders it. Work a
+    person typed, gone, with every diagnostic reading all-clear.
+
+    **This counts; it changes nothing.** Collecting such a file, or moving it
+    to `signals_rejected/`, decides what a misfiled Signal means, and that is
+    a decision (BACKLOG). Reporting it is not — it is the move C19's
+    `is_locked`, C22's review counter, C23's stale lock and C24's
+    `name_collision` all made.
+
+    **Not the `pending_signals` count this module refuses.** That refusal is
+    about *parsing* every Signal to see if it is valid, which is the Agent's
+    job. This is a directory listing: nothing is opened, nothing is parsed,
+    and the question is structural rather than a judgement about content.
+
+    A correctly filed Signal is NOT counted even though it stays on disk
+    after collection — `load_signals()` is deliberately side-effect free and
+    never moves one, so "still in `signals/`" is normal and only the
+    unreachable *location* is the signal.
+
+    **Cost (C87).** The first implementation was `root.rglob("*.json")` and
+    a filter, which builds a `Path` for every Signal ever written — and
+    `signals/` never shrinks, because `load_signals()` deletes nothing and
+    retention is an open policy question (BACKLOG B-6). Measured on this
+    machine, before and after:
+
+           files    rglob    scandir
+             154    3.0 ms    0.9 ms
+             904   35.5 ms    3.7 ms
+           3,654   83.0 ms   29.4 ms      <- a year at 10 Signals/day
+          10,954  567.3 ms  255.9 ms
+
+    Identical answers at every size. The shape of the question is what makes
+    it cheap: a file is reachable only if it sits **directly** in a
+    `YYYY-MM-DD` directory one level down, so a valid date directory needs
+    its entries listed (to find anything nested deeper) and its `.json`
+    files never need to be looked at one by one. The recursive walk only
+    runs for subtrees that are already abnormal.
+
+    Errors count rather than vanish, in both directions: an entry this
+    process cannot even `is_dir()` is counted as unreachable. Over-reporting
+    is the safe direction for a data-loss signal, and it is the direction
+    this repository already chose for secret reporting.
+    """
+    root = Path(signals_dir)
+    if not root.is_dir():
+        return 0
+
+    def _all_json_below(path: str) -> int:
+        total = 0
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir():
+                            total += _all_json_below(entry.path)
+                        elif entry.name.endswith(".json"):
+                            total += 1
+                    except OSError:
+                        total += 1
+        except OSError:
+            # A read-only diagnostic must not become the thing that fails.
+            return total
+        return total
+
+    count = 0
+    try:
+        with os.scandir(root) as entries:
+            top = list(entries)
+    except OSError:
+        return 0
+
+    for entry in top:
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            count += 1
+            continue
+        if not is_dir:
+            if entry.name.endswith(".json"):
+                count += 1
+            continue
+        if not _is_date_directory_name(entry.name):
+            count += _all_json_below(entry.path)
+            continue
+        # A valid date directory: its own `*.json` files are what
+        # `load_signals()` reads, so only what is nested below it counts.
+        try:
+            with os.scandir(entry.path) as inner:
+                children = list(inner)
+        except OSError:
+            # A date directory this process cannot list is a date directory
+            # whose nesting cannot be ruled out, so it counts. `continue`ing
+            # in silence here would have made the number *smaller* for a
+            # tree that got harder to read -- the direction that reads as
+            # reassurance, and the one C62 and C68 both removed elsewhere.
+            # Caught by `ASilentlyDroppedEntryIsARosterNotAParagraphTests`
+            # the first time this function ran under it.
+            count += 1
+            continue
+        for child in children:
+            try:
+                if child.is_dir():
+                    count += _all_json_below(child.path)
+            except OSError:
+                count += 1
+    return count
+
+
+def _entry_is_file(entry) -> bool:
+    """`DirEntry.is_file()`, with a refusal counted as "not a file".
+
+    An entry that cannot be stat-ed is not evidence of delivery, and
+    treating it as one would hide a lost Signal -- the direction this
+    whole family of counters exists to avoid.
+    """
+    try:
+        return entry.is_file()
+    except OSError:
+        return False
+
+
+def _count_undelivered_signals_in_closed_dates(
+    signals_dir: Path,
+    sent_dir: Path,
+    *,
+    source: str | None,
+    collected_through: date_type | None,
+) -> int:
+    """Signal files in a **closed** date that were never delivered.
+
+    `_count_unreachable_signals()` above answers "filed where no date will
+    read it". This answers the other half, and it is the half that needs no
+    mistake at all:
+
+        pending_dates() ends at **yesterday** and never walks backwards
+        (`catchup.pending_dates()`, docs/07 section 50)
+
+    So once the watermark reaches a date, a Signal added to that date's
+    directory afterwards is never read again -- by any run, ever. The
+    directory name is correct, the filename is correct, the content is
+    valid, and nothing looks at it.
+
+    **Measured with the real entrypoint, no misconfiguration anywhere:**
+
+        08:00  the scheduled run collects 2026-08-23   watermark 2026-08-23
+        09:00  the person writes up the afternoon into
+               signals/2026-08-23/afternoon.json
+        09:00  run 2                COMPLETED   delivered: still 1
+        +1 day, +2 days: 2 more runs COMPLETED  delivered: still 1
+
+        the file is still on disk        never delivered, never rejected
+        the agent log never names it
+        outbox_count 0   rejected_signal_count 0   unreachable_signal_count 0
+        pending_dates ()   needs_attention ()
+
+    Writing up yesterday after this morning's run is not an exotic
+    operation; it is the ordinary shape of the working day, and Signal
+    authoring is by hand (BACKLOG A-11).
+
+    **The predicate is exact and reuses production code rather than
+    restating it** (C28): `derive_event_id()` is what stamped the Event, and
+    `outbox.is_sent()` is what the delivery path asks. Neither opens a
+    Signal -- the id is built from the source, the directory name and the
+    file stem -- so this stays a directory listing, which is the whole basis
+    on which this module refuses a `pending_signals` count.
+
+    Dates *after* the watermark are not counted: those are pending, and the
+    next run reads them. That is the same asymmetry C68 drew between an
+    absent subject and a failed read.
+
+    **This counts; it changes nothing.** Re-reading a closed date, or moving
+    the file forward, decides what a late Signal *means* -- and
+    `pending_dates()` refusing to walk backwards is a deliberate rule with
+    its own reasons (a re-read date re-derives Events the Collector has
+    already seen). That is a decision (BACKLOG). Saying it is there is not.
+
+    Rests on `sent/` being kept: it is never pruned today (the retention
+    question is BACKLOG A-6's, still open). If it ever is, this count
+    becomes an over-report rather than an under-report -- the safe
+    direction, and the one this repository already chooses for secrets.
+    """
+    if source is None or collected_through is None:
+        # No watermark and no identity means no date is closed yet.
+        return 0
+    signals = Path(signals_dir)
+    sent = Path(sent_dir)
+
+    # `sent/` read ONCE, not once per Signal (C101). `outbox.is_sent()`
+    # is one `is_file()` per call, so asking it per Signal made this
+    # counter cost one stat each: measured 28 us per Signal, 140 ms at
+    # three years and 560 ms at eleven -- on a script whose whole premise
+    # is that a person runs it first, casually. One directory listing is
+    # 5 us per Signal instead, the same `glob+is_file -> scandir` swap
+    # `_daily_dates()` (16x) and `_count_unreachable_signals()` (C87)
+    # already carry.
+    #
+    # **`is_file()` is kept, not traded for `exists()`.** `is_sent()`'s
+    # own docstring records the measurement: a *directory* carrying an
+    # Event's name made it answer True, which is the Agent declining to
+    # send an Event it never sent. `DirEntry.is_file()` answers from the
+    # listing that was already fetched, so the rule survives the batching
+    # at no cost. `TheDeliveredSetIsTheSameQuestionIsSentAsksTests` pins
+    # that this stays the same question rather than a lookalike.
+    if not sent.is_dir():
+        # Nothing has ever been delivered, which is a fact rather than a
+        # failure: every closed-date Signal below really is undelivered.
+        delivered: set[str] = set()
+    else:
+        try:
+            with os.scandir(sent) as entries:
+                delivered = {e.name for e in entries if _entry_is_file(e)}
+        except OSError:
+            # The directory is there and cannot be listed, so whether a
+            # Signal was delivered is unknown. Reporting every one of
+            # them would be a false alarm the size of the whole tree;
+            # reporting none makes no claim. `read_status()` surfaces an
+            # unreadable `sent/` through `sent_count` either way.
+            return 0
+    count = 0
+    try:
+        days = list(os.scandir(signals))
+    except OSError:
+        # Unreadable, not absent. `_count_unreachable_signals()` reports the
+        # same directory failing the same way, and one line about one
+        # directory is enough -- 0 here, and that line carries it.
+        return 0
+    for day_entry in days:
+        if not _is_date_directory_name(day_entry.name):
+            continue  # `_count_unreachable_signals()` owns those
+        try:
+            if not day_entry.is_dir():
+                continue
+        except OSError:
+            # C88: unreadable is not the same as absent, and collapsing them
+            # is what this whole family of counters exists to stop.
+            count += 1
+            continue
+        day = date_type.fromisoformat(day_entry.name)
+        if day > collected_through:
+            continue  # still pending; a later run will read it
+        try:
+            files = list(os.scandir(day_entry.path))
+        except OSError:
+            count += 1
+            continue
+        for signal in files:
+            if not signal.name.endswith(".json"):
+                continue
+            try:
+                if not signal.is_file():
+                    continue
+            except OSError:
+                count += 1
+                continue
+            event_id = derive_event_id(
+                source=source,
+                target_date=day,
+                signal_id=Path(signal.name).stem,
+            )
+            if safe_event_filename(event_id) not in delivered:
+                count += 1
+    return count
+
+
 def read_status(
     *,
     agent_start_date: date_type | None = None,
@@ -200,6 +507,7 @@ def read_status(
     outbox_dir: Path | None = None,
     sent_dir: Path | None = None,
     rejected_signals_dir: Path | None = None,
+    signals_dir: Path | None = None,
 ) -> AgentStatusSnapshot:
     """Build the snapshot. Never raises for a damaged state file.
 
@@ -221,6 +529,7 @@ def read_status(
         if rejected_signals_dir is not None
         else DEFAULT_REJECTED_SIGNALS_DIR
     )
+    signals_dir = Path(signals_dir) if signals_dir is not None else DEFAULT_SIGNALS_DIR
 
     state_error: str | None = None
     try:
@@ -249,5 +558,14 @@ def read_status(
         outbox_count=len(pending(outbox_dir)),
         sent_count=_count_json(sent_dir),
         rejected_signal_count=_count_rejected_signals(rejected_signals_dir),
+        unreachable_signal_count=_count_unreachable_signals(signals_dir),
+        undelivered_closed_signal_count=_count_undelivered_signals_in_closed_dates(
+            signals_dir,
+            sent_dir,
+            source=state.desktop_id if state is not None else None,
+            collected_through=(
+                state.last_successful_collection_date if state is not None else None
+            ),
+        ),
         state_error=state_error,
     )

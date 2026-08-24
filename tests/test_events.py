@@ -521,5 +521,218 @@ class TheEventSchemaVersionIsAContractAcrossDesktopsTests(unittest.TestCase):
         self.assertIn("schema_version", log, "the log names the cause")
 
 
+class EveryTimestampTheSchemaAcceptsIsReadableDownstreamTests(unittest.TestCase):
+    """The rule is version-independent; the thing that enforces it is not.
+
+    `events.schema._timestamp_error()` states two sentences -- *valid
+    ISO-8601* and *carries a timezone offset* -- and enforces both by calling
+    `datetime.fromisoformat()`, whose accepted grammar **differs by Python
+    version**. C69 measured that on 3.9.7 and filed it as A-24: the same
+    Event is REJECTED on one interpreter and ACCEPTED on another, and the
+    rejection message ("not valid ISO-8601") is false for a `Z` timestamp,
+    which is valid ISO-8601 by any reading.
+
+    **C76: the deployment machine crossed the line.** It moved from Python
+    3.9.7 to 3.13.14 (BACKLOG D's RUNTIME-DECLARATION). Re-measured here with
+    the real Collector:
+
+        2026-08-15T09:00:00Z          3.9.7 REJECTED   3.13.14 ACCEPTED
+        2026-08-15T09:00:00.123456Z   3.9.7 REJECTED   3.13.14 ACCEPTED
+
+    Nobody decided that. It followed from an interpreter upgrade, which is
+    the direction C69 wrote down in advance.
+
+    **What this class pins is not the answer -- it is the implication.**
+    C69's stated fear was a *one-sided* fix: relax the validator alone and an
+    Event that used to be a visible REJECTED becomes an ACCEPTED one that the
+    ~40 downstream `fromisoformat()` call sites cannot read, i.e. a silent
+    `unreadable`. That is the C62 direction this project spends its Sprints
+    walking away from.
+
+    So the invariant is: **whatever the schema accepts, every reader of that
+    timestamp can read.** It holds on 3.9 (where `Z` fails the antecedent and
+    the implication is vacuous for it, while the offset spellings keep the
+    class honest) and on 3.13 (where `Z` passes both halves). It fails the
+    moment the two sides are changed apart -- which is the only change that
+    needs catching, and the one a single-interpreter assertion could never
+    see.
+
+    `test_controltower_notion_projection.py`'s
+    `test_the_parser_is_the_one_that_validates_an_event` already states this
+    shape for one reader (the Notion `date` column). This is the same
+    statement over the readers on the rollup side, plus the end-to-end.
+
+    **Mutation (C76).** Each widens `_timestamp_error()` and nothing else;
+    every mutant was `ast.parse()`d before it counted and `schema.py` was
+    restored byte-for-byte (sha256 and CRLF count checked) after each.
+
+        M1  return None for everything          DETECTS
+        M2  offset no longer required           DETECTS   (so does the rest)
+        M3  validator normalises `Z` itself     MISSES
+        M4  validator calls `.strip()`          DETECTS   **only this class**
+
+    M3 is the correct verdict rather than a gap: measured, that mutation does
+    not change the accepted set on 3.13 at all, because the readers already
+    take `Z`. It is the mutation that would be caught on 3.9 -- which is the
+    whole reason this is written as an implication instead of a list of
+    values, and the reason it cannot be checked from here.
+
+    M4 is the one this class exists for. A validator that strips whitespace
+    and readers that do not is a one-line, entirely plausible widening;
+    `fromisoformat()` refuses all three padded spellings on this interpreter,
+    so the Event would be accepted and then unreadable. Nothing else in the
+    suite sees it.
+    """
+
+    #: Spellings a producer could plausibly emit. Whether each is accepted is
+    #: deliberately NOT asserted -- that is the interpreter's answer and the
+    #: subject of A-24. What is asserted is what happens *after* acceptance.
+    CORPUS = (
+        "2026-08-15T09:00:00+09:00",
+        "2026-08-15T09:00:00.500000+09:00",
+        "2026-08-15T09:00:00.5+09:00",
+        "2026-08-15T09:00:00Z",
+        "2026-08-15T09:00:00.123456Z",
+        "2026-08-15T00:00:00+00:00",
+        "2026-08-15T09:00:00",
+        "2026-08-15",
+        # Padded spellings. `fromisoformat()` refuses all three on every
+        # interpreter this project has run on, so today they sit on the
+        # refused side and the implications below are vacuous for them --
+        # which is the point. They are here because the mutation that a
+        # corpus without them could not see is a real one-sided widening:
+        # a validator that calls `.strip()` and readers that do not.
+        # Measured (C76): with `.strip()` added to `_timestamp_error()`
+        # alone, this class went from MISSES to DETECTS purely by carrying
+        # these three rows.
+        " 2026-08-15T09:00:00+09:00 ",
+        "2026-08-15T09:00:00+09:00" + chr(10),
+        chr(9) + "2026-08-15T09:00:00+09:00",
+        "not-a-date",
+        "",
+    )
+
+    def _accepted(self):
+        from events.schema import _timestamp_error
+
+        return [value for value in self.CORPUS if _timestamp_error(value) is None]
+
+    def test_the_corpus_is_not_all_refused(self):
+        """Guards the guard: every assertion below is quantified over the
+        accepted values, so on an interpreter that refused all of them this
+        class would pass while reading nothing."""
+        accepted = self._accepted()
+
+        self.assertGreaterEqual(
+            len(accepted), 2,
+            "no timestamp in the corpus validates -- the implications below "
+            "are all vacuous",
+        )
+        self.assertIn(
+            "2026-08-15T09:00:00+09:00", accepted,
+            "the ordinary Event timestamp must always validate",
+        )
+
+    def test_every_accepted_timestamp_is_readable_by_the_rollup(self):
+        """`_event_date()` decides which day an Event belongs to and
+        `event_instant_key()` decides the order they are applied in. A value
+        either of them cannot parse is dropped to `unreadable` or sorted into
+        the text tier -- silently, and after the Event was already accepted.
+        """
+        from controltower.rollup import _event_date, event_instant_key
+
+        for value in self._accepted():
+            with self.subTest(timestamp=value):
+                event = Event.from_dict(sample_data(timestamp=value))
+                self.assertIsNotNone(
+                    _event_date(event),
+                    f"{value!r} validates as an Event timestamp and the "
+                    "rollup cannot tell which day it belongs to",
+                )
+                tier, _ = event_instant_key(event)
+                self.assertEqual(
+                    tier, 0,
+                    f"{value!r} validates but sorts in the unparseable tier, "
+                    "so one accepted Event decides the order of the rest",
+                )
+
+    def test_every_accepted_timestamp_is_readable_by_the_notion_date_check(self):
+        """The other side of the same boundary. A value that validates as an
+        Event and is refused here never reaches Notion as a date."""
+        from controltower.notion_projection import _is_iso_8601
+
+        for value in self._accepted():
+            with self.subTest(timestamp=value):
+                self.assertTrue(
+                    _is_iso_8601(value),
+                    f"{value!r} validates as an Event timestamp and would be "
+                    "refused as a Notion date",
+                )
+
+    def test_an_accepted_event_reaches_the_rollup_rather_than_unreadable(self):
+        """The end-to-end statement of C69's fear, through the real Collector
+        and the real fold -- not through either parser in isolation.
+
+        A one-sided relaxation of `_timestamp_error()` turns a visible
+        REJECTED into a file sitting in `processed/` that the Control Tower
+        counts as `unreadable`. This measures the whole path instead of
+        asserting that the two parsers happen to agree.
+        """
+        import json
+        import shutil
+        import tempfile
+
+        from collector.collector import Collector
+        from collector.runtime import run_once
+        from collector.state import PersistentSeenEventStore
+        from controltower.rollup import build_company_rollup
+
+        accepted = self._accepted()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        incoming, processed, rejected, logs, state = (
+            root / "incoming", root / "processed", root / "rejected",
+            root / "logs", root / "state",
+        )
+        for directory in (incoming, processed, rejected, logs, state):
+            directory.mkdir(parents=True)
+
+        for index, value in enumerate(accepted):
+            payload = sample_data(timestamp=value, event_id=f"EVT-TS-{index}")
+            (incoming / f"ts{index}.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+        summary = run_once(
+            collector=Collector(
+                seen_store=PersistentSeenEventStore(
+                    state_path=state / "collector_state.json"
+                )
+            ),
+            incoming_dir=incoming,
+            processed_dir=processed,
+            rejected_dir=rejected,
+            log_path=logs / "collector.log",
+        )
+
+        self.assertEqual(
+            (summary.accepted, summary.rejected, summary.failed),
+            (len(accepted), 0, 0),
+            "the schema and the Collector disagree about the same values",
+        )
+
+        rollup = build_company_rollup(
+            processed_dir=processed,
+            now=datetime.fromisoformat("2026-08-20T09:00:00+09:00"),
+        )
+
+        self.assertEqual(
+            rollup.unreadable, (),
+            "an Event the schema accepted is unreadable to the Control "
+            "Tower -- a visible REJECTED has become a silent gap",
+        )
+        self.assertEqual(rollup.events_read, len(accepted))
+
+
 if __name__ == "__main__":
     unittest.main()

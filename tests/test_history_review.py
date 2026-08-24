@@ -830,7 +830,14 @@ class ReviewedButNotRenderedTests(unittest.TestCase):
     def _check(self):
         module = self._module()
         candidates, _unreadable = module._read_keep_candidates(self.keep)
-        return module._reviewed_but_not_rendered(candidates, self.daily)
+        # C92: the second half is the dates it could not read. The
+        # tests below are about the first, and
+        # `TheTwoRenderChecksNameTheDailyTheyCouldNotReadTests`
+        # holds the second.
+        stranded, _unreadable_daily = module._reviewed_but_not_rendered(
+            candidates, self.daily
+        )
+        return stranded
 
     def test_a_review_the_daily_file_does_not_carry_is_reported(self):
         self._candidate(decision_context="Board asked for 4 weeks; CEO cut it to 2.")
@@ -981,12 +988,40 @@ class ReviewedButNotRenderedTests(unittest.TestCase):
                 self.assertIn(f'f"- {label}: {{candidate.{field}}}"', renderer)
 
     def test_the_check_is_wired_into_the_history_block(self):
-        """A detector nothing runs detects nothing."""
-        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
-            encoding="utf-8"
-        )
+        """A detector nothing runs detects nothing.
 
-        self.assertIn("_reviewed_but_not_rendered(keep_candidates, daily_dir)", source)
+        By AST rather than by matching the call as written. This asserted the
+        exact one-line spelling `_reviewed_but_not_rendered(keep_candidates,
+        daily_dir)`, and C92 gave the function a second return value, so the
+        call had to be split across lines to stay inside the line length --
+        which broke this test without changing anything it is about. The
+        claim is "the HISTORY block calls it", and that is a property of the
+        call graph, not of where the line wraps.
+
+        Fourth correction of this shape in this Sprint (C86, C88, C90, here).
+        """
+        import ast
+
+        tree = ast.parse(
+            (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        printer = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_print_history"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(printer)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+
+        self.assertIn("_reviewed_but_not_rendered", called)
+        # Its sibling rides the same wiring; if one is dropped the other is
+        # the reason to notice.
+        self.assertIn("_kept_but_not_rendered", called)
 
     def test_the_shared_reader_is_still_read_once(self):
         """The fourth element rides along on the existing single pass. A

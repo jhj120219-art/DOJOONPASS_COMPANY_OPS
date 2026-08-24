@@ -32,8 +32,19 @@ from pathlib import Path
 # console defaults to the system's legacy codepage, not UTF-8 — a
 # non-ASCII character in that text would raise UnicodeEncodeError on
 # stdout's default strict error handling and crash the script.
+# `line_buffering=True` (C80): without it Python block-buffers stdout
+# whenever it is not a terminal, while stderr stays unbuffered — so
+# under `> log 2>&1`, which is how a scheduled run is captured, the two
+# streams reorder against each other. The other three entrypoints have
+# had this since the Sprint that measured it; this one was outside that
+# fix's hand-written roster. Measured with this file's own prologue:
+#
+#     0: [FAILED] Notion API error: 429 rate limited
+#     1: Health Check: PASS (database_id=abc)
+#
+# The failure above the line it follows.
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))

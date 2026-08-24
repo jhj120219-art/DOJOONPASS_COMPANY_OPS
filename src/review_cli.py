@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import enum
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 # Same defensive fix as run_company_ops.py/init_notion.py (this Sprint's
 # audit): every Korean string this file prints IS safe on a Korean
@@ -29,10 +29,17 @@ from typing import Any, Callable
 # just never printed) would crash this entry point the same way it did
 # run_company_ops.py. Applied for consistency across all three CLI
 # entry points, not in response to a reproduced failure here.
+# `line_buffering=True` (C80): the same call the other four entrypoints
+# make, for the same reason — block-buffered stdout under `> log 2>&1`
+# lets stderr overtake it. The mixed-stream sequence that makes it
+# visible elsewhere is `init_notion.py`'s; here the stream that would be
+# swallowed is the **prompt**, which is worse than reordered: a redirected
+# session would ask for Decision Context without showing the question.
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8")
 
+from cli import CONFIG_ERROR_EXIT, unexpected_arguments
 from history import (
     FileHistoryRepository,
     HistoryCandidate,
@@ -174,11 +181,49 @@ def run_interactive_review(
     return updated_count
 
 
-def main() -> None:
+def main(argv: Sequence[str] = ()) -> int:
+    """The entry point, and the argument refusal every sibling already had.
+
+    **C79.** `cli.unexpected_arguments()` was written for the four tools at
+    the repository root and this one was not among them — its roster is a
+    hand-written tuple in `AnEntrypointRefusesArgumentsItCannotHonourTests`,
+    and this file lives one directory down. Measured before the fix:
+
+        python src/review_cli.py --help
+
+    printed a real KEEP Candidate out of the operator's live
+    `history_candidates/` and stopped at
+    `이 항목을 검토하시겠습니까? (Enter=예, n=건너뛰기)`, waiting for
+    the operator to start editing it. The argument was not rejected, not
+    warned about, not read.
+
+    That is `cli.py`'s own docstring, one tool over: *"An operator reaching
+    for `--dry-run` ... is reaching for exactly the safety this had none
+    of."* Here the thing on the other side of the prompt is Decision
+    Context, which README RULE 11/12 call the company's most valuable
+    asset, and which this file's own error path already goes out of its way
+    to protect (`_review_one()` echoes typed values back rather than losing
+    them).
+
+    `configured_by=()` because this tool genuinely reads no environment
+    variable — `FileHistoryRepository()` uses its own defaults.
+    `unexpected_arguments()` already spells that case `(없음)`; it is the
+    honest answer rather than a borrowed list from another tool.
+
+    Returns a code, and the `__main__` guard raises it, for the reason the
+    four siblings do: without `SystemExit` the refusal would print and then
+    exit 0, which is the shape of the defect rather than the fix.
+    """
+    refusal = unexpected_arguments(argv, tool="review_cli.py", configured_by=())
+    if refusal is not None:
+        print(f"[FAILED] {refusal}", file=sys.stderr)
+        return CONFIG_ERROR_EXIT
+
     repository = FileHistoryRepository()
     reviewer = RepositoryHistoryReviewer(repository)
     run_interactive_review(reviewer)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv))

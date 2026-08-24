@@ -544,6 +544,24 @@ class SecretPatternHomeTests(unittest.TestCase):
                 self.assertIn(pattern, oplog.SECRET_PATTERNS)
 
 
+def _project_modules() -> list[str]:
+    """Every module name importable from `src/`, except `oplog` itself.
+
+    Two halves, because `src/` holds both. `DependencyGuardTests.
+    LOCAL_PACKAGES` and `LayeringInvariantTests._packages` derive the same
+    roster the same way; this is the third reader of one fact, and it used
+    to be the only one that asked for directories alone.
+
+    `oplog` is dropped rather than never added: the subprocess below imports
+    it on purpose, so leaving it in would make the module under test report
+    itself.
+    """
+    src = REPO_ROOT / "src"
+    names = {p.name for p in src.iterdir() if p.is_dir() and p.name != "__pycache__"}
+    names |= {p.stem for p in src.glob("*.py") if not p.stem.startswith("__")}
+    return sorted(names - {"oplog"})
+
+
 class SharedWriterTests(unittest.TestCase):
     """The point of the module: one implementation, not three."""
 
@@ -569,11 +587,21 @@ class SharedWriterTests(unittest.TestCase):
 
         Checked by importing it in a subprocess with only `src/` on the path
         and asserting no project package was pulled in, which catches a
-        transitive import that reading the file would not.
+        transitive import that reading the file would not. That lane is this
+        test's alone: `LayeringInvariantTests` reads the same rule
+        (`ALLOWED["oplog"] == set()`) off the AST, so it sees a written
+        `import` and nothing else. Measured (C76), with each mutation
+        inserted into `src/oplog.py` and the file restored byte-for-byte
+        afterwards:
+
+            __import__("events")      Layering pass   this file **FAIL**
+            __import__("runsummary")  Layering pass   this file pass  <- hole
+
+        The second row is why the roster is spelled in two halves, and
+        `test_the_roster_this_guard_checks_against_is_the_whole_tree`
+        is why it stays that way.
         """
-        packages = sorted(
-            p.name for p in (REPO_ROOT / "src").iterdir() if p.is_dir() and p.name != "__pycache__"
-        )
+        packages = _project_modules()
         script = (
             "import sys; sys.path.insert(0, r'{src}')\n"
             "import oplog\n"
@@ -589,6 +617,44 @@ class SharedWriterTests(unittest.TestCase):
         self.assertEqual(
             result.stdout.strip(), "", "oplog pulled in a project package"
         )
+
+    def test_the_roster_this_guard_checks_against_is_the_whole_tree(self):
+        """Guards the guard, in both of the ways it was weak (C76).
+
+        **Emptiness.** The check above asserts a *negative* over `packages`,
+        and a negative over an empty list is true. Measured with every scan
+        of the repository tree neutered: all 42 tests in this file passed
+        while checking nothing. `TheScansThisFileTrustsAreNotEmptyTests` is
+        the same guard for `test_repository_hygiene.py`, written after
+        `git ls-files` came back empty outside a checkout; this file had no
+        equivalent and one scan.
+
+        **Spelling.** The roster was `iterdir()` filtered by `is_dir()`, so
+        "a module of this project" meant "a directory". Four modules in
+        `src/` are files -- `cli`, `oplog`, `review_cli`, `runsummary` --
+        and the guard could not see three of them. The two other places that
+        derive this roster both spell it in two halves; this one spelled it
+        in one, and the mutation table above shows what fell through.
+        """
+        packages = _project_modules()
+
+        self.assertGreater(
+            len(packages), 10,
+            "the src/ scan came back nearly empty -- the guard above asserts "
+            "a negative over this list and would pass without checking",
+        )
+        for name in ("events", "collector", "agent", "app"):
+            with self.subTest(module=name):
+                self.assertIn(name, packages)
+        for name in ("cli", "review_cli", "runsummary"):
+            with self.subTest(module=name):
+                self.assertIn(
+                    name, packages,
+                    f"src/{name}.py is a module of this project, and a "
+                    "directory-only roster cannot see it",
+                )
+        self.assertNotIn("oplog", packages)
+        self.assertNotIn("__pycache__", packages)
 
 
 if __name__ == "__main__":

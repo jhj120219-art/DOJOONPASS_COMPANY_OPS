@@ -142,6 +142,9 @@ def find_orphaned_events(
     history_filter = HistoryFilter()
     orphaned: list[OrphanedEvent] = []
     unreadable: list[UnreadableEvent] = []
+    #: casefolded Candidate path -> the Events that expect to own it. More
+    #: than one distinct `event_id` in a group is C89's collision.
+    claimed: dict[str, list] = {}
 
     paths = sorted(processed_dir.glob("*.json"))
     checked = len(paths)
@@ -184,6 +187,50 @@ def find_orphaned_events(
         # by nothing once a directory of that name existed — A-20's detector
         # silenced by the presence of something that is not a Candidate.
         if not expected.is_file():
+            orphaned.append(
+                OrphanedEvent(
+                    event_id=event.event_id,
+                    event_path=event_path,
+                    decision=decision,
+                    expected_candidate_path=expected,
+                )
+            )
+        else:
+            claimed.setdefault(str(expected).casefold(), []).append(
+                (event, event_path, decision, expected)
+            )
+
+    # Two Events whose Candidate paths differ only in case (C89).
+    #
+    # `is_file()` above answers "is there a file at this path", and on a
+    # case-insensitive filesystem — which is the deployment target
+    # (docs/11) — `HIST-twin.json` and `HIST-TWIN.json` are one path. So a
+    # second Event whose id differs from the first only in case finds the
+    # *other* Event's Candidate sitting there and is reported as fine.
+    #
+    # Measured through the real entrypoint, `twin` and `TWIN` in one batch:
+    #
+    #     run 1   exit 2, history_filter STEP_ABORTED (FileExistsError)
+    #             keep/ = HIST-twin.json only
+    #     run 2   exit 0, SUCCESS, Company History rendered and pushed
+    #     TWIN    no Candidate, ever, and this function reported clean
+    #
+    # At most one of a colliding group can own that file, so every other
+    # member is orphaned no matter what is on disk. Reported by identity
+    # rather than by asking the filesystem again, because the filesystem is
+    # what cannot tell them apart.
+    #
+    # No extra reads: the group is built from Events this pass already
+    # parsed, keyed by the path it already computed.
+    for members in claimed.values():
+        if len(members) < 2:
+            continue
+        if len({event.event_id for event, _p, _d, _e in members}) < 2:
+            # The same id twice is a duplicate *file*, not a collision of two
+            # Events, and `rollup.DuplicateEvent` is where that is reported.
+            continue
+        # The first is the one the file can belong to; the rest cannot.
+        for event, event_path, decision, expected in members[1:]:
             orphaned.append(
                 OrphanedEvent(
                     event_id=event.event_id,

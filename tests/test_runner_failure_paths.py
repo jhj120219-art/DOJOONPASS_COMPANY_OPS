@@ -107,7 +107,9 @@ def _force_rmtree(path: Path) -> None:
 def _is_junction(path) -> bool:
     """Whether `path` is an NTFS junction, on any interpreter this runs on.
 
-    `os.path.isjunction()` is Python 3.12+; below that the same fact is the
+    `os.path.isjunction()` is Python 3.12+ (present on the current runtime,
+    absent on the 3.9.7 one this was written for); below that the same fact is
+    the
     reparse-point bit on the lstat result, which every version reports on
     Windows. Written once here because two tests in
     `BackupJunctionTraversalTests` ask the question and one of them used to
@@ -7143,10 +7145,10 @@ class AbortBeforeTheLateUpdateStrandsACandidateTests(RunnerFailurePathTestCase):
 
         module, candidates = self._stored_candidates()
 
-        self.assertEqual(
-            module._kept_but_not_rendered(candidates, self.local_master_dir / "daily"),
-            ("EVT-LATE (2026-08-01)",),
+        stranded, _unreadable = module._kept_but_not_rendered(
+            candidates, self.local_master_dir / "daily"
         )
+        self.assertEqual(stranded, ("EVT-LATE (2026-08-01)",))
 
     def test_a_later_event_on_the_same_date_still_carries_it_in(self):
         """E-17's only automatic recovery path, reached from this entry too:
@@ -7163,9 +7165,10 @@ class AbortBeforeTheLateUpdateStrandsACandidateTests(RunnerFailurePathTestCase):
         self.assertIn("- Event ID: EVT-COMPANION", text)
 
         module, candidates = self._stored_candidates()
-        self.assertEqual(
-            module._kept_but_not_rendered(candidates, self.local_master_dir / "daily"), ()
+        stranded, _unreadable = module._kept_but_not_rendered(
+            candidates, self.local_master_dir / "daily"
         )
+        self.assertEqual(stranded, ())
 
 
 class AnAbortedStepRecordsWhatAbortedItTests(RunnerFailurePathTestCase):

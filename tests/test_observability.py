@@ -4811,7 +4811,8 @@ class DailyCountsMoreThanItShowsTests(unittest.TestCase):
         self.assertEqual(
             select_late_candidates(text, [self._candidate("VICTIM", "genuinely late")]), ()
         )
-        self.assertEqual(module._kept_but_not_rendered(stored, self.daily), ())
+        stranded, _unreadable = module._kept_but_not_rendered(stored, self.daily)
+        self.assertEqual(stranded, ())
 
     def test_a_category_less_candidate_is_reported(self):
         """The other direction, and the loss `test_daily_history.py` already
@@ -9154,12 +9155,20 @@ class JunctionInBackupScopeTests(unittest.TestCase):
 
         It was called `test_it_reports_nothing_when_the_platform_cannot_answer`
         and it pinned `found == ()` for an interpreter without
-        `os.path.isjunction` — which is every interpreter this project
-        actually runs on (Python 3.9.7, BACKLOG D). So the detector's
-        blindness on the deployment machine was not an oversight that slipped
-        through: it was **held in place by a passing test**, while the two
-        tests above skipped rather than catching it. Three tests, and the net
-        effect was that a security detector never ran here and nothing said so.
+        `os.path.isjunction` — which was every interpreter this project ran
+        on at the time (Python 3.9.7, BACKLOG D). So the detector's blindness
+        on the deployment machine was not an oversight that slipped through:
+        it was **held in place by a passing test**, while the two tests above
+        skipped rather than catching it. Three tests, and the net effect was
+        that a security detector never ran there and nothing said so.
+
+        **C76: the deployment runtime is now 3.13.14, so the stdlib probe is
+        present and the production path no longer reaches the fallback.**
+        This test keeps reaching it on purpose, by injecting `None`. A
+        fallback that only runs on machines the project has left is a
+        fallback nobody would notice breaking — and the project is worked on
+        from several machines (AGENT.md section 1), so "left" is not
+        "gone".
 
         There was never a platform that could not be asked.
         `os.lstat().st_reparse_tag` has carried the answer since 3.8.
@@ -9380,13 +9389,16 @@ class StrandedCandidateHiddenByASummaryTests(unittest.TestCase):
         )
         from ops_status import StoredCandidate
 
-        return _kept_but_not_rendered(
+        # C92: the second half is the dates it could not read;
+        # `TheTwoRenderChecksNameTheDailyTheyCouldNotReadTests` holds it.
+        stranded, _unreadable = _kept_but_not_rendered(
             tuple(
                 StoredCandidate(f"s{i}", e, date(2026, 8, 5))
                 for i, e in enumerate(stored)
             ),
             directory,
         )
+        return stranded
 
     def test_a_summary_cannot_hide_a_stranded_candidate(self):
         found = self._stranded(
@@ -9582,10 +9594,12 @@ class AStrandedCandidateIsRecoveredByACompanionTests(unittest.TestCase):
 
         from ops_status import StoredCandidate
 
-        return _kept_but_not_rendered(
+        # C92: see the sibling helper above on the second return value.
+        stranded, _unreadable = _kept_but_not_rendered(
             (StoredCandidate(f"HIST-{event_id}", event_id, date(2026, 8, 5)),),
             self.daily_dir,
         )
+        return stranded
 
     def _close_the_day_then_strand(self):
         from daily import generate_daily_history
@@ -10551,9 +10565,14 @@ class ADetectorSaysWhatItCouldNotCheckTests(unittest.TestCase):
         self.assertEqual(skipped, 1)
 
     def test_the_junction_check_counts_a_probe_that_refused(self):
-        """`os.path.isjunction` is 3.12+, so on this interpreter the real
-        probe is absent and the branch is reached with an injected one — the
-        same way `_junctions_in_scope`'s existing test injects `None`."""
+        """A probe that *refuses* — distinct from one that is absent.
+
+        Injected rather than provoked, and that is not a limitation of the
+        interpreter: a real `isjunction()` does not raise `PermissionError`
+        on demand, so there is no way to reach this branch without standing
+        one in. (C76 note: it used to say the real probe was absent on this
+        interpreter. On 3.13.14 it is present — which changes why the
+        injection is needed, not whether it is.)"""
         module = self._module()
 
         def refuse(path):
@@ -10680,6 +10699,443 @@ class ADetectorSaysWhatItCouldNotCheckTests(unittest.TestCase):
 
         self.assertNotIn("확인 못 함", healthy)
         self.assertIn("확인 못 함", broken)
+
+
+class TheTwoRenderChecksNameTheDailyTheyCouldNotReadTests(unittest.TestCase):
+    """C92 (A-28): the last two of the three the C91 AST sweep found.
+
+    `_kept_but_not_rendered()` is the detector for E-17 -- a KEEP Candidate
+    stored as Company History and absent from the Daily file of the day it
+    belongs to. `_reviewed_but_not_rendered()` is the same shape for
+    Decision Context, which its own docstring calls the most expensive
+    content this pipeline handles because a human wrote it.
+
+    Both walked the dates, and both answered an unreadable Daily with a bare
+    `continue`. Every Candidate of that date was then treated exactly like a
+    Candidate that IS in its file: the stranded list came back shorter by
+    precisely the ones nobody could check, and a shorter list of losses is
+    what a healthier machine looks like.
+
+    Measured -- one KEEP Candidate genuinely missing from its Daily:
+
+        control, the Daily is readable    stranded ('EVT-LOST (2026-08-05)',)
+        the Daily cannot be decoded       stranded ()
+
+    Both now return `(stranded, unreadable_dates)`, and the caller prints one
+    line naming the dates. **One line for both**, because it is one fact
+    about one set of files: the two detectors walk the same dates over the
+    same directory, so two independent counters would report the same file
+    twice, and a second opinion on "which files could not be read" is what
+    C28 keeps out of this module. A union of dates cannot double-count; a sum
+    of two counts can, and `test_one_unreadable_file_is_one_line` is that
+    difference stated as a number.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.daily = self.root / "daily"
+        self.daily.mkdir(parents=True)
+        self.when = date(2026, 8, 5)
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c92", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _write_daily(self, *event_ids):
+        """The real renderer, so "rendered" means what the renderer means."""
+        from daily.markdown import render_daily_markdown
+        from history import HistoryCandidate, HistoryDecision
+
+        candidates = [
+            HistoryCandidate(
+                history_id=f"HIST-{event_id}",
+                event_id=event_id,
+                timestamp="2026-08-05T10:00:00+09:00",
+                category="MILESTONE",
+                project_id="PRJ_A",
+                role="COO",
+                summary="did work",
+                evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+            for event_id in event_ids
+        ]
+        (self.daily / f"{self.when.isoformat()}.md").write_text(
+            render_daily_markdown(self.when, candidates, "gen"), encoding="utf-8"
+        )
+
+    def _corrupt_daily(self):
+        (self.daily / f"{self.when.isoformat()}.md").write_bytes(b'\xff\xfe\x00 not utf-8 \xff')
+
+    def _stored(self, module, event_id, reviewed=()):
+        return (
+            module.StoredCandidate(
+                stem="s", event_id=event_id, when=self.when, reviewed=reviewed
+            ),
+        )
+
+    # ---- _kept_but_not_rendered ------------------------------------------
+
+    def test_the_control_finds_the_stranded_candidate(self):
+        """Without this the rest proves nothing."""
+        module = self._module()
+        self._write_daily("EVT-PRESENT")
+
+        stranded, unreadable = module._kept_but_not_rendered(
+            self._stored(module, "EVT-LOST"), self.daily
+        )
+
+        self.assertEqual(stranded, ("EVT-LOST (2026-08-05)",))
+        self.assertEqual(unreadable, ())
+
+    def test_an_unreadable_daily_loses_the_finding_and_is_named(self):
+        module = self._module()
+        self._corrupt_daily()
+
+        stranded, unreadable = module._kept_but_not_rendered(
+            self._stored(module, "EVT-LOST"), self.daily
+        )
+
+        self.assertEqual(stranded, ())  # the loss is genuinely invisible
+        self.assertEqual(unreadable, ("2026-08-05",))  # and the date is named
+
+    # ---- _reviewed_but_not_rendered --------------------------------------
+
+    def test_the_review_control_finds_the_missing_decision_context(self):
+        module = self._module()
+        self._write_daily("EVT-A")
+        reviewed = (("Decision Context", "Board asked for 4 weeks."),)
+
+        stranded, unreadable = module._reviewed_but_not_rendered(
+            self._stored(module, "EVT-A", reviewed), self.daily
+        )
+
+        self.assertTrue(stranded)
+        self.assertEqual(unreadable, ())
+
+    def test_an_unreadable_daily_loses_the_review_finding_and_is_named(self):
+        module = self._module()
+        self._corrupt_daily()
+        reviewed = (("Decision Context", "Board asked for 4 weeks."),)
+
+        stranded, unreadable = module._reviewed_but_not_rendered(
+            self._stored(module, "EVT-A", reviewed), self.daily
+        )
+
+        self.assertEqual(stranded, ())
+        self.assertEqual(unreadable, ("2026-08-05",))
+
+    # ---- what must NOT be named ------------------------------------------
+
+    def test_a_day_not_yet_rendered_is_not_an_unreadable_day(self):
+        """The Scheduler window. A date whose Daily file does not exist yet
+        will carry its Candidate when the day is closed -- both functions
+        already treat that as "not a loss", and it must not become "a file I
+        failed to read" either, or every machine reports the current day."""
+        module = self._module()  # no Daily file written at all
+
+        for name in ("_kept_but_not_rendered", "_reviewed_but_not_rendered"):
+            with self.subTest(function=name):
+                reviewed = (("Decision Context", "x"),)
+                stranded, unreadable = getattr(module, name)(
+                    self._stored(module, "EVT-A", reviewed), self.daily
+                )
+                self.assertEqual((stranded, unreadable), ((), ()))
+
+    def test_an_absent_directory_is_an_absent_subject(self):
+        """C68's asymmetry, which both early returns had to learn too."""
+        module = self._module()
+        missing = self.root / "not_deployed"
+
+        for name in ("_kept_but_not_rendered", "_reviewed_but_not_rendered"):
+            with self.subTest(function=name):
+                self.assertEqual(
+                    getattr(module, name)(self._stored(module, "EVT-A"), missing),
+                    ((), ()),
+                )
+
+    # ---- one file, one line ----------------------------------------------
+
+    def test_one_unreadable_file_is_one_line(self):
+        """The reason the caller unions rather than adds.
+
+        Both detectors walk the same dates over the same directory, so one
+        unreadable Daily is reported by both. Adding the two counts would
+        tell the operator two files could not be read when one could not.
+        """
+        module = self._module()
+        self._corrupt_daily()
+        reviewed = (("Decision Context", "x"),)
+        stored = self._stored(module, "EVT-A", reviewed)
+
+        _kept, from_keep = module._kept_but_not_rendered(stored, self.daily)
+        _review, from_review = module._reviewed_but_not_rendered(stored, self.daily)
+
+        self.assertEqual(len(from_keep) + len(from_review), 2)  # the hazard
+        self.assertEqual(len(set(from_keep) | set(from_review)), 1)  # the fix
+
+    def test_the_caller_unions_the_two_rosters(self):
+        """...and that the caller really does take the union. By AST: a
+        `+` between the two would pass any test that only reads one of
+        them."""
+        import ast
+
+        tree = ast.parse(
+            (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        printer = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_print_history"
+        )
+        union = next(
+            node
+            for node in ast.walk(printer)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "unreadable_daily"
+                for target in node.targets
+            )
+        )
+        operators = {
+            type(node.op).__name__
+            for node in ast.walk(union)
+            if isinstance(node, ast.BinOp)
+        }
+
+        self.assertIn("BitOr", operators)
+        self.assertNotIn("Add", operators)
+
+
+class TheMonthlyLagVerdictCountsEveryReadItLostTests(unittest.TestCase):
+    """C91: C68 built the `skipped` counter for one read and left three.
+
+    `ADetectorSaysWhatItCouldNotCheckTests` above states the principle -- a
+    detector whose list gets shorter on a failed read is indistinguishable
+    from a healthier machine -- and applies it to the `st_mtime` loop in
+    `_monthly_lags_its_daily_source()`. Three further reads in that same
+    function could each fail and still return a verdict:
+
+        the Monthly's `is_file()`/`stat()`   -> the month is never compared
+        the Monthly's `read_text()`          -> the month is never compared
+        `read_daily_document()` per day      -> that day's ids never enter
+                                                `source_ids`, so `missing`
+                                                is computed against a
+                                                SHORTER source
+
+    The third is the one that does not merely skip a month: it returns a
+    finding for the month while having read less than all of it.
+
+    Measured against a tree whose 2026-07 Monthly genuinely lacks an Event
+    its Daily carries:
+
+        control, everything readable      finding ('E-LATE',)   skipped 0
+        the Daily carrying it is corrupt  finding ()            skipped 0
+        the Monthly itself is corrupt     finding ()            skipped 0
+        the Monthly cannot be stat-ed     finding ()            skipped 0
+
+    `0 found, 0 skipped` is the screen a healthy machine prints, and all
+    three printed it about a month with a real hole in it.
+
+    Counting does not find the hole and is not meant to. It stops the answer
+    from claiming a completeness it does not have -- the caller already
+    prints the count, so it reaches the operator the moment it is non-zero.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.daily = self.root / "daily"
+        self.monthly = self.root / "monthly"
+        self.daily.mkdir(parents=True)
+        self.monthly.mkdir(parents=True)
+        self._write_day(date(2026, 7, 29), "E-OK")
+        self._write_day(date(2026, 7, 30), "E-LATE")
+        # Consolidated before 07-30 was edited: it carries E-OK only.
+        (self.monthly / "2026-07.md").write_text(
+            "# 2026-07\n\n- Event ID: E-OK\n", encoding="utf-8"
+        )
+        self._age(self.monthly / "2026-07.md", 1_700_000_000)
+        self._age(self.daily / "2026-07-29.md", 1_700_000_000)
+        # Newer than the Monthly, so the mtime prefilter lets the month through.
+        self._age(self.daily / "2026-07-30.md", 1_800_000_000)
+
+    def _write_day(self, day, *event_ids):
+        """Rendered by the real renderer, so the real parser can read it."""
+        from daily.markdown import render_daily_markdown
+        from history import HistoryCandidate, HistoryDecision
+
+        candidates = [
+            HistoryCandidate(
+                history_id=f"HIST-{event_id}",
+                event_id=event_id,
+                timestamp="2026-07-30T10:00:00+09:00",
+                category="MILESTONE",
+                project_id="PRJ_A",
+                role="COO",
+                summary="did work",
+                evidence=(),
+                filter_result=HistoryDecision.KEEP,
+            )
+            for event_id in event_ids
+        ]
+        (self.daily / f"{day.isoformat()}.md").write_text(
+            render_daily_markdown(day, candidates, "gen"), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _age(path, stamp):
+        os.utime(path, (stamp, stamp))
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c91", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _run(self):
+        return self._module()._monthly_lags_its_daily_source(
+            self.daily, self.monthly, dirty_months=()
+        )
+
+    # ---- the control: the hole is real and is found ----------------------
+
+    def test_the_hole_is_found_when_everything_is_readable(self):
+        """Without this the rest proves nothing: a detector that never fires
+        would satisfy every assertion below."""
+        lagging, skipped = self._run()
+
+        self.assertEqual(lagging, (("2026-07", ("E-LATE",)),))
+        self.assertEqual(skipped, 0)
+
+    # ---- the three reads C68 did not cover -------------------------------
+
+    def test_a_corrupt_daily_shortens_the_finding_and_is_counted(self):
+        """The one that returns a verdict for a month it did not fully read.
+
+        `source_ids` loses E-LATE, so `missing` is empty and the month looks
+        current. The count is the only thing standing between that and
+        "2026-07 is fine".
+        """
+        (self.daily / "2026-07-30.md").write_bytes(b'\xff\xfe\x00 not utf-8 \xff')
+        self._age(self.daily / "2026-07-30.md", 1_800_000_000)
+
+        lagging, skipped = self._run()
+
+        self.assertEqual(lagging, ())  # the finding is genuinely lost
+        self.assertEqual(skipped, 1)  # and the answer says so
+
+    def test_a_corrupt_monthly_is_counted(self):
+        (self.monthly / "2026-07.md").write_bytes(b'\xff\xfe\x00 not utf-8 \xff')
+        self._age(self.monthly / "2026-07.md", 1_700_000_000)
+
+        lagging, skipped = self._run()
+
+        self.assertEqual(lagging, ())
+        self.assertEqual(skipped, 1)
+
+    def test_a_monthly_that_cannot_be_stat_ed_is_counted(self):
+        """Injected: a real file does not refuse `stat()` on demand, exactly
+        as `ADetectorSaysWhatItCouldNotCheckTests` reasons about its own
+        junction probe."""
+        module = self._module()
+        real_stat = Path.stat
+
+        def refusing(self, *args, **kwargs):
+            if self.name == "2026-07.md":
+                raise PermissionError(13, "Access is denied")
+            return real_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", refusing):
+            lagging, skipped = module._monthly_lags_its_daily_source(
+                self.daily, self.monthly, dirty_months=()
+            )
+
+        self.assertEqual(lagging, ())
+        self.assertEqual(skipped, 1)
+
+    # ---- the asymmetry the count must not lose ---------------------------
+
+    def test_an_unconsolidated_month_is_not_a_skipped_check(self):
+        """C68's asymmetry, restated where it is now easiest to break: a
+        month with no Monthly file has nothing to lag behind. Counting it
+        would put a permanent caveat on every machine whose current month is
+        not closed yet."""
+        (self.monthly / "2026-07.md").unlink()
+
+        self.assertEqual(self._run(), ((), 0))
+
+    def test_a_day_with_no_history_is_not_a_skipped_check(self):
+        """`render_daily_markdown()` writes "No material company history
+        recorded." for a day with no candidates, and the parser reads it as
+        zero items rather than raising. If it raised, every ordinary quiet
+        day would count as a failed read -- which is the standing alarm this
+        file keeps removing."""
+        self._write_day(date(2026, 7, 28))  # no candidates at all
+        self._age(self.daily / "2026-07-28.md", 1_700_000_000)
+
+        lagging, skipped = self._run()
+
+        self.assertEqual(lagging, (("2026-07", ("E-LATE",)),))
+        self.assertEqual(skipped, 0)
+
+    # ---- the drift that hid it -------------------------------------------
+
+    def test_both_c68_detectors_declare_the_pair_they_return(self):
+        """C68 changed these functions to return `(result, skipped)` and left
+        their annotations describing the old single value. An annotation that
+        disagrees with the `return` is how a reader concludes there is no
+        count to check -- which is how three uncounted reads sat in the
+        middle of the one function that has a counter.
+
+        By AST rather than by text: the annotation is a nested type
+        expression, and matching it as a string is the mistake this session
+        has already corrected three times.
+        """
+        import ast
+
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        for name in ("_monthly_lags_its_daily_source", "_junctions_in_scope"):
+            with self.subTest(function=name):
+                node = functions[name]
+                self.assertIsNotNone(node.returns, f"{name} declares no return type")
+                self.assertIsInstance(node.returns, ast.Subscript)
+                elements = node.returns.slice.elts
+                self.assertEqual(len(elements), 2, f"{name} does not declare a pair")
+                self.assertEqual(ast.unparse(elements[1]), "int")
+
+                # ...and the function really does return two things.
+                returns = [
+                    child
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Return) and child.value is not None
+                ]
+                self.assertTrue(returns)
+                for statement in returns:
+                    self.assertIsInstance(statement.value, ast.Tuple)
+                    self.assertEqual(len(statement.value.elts), 2)
 
 
 class MonthlyLagsItsDailySourceTests(unittest.TestCase):
@@ -13288,6 +13744,1265 @@ class AnIdIsAlsoAuthoredTextTests(unittest.TestCase):
 
                 self.assertNotIn(self.SECRET, printed)
                 self.assertNotIn(self.SECRET, "\n".join(attention))
+
+class OneEventInTwoFilesIsOneLineTests(unittest.TestCase):
+    """Two ATTENTION lines in this view walked `processed/` file by file and
+    then showed the first five. `processed/` can hold two files for one
+    `event_id`.
+
+    That is not a corruption case. This view already reports it as
+    `중복 파일` in the COMPANY and CONTROL TOWER blocks, C51 settled how
+    those two should count ("위 숫자는 Event당 한 번만 센다"), and the
+    deployment runtime is in that state right now -- `dup-bypass.json` and
+    `f75edf1b-….json` are the same Event, so the real screen printed
+    `Event 16건` in two blocks and `Event 17건` in a third.
+
+    C51's sweep reached two of the four readers of that directory. These are
+    the other two, and on them the cost is not a disagreeing number:
+
+        orphan line   6 Events lost, 6 copies of one of them ->
+                      "Event 11건" and one id five times.
+                      EVT-REALLY-LOST-0..4 named **nowhere** on the page
+        secret line   6 leaked credentials, 6 copies of one ->
+                      "11건" and one id five times.
+                      Five live credentials named **nowhere**
+
+    Both lines end in an instruction about a thing rather than a file --
+    "사람이 확인해야 한다" and "자격증명을 **교체**해야 한다" -- so an
+    operator who follows them rotates one credential and leaves five live.
+    """
+
+    SECRET_PREFIX = "ntn_"
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c77", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _runtime(self, module):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in (
+            "events/transport", "events/incoming", "events/processed",
+            "events/rejected", "history_candidates/keep",
+            "history_candidates/review", "local_master/daily",
+            "local_master/monthly", "state", "locks", "runs", "logs",
+        ):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+        return module.RUNTIME_DIR
+
+    def _event(self, **overrides):
+        payload = {
+            "schema_version": "1.0",
+            "event_id": "E1",
+            "timestamp": "2026-08-09T10:00:00+09:00",
+            "source": "DESKTOP_2",
+            "role": "CMO",
+            "project_id": "PRJ",
+            "event_type": "MILESTONE_COMPLETED",
+            "status": "IN_PROGRESS",
+            "milestone": "M1",
+            "summary": "work",
+            "blocker": None,
+            "evidence": [],
+            "history_candidate": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    def _capture(self, block, now):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = block(now)
+        return buffer.getvalue(), list(attention or ())
+
+    def _crowded_processed(self, module, *, secret=False):
+        """One Event in six files, plus five genuinely different ones.
+
+        The duplicated id sorts first on purpose: the bug is that its copies
+        take every slot, and a fixture where it sorted last would pass
+        against the broken code.
+        """
+        runtime = self._runtime(module)
+        processed = runtime / "events" / "processed"
+
+        def payload(event_id, index):
+            extra = (
+                {"summary": f"deploy {self.SECRET_PREFIX}0123456789ab{index}"}
+                if secret else {}
+            )
+            return json.dumps(self._event(event_id=event_id, **extra))
+
+        duplicated = payload("EVT-AAA-DUPLICATED", 0)
+        for i in range(6):
+            (processed / f"aaa-copy-{i}.json").write_text(duplicated, encoding="utf-8")
+        for i in range(5):
+            (processed / f"zzz-{i}.json").write_text(
+                payload(f"EVT-REALLY-LOST-{i}", i + 1), encoding="utf-8"
+            )
+        return runtime
+
+    #: `2026-08-12`, after the fixture's Events, so nothing is future-dated.
+    NOW = datetime(2026, 8, 12, 9, 0)
+
+    def test_the_fixture_really_is_eleven_files_and_six_events(self):
+        """Guards the guard. Every assertion below is about the difference
+        between those two numbers, and a fixture that lost it would make them
+        all pass for the wrong reason."""
+        module = self._load_entrypoint()
+        runtime = self._crowded_processed(module)
+        processed = runtime / "events" / "processed"
+
+        files = sorted(processed.glob("*.json"))
+        ids = {json.loads(p.read_text(encoding="utf-8"))["event_id"] for p in files}
+
+        self.assertEqual(len(files), 11)
+        self.assertEqual(len(ids), 6)
+
+    def test_every_lost_event_gets_a_line_of_its_own(self):
+        """The orphan block. Five slots, five **different** Events."""
+        module = self._load_entrypoint()
+        self._crowded_processed(module)
+
+        printed, attention = self._capture(
+            module._print_history, self.NOW.astimezone()
+        )
+
+        listed = [
+            line.split("!")[1].split("[")[0].strip()
+            for line in printed.splitlines()
+            if line.strip().startswith("!")
+        ]
+        self.assertEqual(
+            len(listed), len(set(listed)),
+            f"the same Event is listed more than once: {listed}",
+        )
+        self.assertIn("EVT-AAA-DUPLICATED", listed)
+        self.assertTrue(
+            any(name.startswith("EVT-REALLY-LOST") for name in listed),
+            f"a genuinely lost Event was crowded out by copies of another: {listed}",
+        )
+
+    def test_the_orphan_alert_counts_events_and_still_shows_the_files(self):
+        module = self._load_entrypoint()
+        self._crowded_processed(module)
+
+        printed, attention = self._capture(
+            module._print_history, self.NOW.astimezone()
+        )
+        line = next(item for item in attention if "History에 들어가지 못한" in item)
+
+        self.assertIn("Event 6건", line)
+        self.assertIn("파일 11건", line, "the file count must stay visible")
+        self.assertNotIn("Event 11건", line)
+        self.assertIn("EVT-REALLY-LOST", line)
+
+    def test_the_coverage_count_says_files_because_that_is_what_it_counts(self):
+        """`checked` is `len(paths)`. The COMPANY and CONTROL TOWER blocks
+        print `Event N건` meaning distinct Events, so this line calling the
+        file count `Event` put two meanings of one word on one screen --
+        differing by exactly the duplicate count."""
+        module = self._load_entrypoint()
+        self._crowded_processed(module)
+
+        printed, _ = self._capture(module._print_history, self.NOW.astimezone())
+        line = next(l for l in printed.splitlines() if "Candidate 정합성" in l)
+
+        self.assertIn("파일 11건 확인", line)
+        self.assertNotIn("Event 11건", line)
+
+    def test_every_leaked_credential_gets_a_slot(self):
+        """The security half, and the reason it is the worse of the two: the
+        alert's own instruction is to **rotate** the credential."""
+        module = self._load_entrypoint()
+        self._crowded_processed(module, secret=True)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module.main()
+        text = buffer.getvalue()
+        line = next(
+            (l for l in text.splitlines() if "Secret 형태의 문자열" in l), ""
+        )
+
+        self.assertTrue(line, "the secret alert did not fire at all")
+        self.assertIn("문자열 6건", line)
+        self.assertIn("파일 11건", line)
+        self.assertIn("EVT-REALLY-LOST", line)
+        self.assertEqual(
+            line.count("EVT-AAA-DUPLICATED"), 1,
+            "one credential, named once",
+        )
+
+    def test_nothing_is_added_when_there_are_no_duplicates(self):
+        """The qualifier has to mean something. A line that always carried
+        "파일 N건" would be noise, and a reader would stop reading it."""
+        module = self._load_entrypoint()
+        runtime = self._runtime(module)
+        for i in range(3):
+            (runtime / "events" / "processed" / f"e{i}.json").write_text(
+                json.dumps(self._event(event_id=f"EVT-{i}")), encoding="utf-8"
+            )
+
+        printed, attention = self._capture(
+            module._print_history, self.NOW.astimezone()
+        )
+        line = next(item for item in attention if "History에 들어가지 못한" in item)
+
+        self.assertIn("Event 3건", line)
+        self.assertNotIn("파일", line)
+        self.assertIn("파일 3건 확인", printed)
+
+    def test_the_fold_keeps_the_first_of_each_and_the_order(self):
+        """`_one_per_event()` on its own. Order is the operator-visible part
+        -- the list is truncated at five, so a fold that reordered would
+        change which Events are shown."""
+        module = self._load_entrypoint()
+        rows = [("a", 1), ("b", 2), ("a", 3), ("c", 4), ("b", 5)]
+
+        folded = module._one_per_event(rows, lambda row: row[0])
+
+        self.assertEqual(folded, [("a", 1), ("b", 2), ("c", 4)])
+        self.assertEqual(module._one_per_event([], lambda row: row), [])
+
+
+
+class ASignalWrittenAfterItsDateClosedIsCountedTests(unittest.TestCase):
+    """C95. The other half of the class below, and this one needs no
+    mistake by anybody.
+
+    `ASignalNoDateWillEverReadIsCountedTests` is about a Signal filed where
+    no target date will look: the top level, an unpadded date, a name that
+    is not a date. Every case there starts with somebody typing the path
+    wrong.
+
+    This one starts with nothing wrong at all. `catchup.pending_dates()`
+    ends at **yesterday** and never walks backwards (docs/07 section 50), so
+    the moment the watermark reaches a date, a Signal added to that date's
+    directory afterwards is never read again -- by any run, ever. The
+    directory name is right, the filename is right, the content is valid.
+
+    **Measured through the real entrypoint, `agent.run_once()`:**
+
+        08:00  the scheduled run collects 2026-08-23   watermark 2026-08-23
+        09:00  the person writes up the afternoon into
+               signals/2026-08-23/afternoon.json
+        09:00  run 2                 COMPLETED   delivered: still 1
+        +1 day / +2 days, 2 runs     COMPLETED   delivered: still 1
+
+        never delivered, never rejected, never named in the agent log
+        outbox_count 0   rejected_signal_count 0   unreachable_signal_count 0
+        pending_dates ()   needs_attention ()
+
+    Writing up yesterday after this morning's run is the shape of an
+    ordinary working day, and Signal authoring is by hand (BACKLOG A-11).
+    What is lost is something a person typed, and every diagnostic read
+    all-clear.
+
+    **Counted, not repaired.** Re-reading a closed date re-derives Events
+    the Collector has already seen, and `pending_dates()`' refusal to walk
+    backwards is a deliberate rule with its own reasons. What a late Signal
+    *means* is a decision (BACKLOG). That it is there is not.
+    """
+
+    def _agent_tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        agent = root / "agent"
+        for rel in ("signals", "signals_rejected", "outbox", "sent", "state"):
+            (agent / rel).mkdir(parents=True)
+        return agent
+
+    def _signal(self, path, summary="typed by a person"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "event_type": "MILESTONE_COMPLETED", "project_id": "PRJ",
+                "status": "IN_PROGRESS", "summary": summary,
+                "milestone": "M", "history_candidate": True,
+            }),
+            encoding="utf-8",
+        )
+        return path
+
+    def _mark_delivered(self, agent, day, stem, source="DESKTOP_1"):
+        """Through the same two functions the delivery path uses, so the
+        test cannot agree with a spelling production does not use (C28)."""
+        from agent.agent import derive_event_id
+        from agent.outbox import safe_event_filename
+
+        event_id = derive_event_id(source=source, target_date=day, signal_id=stem)
+        (agent / "sent" / safe_event_filename(event_id)).write_text(
+            "{}", encoding="utf-8"
+        )
+
+    def _count(self, agent, *, source="DESKTOP_1", collected_through=date(2026, 8, 23)):
+        from agent.status import _count_undelivered_signals_in_closed_dates
+
+        return _count_undelivered_signals_in_closed_dates(
+            agent / "signals",
+            agent / "sent",
+            source=source,
+            collected_through=collected_through,
+        )
+
+    # ---- the defect ------------------------------------------------------
+
+    def test_a_signal_added_after_its_date_closed_is_counted(self):
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-23" / "afternoon.json")
+
+        self.assertEqual(self._count(agent), 1)
+
+    def test_a_delivered_signal_on_the_same_closed_date_is_not_counted(self):
+        """The half that must not fire, and the reason the count is exact
+        rather than "how many files are still lying there": `load_signals()`
+        never moves a Signal, so a collected one stays on disk. Being in
+        `signals/` is normal; being in `signals/` *and* not in `sent/` is
+        not."""
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-23" / "standup.json")
+        self._mark_delivered(agent, date(2026, 8, 23), "standup")
+
+        self.assertEqual(self._count(agent), 0)
+
+    def test_both_at_once(self):
+        """The measured scenario: one collected, one written afterwards."""
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-23" / "standup.json")
+        self._mark_delivered(agent, date(2026, 8, 23), "standup")
+        self._signal(agent / "signals" / "2026-08-23" / "afternoon.json")
+
+        self.assertEqual(self._count(agent), 1)
+
+    # ---- what must NOT be counted ----------------------------------------
+
+    def test_a_date_the_watermark_has_not_reached_is_not_counted(self):
+        """Still pending -- the next run reads it. Counting it would put a
+        permanent alert on every machine that has today's Signals ready,
+        which is the standing alarm this file keeps removing."""
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-24" / "tomorrow.json")
+
+        self.assertEqual(self._count(agent), 0)
+
+    def test_a_first_ever_run_counts_nothing(self):
+        """No watermark means no date is closed. A machine that has never
+        collected must not report every Signal it is holding."""
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-23" / "s.json")
+
+        self.assertEqual(self._count(agent, collected_through=None), 0)
+
+    def test_an_unknown_desktop_id_counts_nothing(self):
+        """The id is half of `derive_event_id()`. Without it the predicate
+        would be guessing, and a guess here reports work as lost that is
+        sitting in `sent/` under a different id."""
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-23" / "s.json")
+
+        self.assertEqual(self._count(agent, source=None), 0)
+
+    def test_a_misfiled_signal_belongs_to_the_other_counter(self):
+        """The two counters partition the problem rather than overlap it.
+
+        A `*.json` outside a valid date directory is
+        `_count_unreachable_signals()`' subject, and reporting it twice
+        would be the second opinion this project keeps removing (C28).
+
+        The directories are C84's own catalogue, and they are the input that
+        makes `_is_date_directory_name()` load-bearing rather than tidy:
+        without it this function reaches `date.fromisoformat("august-21")`
+        and raises. A first draft of this test used a top-level *file*,
+        which the `is_dir()` branch already skips -- so a mutation deleting
+        the filter passed. That is what the mutation matrix is for.
+        """
+        from agent.status import _count_unreachable_signals
+
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "toplevel.json")
+        self._signal(agent / "signals" / "august-21" / "s.json")
+        self._signal(agent / "signals" / "2026-8-21" / "s.json")
+
+        self.assertEqual(self._count(agent), 0)
+        self.assertEqual(_count_unreachable_signals(agent / "signals"), 3)
+
+    # ---- through the real entrypoint -------------------------------------
+
+    def test_the_real_agent_loses_it_and_the_counter_sees_it(self):
+        """End to end, with `agent.run_once()` and a real transport.
+
+        The assertion that matters is the pair: the Agent reports COMPLETED
+        every time and the Signal is never delivered.
+        """
+        from agent.agent import run_once
+        from agent.state import load_state
+        from transport.onedrive import OneDriveTransport
+
+        agent = self._agent_tree()
+        root = agent.parent
+        kw = dict(
+            signals_dir=agent / "signals",
+            rejected_signals_dir=agent / "signals_rejected",
+            outbox_dir=agent / "outbox",
+            sent_dir=agent / "sent",
+            state_path=agent / "state" / "agent_state.json",
+            lock_path=root / "locks" / "agent.lock",
+            log_path=root / "logs" / "agent.log",
+        )
+        yesterday = date(2026, 8, 23)
+        morning = datetime(2026, 8, 24, 8, 0).astimezone()
+        transport = OneDriveTransport(root / "sync")
+
+        self._signal(agent / "signals" / "2026-08-23" / "standup.json", "shipped it")
+        first = run_once(transport=transport, agent_start_date=yesterday,
+                         profile="DESKTOP_1", now=morning, **kw)
+        self.assertEqual(first.status.value, "COMPLETED")
+        self.assertEqual(len(list((agent / "sent").glob("*.json"))), 1)
+
+        # ...and now the person writes up the afternoon.
+        self._signal(agent / "signals" / "2026-08-23" / "afternoon.json", "closed it")
+        for extra in range(3):
+            later = run_once(
+                transport=transport, agent_start_date=yesterday,
+                profile="DESKTOP_1", now=morning + timedelta(days=extra), **kw
+            )
+            self.assertEqual(later.status.value, "COMPLETED")
+
+        # Never delivered, by three more runs that all reported success.
+        self.assertEqual(len(list((agent / "sent").glob("*.json"))), 1)
+        self.assertFalse(list((agent / "signals_rejected").rglob("*.json")))
+        self.assertNotIn(
+            "afternoon", (root / "logs" / "agent.log").read_text(encoding="utf-8")
+        )
+
+        watermark = load_state(kw["state_path"]).last_successful_collection_date
+        self.assertEqual(
+            self._count(agent, collected_through=watermark),
+            1,
+            "the one thing that noticed",
+        )
+
+    def test_the_snapshot_carries_it_and_the_old_fields_still_read_clear(self):
+        """The whole point: every other field says all-clear. If any of them
+        had reported this, the counter would be a second opinion."""
+        from agent.status import read_status
+
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-23" / "afternoon.json")
+        (agent / "state" / "agent_state.json").write_text(
+            json.dumps({
+                "desktop_id": "DESKTOP_1",
+                "last_successful_collection_date": "2026-08-23",
+                "last_run": "2026-08-24T08:00:00+09:00",
+            }),
+            encoding="utf-8",
+        )
+
+        snapshot = read_status(
+            agent_start_date=date(2026, 8, 23),
+            now=datetime(2026, 8, 24, 9, 0).astimezone(),
+            state_path=agent / "state" / "agent_state.json",
+            outbox_dir=agent / "outbox",
+            sent_dir=agent / "sent",
+            rejected_signals_dir=agent / "signals_rejected",
+            signals_dir=agent / "signals",
+        )
+
+        self.assertEqual(snapshot.undelivered_closed_signal_count, 1)
+        self.assertEqual(snapshot.outbox_count, 0)
+        self.assertEqual(snapshot.rejected_signal_count, 0)
+        self.assertEqual(snapshot.unreachable_signal_count, 0)
+        self.assertEqual(snapshot.pending_dates, ())
+
+    def test_the_operator_screen_prints_it_and_raises_attention(self):
+        """A count that is computed and never shown is not a detector.
+
+        C84's sibling test states the rule; C90's M4a/M4b mutations are why
+        both halves are pinned here -- the line and the ATTENTION entry can
+        be lost independently, and each of them alone is the whole fix.
+        """
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c95", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in ("agent/signals", "agent/signals_rejected", "agent/outbox",
+                    "agent/sent", "agent/state", "state", "logs", "runs",
+                    "locks", "local_master/daily", "events/processed"):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+        agent = module.RUNTIME_DIR / "agent"
+        (agent / "state" / "agent_state.json").write_text(
+            json.dumps({
+                "desktop_id": "DESKTOP_1",
+                "last_successful_collection_date": "2026-08-23",
+                "last_run": "2026-08-24T08:00:00+09:00",
+            }),
+            encoding="utf-8",
+        )
+        now = datetime(2026, 8, 24, 9, 0).astimezone()
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            clean = list(module._print_agent(now) or ())
+        self.assertIn("\uc9c0\ub09c \ub0a0\uc9dc\uc758 \ubbf8\uc804\ub2ec  : 0", buffer.getvalue())
+        self.assertFalse(
+            [item for item in clean if "\ubbf8\uc804\ub2ec Signal" in item],
+            "a clean tree raised the alert",
+        )
+
+        self._signal(agent / "signals" / "2026-08-23" / "afternoon.json")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            dirty = list(module._print_agent(now) or ())
+
+        self.assertIn("\uc9c0\ub09c \ub0a0\uc9dc\uc758 \ubbf8\uc804\ub2ec  : 1", buffer.getvalue())
+        alert = [item for item in dirty if "\ubbf8\uc804\ub2ec Signal" in item]
+        self.assertEqual(len(alert), 1, dirty)
+        # It has to say what to do, not only that something is wrong.
+        self.assertIn("\uc218\uc9d1\ub418\uc9c0 \uc54a\uc740 \ub0a0\uc9dc", alert[0])
+
+
+class TheDeliveredSetIsTheSameQuestionIsSentAsksTests(unittest.TestCase):
+    """C101. The counter batches `sent/`, and this is what keeps that honest.
+
+    `_count_undelivered_signals_in_closed_dates()` asked
+    `outbox.is_sent(event_id, sent_dir)` once per Signal, which is one
+    `is_file()` each. Measured on this machine, warm:
+
+        signals    per-Signal is_sent    one directory listing
+            200          5.9 ms                 2.6 ms
+          1,000         27.9 ms                13.0 ms
+          5,000        139.1 ms                59.1 ms
+         20,000        559.5 ms               243.6 ms
+
+    28 us per Signal down to 12 -- on a script whose premise is that a
+    person runs it first, casually, and whose whole run is ~230 ms on a
+    healthy tree. At three years of Signals the old form was 140 ms of that
+    by itself.
+
+    **Batching a predicate is how a second opinion gets made** (C28), so the
+    two halves are pinned here rather than assumed:
+
+      * the *name* still comes from `safe_event_filename()`, the function
+        `is_sent()` itself calls -- not from a copy of its rule;
+      * `is_file()` is still the test, not `exists()`. `is_sent()`'s own
+        docstring records the measurement behind that: a **directory**
+        carrying an Event's name made it answer True, which is the Agent
+        declining to send an Event it never sent. A set built from a bare
+        `scandir` would have re-introduced exactly that.
+
+    If `is_sent()` ever becomes more than "the file named
+    `safe_event_filename(event_id)` exists", the first test below fails and
+    points at this counter.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.signals = self.root / "signals"
+        self.sent = self.root / "sent"
+        self.signals.mkdir()
+        self.sent.mkdir()
+        self.day = date(2026, 8, 23)
+
+    def _signal(self, stem):
+        directory = self.signals / self.day.isoformat()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{stem}.json").write_text(
+            json.dumps({
+                "event_type": "MILESTONE_COMPLETED", "project_id": "PRJ",
+                "status": "IN_PROGRESS", "summary": "typed by a person",
+                "milestone": "M", "history_candidate": True,
+            }),
+            encoding="utf-8",
+        )
+
+    def _filename_for(self, stem):
+        from agent.agent import derive_event_id
+        from agent.outbox import safe_event_filename
+
+        return safe_event_filename(
+            derive_event_id(source="DESKTOP_1", target_date=self.day, signal_id=stem)
+        )
+
+    def _count(self):
+        from agent.status import _count_undelivered_signals_in_closed_dates
+
+        return _count_undelivered_signals_in_closed_dates(
+            self.signals, self.sent, source="DESKTOP_1", collected_through=self.day
+        )
+
+    def test_is_sent_is_still_only_that_file_existing(self):
+        """The coupling, stated as behaviour rather than as a hope."""
+        from agent.outbox import is_sent
+        from agent.agent import derive_event_id
+
+        event_id = derive_event_id(
+            source="DESKTOP_1", target_date=self.day, signal_id="s"
+        )
+        self.assertFalse(is_sent(event_id, self.sent))
+
+        (self.sent / self._filename_for("s")).write_text("{}", encoding="utf-8")
+
+        self.assertTrue(is_sent(event_id, self.sent))
+
+    def test_the_batched_set_agrees_with_is_sent_on_a_delivered_signal(self):
+        self._signal("s")
+        self.assertEqual(self._count(), 1)
+
+        (self.sent / self._filename_for("s")).write_text("{}", encoding="utf-8")
+
+        self.assertEqual(self._count(), 0)
+
+    def test_a_directory_wearing_the_name_is_not_a_delivery(self):
+        """The measurement `is_sent()`'s docstring carries, applied to the
+        batched form. A set built from a bare `scandir` would call this
+        delivered and the lost Signal would go unreported."""
+        from agent.outbox import is_sent
+        from agent.agent import derive_event_id
+
+        self._signal("s")
+        (self.sent / self._filename_for("s")).mkdir()
+
+        self.assertFalse(
+            is_sent(
+                derive_event_id(
+                    source="DESKTOP_1", target_date=self.day, signal_id="s"
+                ),
+                self.sent,
+            )
+        )
+        self.assertEqual(self._count(), 1, "a directory counted as a delivery")
+
+    def test_an_absent_sent_directory_means_nothing_was_delivered(self):
+        """A fact, not a failure -- on a machine that has never delivered,
+        every closed-date Signal really is undelivered."""
+        self._signal("s")
+        self.sent.rmdir()
+
+        self.assertEqual(self._count(), 1)
+
+    def test_an_entry_that_cannot_be_stat_ed_is_not_a_delivery(self):
+        """A refusal is not evidence. Treating an unstat-able entry as a
+        delivered Event would hide the lost Signal it is named after, which
+        is the one direction this family of counters must never fail in.
+
+        Injected: a real `DirEntry` does not refuse `is_file()` on demand,
+        the same reasoning `ADetectorSaysWhatItCouldNotCheckTests` gives for
+        its junction probe.
+        """
+        import agent.status as status_module
+
+        self._signal("s")
+        (self.sent / self._filename_for("s")).write_text("{}", encoding="utf-8")
+        self.assertEqual(self._count(), 0)  # control: it IS delivered
+
+        real = os.scandir
+
+        class Refusing:
+            def __init__(self, entry):
+                self.name = entry.name
+
+            def is_file(self, *args, **kwargs):
+                raise PermissionError(13, "Access is denied")
+
+        class RefusingScandir:
+            def __init__(self, entries):
+                self._entries = iter(entries)
+
+            def __iter__(self):
+                return self._entries
+
+            def __next__(self):
+                return next(self._entries)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def close(self):
+                return None
+
+        def wrap(path, *args, **kwargs):
+            if Path(path) == self.sent:
+                return RefusingScandir([Refusing(e) for e in real(path)])
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(status_module.os, "scandir", wrap):
+            self.assertEqual(
+                self._count(), 1, "an entry that refused counted as delivered"
+            )
+
+    def test_the_name_comes_from_the_namer_rather_than_a_copy(self):
+        """Structural on purpose, and the mutation matrix is why.
+
+        Every `event_id` this counter sees is a uuid5 from
+        `derive_event_id()`, and `safe_event_filename()` is a no-op on those
+        -- so a mutation replacing the call with `f"{event_id}.json"` passes
+        every behavioural test here, because no input can tell them apart.
+        The claim is not about a value this can produce; it is that the
+        counter asks the **namer** rather than restating its rule, so a
+        namer that starts shortening or escaping is followed rather than
+        drifted from (C28).
+        """
+        import ast
+        import inspect
+
+        import agent.status as status_module
+
+        source = inspect.getsource(
+            status_module._count_undelivered_signals_in_closed_dates
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(ast.parse(source.lstrip()))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+
+        self.assertIn("safe_event_filename", called)
+        self.assertIn("derive_event_id", called)
+
+    def test_a_sent_directory_that_cannot_be_listed_makes_no_claim(self):
+        """The other half. Reporting every Signal would be a false alarm the
+        size of the tree; reporting none says nothing, which is the honest
+        answer to "I could not look"."""
+        import agent.status as status_module
+
+        self._signal("s")
+        real = os.scandir
+
+        def refusing(path, *args, **kwargs):
+            if Path(path) == self.sent:
+                raise PermissionError(13, "Access is denied")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(status_module.os, "scandir", refusing):
+            self.assertEqual(self._count(), 0)
+
+
+class ASignalNoDateWillEverReadIsCountedTests(unittest.TestCase):
+    """`load_signals()` reads exactly `signals/<YYYY-MM-DD>/*.json`. A Signal
+    filed anywhere else under `signals/` is not queued — it is unreachable.
+
+    **Measured with the real entrypoint (C84).** The same Signal content
+    filed four ways, one `run_agent.py` run:
+
+        signals/2026-08-21/s.json   COLLECTED, delivered to the sync folder
+        signals/toplevel.json       never read
+        signals/2026-8-21/s.json    never read   (unpadded month/day)
+        signals/august-21/s.json    never read
+
+    The three that were never read were **not moved, not rejected, not
+    logged**. The run printed `COMPLETED` and exited 0, and
+    `last_successful_collection_date` advanced to 2026-08-23 — *past* the
+    date the work belonged to — so no later run reconsiders it. Every field
+    of the Agent snapshot said all-clear: `rejected_signal_count=0`,
+    `outbox_count=0`, `pending_dates=()`.
+
+    What is lost is something a person typed. Signal authoring is not
+    automated (BACKLOG A-11), so filing one a directory too high is the
+    ordinary mistake rather than an exotic one.
+
+    **This class is about the count, not about a repair.** Collecting such a
+    file, or moving it to `signals_rejected/`, decides what a misfiled Signal
+    *means*, and that is a decision. Counting it is the move C19's
+    `is_locked`, C22's review counter, C23's stale lock and C24's
+    `name_collision` all made.
+
+    **And it is not the `pending_signals` count `agent/status.py` refuses.**
+    That refusal is about *parsing* every Signal to judge validity, which is
+    the Agent's job. This is a directory listing: nothing is opened.
+    """
+
+    def _agent_tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        agent = root / "agent"
+        for rel in ("signals", "signals_rejected", "outbox", "sent", "state"):
+            (agent / rel).mkdir(parents=True)
+        return agent
+
+    @staticmethod
+    def _signal(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "event_type": "MILESTONE_COMPLETED", "project_id": "PRJ",
+                "status": "IN_PROGRESS", "summary": "typed by a person",
+                "milestone": "M", "history_candidate": True,
+            }),
+            encoding="utf-8",
+        )
+
+    def _count(self, agent):
+        from agent.status import _count_unreachable_signals
+
+        return _count_unreachable_signals(agent / "signals")
+
+    def test_a_correctly_filed_signal_is_not_counted(self):
+        """The half that must not fire. `load_signals()` is deliberately
+        side-effect free and never moves a Signal, so a collected one stays
+        on disk — "still in `signals/`" is normal, and only the unreachable
+        *location* is the signal."""
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "2026-08-21" / "s.json")
+
+        self.assertEqual(self._count(agent), 0)
+
+    def test_each_way_of_filing_it_out_of_reach_is_counted(self):
+        agent = self._agent_tree()
+        cases = {
+            "top level": agent / "signals" / "toplevel.json",
+            "unpadded date": agent / "signals" / "2026-8-21" / "s.json",
+            "not a date": agent / "signals" / "august-21" / "s.json",
+            "nested below a date": agent / "signals" / "2026-08-21" / "sub" / "s.json",
+        }
+        for label, path in cases.items():
+            with self.subTest(filed=label):
+                self._signal(path)
+                self.assertEqual(
+                    self._count(agent), 1,
+                    f"a Signal filed {label} is unreachable and was not counted",
+                )
+                path.unlink()
+
+    def test_a_date_shaped_name_the_agent_never_builds_is_still_unreachable(self):
+        """`date.fromisoformat()` alone is too generous: on this interpreter
+        it accepts `20260821` and `2026-W34-5`. `load_signals()` builds the
+        directory it reads with `target_date.isoformat()`, which is always
+        `YYYY-MM-DD`, so the round trip is the test rather than the parse."""
+        from agent.status import _is_date_directory_name
+
+        for name in ("2026-08-21",):
+            with self.subTest(name=name):
+                self.assertTrue(_is_date_directory_name(name))
+        for name in ("20260821", "2026-W34-5", "2026-8-21", "august-21", ""):
+            with self.subTest(name=name):
+                self.assertFalse(_is_date_directory_name(name))
+
+    def test_a_missing_or_unreadable_signals_directory_answers_zero(self):
+        """A read-only diagnostic must not become the thing that fails.
+
+        **The injection has to hit what the implementation calls (C87).** The
+        first version of this test patched `Path.rglob`, which is what C84's
+        counter used. C87 rewrote the counter on `os.scandir` for cost, and
+        this test kept passing — over a tree with nothing in it, so 0 was
+        the honest answer and the error path was never entered. A patched
+        function nobody calls is the same vacuous pass as an empty scan.
+
+        So the tree now holds an unreachable Signal, which makes 0 the *wrong*
+        answer unless the failure is handled, and the patch is on `os.scandir`.
+        """
+        import os as os_module
+
+        from agent import status as status_module
+        from agent.status import _count_unreachable_signals
+
+        agent = self._agent_tree()
+        self.assertEqual(_count_unreachable_signals(agent / "nope"), 0)
+
+        # With this file present, a working scan answers 1 -- so a 0 below can
+        # only come from the error path, not from an empty directory.
+        self._signal(agent / "signals" / "toplevel.json")
+        self.assertEqual(_count_unreachable_signals(agent / "signals"), 1)
+
+        real = status_module.os.scandir
+
+        def boom(*args, **kwargs):
+            raise PermissionError(13, "Access is denied")
+
+        status_module.os = type(
+            "_os", (), {"scandir": staticmethod(boom)}
+        )()
+        try:
+            self.assertEqual(_count_unreachable_signals(agent / "signals"), 0)
+        finally:
+            status_module.os = os_module
+        # and it still works afterwards, so the patch really was the cause
+        self.assertEqual(_count_unreachable_signals(agent / "signals"), 1)
+
+    def test_the_snapshot_carries_it_and_defaults_to_zero(self):
+        """The field is defaulted so a caller that does not pass
+        `signals_dir` keeps working rather than raising."""
+        from agent.status import read_status
+
+        agent = self._agent_tree()
+        self._signal(agent / "signals" / "toplevel.json")
+
+        without = read_status(
+            state_path=agent / "state" / "agent_state.json",
+            outbox_dir=agent / "outbox",
+            sent_dir=agent / "sent",
+            rejected_signals_dir=agent / "signals_rejected",
+            signals_dir=agent / "signals",
+        )
+        self.assertEqual(without.unreachable_signal_count, 1)
+
+    def test_the_operator_screen_prints_it_and_raises_attention(self):
+        """The whole point: the number has to reach the screen an operator
+        reads first (AGENT.md), and a non-zero one has to reach ATTENTION."""
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c84", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in ("agent/signals", "agent/signals_rejected", "agent/outbox",
+                    "agent/sent", "agent/state", "state", "logs", "runs",
+                    "locks", "local_master/daily", "events/processed"):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+
+        now = datetime(2026, 8, 24, 9, 0).astimezone()
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            clean = list(module._print_agent(now) or ())
+        self.assertIn("읽힐 수 없는 Signal : 0", buffer.getvalue())
+        self.assertFalse(
+            [item for item in clean if "수집되지 않는 Signal" in item],
+            "a clean tree raised the alert",
+        )
+
+        self._signal(module.RUNTIME_DIR / "agent" / "signals" / "toplevel.json")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            dirty = list(module._print_agent(now) or ())
+        self.assertIn("읽힐 수 없는 Signal : 1", buffer.getvalue())
+        alert = [item for item in dirty if "수집되지 않는 Signal" in item]
+        self.assertEqual(len(alert), 1, dirty)
+        self.assertIn("signals/<YYYY-MM-DD>", alert[0])
+
+
+
+class TheDecisionContextAlertDoesNotStopAtTheReassuringHalfTests(unittest.TestCase):
+    """The alert for reviewed-but-unrendered Decision Context used to end
+    "유실은 아니지만" — *not lost, but*.
+
+    Every word of that was true and it was the reassuring half. The content
+    sits in `runtime/history_candidates/keep/`, which is:
+
+        a **sibling** of the backup source (`runtime/local_master/`), so no
+        Backup scope setting reaches it — docs/08 sections 26-28 sync
+        `daily/` and `monthly/` and never mention `history_candidates/`
+
+        under `runtime/`, which `.gitignore` excludes, so the repository does
+        not carry it either
+
+    A-14's own table records both rows. So this is one copy on one machine:
+    not lost, and not the same as safe. README RULE 11/12 calls Decision
+    Context the company's most important asset, and an operator reading
+    "유실은 아니다" has been told to stop worrying about it.
+
+    C85 changed no behaviour. The repair is A-14's, every route to it needs a
+    decision, and this is the same restraint the alert already practises —
+    it says what is true and asks for nothing. What changed is that it now
+    says all of what is true.
+    """
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c85", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_two_locations_really_are_out_of_reach(self):
+        """The premise, checked rather than asserted — if either of these
+        ever becomes false, the alert's new half is the thing that is wrong.
+        """
+        repo = Path(__file__).resolve().parents[1]
+
+        gitignore = (repo / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("runtime/", gitignore.split())
+
+        spec = (repo / "docs" / "08_BACKUP_SPEC.md").read_text(encoding="utf-8")
+        self.assertNotIn("history_candidates", spec)
+
+        module = self._module()
+        candidates = module.RUNTIME_DIR / "history_candidates"
+        local_master = module.RUNTIME_DIR / "local_master"
+        self.assertEqual(candidates.parent, local_master.parent,
+                         "they are siblings; neither contains the other")
+        self.assertFalse(
+            str(candidates).startswith(str(local_master)),
+            "a Backup rooted at local_master cannot reach the Candidates",
+        )
+
+    def test_the_alert_says_it_is_neither_backed_up_nor_in_the_repository(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "ops_status.py"
+        ).read_text(encoding="utf-8")
+        start = source.index("사람이 입력한 Decision Context")
+        alert = source[start:start + 1200]
+
+        self.assertIn("Backup 대상도 아니고", alert)
+        self.assertIn(".gitignore", alert)
+        self.assertIn("A-14", alert)
+
+    def test_it_no_longer_says_plainly_that_nothing_is_lost(self):
+        """The exact clause that was doing the reassuring. Pinned as an
+        absence, because a future edit that shortens the sentence would
+        most naturally shorten it back to this."""
+        source = (
+            Path(__file__).resolve().parents[1] / "ops_status.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("유실은 아니지만", source)
+
+    def test_the_alert_still_fires_and_still_asks_for_nothing(self):
+        """Behaviour is unchanged: same trigger, same restraint. Driven
+        through the real block so the wording under test is the wording an
+        operator gets.
+
+        The Candidate is written by the real repository and reviewed by the
+        real reviewer rather than hand-built as JSON — a first draft wrote
+        the file by hand, got the shape wrong, and the view reported it as an
+        *unreadable* Candidate instead. A fixture the production loader
+        rejects tests the wrong branch.
+        """
+        from events import create_event
+        from history import FileHistoryRepository, HistoryFilter
+        from history.review import RepositoryHistoryReviewer
+
+        module = self._module()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in ("events/processed", "history_candidates/keep",
+                    "history_candidates/review", "local_master/daily",
+                    "local_master/monthly", "state", "logs", "runs", "locks"):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+
+        keep_dir = module.RUNTIME_DIR / "history_candidates" / "keep"
+        review_dir = module.RUNTIME_DIR / "history_candidates" / "review"
+        repository = FileHistoryRepository(keep_dir=keep_dir, review_dir=review_dir)
+
+        event = create_event(
+            source="DESKTOP_1", role="CTO_BACKEND", project_id="PRJ",
+            event_type="MILESTONE_COMPLETED", status="IN_PROGRESS",
+            summary="s", milestone="M",
+            timestamp="2026-08-05T10:00:00+09:00", history_candidate=True,
+        )
+        candidate = HistoryFilter().evaluate(event).candidate
+        repository.save(candidate)
+        RepositoryHistoryReviewer(repository).submit_review(
+            candidate.history_id, decision_context="why we chose this"
+        )
+
+        # The day is already rendered and already carries the event_id —
+        # which is exactly what makes the review unreachable.
+        (module.RUNTIME_DIR / "local_master" / "daily" / "2026-08-05.md").write_text(
+            f"# 2026-08-05\n\n- Event ID: {event.event_id}\n", encoding="utf-8"
+        )
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = list(
+                module._print_history(datetime(2026, 8, 12, 9, 0).astimezone()) or ()
+            )
+
+        alert = [item for item in attention if "Decision Context" in item]
+        self.assertEqual(len(alert), 1, attention)
+        self.assertIn("Backup 대상도 아니고", alert[0])
+        self.assertIn("검토 미반영", buffer.getvalue())
+
+
+class TwoProjectsUnderOneHistoryHeadingTests(unittest.TestCase):
+    """`daily/markdown._display_project_name()` is `.replace("_", " ").title()`
+    and it is not injective.
+
+    **Measured end to end (C90).** Three Events, one per spelling of the same
+    name, one day:
+
+        Events written              3 distinct project_id
+        Control Tower / PROJECTS    3 projects
+        Company History             3 sections, all `### Prj Alpha`
+        Monthly parser              3 items, **1 distinct project**
+
+    No Event is lost — each is in the Daily file under its own
+    `Event ID:` line. What diverges is a number the COO reads: the Control
+    Tower says three projects moved and Monthly History says one, about the
+    same month.
+
+    **More reachable than E-22.** That entry's `event_id` collision is
+    narrowed by construction — the Agent derives `event_id` as a lowercase
+    uuid5 and `FORBIDDEN_SIGNAL_FIELDS` stops a Signal from setting it.
+    `project_id` has no such narrowing: a person types it on every Signal.
+
+    **Detection only.** Making the transform injective rewrites every
+    heading in existing Company History, and keying Monthly on something
+    else changes what the Daily document carries (docs/06's format). Both
+    are decisions. This class pins the report.
+    """
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_c90", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _runtime(self, module):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        for rel in ("events/processed", "history_candidates/keep",
+                    "history_candidates/review", "local_master/daily",
+                    "local_master/monthly", "state", "logs", "runs", "locks"):
+            (module.RUNTIME_DIR / rel).mkdir(parents=True)
+        return module.RUNTIME_DIR
+
+    @staticmethod
+    def _event(runtime, event_id, project_id):
+        (runtime / "events" / "processed" / f"{event_id}.json").write_text(
+            json.dumps({
+                "schema_version": "1.0", "event_id": event_id,
+                "timestamp": "2026-08-18T10:00:00+09:00",
+                "source": "DESKTOP_1", "role": "CTO_BACKEND",
+                "project_id": project_id,
+                "event_type": "MILESTONE_COMPLETED", "status": "IN_PROGRESS",
+                "summary": "s", "milestone": "M", "blocker": None,
+                "evidence": [], "history_candidate": True,
+            }),
+            encoding="utf-8",
+        )
+
+    NOW = datetime(2026, 8, 19, 9, 0)
+
+    def _render(self, module):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = list(
+                module._print_control_tower(self.NOW.astimezone()) or ()
+            )
+        return buffer.getvalue(), attention
+
+    def test_the_transform_really_is_not_injective(self):
+        """The premise, taken from the renderer rather than restated. If
+        `_display_project_name` ever becomes injective this fails, and the
+        report below should go with it."""
+        from daily.markdown import _display_project_name
+
+        folded = {_display_project_name(p)
+                  for p in ("PRJ_ALPHA", "prj_alpha", "Prj_Alpha")}
+
+        self.assertEqual(len(folded), 1, folded)
+
+    def test_a_collision_is_named_on_the_screen_and_in_attention(self):
+        module = self._module()
+        runtime = self._runtime(module)
+        for event_id, project in (("E1", "PRJ_ALPHA"), ("E2", "prj_alpha"),
+                                  ("E3", "Prj_Alpha"), ("E4", "OTHER")):
+            self._event(runtime, event_id, project)
+
+        printed, attention = self._render(module)
+
+        self.assertIn("한 제목을 공유", printed)
+        alert = [item for item in attention if "한 제목" in item or "제목으로" in item]
+        self.assertEqual(len(alert), 1, attention)
+        for project in ("PRJ_ALPHA", "prj_alpha", "Prj_Alpha"):
+            with self.subTest(project_id=project):
+                self.assertIn(project, alert[0])
+        self.assertNotIn("OTHER", alert[0])
+
+    def test_nothing_is_said_when_every_heading_is_its_own(self):
+        """The qualifier has to mean something. Four ordinary project_ids
+        must produce no line at all."""
+        module = self._module()
+        runtime = self._runtime(module)
+        for event_id, project in (("E1", "ALPHA"), ("E2", "BETA"),
+                                  ("E3", "GAMMA"), ("E4", "DELTA")):
+            self._event(runtime, event_id, project)
+
+        printed, attention = self._render(module)
+
+        self.assertNotIn("한 제목을 공유", printed)
+        self.assertEqual(
+            [item for item in attention if "제목으로" in item], []
+        )
+
+    def test_the_underscore_half_is_covered_too(self):
+        """`.replace("_", " ")` folds as well as `.title()` does: `PRJ_A` and
+        `PRJ A` are two ids and one heading. Named because a reader who only
+        knows about case would not expect it."""
+        module = self._module()
+        runtime = self._runtime(module)
+        self._event(runtime, "E1", "PRJ_A")
+        self._event(runtime, "E2", "PRJ A")
+
+        printed, attention = self._render(module)
+
+        self.assertIn("한 제목을 공유", printed)
+
+    def test_the_grouping_is_by_heading_not_by_pairs(self):
+        """Three spellings are one group of three, not three pairs — the
+        count an operator reads has to be "3 ids, 1 heading"."""
+        module = self._module()
+        runtime = self._runtime(module)
+        for event_id, project in (("E1", "PRJ_ALPHA"), ("E2", "prj_alpha"),
+                                  ("E3", "Prj_Alpha")):
+            self._event(runtime, event_id, project)
+
+        printed, _attention = self._render(module)
+
+        self.assertIn("3개 project_id가 1개 제목으로", printed)
+
+    def test_the_detector_uses_the_renderers_own_transform(self):
+        """C28: one opinion about what Company History calls a project. A
+        second `.title()` in `ops_status.py` would drift from the renderer
+        the day the renderer changes."""
+        source = (
+            Path(__file__).resolve().parents[1] / "ops_status.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("_display_project_name", source)
+
+        # By AST, not by searching the text: the function's own docstring
+        # quotes `.title()` where it explains the fold, and a first draft of
+        # this assertion tripped on that prose. The claim is about what the
+        # code *calls* -- the same correction C86 and C88 already made to two
+        # other source-string assertions in this session.
+        import ast as ast_module
+
+        tree = ast_module.parse(source)
+        function = next(
+            node for node in ast_module.walk(tree)
+            if isinstance(node, ast_module.FunctionDef)
+            and node.name == "_projects_sharing_one_history_heading"
+        )
+        called = {
+            getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            for node in ast_module.walk(function)
+            if isinstance(node, ast_module.Call)
+        }
+
+        self.assertIn("_display_project_name", called)
+        self.assertNotIn("title", called)
+        self.assertNotIn("casefold", called)
+
+
 
 if __name__ == "__main__":
     unittest.main()

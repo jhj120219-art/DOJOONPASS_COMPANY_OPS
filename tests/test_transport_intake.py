@@ -90,10 +90,11 @@ class NotStableTests(IntakeTestCase):
         # function on `_NormalAccessor` at import time, so patching `os.stat`
         # there changes nothing and the file is promoted as though it had
         # stat'ed cleanly — the test failed while asserting the very
-        # behaviour it was written to protect. This project's interpreter is
-        # 3.9.7 (see
-        # `EveryTrackedModuleParsesOnThisInterpreterTests`). Patching the
-        # method the production code actually calls works on every version.
+        # behaviour it was written to protect. It was written on 3.9.7; the
+        # current runtime is 3.13.14 (BACKLOG D), where patching `os.stat`
+        # would happen to work. Patching the method the production code
+        # actually calls works on every version, which is why the move
+        # needed no edit here.
         real_stat = Path.stat
         blocked = str(path)
 
