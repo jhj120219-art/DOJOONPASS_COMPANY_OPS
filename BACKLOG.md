@@ -7,6 +7,522 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
+마지막 갱신: 2026-08-25 (C91 — **Notion 실패 경로와 10k 규모를 실측했다. 결함 0건, 코드 변경 0줄.**
+지시된 우선 조사 영역 중 아직 재현으로 확인하지 않은 둘을 닫았다.
+
+**#5 — Notion 동기화 실패가 '정상'으로 보이는가. 아니다.** 세 상태를 주입해 화면까지 따라갔다:
+
+    Retry Queue 손상        "손상된 Retry Queue" + ATTENTION (0건으로 조용히 넘어가지 않는다)
+    0.5일 묶인 항목         블록에 건수·재시도·최고령 표시, ATTENTION 없음 (큐가 존재하는 이유)
+    9일 묶인 항목           ATTENTION — event id·재시도 횟수·notion_sync.log를 지목
+
+또 `app/runner.py`가 `NOTION_RETRY_REQUIRED`와 `NOTION_FAILED`를 **둘 다** 큐에 넣는다(:592-594).
+영구 거부도 조용히 사라지지 않고 큐에 남아 3일 뒤 ATTENTION이 된다. **False OK 경로 없음.**
+
+**#10 — 10,000 Event 규모. 실제 브라우저에서 렌더된다.** 임시 트리에 probe Event 1만 개를 만들어
+8766에 띄우고 headless Chrome으로 렌더했다(실제 `runtime/`은 건드리지 않았고 끝나고 지웠다):
+
+    cold 첫 요청   10.96 s        warm 요청   3.50 / 3.50 / 3.51 s
+    페이지 크기    99.6 KB        패널 행     PROJECTS 40 / ACTIVITY 20 / COMPLETIONS 20
+
+**페이지 크기는 16건일 때(93 KB)와 사실상 같다** — 상한이 듣는다. 화면도 읽을 수 있다:
+ATTENTION의 "History에 못 들어간 Event 10000건"이 **이름 5개 + '외'로 잘려** 있다(C71의 상한이
+규모에서 실제로 작동한다). 그리고 헤더가 `3952ms에 생성`이라고 **비용을 말한다** — C78에서 그 표시를
+넣은 이유가 정확히 이 화면이다. 3.5초는 느리지만 숨겨지지 않는다.
+
+**#9 — 지금 이 순간의 Dashboard ↔ Notion 대조**: Project 4개, status 불일치 **0건**.
+Notion에만 있는 행 1개(`COMPANY_OPS_E2E_VERIFICATION`)는 과거 실행의 잔재이며 **지우지 않는다**.
+
+전체 회귀 **3872 passed, 8 skipped**. 코드 변경 없음 — 재현했고, 결함이 없었다.
+아래는 C90 기록이다.)
+
+마지막 갱신: 2026-08-25 (C90 — **Notion에 Control Tower가 실제로 올라갔다. 그리고 왜 15일이나 비어 있었는지가 나왔다.**
+
+**연결 실측.** `.env`에 자격증명이 있었다(값은 한 번도 출력하지 않았다 — 이름과 길이만 확인).
+읽기 전용부터: `health_check` ok=True, PROJECTS Database가 살아 있고 docs/04 §8의 **14개 속성**이
+전부 있다(`Project ID`, `Status`, `Owner`, `Current Milestone`, `Last Event ID`, `Last Updated` …).
+기존 행은 **2개**뿐이고 Dashboard는 Project **4개**를 보여주고 있었다 — 즉 **Notion이 15일 뒤처져 있었다.**
+
+**쓰기.** 새 코드를 만들지 않고 **기존 `ExecutionPlanSync`**로 현재 증거를 순서대로 동기화했다:
+**CREATE 3 / UPDATE 10 / SKIPPED_OLD_EVENT 4**(마지막 것은 docs/04 §29-30대로 옛 Event가 최신 상태를
+덮지 않는 것 — 정상). 재실행하니 **17건 전부 SKIPPED_OLD_EVENT, 행 수 그대로 5** — 멱등이다.
+**대조 결과 Dashboard의 4개 Project가 status·last_event까지 전부 일치**한다.
+가짜 업무 Event는 만들지 않았다 — `processed/`에 이미 있는 것만 올렸다.
+Notion에 남아 있는 `COMPANY_OPS_E2E_VERIFICATION` 한 행은 현재 증거에 대응하는 Event가 없다(과거 실행의
+잔재). **지우지 않았다** — docs/14 §1이 Notion을 View로 고정하고, 사용자 데이터 삭제는 금지다. 기록만 한다.
+
+**결함 P1 — 화면이 "미설정"이라고 말했는데 설정돼 있었다.**
+`.env`는 일부러 자동 로드하지 않는다(템플릿이 그렇게 적는다). 그 대가가 보이지 않았다: 유효한
+자격증명이 `.env`에 있는 채로 `from_env()`가 raise하고, `run_company_ops.py`가 "Notion 미설정 …
+건너뜁니다"를 찍고, Run Manifest에 `notion_sync: SKIPPED`가 남는다. 운영자는 **설정된 `.env`를 보면서
+'미설정'이라는 말을 듣는다.** "없음"과 "있는데 전달이 안 됨"은 정반대의 대응을 요구한다.
+NOTION 블록에 진단을 넣었다 — **이름만, 값은 절대 다루지 않는다.**
+
+**이 수정이 스스로 두 번 걸렸고, 둘 다 정당한 게이트였다.**
+(1) 첫 구현이 `PROJECT_ROOT / ".env"`를 읽어 **기존 테스트 12개가 한꺼번에 실패**했다 — `.env`가 없는
+fixture들이 저장소의 진짜 `.env`를 읽은 것이다. **C31의 사고이고 C88이 세 사이클 전에 게이트를 붙인
+바로 그 모양인데, 내 새 코드가 그대로 걸어 들어갔다.** `RUNTIME_DIR.parent`로 고쳤다(seam을 따라간다).
+그 게이트에 반대할 근거가 아니라 찬성할 근거다.
+(2) `test_no_entrypoint_silently_loads_a_dotenv_file`이 걸렸다. 규칙의 목적은 "`.env.example`의
+'자동으로 읽히지 않는다'가 거짓이 되지 않게"이고, 내 함수는 **로드하지 않는다** — 값을 쓰지 않고
+오히려 그 문장을 운영자에게 그대로 전한다. 그래도 **내 변경을 통과시키려고 게이트를 느슨하게 하지
+않았다**: 문자열 금지를 **성질 검사로 바꿔 더 강하게** 만들었다 — dotenv 라이브러리 금지(그대로),
+**`os.environ`에 쓰는 것 금지(신규 — 이것이 진짜 '로드'이고 예전 테스트는 보지 않았다)**,
+`.env`를 언급하는 파일은 "자동으로 읽히지 않는다"를 같이 적어야 함. M60·M61·M62 전부 DETECTS.
+(3) C84와 같은 발견 하나 더 — 주석 가드가 **도달 불가**였다(`# NOTION_API_TOKEN`은 이름이 다르므로
+애초에 매치되지 않는다). M58 MISSES가 그것을 드러냈고, 지우고 답을 단정으로 남겼다.
+Evidence: 신규 8건, mutation M55·M56·M57·M59·M60·M61·M62 DETECTS. 전체 회귀 **3872 passed, 8 skipped**.
+
+**SKIP: `sync_control_tower()`의 CT_* 5개 Database.** 이 저장소 자신의 기록이 그것을 **명세 결정**으로
+분류한다(docs/14 §1이 Operational Projection을 `Notion (PROJECTS / OPS_RUNS)`로 고정하므로 CT_*는
+계약 밖). 워크스페이스에 계약 밖 Database 5개를 만드는 것은 승인 사항이라 하지 않았다.
+**SKIP: OPS_RUNS.** `NOTION_OPS_RUNS_DATABASE_ID` 미설정이고, 채우려면 git push·backup을 포함한
+전체 Runner 실행이 필요하다.
+아래는 C89 기록이다.)
+
+마지막 갱신: 2026-08-25 (C89 — **인코딩 Audit. 깨진 바이트는 전부 정직하게 막히는데, 멀쩡한 UTF-8 하나가 두 행을 한 행처럼 보이게 했다.**
+
+**먼저 Python 3.9 호환성 — False Positive.** 새 파일 둘을 의심했다(`tests/test_dashboard_server.py`에는
+`from __future__ import annotations`가 없다). 실측: 저장소 141개 파일 전수 AST 스캔에서 런타임 평가되는
+**PEP604(`X | Y`) 0건, `match` 0건**. PEP585(`list[int]`)는 8개 파일에 있지만 **3.9에 들어온 기능**이라
+문제가 아니다(첫 스캔이 둘을 뭉뚱그린 것이 내 실수였다). 그리고 이 게이트는 **이미 있다** —
+`test_no_module_evaluates_a_pep604_annotation_without_the_future_import`가 버전 독립 AST 규칙이고,
+`_tracked_files()`가 미추적 파일도 포함하므로 **내 새 파일 둘도 141개에 들어 있고 통과한다**(확인함).
+결함 없음.
+
+**인코딩 주입 — 결함 0건.** Windows 운영자가 실제로 만들어내는 것들을 넣고 화면까지 따라갔다:
+
+    utf-8            수용, 한글이 화면에 그대로
+    utf-8-BOM        거부 · 사유 "Unexpected UTF-8 BOM (decode using utf-8-sig)"
+    cp949            거부 · 사유 "'utf-8' codec can't decode byte 0xc7 ..."
+    utf-16           거부 · 사유 "... byte 0xff in position 0 ..."
+    중간에 깨진 바이트  거부 · 위치까지 명시
+
+전부 **조용히 잘못 읽히지 않고** `unreadable`로 세어지며, 화면에 파일명·사유·`불완전`이 함께 뜬다.
+BOM 사유는 고치는 방법(`utf-8-sig`)까지 이름을 댄다. 파이썬 자신의 메시지가 좋았다.
+
+**결함(P2): 눈에 보이지 않는 문자가 서로 다른 두 행을 같은 행처럼 보이게 한다.**
+`project_id`가 **U+200B 하나만 다른** Event 둘을 넣으면 PROJECTS 패널에 행이 둘 생기는데
+**둘 다 `SEARCH_BACKEND`로 렌더**되고 한쪽은 Event 3, 다른 쪽은 1이다. 모델은 내내 옳았고
+(행 둘, 키 다름) **무너진 것은 렌더링뿐**이다. "같은 것이 두 번 나오는데 숫자가 다르다"는
+이 화면이 통째로 막으려고 만들어진 바로 그 읽기다.
+`oplog.one_line()`을 고치지 **않았다** — 그 함수의 계약은 "줄을 끝내거나 순서를 뒤집는 것"이고
+zero-width는 둘 다 아니다(RLO U+202E는 이미 `‮`로 escape된다. 실측). 로그 한 줄에서는 그 판단이
+옳다. 표에서만 틀리므로 **렌더러에서** 고쳤다.
+**지우지 않고 드러낸다** — `one_line()`의 규칙 그대로, 원래 값이 복구 가능해야 그 행이 증거 파일에서
+찾을 수 있는 무언가를 가리킨다. `SEARCH<U+200B>_BACKEND`로 보인다. 손으로 쓴 목록이 아니라
+**Unicode 카테고리 `Cf`**가 규칙이다(목록은 문자가 하나 추가되는 날 낡는다 — M53이 그 변이다).
+Evidence: 신규 5건, mutation **4종 전부 DETECTS**(제거·strip·목록화·전부드러내기).
+전체 회귀 **3864 passed, 8 skipped**.
+아래는 C88 기록이다.)
+
+마지막 갱신: 2026-08-25 (C88 — **Backlog 2·3번을 실측으로 닫았다. 둘 다 "변경하지 않는 것"이 답이고, 근거는 숫자다.**
+
+**Backlog 2 — `_print_history`의 2-pass.** 중복 순회가 **아니다.** 두 pass는 서로 다른 질문에
+답한다 — `find_orphaned_events`(수집됐지만 History에 못 들어간 Event)와
+`_secret_shaped_event_content`(내용이 자격증명 모양인 Event). 둘 다 전 파일 파싱이 필요하다.
+**실측(warm, N=2,000)**: orphan **178 ms**(1 pass) + secret **120 ms**(1 pass) = 298 ms ≈ 블록 전체
+299 ms. 즉 두 pass가 HISTORY 비용의 **100%**다. 합치면 한 pass(≈120 ms)를 아낀다.
+**합치지 않는다.** `find_orphaned_events`는 `src/history/reconciliation.py`(파이프라인)에 있고
+`_secret_shaped_event_content`는 `ops_status.py`(뷰)에 있다. 120 ms를 위해 **보안 detector를
+정합성 함수에 결합**하거나 반환 계약을 바꾸는 것은 나쁜 거래다 — 실제 배포 규모(16건)에서는 1 ms다.
+(cold 경로도 재 봤지만 AV 스캔 타이밍 때문에 편차가 커서 **그 수치로는 아무 판단도 하지 않았다.**)
+
+**Backlog 3 — `ops_status.py` 4,940줄 분할.** 결합도를 먼저 쟀다: 모듈 레벨 함수 46개,
+블록이 도달하는 helper 38개 중 **33개가 정확히 한 블록 전용**이고 **공유는 5개뿐**
+(`_authored`, `_daily_dates`, `_rendered_event_ids`, `_runner_lock_path`, `_comparable`).
+`_print_history`가 26개로 가장 무겁다. **즉 기계적으로는 쪼갤 수 있다.**
+**그런데 쪼개면 안 된다.** 옮겨진 블록은 **자기 모듈의** `RUNTIME_DIR`을 읽으므로
+`ops_status.RUNTIME_DIR = tmp`가 더는 닿지 않는다 — 그 rebinding은 테스트 9개 파일과
+`dashboard_server.py`에 걸쳐 **99곳**이 하고 있고, 모듈 안 읽기는 34곳이다. 실패는 **조용하다**:
+옮겨진 블록만 개발자의 실제 `runtime/`을 보고한다. 이건 이 파일이 이미 기록한 **C31 실측 사고**
+(`RUNTIME_DIR`만 돌린 probe가 저장소 자신의 runtime을 읽고 "agent has not run for 3 day(s)"를
+가져왔다)와 같은 모양이다. 올바른 분할은 34곳을 전부 접근자로 바꾸는 선행 작업을 요구하며,
+그것은 이 목표가 금지한 대규모 리팩터링이다.
+
+**대신 그 seam에 게이트를 붙였다.** 기존 `RuntimeDirIsTheOnlyKnobTests`는 **AGENT 블록 하나만**
+검사했다 — 분할이 빠져나갈 바로 그 틈이다. 여섯 블록 전부를 빈 fixture에 돌려 **실제 runtime에만
+존재하는 식별자**를 하나라도 찍는지 본다(블록별이 아니라 일반적으로 — 일곱 번째 블록이 생겨도 덮인다).
+
+**이 사이클에서 내 테스트가 나를 두 번 잡았다.**
+(1) **False Positive 1건 기록** — 첫 detector가 `_print_history`가 빈 fixture에 `COMPANY_OPS`를
+흘린다고 신고했다. **결함이 아니다**: 출력에 있는 것은 **환경변수 이름**
+`COMPANY_OPS_HISTORY_START_DATE`였고 블록의 모든 수치는 0이었다. 부분 문자열 일치가 멀쩡한 블록을
+유출로 만든 것이고, 그런 오경보가 진짜 detector를 꺼지게 한다. 토큰 경계 일치로 바꿨다.
+(2) **guard-the-guard가 detector를 두 번 고치게 했다** — 처음엔 파일명만 모아서(블록은 `event_id`를
+찍는다), 다음엔 id만 모아서(CONTROL TOWER는 id를 아예 안 찍고 Project 이름을 찍는다) 검사가
+'절대 나타나지 않는 것'을 찾고 있었다.
+(3) **기존 구조 게이트에 구멍이 있었다** — `FOO = RUNTIME_DIR / ...`만 보고 있어서
+`FOO = PROJECT_ROOT / "runtime"`(분할이 실제로 만드는 모양)이 그냥 통과했다. 두 철자 모두 막았고
+M49·M50 둘 다 DETECTS다.
+Evidence: 신규 2건 + 기존 게이트 1건 보강, mutation 2종 DETECTS. 전체 회귀는 아래.
+아래는 C87 기록이다.)
+
+마지막 갱신: 2026-08-25 (C87 — **하네스를 만들어 재 봤더니 내 결론이 뒤집혔다. 코드는 한 줄도 바꾸지 않았다.**
+Backlog 1번(`_read_all` 성능). 지시대로 **측정 하네스를 먼저** 만들고, 재지 못하는 것은 추측하지 않았다.
+
+**먼저 코드를 다시 읽고 전제를 고쳤다.** `_read_all`의 호출부는 **둘**이다 —
+`read_company_activity`(로컬 `processed/`)와 `_attribute(promotable)`인데 후자가 도는 곳이
+**`transport/`, 즉 OneDrive Sync Folder**(AGENT.md §1)다. C78은 로컬 경로 하나만 재고
+"풀은 손해"라고 적었다.
+
+**실측** (`_read_one` 기준, best-of-5):
+
+    warm local    500건   serial   23 ms   pool16    32 ms
+    warm local  2,000건   serial   83 ms   pool16   126 ms
+    warm local  5,000건   serial  230 ms   pool16   336 ms
+    cold local    500건   serial  547 ms   pool16    93 ms   **5.9x**
+    cold local  2,000건   serial 7,537 ms  pool16   890 ms   **8.5x**
+
+warm에서 풀은 2,000건에 약 40 ms 손해다. **cold에서는 초 단위로 이득이다.** 순서를 번갈아 3회
+독립 시행: 5.9x / 5.9x / 9.4x — 누가 먼저 도느냐의 artefact가 아니다. 그리고 cold야말로 운영의
+보통 경우다: Runner는 **방금 도착한** Event를 읽고, 운영자는 재부팅 뒤에 화면을 연다.
+지연 시뮬레이션(실측 아님, 명시): 파일당 **0.1 ms**만 있어도 풀이 6.6배, 1 ms면 14배 빠르다.
+
+**결론: 코드 변경 없음. 풀은 옳다.** C78의 "풀은 손해다"를 정정했다.
+대신 이 판단이 warm-cache 벤치마크로 다시 뒤집히지 않도록 **측정치를 `_read_all` docstring에 남기고
+게이트를 붙였다** — `test_the_reads_really_do_overlap`은 구현이 아니라 **겹침 자체**를 단정하고
+(`_read_one`을 감싸 동시 실행 최대치를 잰다), `test_order_is_preserved_even_though_the_reads_overlap`은
+풀이 완료 순서를 돌려주지 않는지 본다(그것이 바뀌면 타이밍이 아니라 **답**이 바뀐다).
+
+**SKIP: 실제 OneDrive 측정.** `C:\Users\user\OneDrive`가 이 머신에 있지만, probe 파일 수천 개를
+쓰면 **사용자의 Microsoft 계정으로 실제 업로드**된다. 외부 서비스에 대한 부수효과이므로 승인 없이는
+하지 않는다. 대신 지연을 시뮬레이션하고 **시뮬레이션이라고 명시**했다.
+
+**mutation 하네스가 세 번째로 거짓말했다.** M46/M47이 MISSES로 나왔는데 확인해 보니
+`src/app/desktop_activity.py`는 **CRLF**이고 내 앵커는 LF였다 — 변이가 아예 적용되지 않았다.
+본문을 파일에서 **프로그램으로 추출**해 다시 돌리니 둘 다 DETECTS. C83의 교훈이 그대로 반복됐다:
+**변이가 실제로 변이했는지 확인하기 전에는 MISSES도 사실이 아니다.**
+Evidence: 신규 2건, mutation 3종 DETECTS(M46 순차화 · M47 완료순서 · M48 worker=1).
+전체 회귀 **3857 passed, 8 skipped**.
+아래는 C86 기록이다.)
+
+마지막 갱신: 2026-08-25 (C86 — **기간 필터는 C48부터 모델에 있었고, 화면이 한 번도 넘겨준 적이 없었다.**
+BACKLOG 최우선 항목 실행. 먼저 **주장을 재검증**했다 — `build_company_rollup(since=, until=)`은
+실재하고 Event의 **작업일** 기준으로 자르며(docs/06 §12 — 도착일로 자르면 일주일 꺼져 있던 Desktop이
+엉뚱한 기간에 들어간다) `DashboardModel.since/until`까지 흐른다. 화면만 안 쓰고 있었다.
+
+**배선 전에 실측했더니 함정이 나왔다.** 빈 기간은 `events_read=0`을 내는데, 그 모양이 **빈
+`processed/`와 똑같다.** 배포 트리에서 2026-08-20~25로 자르면 파일 16개가 디스크에 있는 채로 0이
+나온다. C76이 넣은 배너는 거기서 "`runtime/events/processed/` 가 비어 있다"고 말했을 것이다 —
+**참인 필드가 만들어내는 거짓 문장**, 그 배너가 존재하는 이유 자체를 기능 추가로 되살리는 것.
+그래서 배선과 함께 갈랐다: 기간이 있으면 "이 **기간**에 Event가 없다 — 다른 기간에는 있을 수 있다",
+없으면 종전대로 디렉터리를 지목한다.
+**거절이 기본이다.** 잘못된 날짜·거꾸로 된 기간·모르는 조건·중복 파라미터는 전부 **400**이고 이유를
+댄다. 조용히 전체 기간으로 되돌아가면 운영자는 한 주를 본다고 믿으면서 전 기간을 본다 — 숫자는 전부
+진짜이고 답하는 질문만 틀린다. `cli.unexpected_arguments()`가 argv에서 막는 그 실수를 HTTP에서 막는다.
+**범위도 말한다.** 기간은 **위쪽 KPI·패널에만** 적용된다 — 운영 블록은 `ops_status.py`의 출력이고
+그 모듈에는 기간 개념이 없다(이 모듈이 그것을 **그대로** 소비하는 것이 설계다). 말하지 않으면
+`기간 2026-08-01~07` 아래에 오늘 아침 LAST RUN이 붙어 한 화면이 '언제'에 대해 두 주장을 하게 된다.
+같은 이유로 초록 배너와 나이 표시도 기간에 맞춰 좁혔다 — `이 기간의 증거 전체를 덮는다`,
+`이 기간의 마지막 증거 18일 전`.
+실측(브라우저): 전체=Event 16건 / 2026-08-05~07=**4건**, KPI 4·2·0·3 / 빈 기간=0건에 정직한 배너.
+`/healthz`는 질의 문자열을 아예 보지 않는다 — liveness probe가 오타로 실패하면 안 된다.
+**mutation 하나가 또 하네스를 고치게 했다** — M43이 세 조각짜리 문장의 가운데 조각만 지워서 MISSES가
+났다. 테스트가 나머지 둘을 검사하고 있었으니 약한 것이 아니었고, 문장 전체를 지우자 DETECTS다.
+Evidence: 신규 23건(총 111건), mutation **8종 전부 DETECTS**(M38~M45). 전체 회귀 **3855 passed, 8 skipped**.
+아래는 C85 기록이다.)
+
+마지막 갱신: 2026-08-25 (C85 — **Release Audit: 결함 0건. 그리고 다음 Sprint.**
+릴리스 관점 점검: 신규 파일 둘(`dashboard_server.py`, `tests/test_dashboard_server.py`)은 **git이
+무시하지 않는다**(`check-ignore` 확인 — 무시됐다면 영원히 커밋되지 않았을 것이다), LF·UTF-8이고
+CRLF 0, `SecretExposureGuardTests` 통과, `--help`가 exit 1로 AGENT.md를 가리킨다.
+`git add -A`가 집어갈 예상 밖 파일은 없다. **커밋은 금지 범위이므로 하지 않았다.**
+
+**다음 Sprint 후보 (승인 불필요, 우선순위 순)**
+1. ~~**`app/desktop_activity._read_all`의 스레드 풀**~~ — **C87에서 하네스를 만들어 실측했고
+   결론이 뒤집혔다. 코드 변경 없음.** 풀은 옳다.
+2. **`ops_status.py` 4,900줄** — 여섯 블록 렌더러가 한 파일에 있고 `dashboard_server`가 그것을
+   그대로 소비한다(의도된 것). 분할은 이득보다 위험이 클 수 있으니 **먼저 결합도를 측정**한다.
+3. **Dashboard의 필터/기간 선택** — 지금 화면은 항상 전체 기간이다. `since`/`until`이 모델에
+   이미 있고(`DashboardModel`) 화면에는 없다. 승인 불필요.
+4. **`_print_history` 2 passes** — 페이지당 5회 순회 중 둘이 여기다(C78). 줄일 수 있는지는
+   측정 후 판단.
+
+**승인이 필요해 SKIP한 것 (변동 없음)**
+- 127.0.0.1 고정 해제 = 인증·TLS·리버스 프록시가 걸린 **배포 결정**.
+- `sync_control_tower()` 배선 = 자격증명 있는 Notion Workspace(A-8) + docs/14 §1 계약 확장.
+- Task Scheduler에 Dashboard 등록 = 시스템 설정 변경.
+- Commit / Push.
+아래는 C84 기록이다.)
+
+마지막 갱신: 2026-08-25 (C84 — **Fleet 표는 정직했지만 훑을 수 없었다. 그리고 mutation이 내 방어 코드를 도달 불가로 판정했다.**
+Multi-Desktop / Sync Audit. 섞인 함대를 주입했다 — 오늘 보고 / 1일 전 / 20일 전 / **한 번도 보고한 적 없음**.
+**모델은 이미 정직하다**: 한 번도 보고 안 한 DESKTOP_4는 `events=0 / last_seen=None / days_silent=None /
+has_activity=False`이고, ATTENTION이 "3일 이상 아무것도 오지 않은 Desktop"과 "작업일은 오래됐지만 최근
+파일이 도착한 Desktop"을 **서로 다른 줄로** 가른다(후자는 Agent가 살아 있다는 뜻이다). 결함 0건.
+**빠진 것은 훑을 수 있음(scannability)이었다.** `무응답 일수 20`이 `무응답 일수 1`과 같은 무게로
+찍혀서, 읽는 사람이 `SILENT_AFTER_DAYS`를 머리에 들고 행마다 눈으로 비교해야 했다. COO가 "모든 머신이
+보고하고 있나"를 답하려고 보는 표인데. 증거 나이 타일과 **같은 논리, 같은 임계값**으로 두 열만 칠했다 —
+`days_silent`(임계값 초과)와 `has_activity`(한 번도 없음). 다른 열은 건드리지 않았다: 모든 숫자를
+칠하면 아무 숫자도 칠하지 않은 것이다.
+
+**그리고 mutation이 내 코드를 하나 깎았다.** 첫 draft에는 `isinstance(value, bool)` 가드가 있었다 —
+`True`가 `1`인 파이썬의 고전적 실수를 막으려고. M36(가드 제거)이 **MISSES**로 나왔고, 확인해 보니
+테스트가 약한 게 아니라 **가드가 도달 불가능**했다: bool은 0 아니면 1, 임계값은 3, 그리고
+`days_silent`는 패널의 열 계약상 `int | None`이다. 아무 결과도 바꿀 수 없는 가드는 아무도 정당화할 수
+없는 가드이고, 이 프로젝트가 `DashboardPanel`에서 같은 이유로 지운 모양이다. 지우고, 그 답을
+**단정으로** 남겼다(임계값이 1보다 크다 + bool 두 값 모두 None).
+Evidence: 신규 7건, mutation 5종 중 4종 DETECTS + 1종이 **코드를 지우게 만들었다**(M33·M34·M35·M37).
+전체 회귀 **3832 passed, 8 skipped**.
+아래는 C83 기록이다.)
+
+마지막 갱신: 2026-08-25 (C83 — **내가 쓴 "포트가 이미 쓰이고 있습니다" 에러는 이 프로젝트가 도는 OS에서 절대 발동하지 않았다.**
+Production Readiness Audit. 운영자가 실제로 부딪히는 것부터 눌렀다.
+**좋은 것 둘**: cwd 독립성은 진짜다 — `C:\`에서 실행해도 `runtime/`을 찾아 `events_read=16`을 낸다
+(`PROJECT_ROOT`가 `__file__` 기준). Ctrl+C/terminate도 깨끗하다.
+**결함**: 같은 포트에 두 번째 인스턴스를 띄웠더니 **에러 없이 60초를 그냥 돌았다.** 원인은
+stdlib이 `HTTPServer.allow_reuse_address = 1`로 두는 것이고, **Windows의 `SO_REUSEADDR`는 POSIX와
+뜻이 다르다** — TIME_WAIT를 푸는 것이 아니라 **현재 사용 중인 포트에 바인딩을 허용한다.**
+그래서 `main()`의 `except OSError`(= "포트가 쓰이고 있습니다, COMPANY_OPS_DASHBOARD_PORT를
+설정하세요")는 **이 프로젝트가 실제로 도는 플랫폼에서 도달 불가능한 코드**였다(AGENT.md §2b: Windows
+Task Scheduler). C70이 `os.path.isjunction()`에서 잡은 것과 같은 모양 — 플랫폼이 조용히 다르게 답한다.
+**실측**: 기본값이면 두 번째 바인딩 OK, `allow_reuse_address = False`면 `[Errno 10048]` 거절.
+왜 단정함의 문제가 아닌가 — 두 번째 인스턴스는 **뭔가 고친 뒤에** 또는 **다른 체크아웃에서** 띄우는
+그것이고 `RUNTIME_DIR`은 프로세스마다 결정된다. Control Tower가 **간헐적으로 낡은 프로세스에서**
+답하고 화면에는 어느 쪽이 답했는지 아무 표시가 없는 것은, 읽는 사람이 생각하는 트리와 화면이 다른
+상태다. 수정 후 실측: 두 번째 실행이 `[FAILED] ... [WinError 10048] ... COMPANY_OPS_DASHBOARD_PORT를
+설정하세요`, exit 1.
+비용은 숨기지 않고 적는다 — POSIX에서는 TIME_WAIT 중 즉시 재시작이 실패할 수 있다. 다만
+**이 머신에서 실측**: 요청을 처리한 뒤 곧바로 재시작하는 사이클을 3회 연속 돌려 전부 즉시 떴다.
+손으로 재시작하는 도구에서 "조용한 중복 인스턴스"가 더 비싼 오류다.
+**그리고 mutation 하네스 자신이 한 번 거짓말했다** — `allow_reuse_address = False`를 앵커로 썼는데
+그 문자열이 **docstring의 측정 기록에도** 있어서 `replace(..., 1)`이 산문을 바꾸고 코드는 그대로 뒀다.
+M30이 MISSES로 나온 것은 테스트가 약해서가 아니라 변이가 일어나지 않아서였다. 유일한 앵커로 다시
+돌려 M30/M32 둘 다 DETECTS. **변이가 실제로 변이했는지 확인하기 전에는 MISSES도 사실이 아니다.**
+Evidence: 신규 5건, mutation 3종 DETECTS(M30·M31·M32). 전체 회귀 **3825 passed, 8 skipped**.
+아래는 C82 기록이다.)
+
+마지막 갱신: 2026-08-25 (C82 — **127.0.0.1 바인딩은 절반이다. 나머지 절반이 없었다.**
+Security Audit. 새로 생긴 네트워크 표면을 실제 요청으로 두드렸다. 좋은 소식 둘부터:
+**바인딩은 진짜다** — 이 머신의 LAN 주소(192.168.0.17:8765)는 연결 자체를 거부한다. **경로 순회도
+불가능하다** — `/../../ops_status.py`, `/%2e%2e/...` 전부 404이고, 애초에 파일을 서빙하지 않는다.
+**결함은 `Host` 헤더였다.** 바인딩은 *다른 머신의 패킷*을 막지 `이 머신의 브라우저`를 막지 않는다.
+DNS rebinding이 그 틈이다: 운영자가 방문한 페이지가 `attacker.example`을 127.0.0.1로 해석시키고
+`http://attacker.example:8765/api/dashboard.json`을 부르면, 브라우저는 그것을 **same-origin으로
+취급**하므로 공격자의 스크립트가 **본문을 읽는다.** 그 본문은 이 회사의 내부 상태다 — `project_id`,
+다른 Desktop에서 사람이 쓴 `blocker` 문장, Desktop 이름, 증거 파일명.
+**실측(수정 전)**: `Host: evil.example.com` → **200, 51 KB 전체 페이지**. `internal.corp`도 같다.
+`_ALLOWED_HOSTS`로 닫았다. 표준적이고 싸다 — rebinding 공격은 공격자 자신의 호스트명을 `Host`에
+실을 수밖에 없고(브라우저가 URL에서 채우며 스크립트가 못 바꾼다), loopback 이름이 아닌 것을 전부
+거절하면 끝난다. `Host` 부재는 허용한다(HTTP/1.0이 생략하며, 없는 헤더는 공격자 이름을 못 싣는다).
+실측(수정 후): loopback 이름 넷 전부 200, `evil.example.com`/`attacker.test`/`internal.corp` 403,
+그리고 **`127.0.0.1.evil.com`도 403** — 이것이 요점이다. 뻔한 오답(`startswith`)은 공격자가 소유한
+도메인에 페이지를 그대로 넘긴다. mutation M26이 정확히 그 오답이고 테스트가 잡는다.
+쓰기 메서드에는 이 검사를 **일부러 다시 걸지 않았다** — 이미 거절만 답하고, rebinding 공격자가
+405에서 얻는 정보가 403보다 적다. 지켜야 하는 것은 GET의 본문이다.
+**Recovery Audit도 같은 Cycle에서 했고, 결함은 0건이다.** Backup 범위는 `daily/`·`monthly/`뿐이고
+(docs/08 §26) `processed/`는 Execution Evidence라(docs/14 §2), 원격에서 복구한 머신은 Company History를
+전부 되찾고 **Event는 하나도 못 되찾는다.** 배포 트리 복사본에서 `processed/`만 비우고 Daily 6개를
+남겨 실측: `events_read` 0, `history_uncovered_from` 2026-08-05, `complete` False —
+그리고 화면이 **한 배너에 두 사유를 같이** 댄다("셀 Event가 없다" + "증거보다 오래된 Company History가
+있다"). 이 자리에서 이 페이지의 규칙 둘(C76 빈 증거 배너, C49 이력 빈틈 수식)이 만나 서로를 지울 수도
+있었는데 그러지 않는다. `마지막 증거 N일 전`도 **찍지 않는다** — 증거가 없으면 나이도 없다.
+결함 0건이지만 게이트는 넣었다: 아무도 예행연습하지 않는 상태이고, 표면에서 그 짝을 검사하는 것이
+없었다.
+Evidence: 신규 10건(보안 6 + 복구 4), mutation **5종 전부 DETECTS**. 전체 회귀 **3820 passed, 8 skipped**.
+아래는 C81 기록이다.)
+
+마지막 갱신: 2026-08-25 (C81 — **돌아가는 화면을 실제 데이터로 읽었더니, 모든 단어가 참인데 문장이 오해를 만든다.**
+Dashboard Audit을 코드가 아니라 **띄워 놓은 화면**에서 했다. 2026-08-25의 배포 트리:
+
+    증거 범위   2026-08-05 ~ 2026-08-10
+    완전성      완전
+    완료된 Milestone  14
+
+한 단어도 틀리지 않았고, 가장 최근 증거가 **15일 전**이라는 사실만 숫자 어디에도 없다.
+`완료된 Milestone 14`는 두 날짜를 머릿속에서 빼기 전에는 최근 성과처럼 읽힌다. ATTENTION 블록이
+Desktop 넷의 침묵을 말하긴 하는데, **8개짜리 목록 안**이고 그것이 수식하는 숫자에서 떨어져 있다.
+이 페이지는 이미 **자기 자신에게는** 같은 논리를 적용하고 있었다(경과 시간 배지 — 두 timestamp를
+눈으로 빼는 사람은 없다). 그 배지는 *페이지*가 언제 만들어졌는지를 말하고, 이번 것은 *회사*가
+마지막으로 보고한 때를 말한다 — KPI가 세고 있는 바로 그 범위다.
+증거 범위 타일에 `마지막 증거 N일 전`을 붙이고 `SILENT_AFTER_DAYS`(3)를 넘으면 amber로 바꿨다.
+임계값을 새로 만들지 않았다 — "보고 없이 얼마가 너무 긴가"에 대한 이 프로젝트의 답이 이미 그것이다.
+계산 불가(파싱 실패·증거 없음)는 **숫자로 보여주지 않는다** — `history_checked`가 한 층 아래에서
+지키는 규칙과 같다. 실측: 화면에 `마지막 증거 15일 전`, 타일 amber.
+
+**그리고 데이터 자체에 대한 정직한 기록 하나.** `runtime/events/processed/`의 **17개 파일 전부가
+엔지니어링 probe 산출물**이다 — fault injection 4, push 실패 3, Multi-Desktop 순서 3, Runner E2E 3,
+중복 Event probe 2, 검증 Event 2. 파이프라인은 진짜이고 수집→집계→Control Tower→화면은 실제로
+이어져 있다. 다만 **증거의 내용이 회사 업무가 아니라 이 시스템의 자체 검증 기록**이고,
+`움직인 Project 4` 중 셋이 ops 프로젝트 자신이다. 시스템에는 "이것은 시험 Event"라는 필드가 없고
+(docs/02에 그 계층이 없다) 만들어 넣는 것은 원천을 발명하는 것이라 **하지 않는다**. 화면은
+정직하다 — 범위·나이·Desktop 침묵을 전부 말한다. 실제 업무 Event가 들어오면 같은 화면이 그것을
+보여준다. **남은 것은 코드가 아니라 입력이다.**
+Evidence: 신규 6건, mutation **4종 전부 DETECTS**. 전체 회귀 **3810 passed, 8 skipped**.
+아래는 C80 기록이다.)
+
+마지막 갱신: 2026-08-25 (C80 — **C71은 줄의 *개수*를 묶고 *길이*는 풀어 뒀다. 작은 수 곱하기 무한대.**
+기술부채 Audit. 저장소는 깨끗하다 — 운영 코드의 TODO는 **1건**이고 그나마 "TODO:"라는 *문자열을*
+파싱하는 주석이며, 광범위 `except`는 40개 전부 이유가 적혀 있다. 그래서 이 프로젝트가 **자기 원칙을
+자기한테 적용하지 않은 자리**를 찾았다. `oplog.append_line()`은 "로그에 적히는 것 중 무한한 것은
+없다"를 선언하고 `to_payload()`는 `unreadable` 사유에 `bounded()`를 건다. 그런데 **사람이 쓴 필드
+자체는 아무 데서도 묶이지 않는다** — docs/02가 `blocker`/`summary`/`project_id`에 최대 길이를 주지
+않고 `validate_event()`는 타입만 본다(`test_notion_sync.py`가 반대편에서 그렇게 단정한다).
+C71은 RISKS를 종류당 5줄로 묶었지만, 5는 **무한대에 곱해지는 작은 수**였다.
+
+**실측**: 막힌 Project 3개가 각각 100,000자 `blocker`를 들면 그 덩어리가 페이지에 **9번** 닿는다
+(RISKS 행 · PROJECTS 행 · ATTENTION 줄 × 3) — **0.89 MB**. Event 하나에 1,000,000자면 **1.98 MB**.
+ATTENTION 한 줄이 **100,176자**이고, 그것은 "사람이 지금 무엇을 해야 하는가"를 말하는 블록이며
+예약 실행이 디스크로 리다이렉트하는 로그이기도 하다.
+
+두 자리를 고쳤고, 자리 선택이 요점이다.
+(1) **`ops_status._authored()`에 `bounded()`** — 사람이 쓴 값이 사람이 읽을 형태로 준비되는
+**유일한 곳**이라, 터미널과 웹 페이지가 **한 번의 수정으로** 같이 닫힌다. 상한은 이 프로젝트가
+같은 모양에 이미 고른 `MAX_LOG_ERROR`(600)다.
+(2) **페이지 셀에 `_clip()`** — `to_payload()`는 일부러 그대로 둔다(충실한 기록이고 Notion
+projection이 원문을 쓴다). 잘렸다는 사실과 **진짜 길이**를 같이 찍고 원문은 같은 행의 증거 파일에
+있다고 말한다 — 목록에 쓰던 `evidence_truncated` 규칙을 값에 적용한 것이다.
+결과: 0.89 MB → **37 KB**, 1.98 MB → **29 KB**, 최장 ATTENTION 100,176자 → **779자**.
+
+**그리고 mutation이 내 테스트 하나를 decorative로 판정했다.** 순서(`bounded(redact(x))` vs
+`redact(bounded(x))`)를 검사한다고 이름 붙인 테스트가 **두 순서 모두에서 통과**했다 —
+`assertNotIn(전체_secret)`은 어느 쪽이든 참이기 때문이다(한쪽은 잘라서 반토막을 냈을 뿐).
+진짜 주제는 **파편**이다: 경계에 걸친 자격증명은 `ntn_A`로 남고, `SECRET_PATTERNS`는 접두사 뒤
+10자를 요구하므로 그 파편을 못 알아본다. 조각을 단정하도록 바꿨고 M19가 이제 DETECTS다.
+(부수 관찰: `[REDACTED]` 표식 자체가 경계에 걸리면 `[REDA...`로 잘린다. 그래서 "redaction이
+일어났다"는 상한 안쪽 문자열로 따로 단정한다.)
+Evidence: 신규 10건(대시보드 6 + ops_status 4), mutation **M16/M18/M19/M20 전부 DETECTS**.
+전체 회귀 **3804 passed, 8 skipped**.
+아래는 C79 기록이다.)
+
+마지막 갱신: 2026-08-25 (C79 — **거절 메시지가 가리키는 문서에 그 도구가 없었다. 두 개나.**
+문서 Audit. 모든 entrypoint의 거절 메시지는 `사용법은 AGENT.md를 보세요`로 끝난다 —
+인자를 잘못 넣은 운영자가 받는 **출구 전부**다. 그 출구가 출구이려면 AGENT.md가 그 도구에 대해
+무언가는 말해야 한다. **실측**: `dashboard_server.py`는 거절 메시지를 찍고, AGENT.md에는
+`dashboard_server`라는 문자열이 **하나도 없었다.** 아는 문서는 `.env.example` 하나였는데
+메시지가 가리키는 곳은 거기가 아니다. 아무 말도 안 해 주는 것보다 나쁘다.
+AGENT.md에 §6d(브라우저에서 보기)를 넣었다 — 실행/주소/종료, `ops_status.py`와 **같은 사실**이라는
+관계, 읽는 법 표(빨간 배지 / `증거가 하나도 없다` / `UNSOURCED` 점선 / `해당 없음` / `불완전` /
+`증거 N건` / 경과 시간 / 생성 시간), 그리고 127.0.0.1 고정이 배포 결정이라는 것.
+**그리고 게이트를 달았더니 첫 실행에서 두 번째 사례를 잡았다** — `init_notion.py`도 같은 메시지를
+찍는데 AGENT.md가 이름을 대지 않는다. 기존 결함이고, C48 이후 계속 그 상태였다. §2에 넣었다
+(Runtime 파이프라인이 아니라는 것, 없는 Property만 만든다는 것, 여러 번 안전하다는 것).
+게이트는 일부러 약하다 — "이름이 어딘가 있다"만 본다. 더 세게 만들면 산문을 규정하게 되고,
+있는 이름은 Ctrl-F로 찾을 수 있지만 없는 이름은 찾을 수 없다는 것이 요지다.
+Evidence: 신규 1건, mutation **3종 전부 DETECTS**(도구 이름 셋을 각각 지워서 확인).
+전체 회귀 **3794 passed, 8 skipped**.
+아래는 C78 기록이다.)
+
+마지막 갱신: 2026-08-25 (C78 — **동시 요청 둘이 서로의 출력을 훔쳤고, 그 다음엔 프로세스의 stdout이 영영 사라졌다.**
+성능 Audit으로 들어갔다가 C76이 심은 결함을 찾았다. `gather()`의 `redirect_stdout`은
+**프로세스 전역** `sys.stdout`을 갈아끼우는데 `ThreadingHTTPServer`는 요청마다 스레드를 쓴다.
+탭 두 개, 렌더 중 새로고침, 페이지 옆에 `/api/dashboard.json` 열기 — 전부 평범한 동작이다.
+**실측(수정 전)**:
+
+    동시 2건   블록 12개 중 2개가 남의 텍스트, 2개는 빈칸
+    동시 4건   블록 24개 중 8개가 남의 텍스트, 4개는 빈칸
+
+한 섹션의 출력이 **다른 섹션 제목 아래** 찍힌다 — AGENT.md §6이 제일 먼저 읽으라는 그 화면에서,
+이 프로젝트가 두 번 제거한 "보고서가 엉뚱한 사건을 설명한다" 모양(`oplog.one_line()`, C71)이다.
+**두 번째 증상이 이걸 표시 버그가 아니라 유출로 만든다**: 중첩된 context manager는 각자 *자기가*
+저장한 것을 복원하므로, 스레드가 엇갈리면 바깥쪽이 안쪽이 설치한 버퍼를 되돌려 놓는다 —
+동시 4건 뒤 `sys.stdout`이 **버려진 StringIO로 남는다.** 그 순간부터 프로세스의 모든 `print()`가
+서버 자신의 콘솔 출력까지 포함해 **영구히 아무 데도 가지 않고, 아무것도 raise하지 않는다.**
+이걸 찾은 probe 자신이 중간에 조용해져서 남은 결과를 끝내 못 찍은 것이 증거다.
+`_CAPTURE_LOCK`으로 캡처 구간만 직렬화했다 — 모델 빌드는 일부러 밖에 뒀다(락은 전역 하나를 위한
+것이고, 순수 계산까지 묶으면 이유 없이 줄을 세운다). 수정 후 동시 1/2/4/8 전부 foreign 0, empty 0,
+stdout 온전. 대안 둘은 기각: 렌더러 여섯 개에 file 인자를 주는 것은 `ops_status`를 **그대로**
+쓴다는 이 모듈의 존재 이유를 무너뜨리고, 단일 스레드 서버는 느린 요청 하나가 전부를 막는다.
+
+**성능 실측 (본론) — 그리고 첫 측정은 틀렸다.**
+페이지 비용은 Event 파일 수에 선형이다. **warm(모든 파일을 한 번 읽은 뒤) 기준**:
+
+    200 events      78 ms        2,000 events    630 ms
+    10,000 events 3,130 ms       Event당 약 310 us
+
+페이지 크기는 93→96 KB로 평평하다(패널 상한 `rollup.RECENT_LIMIT`가 듣는다). 커지는 것은 **읽기**다.
+2,000건 warm 분해: HISTORY 272 ms(44%) / COMPANY 134(21%) / model 111(18%) / CONTROL TOWER 106(17%) /
+나머지 셋 ~0. **지배하는 블록은 없다** — 비용은 `processed/` **전수 순회 횟수**를 따라가고
+한 페이지가 5회 돈다(HISTORY 2, COMPANY 1, CONTROL TOWER 1, 패널 1). 그중 **4회가 `ops_status.py`가
+자기 증거를 읽는 것**이고 터미널 실행도 같은 값을 낸다.
+
+**정정.** 이 항목의 첫 기록은 "COMPANY 1,447 ms (75%)"였다. 틀렸다 — 그것은 블록이 아니라 **순서**의
+비용이었다. 갓 쓴 2,000개 파일을 **처음** 읽는 블록이 전부를 문다. 블록 순서를 뒤집어 실측했다:
+
+    정방향 cold   COMPANY 1,056   CONTROL TOWER 108
+    역방향 cold   COMPANY   136   CONTROL TOWER 4,660      <- 페널티가 따라 움직인다
+    정방향 warm   COMPANY   140   CONTROL TOWER  102
+
+cold 첫 읽기는 warm의 약 3배다(10,000건: 9,389 ms vs 3,130 ms). 그것은 파일시스템이지 이 코드가
+아니며, 복원 직후 첫 조회 한 번에만 나타난다. 같은 착각으로 `read_company_activity`가 범인처럼
+보였는데 **단독 실측은 2,000건에 132 ms**(66 us/event)로 바닥에 가깝다. 바닥값도 재 뒀다 —
+같은 2,000건에 `read_text` 70 ms, `+json+validate` 74 ms, `build_company_rollup` 104 ms.
+**롤업은 최적에 가깝다.**
+덤으로 하나 더: `desktop_activity._read_all`의 16-스레드 풀은 이 작업량에서 **손해**다 —
+2,000건 serial 76 ms vs pooled 115 ms. 별도 항목으로 남긴다(이번에 건드리지 않았다).
+**[C87 정정] 이 문장은 틀렸다.** warm 경로만 재고 cold 경로를 재지 않은 결론이었다. 실측하니
+cold에서 풀이 **5.9~9.4배 빠르다**(2,000건 serial 7,537 ms vs pooled 890 ms). warm의 손해는 40 ms이고
+cold의 이득은 초 단위다. **코드는 바꾸지 않는 것이 옳다** — C87 항목 참조.
+
+**아무것도 빠르게 만들지 않았다.** 대신 **비용을 화면에 띄웠다**(`63ms에 생성`) — 몇 초 걸리는
+페이지에 아무 말이 없으면 운영자는 그것을 '멈췄다'로 읽는다.
+Evidence: 신규 12건(총 54건), mutation 2종 DETECTS(**M11 락 제거가 11건을 깨뜨린다**).
+전체 회귀 **3793 passed, 8 skipped**.
+
+**남은 결정 (승인 필요, C76·C77에서 이어짐)**
+- 127.0.0.1 고정, `--host` 없음 — 배포 결정(인증·TLS·리버스 프록시).
+- `sync_control_tower()` 미배선 — A-8 자격증명 + docs/14 §1 계약.
+- **`_read_all`의 스레드 풀이 순차보다 느리다**(위 실측). `app/desktop_activity.py` 소관이고
+  대시보드 Sprint에서 건드리지 않았다. 전용 성능 Sprint 대상.
+
+**규칙 하나를 남긴다** — 순서가 있는 측정에서 첫 번째 항목의 숫자는 그 항목의 것이 아닐 수 있다.
+순서를 뒤집어 보기 전에는 "이 블록이 느리다"는 사실이 아니다.
+아래는 C77 기록이다.)
+
+마지막 갱신: 2026-08-25 (C77 — **화면에만 있던 규칙에 게이트를 달았다. 그리고 화면은 자기가 언제의 것인지 말하지 않았다.**
+C76이 브라우저에서 찾은 결함 — 증거가 하나도 없는 트리에서 `coverage.complete`가 True라 초록
+전면 통과 배너가 0으로 가득 찬 화면 위에 뜬 것 — 은 고쳐졌지만 그것을 지키는 것은 아무것도
+없었다. `tests/test_dashboard_server.py` 신설, **43건**. 이 프로젝트가 한 계층 아래에서 두 번
+제거한 바로 그 전환(`history_checked` C68, `PanelStatus.UNSOURCED` C48)이 **렌더러라는 세 번째
+자리**에서 다시 일어난 것이고, 그래서 클래스 이름도 그 성질로 지었다.
+**mutation 9종 전부 DETECTS** — 그중 M1(C76 결함 원복)이 2건을, M9(완전성 타일만 원복)가 1건을
+깨뜨린다. 하나의 결함에 하나의 게이트가 아니라, 같은 거짓말의 두 표면에 각각 붙어 있다.
+게이트 하나는 스스로를 지킨다: `test_the_kpi_zeros_are_marked_as_zeros_not_as_values`는 빈 트리에도
+**live 타일이 정확히 하나**(`teams_silent`=4, 아무 소리도 못 들었으니 전 role이 조용하다) 있음을
+단정한다 — 그것까지 회색으로 칠하는 것은 반대쪽에서 하는 같은 거짓말이다.
+**자동 갱신은 하지 않기로 결정했다.** 벽에 걸린 Control Tower의 진짜 실패는 *세 시간 전 화면에서
+이상 없음을 읽는 것*이고, 폴링은 그것을 고치지 않고 옮긴다 — 서버가 죽은 순간 reload는 마지막으로
+알던 상태를 브라우저 오류 페이지로 **바꿔치운다**. 대신 스냅샷의 **경과 시간을 화면에 띄웠다**
+(`generated_at` 기준 client-side, 10초마다, `_STALE_AFTER_S`=300초 넘으면 amber). 실측: 갓 만든
+페이지 `0초 전 기준`(회색), 3시간 12분 된 페이지 `3시간 12분 전 기준`(amber). 스크립트가 없으면
+배지는 `hidden`이고 ISO 시각만 남는다 — 빈 배지가 아무것도 아닌 것을 주장하지 않게.
+전체 회귀 **3787 passed, 8 skipped**.
+
+**SKIP / 남은 결정 (C76에서 이어짐)**
+- 127.0.0.1 고정, `--host` 없음. 다른 머신 노출은 인증·TLS·리버스 프록시가 필요한 **배포 결정**.
+- Notion Control Tower 반영(`sync_control_tower`)은 여전히 미배선 — A-8 자격증명 + docs/14 §1 계약.
+아래는 C76 기록이다.)
+
+마지막 갱신: 2026-08-25 (C76 — **Control Tower를 사람이 볼 수 있는 곳에 두었다.**
+C48이 만든 Dashboard Model에는 소비자가 둘뿐이었다 — 터미널(`ops_status.py`)과, 자격증명이 있는
+Workspace를 요구해 이 저장소가 실행할 수 없는 Notion projection(A-8). 그래서 회사를 *지켜보는*
+자리인 COO 좌석이 콘솔에서만 볼 수 있었다. `dashboard_server.py`를 더했다 — `to_payload()`를
+HTML로 렌더하는 세 번째 소비자이고, 아무것도 새로 유도하지 않는다. 운영 절반(COMPANY / HISTORY /
+LAST RUN / NOTION / AGENT)은 **모델을 새로 만들지 않고** 블록 렌더러의 stdout을 그대로 싣는다 —
+한 실행에 대한 두 번째 의견을 만들지 않기 위해서다(dashboard.py 자신의 논거). CONTROL TOWER만
+패널과 터미널 텍스트 양쪽으로 실려 있고 그것은 대조 장치다.
+**실측**: 실제 브라우저(headless Chrome)에서 전체 페이지를 렌더해 확인했고, 결함 1건을 화면에서
+찾았다 — 증거가 **하나도 없는** 트리에서 `coverage.complete`가 True(읽지 못한 파일 0, 이력 확인함,
+빈틈 없음)라 초록 배너 "이 화면의 숫자는 증거 전체를 덮는다"가 0으로 가득 찬 화면 위에 떴다.
+모델은 틀리지 않았다. 그 참인 필드를 아무도 묻지 않은 질문의 답처럼 말한 것이 렌더러였고,
+비어 있음에 전용 배너를 주어 닫았다. Fault injection 5종(빈 트리 / 손상된 증거 2건 / 열린 Blocker +
+role 불일치 / Company History를 읽을 수 없음 / 증거보다 오래된 History)을 **runtime/ 복사본**에
+주입해 화면까지 확인했다.
+저장소 불변식 넷이 새 entrypoint를 자동으로 잡아냈고 전부 규칙에 맞췄다 — `argparse`를 버리고
+`cli.unexpected_arguments()`로, `finally`를 없애고(그 roster는 lock 전용이다), 파생 roster 둘과
+`.env.example`에 등록. `do_GET`/`do_POST`/`log_message`는 프레임워크가 이름으로 디스패치하므로
+dead-capability 목록에 **자체 항목으로** 기록했다(죽은 것이 아니라 호출 지점이 이 저장소에 없다).
+전체 회귀 **3739 passed, 8 skipped**(skip 8건은 전부 환경 — symlink 권한, autocrlf).
+
+**SKIP / 남은 결정**
+- `dashboard_server.py`에 전용 테스트가 아직 없다. 이번에 고친 "증거 없음" 규칙을 고정하는
+  테스트가 첫 항목이다. (승인 불필요 — 다음 Sprint 최우선)
+- 127.0.0.1 고정이고 `--host`가 없다. 다른 머신에서 보려면 인증·TLS·리버스 프록시가 필요한
+  **배포 결정**이며 승인 사항이다.
+- 이 페이지는 자동 갱신하지 않는다(요청마다 새로 계산). 폴링/SSE는 결정 사항.
+아래는 C75 기록이다.)
+
 마지막 갱신: 2026-08-23 (C75 — **스키마 셋 중 기계를 건너는 하나만 게이트가 없었다.**
 전용 Schema/Contract Audit 첫 수행. `runsummary`(1.1)와 `controltower`(1.2)는 버전별
 기록된 형태를 갖고 실제 payload와 대조되는데, **`events.SUPPORTED_SCHEMA_VERSION`(1.0)은
@@ -2848,6 +3364,243 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 차집합을 내면 끝난다(이번에 43개를 그렇게 찾았다). 자동화하려면 형식 결정이
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
+
+
+---
+
+## C102. 잃은 것을 세는 탐지기 둘 — 하나는 **다른 이름**을 댔고, 하나는 **0**을 답했다
+
+방법 둘을 붙여 썼다. 먼저 C41이 한 것을 다시 했다(전체 suite를 line+branch
+coverage로 돌려 "한 번도 실행되지 않은 줄"을 뽑는다). 그 다음이 이번 Sprint의
+차이다 — **그 줄들을 주입으로 실제 실행해 봤다.** 읽어서 판단하지 않았다.
+
+결함 둘이 나왔고 **둘 다 데이터 유실 탐지기**다. 하나는 개수가 맞는데 이름이
+틀렸고, 하나는 개수 자체가 0이었다. 둘 다 승인이 필요 없다 — 어느 쪽도 무엇을
+셀지를 바꾸지 않고, 이미 적혀 있는 답을 코드에 적용할 뿐이다.
+
+### 1. 충돌 그룹에서 살아남은 쪽을 `processed/` **정렬 순서**로 정하고 있었다
+
+C89가 연 탐지다. 대소문자만 다른 두 `event_id`는 배포 파일시스템에서 같은
+Candidate 파일 하나를 가리키므로, 그 그룹에서 파일을 소유할 수 있는 것은
+**최대 하나**이고 나머지는 디스크가 무엇을 답하든 orphan이다. C89는 그것을
+"파일시스템에게 다시 묻지 않는다"로 구현했다 — `members[0]`이 소유자, 나머지가
+orphan.
+
+**그 문장은 *몇 개*를 정하지 *어느 것*을 정하지 않는다.** `members`의 순서는
+`sorted(processed_dir.glob("*.json"))`, 즉 **Event 파일 이름의 정렬 순서**다.
+살아남은 Candidate는 5단계 루프가 충돌로 중단되기 전에 **먼저 도달한 쪽**이다.
+두 순서는 아무 관계가 없다. `processed/`의 이름은 Event 파일을 쓴 쪽이 정하고
+(Agent outbox는 `event_id`로 짓지만 Desktop 4 reporter와 운영자는 `incoming/`에
+직접 쓴다), C89 자신의 재현도 `evtNN.json`을 썼다.
+
+**측정** — `twin` + `TWIN`, 디스크에 있는 파일은 `HIST-twin.json`, `TWIN`의
+Event 파일이 먼저 정렬되는 배치:
+
+| | 보고된 orphan | 실제로 Candidate가 없는 Event |
+|---|---|---|
+| 이전 | `['twin']` | `TWIN` |
+| 이후 | `['TWIN']` | `TWIN` |
+
+개수는 양쪽 다 1로 맞다. **틀린 것은 이름이고, 그 이름이 전부다** —
+`ops_status.py`는 "수집됐지만 History에 들어가지 못한 Event 1건: <event_id>"로
+사람을 그 id를 찾으러 보낸다. 이전 동작은 두 번 손해다: 영구 유실을 감추고,
+그 대신 렌더링도 백업도 끝난 Event를 찾아가게 만든다.
+
+**C89의 측정은 옳았다 — 살아남은 쪽이 우연히 먼저 정렬됐기 때문이다.** 그래서
+그때 붙인 테스트 넷이 전부 초록인 채로 남아 있었다. 순서를 뒤집는 fixture가
+하나도 없었다.
+
+**얼마나 자주 틀리는가 — 무작위 트리 150개로 잰다.** 수정 전후 두 구현을 같은
+트리에 나란히 돌렸다(seed 고정, 대소문자 쌍둥이 id 530개, Candidate를 쓰는
+순서와 `processed/` 파일 이름 순서는 서로 독립적인 난수):
+
+    개수 불일치 (전 vs 후)                                  0 / 150
+    이름 불일치                                            97 / 150
+    "잃었다"고 지목했는데 그 Candidate가 **자기 이름 그대로**
+    디스크에 있는 건수            수정 전 182건   수정 후 0건
+
+**개수는 한 번도 달라지지 않았다** — C89의 불변식은 손대지 않았다는 뜻이다.
+달라진 것은 이름뿐이고, 이름이 이 메시지의 전부다.
+
+**수정.** 디렉토리 목록은 **실제로 쓰인 이름**을 갖고 있고, 그것이 접히는
+파일시스템(docs/11)에서 `HIST-twin.json`과 `HIST-TWIN.json`을 구별할 수 있는
+유일한 것이다. `is_file()`은 할 수 없다 — 그것이 C89가 파일시스템에게 묻지
+않기로 한 이유이고, 여기서는 **다른 질문**이라 답할 수 있다. 정확히 일치하는
+멤버가 없으면(제3의 대소문자, 목록을 읽을 수 없는 디렉토리) 이전 답으로
+폴백하므로 **이름만 좋아지고 개수는 어떤 경우에도 바뀌지 않는다.**
+
+**비용 0 — 충돌이 없으면 목록을 읽지 않는다.** `keep/`는 줄어들지 않는
+디렉토리이므로(B-6) 매 실행 스캔이 되면 안 된다. lazy 캐시로 그룹이 실제로
+생겼을 때만 한 번 읽고, `test_no_directory_is_listed_without_a_collision`이
+그것을 고정한다.
+
+### 2. 목록을 읽을 수 없는 디렉토리가 "볼 것이 없다"로 보고됐다
+
+`agent/status._count_unreachable_signals()`. 이 함수의 docstring이 약속한다 —
+*"Errors count rather than vanish, in both directions"*. 그리고 날짜 디렉토리
+분기의 주석은 이유까지 적어 두었다:
+
+    "`continue`ing in silence here would have made the number *smaller*
+     for a tree that got harder to read -- the direction that reads as
+     reassurance"
+
+**같은 함수의 `_all_json_below()`가 정확히 그것을 하고 있었다.**
+`except OSError: return total` — 첫 호출에서 거부당하면 `total`은 0이다.
+
+coverage가 찾았다. 이 네 분기 중 **어느 것도 실행된 적이 없었으므로**, 위
+문장은 한 곳에서만 코드였고 세 곳에서는 산문이었다. `os.scandir()`이 디렉토리
+하나를 거부하게 하고, 그 아래 잘못 놓인 Signal 3건을 두고 재측정:
+
+| 읽을 수 없는 디렉토리 | 정상 스캔 | 주입 후 (이전) | 주입 후 (이후) |
+|---|---|---|---|
+| 날짜 아닌 디렉토리 전체 | 3 | **0** | 1 |
+| 날짜 아닌 디렉토리 아래 subtree | 3 | **0** | 1 |
+| 날짜 디렉토리 **안**의 중첩 디렉토리 | 3 | **0** | 1 |
+| 날짜 디렉토리 자신 (원래 옳던 분기) | 0 | 1 | 1 |
+
+앞의 셋에서 운영자가 본 것: `읽힐 수 없는 Signal : 0`, ATTENTION 없음 — 어떤
+날짜도 읽지 않을 Signal이, 아무도 안을 들여다볼 수 없는 디렉토리에 있는데.
+C62·C68·C101 M5와 같은 모양이다(거부당한 항목이 깨끗한 항목으로 세어진다).
+
+**도달 경로는 평범하다.** `signals/`는 사람이 손으로 파일을 놓는 디렉토리이고
+(A-11), Windows에서 복원된 ACL·백신·핸들을 쥔 sync client가 전부 이 모양을
+만든다. 부모의 목록과 이 호출 사이에 디렉토리가 사라지는 것도 같다.
+
+**`+ 1`이지 정상 개수가 아니다.** 정상 개수는 바로 여기서 알 수 없는 값이다.
+1은 여전히 주장인 가장 작은 값이고, 아래 형제 분기와 글자까지 같다.
+
+**`signals/` 루트는 일부러 바꾸지 않았고 여전히 0이다.** 거기서는 *무엇이든
+있는지*조차 모르므로 1은 거부당한 수가 아니라 **지어낸 수**가 된다. 기존
+`test_a_missing_or_unreadable_signals_directory_answers_zero`가 그 결정을
+고정하고 있고, 새 클래스가 그 차이를 고정한다.
+
+### 3. 형제 카운터의 미실행 분기 일곱 — 전부 **옳았다**, 그리고 이제 코드다
+
+같은 파일의 `_count_undelivered_signals_in_closed_dates()`도 여섯 분기가 한 번도
+실행된 적이 없었다. 방금 형제 함수에서 바로 그 약속이 깨져 있는 것을 봤으므로
+**읽지 않고 쟀다.** 닫힌 날짜에 미전달 Signal 3건을 두어 정상 답이 3이 되게
+하고(0도, 우연한 1도 통과로 오인될 수 없다) 주입:
+
+    날짜 entry의 is_dir()이 거부           정상 3  ->  1
+    닫힌 날짜 디렉토리를 못 읽는다           정상 3  ->  1
+    Signal 3개 중 2개의 is_file()이 거부    정상 3  ->  3
+    날짜 이름을 단 **파일**                 0 (날짜 디렉토리가 아니다)
+    닫힌 날짜 안의 비-.json 파일             1 (.json만 센다)
+    `x.json`이라는 **디렉토리**              1 (`exists()`가 아니라 `is_file()`)
+
+**여섯 다 방향이 옳다.** C101이 이 모양을 `sent/` 쪽에서 한 번 닫았고(M5),
+`signals/` 쪽이 나머지 반이었다. 결함 0건, 테스트 7건 추가.
+
+    control                                        7 passed
+    N1 날짜 entry 거부를 버린다                      DETECTS
+    N2 닫힌 날짜 디렉토리 거부를 버린다               DETECTS
+    N3 Signal entry 거부를 버린다                    DETECTS
+    N4 비-.json도 센다                              DETECTS
+    N5 `x.json` 디렉토리도 센다                      DETECTS
+    N6 `_is_date_directory_name` 가드 제거           **첫 회차 MISSES**
+
+**N6은 한 번 놓쳤고, 그것이 테스트를 하나 더 만들었다.** 파일 모양 케이스는
+가드가 없어도 바로 아래 `is_dir()`에서 걸러지므로 가드에 대해 아무것도 증명하지
+않았다. 날짜가 **아닌 디렉토리**를 넣자 두 방향이 갈린다 — `2026-8-21`은 이
+인터프리터의 `date.fromisoformat()`이 받아들이므로 `_count_unreachable_signals()`가
+이미 세고 있는 Signal을 **두 번째로 보고**하게 되고, `august-21`은 받아들이지
+않으므로 읽기 전용 화면에서 `ValueError`가 올라온다. 그 테스트를 더하니 DETECTS.
+
+### 3b. Coverage baseline (수정 후, `ops_status.py` 포함)
+
+앞선 pass는 `--source=ops_status`가 이미 import된 모듈을 잡지 못해
+(`module-not-measured`) 이 파일을 **한 줄도 재지 않았다.** 경로 패턴으로 바꿔
+다시 쟀다:
+
+    TOTAL                          6,965 stmt / 120 miss   1,974 branch / 58 partial   98%
+    ops_status.py                  1,169 stmt /  26 miss   97%
+    src/history/reconciliation.py     88 stmt /   0 miss   99%
+    src/agent/status.py              197 stmt /  12 miss   94%
+
+남은 120줄의 정체는 §5 마지막 행에 적었다 — abstract method 본문, 문서화된
+도달 불가, 그리고 `ops_status.py`의 메시지 변형(같은 ATTENTION 줄의 총계 문구
+분기 등). 이 pass가 이 파일을 잰 것이 저장소 역사상 처음인지는 확인하지
+않았다 — 확인한 것은 **앞 pass가 재지 못했다**는 것뿐이다.
+
+### 4. Mutation — 11종 전부 DETECTS
+
+    reconciliation (7건)
+    control                                          32 passed
+    M1 소유자를 항상 members[0]으로 (= C102 이전)      DETECTS
+    M2 소유자를 항상 마지막으로                        DETECTS
+    M3 실제 이름을 casefold로 비교 (= 접힘을 되돌림)    DETECTS
+    M4 충돌이 없어도 디렉토리를 읽는다                  DETECTS
+    M5 읽을 수 없는 디렉토리에서 예외를 올린다           DETECTS
+
+    _count_unreachable_signals (6건)
+    control                                          12 passed
+    M1 `return total` (= C102 이전)                  DETECTS  4 failed
+    M2 날짜 디렉토리 분기도 조용히 continue             DETECTS
+    M3 타입을 못 읽는 entry를 버린다                    DETECTS
+    M4 `_all_json_below()`의 재귀를 없앤다              DETECTS  2 failed
+    M5 `signals/` 루트가 1을 지어낸다                   DETECTS
+    M6 거부당한 디렉토리를 3으로 과다 보고               DETECTS
+
+M5(양쪽)와 M6이 거짓 양성 방향이다. 유실 경보를 넓힐 때 그 방향을 같이
+고정하지 않으면 C26이 말한 "읽고 넘기게 만드는 경보"가 된다.
+
+### 5. 같은 Sprint에서 결함 없음으로 닫은 것 (측정)
+
+| 감사 | 결과 |
+|---|---|
+| `oplog.SECRET_RE` ReDoS 재측정 (적대적 6종, n=1k~50k) | **선형**. `A`*16,000이 72 ms, `-----BEGIN` 반복 49,600자가 71.7 ms. `MAX_SECRET_NAME_PREFIX`와 `_PEM_BODY` 두 경계가 실제로 듣는다 |
+| State loader 5종 × 적대적 타입 (`backup_status`에 list/dict/int/bool) | 전부 typed error. Python 3.12+ Enum이 unhashable을 `ValueError`로 답하므로 C72의 frozenset 모양이 여기엔 없다 |
+| E-18 재검증 — `scheduler/lock.py`의 `tasklist` | **여전히 해당 없음.** 이 머신 실측: tasklist는 콘솔이 아니라 **cp949**로 쓰고(`\xc1\xa4\xba\xb8...`), `locale.getencoding()`도 cp949라 디코딩 실패가 없다. `result.stdout`이 None이 되는 경로가 열리지 않는다 |
+| `late_events.append_late_events()`의 미실행 분기(`363->367`) | Late Events가 **마지막 섹션**인 손편집 파일. 실측: 블록이 섹션 끝에 들어가고 `_update_metadata()`가 없는 Metadata를 만들어 `Event Count: 3`까지 맞다. 결함 아님 |
+| 나머지 미실행 줄 전수 | abstract method 본문(`transport.py` 5, `review.py` 2, `repository.py` 3), 문서화된 도달 불가(`runner.py` 1390 — `BackupPendingReachesTheManifestTests`가 전제를 고정, 1627), 방어적 대칭(`file_repository.py` 142 — 호출자가 항상 `HIST-` 접두사를 붙이므로 device head가 될 수 없다) |
+| junction이 `_relative_files()`의 symlink 거부를 뚫는가 | 이 Python(3.13)에서 junction은 `is_symlink()` False다. 그러나 `scan_for_secrets()`도 rglob으로 **같이** 내려가므로 게이트와 sync가 보는 집합이 어긋나지 않는다 — A-19가 이미 기록한 동작이고 새 구멍이 아니다 |
+| 화면 숫자 상호 대조 (실 runtime) | Desktop 합 9+1+5+1=16 = Control Tower 16, `파일 17건` = 16 Event + 중복 1, rejected 4 = 출처불명 4. 어긋남 0 |
+| **인코딩 왕복 fuzz** — renderer -> parser 19종 (emoji/astral, 결합 문자, zero-width, RTL override, CJK ext B, NBSP, tab, `## Metadata` 모양 요약, label 접두어, 3,000자, astral `event_id`/`project_id`) | **18/19 왕복 무손실**(id·summary·category·`unconsolidated=0`). 유일한 실패는 `project_id`에 개행이 든 경우이고, `monthly/parser.py`가 이미 그 측정을 주석에 적어 두었으며 `unconsolidated=1`은 탐지기가 제 일을 한 것이다 |
+| `# pragma: no cover` 7개 전수 | 전부 정당하다. `_label_position()` 둘은 `_LABEL_BULLET`이 같은 tuple로 만들어지고 대소문자를 구분하므로 도달 불가, `fit_properties()`의 비-dict는 builder 둘만 부르므로 불가, `rollup`/`dashboard`의 timestamp 넷은 `_event_date()`가 같은 `fromisoformat`으로 이미 걸러 `unreadable`로 보낸 뒤라 불가 — 넷 다 "sort key/뷰가 값 하나로 죽지 않는다"를 이유로 남겨 둔 것이라고 적혀 있다 |
+| `except Exception` 36곳 전수 | 원 신호를 잃는 곳 0. `exc`를 안 묶는 셋(`runner.py` 783·1110, `transport.py` 50)도 각각 "로그도 못 쓰면 원 예외를 가리는 것이 더 나쁘다" / "실패하면 date별 개별 호출로 폴백" / "읽기가 실패를 둘로 만들면 안 된다"를 주석으로 갖고 실제로 그렇게 동작한다 |
+| entrypoint stdout 인코딩 (임시로 의심했다가 기각) | `event_id`에 cp949 밖 문자가 들어가면 `print()`가 죽는가 — **네 entrypoint 전부 이미 막혀 있다**(`ops_status.py` 55-57 포함). 재현했던 crash는 reconfigure가 없는 내 임시 스크립트였다 |
+
+### 6. 기록만 남기는 관찰 (수정 안 함)
+
+- **`retry_queue.remove_entry()`의 index 경로는 중복 `event_id`에서 갈린다**
+  (읽지 않고 쟀다). 같은 `event_id`를 가진 entry 2건으로:
+
+        index 없음   removed=True   남은 entry 0
+        index 있음   removed=True   남은 entry 1
+
+  `build_index()`가 마지막 위치만 남기기 때문이다. 그런 파일이 저장·재적재도
+  된다(2건 저장 -> 2건 로드). 다만 큐에 중복을 만드는 것은 `upsert_entry()`가
+  아니므로 손편집·복원본에서만 생기고, 남은 한 건은 다음 실행이 index를 다시
+  만들어 지운다. 클래스 docstring이 주장하는 것은 **index를 안 준 경로의
+  동등성**이고 그것은 참이므로, 계약 위반이 아니라 문서화되지 않은 경계다.
+- **`ops_status._daily_dates()`의 `entry.is_file()` 실패는 조용히 버려지지만,
+  그 결과는 안심이 아니라 경보다 — 읽고 나서 반대로 쟀다.** C68이 형제들에 붙인
+  `skipped` 카운트가 여기엔 없어서 처음에는 "조용히 사라진다"로 적었는데,
+  주입해 보니 반대였다. Daily 3일치에서 가운데 하나의 `is_file()`을 거부시키자:
+
+        daily 파일 : 3            (그대로 — 이 숫자는 다른 함수가 만든다)
+        ATTENTION  : 1 -> 2       "Daily History 시퀀스에 구멍 1일: 2026-08-02"
+
+  즉 **과다 보고**이고, 그것이 이 저장소가 일관되게 고르는 방향이다. 사람이
+  파일을 보러 가고, 가 보면 읽을 수 없는 파일이 있다. 남는 흠 둘: 한 화면의 두
+  숫자가 어긋나고(`daily 파일 3` vs "그중 하나가 없다" — C77이 고친 모양),
+  문장이 "파일이 있었는데 **지금 없다**"라고 단정하는데 파일은 거기 있다.
+  고치려면 `_daily_dates()`가 `skipped` 채널을 갖거나 거부된 entry를 **있는
+  것으로** 세야 하고, 앞은 docstring이 세는 "여섯 군데 호출부"의 반환 타입을
+  바꾸며 뒤는 경보를 지우는 방향이다 — 둘 다 C102의 최소 수정 범위 밖이고,
+  뒤쪽은 방향 자체가 결정이다.
+- **이 파일의 `마지막 갱신:` 헤더는 C75에서 멈춰 있다.** C76~C101 스물여섯
+  Sprint가 `## C##` 섹션만 추가했다. C102도 그 관행을 따랐다 — 헤더 스택을
+  되살릴지는 형식 결정이다.
+
+### 전체 Regression
+
+    C101 종료 시점   3719 passed, 8 skipped, 5713 subtests   exit 0
+    C102 중간        3732 passed, 8 skipped, 5718 subtests   exit 0   (결함 2건 수정)
+    C102 종료 시점   3739 passed, 8 skipped, 5720 subtests   exit 0   (형제 카운터 7건)
+
+신규 20건 — `test_history_reconciliation.py` 7, `test_observability.py` 13.
+신규 subtest 7건.
 
 
 ---

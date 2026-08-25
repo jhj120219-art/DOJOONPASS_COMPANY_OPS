@@ -707,7 +707,17 @@ class EnvironmentContractTests(unittest.TestCase):
     So the two are checked against each other in both directions.
     """
 
-    ENTRYPOINTS = ("run_company_ops.py", "run_agent.py", "init_notion.py", "ops_status.py")
+    ENTRYPOINTS = (
+        "run_company_ops.py",
+        "run_agent.py",
+        "init_notion.py",
+        "ops_status.py",
+        # `dashboard_server.py` reads `COMPANY_OPS_DASHBOARD_PORT`. Left out
+        # of this roster it would have been the one tool whose variable
+        # nothing checked against `.env.example` — which is the gap C80
+        # closed for the two rosters below and the same gap in this one.
+        "dashboard_server.py",
+    )
 
     def _declared_variables(self) -> set[str]:
         declared = set()
@@ -951,12 +961,73 @@ class EnvironmentContractTests(unittest.TestCase):
 
     def test_no_entrypoint_silently_loads_a_dotenv_file(self):
         """`.env.example` states that nothing auto-loads it. If that ever
-        changes, the template's own instructions become wrong."""
+        changes, the template's own instructions become wrong.
+
+        **What "loads" means, made precise (C90).** The original form of this
+        test banned the *string* `".env"` from every entrypoint. That is a
+        proxy for the property, and it turned out to forbid something the
+        property permits: `ops_status.py` now reports **that** `.env` holds
+        Notion credentials this process was never given, which is the
+        opposite of loading them — it names the two variables, uses neither
+        value, and tells the operator the template's own sentence ("`.env`는
+        자동으로 읽히지 않는다 … 셸에서 export"). It makes the template's
+        instruction *more* likely to be followed, not wrong.
+
+        Why that report exists is measured, not hypothetical: on this
+        deployment `.env` held a token and database id that worked — they
+        wrote four rows into the live PROJECTS database — while every run
+        printed `notion_sync: SKIPPED (미설정)` and the Notion projection sat
+        **15 days** behind the Control Tower. "Not configured" and
+        "configured but not exported" need opposite reactions.
+
+        So the check is now the property itself, and it is stricter than the
+        string ban in the direction that matters:
+
+            no dotenv library, anywhere        as before
+            nothing writes to `os.environ`     new — this is what "load"
+                                               actually is, and the old test
+                                               never looked for it
+            a file that mentions `.env` must
+            also state that it is not loaded   so the template cannot be
+                                               contradicted in silence
+        """
+        import ast
+
         for name in self.ENTRYPOINTS:
             text = (REPO_ROOT / name).read_text(encoding="utf-8")
             with self.subTest(entrypoint=name):
                 self.assertNotIn("dotenv", text.lower())
-                self.assertNotIn('".env"', text)
+
+                # Loading is assignment into the environment. Nothing here
+                # may do it, whether or not `.env` is involved.
+                tree = ast.parse(text)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if (
+                                isinstance(target, ast.Subscript)
+                                and isinstance(target.value, ast.Attribute)
+                                and target.value.attr == "environ"
+                            ):
+                                self.fail(f"{name} assigns into os.environ")
+                    if isinstance(node, ast.Call):
+                        func = node.func
+                        if (
+                            isinstance(func, ast.Attribute)
+                            and func.attr in {"update", "setdefault"}
+                            and isinstance(func.value, ast.Attribute)
+                            and func.value.attr == "environ"
+                        ):
+                            self.fail(f"{name} mutates os.environ")
+
+                if '".env"' in text:
+                    self.assertIn(
+                        "자동으로 읽히지 않는다",
+                        text,
+                        f"{name} mentions .env without saying it is not "
+                        "auto-loaded — the template's instruction must not be "
+                        "contradicted in silence",
+                    )
 
     def test_the_template_names_every_entrypoint(self):
         """An operator reading only this file must be able to tell which
@@ -1043,6 +1114,7 @@ class EntrypointOutputOrderingTests(unittest.TestCase):
                 "run_agent.py",
                 "init_notion.py",
                 "ops_status.py",
+                "dashboard_server.py",
                 "src/review_cli.py",
             },
         )
@@ -1429,6 +1501,19 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         # from_the_last_run()` needs one named component's metrics out of the
         # manifest, which is exactly the lookup it was written for.
         "read_event_json",                # local_output read seam
+        # --- dispatched by name, never called from this source ------------
+        #
+        # `http.server` resolves a request method to `do_<VERB>` with
+        # `getattr()`, and calls `log_message()` from inside
+        # `BaseHTTPRequestHandler`. There is no call site in this repository
+        # to find and there cannot be one: naming them here is what the
+        # detector can see. They are the opposite of dead — every request to
+        # `dashboard_server.py` enters through them — so they are recorded
+        # under their own heading rather than filed beside the entries that
+        # are waiting on a decision.
+        "do_GET",
+        "do_POST",
+        "log_message",
     }
 
     def _production_files(self):
@@ -2617,6 +2702,7 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
                 "run_agent.py",
                 "init_notion.py",
                 "ops_status.py",
+                "dashboard_server.py",
                 "src/review_cli.py",
             },
         )
@@ -2748,6 +2834,38 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
             "no entrypoint named a variable — the subset check above just "
             "compared two empty sets",
         )
+
+    def test_the_file_the_refusal_sends_them_to_names_the_tool(self):
+        """Every refusal ends with "AGENT.md를 보세요". That sentence is the
+        whole exit an operator gets, and it is only an exit if AGENT.md
+        actually says something about the tool they typed.
+
+        Measured on `dashboard_server.py` (C79): it printed the refusal, and
+        AGENT.md — the file the refusal names — did not contain the string
+        `dashboard_server` anywhere. The operator is told where to look and
+        the place they look does not answer, which is worse than being told
+        nothing: `.env.example` had it, so the one document that did know was
+        not the one the message pointed at.
+
+        The check is deliberately weak — the tool's name appears somewhere —
+        because a stronger one would be prescribing prose. A name that is
+        present can be found with Ctrl-F; a name that is absent cannot.
+        """
+        text = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                tool = Path(name).name
+                message = self._run(name, "--dry-run").stderr
+
+                # The premise: this tool really does send them to AGENT.md.
+                self.assertIn("AGENT.md", message)
+                self.assertIn(
+                    tool,
+                    text,
+                    f"{tool}'s refusal sends an operator to AGENT.md, which "
+                    f"never mentions {tool}",
+                )
 
     def test_the_rule_lives_in_one_place(self):
         """One copy per entrypoint of "reject unknown arguments" is one

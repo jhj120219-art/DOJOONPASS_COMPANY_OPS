@@ -295,8 +295,34 @@ def _count_unreachable_signals(signals_dir: Path) -> int:
                     except OSError:
                         total += 1
         except OSError:
-            # A read-only diagnostic must not become the thing that fails.
-            return total
+            # A read-only diagnostic must not become the thing that fails —
+            # and it must not answer **zero** either, which is what returning
+            # `total` unchanged did.
+            #
+            # This is the branch the date-directory case below argues
+            # against, in this function, unfixed: a directory whose parent
+            # listed it is a directory that exists, so its contents "cannot
+            # be ruled out" for exactly the reason written there. Measured,
+            # three misfiled Signals under a directory `os.scandir()`
+            # refuses:
+            #
+            #     whole non-date dir unlistable        healthy 3  ->  0
+            #     subtree under a non-date dir          healthy 3  ->  0
+            #     a nested dir inside a date dir        healthy 3  ->  0
+            #     a date dir itself (the branch below)  healthy 0  ->  1
+            #
+            # Three of the four ways to hit "cannot list this" made the
+            # number *smaller* — down to the one value that reads as "there
+            # is nothing to look at". `ops_status.py` then prints
+            # `읽힐 수 없는 Signal : 0` and raises no ATTENTION for Signals
+            # that no date will ever read. Same shape as C62, C68 and C101's
+            # M5: a refused entry counted as a clean one.
+            #
+            # `+ 1`, not the healthy count, because the healthy count is
+            # exactly what is unknowable here. One is the smallest statement
+            # that is still a statement, and it matches the sibling branch
+            # below to the character.
+            return total + 1
         return total
 
     count = 0

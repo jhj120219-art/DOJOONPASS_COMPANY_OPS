@@ -128,7 +128,7 @@ from scheduler.consistency import (  # noqa: E402
     ConsistencyStatus,
     check_state_consistency,
 )
-from oplog import one_line, redact  # noqa: E402
+from oplog import bounded, one_line, redact  # noqa: E402
 
 # The same compiled rule the Agent refuses a Signal with and `redact()`
 # scrubs a log line with. A second opinion about what a secret looks like is
@@ -771,8 +771,23 @@ def _authored(text: str) -> str:
     the sink stays as it is: a message that carries authored text redacts at
     the place it is produced, exactly as `_print_control_tower()`'s blocker
     line already did.
+
+    `bounded()` for the same reason `oplog.append_line()` applies it: nothing
+    this system reports is allowed to be as long as whatever produced it.
+    Nothing bounds `blocker`, `summary` or `project_id` — docs/02 gives them
+    no maximum and `validate_event()` only type-checks — and C71 bounded the
+    **number** of RISKS lines in ATTENTION without bounding the **length** of
+    any one of them. Five is a small number times an unbounded one.
+
+    Measured on three blocked Projects carrying a 100,000-character
+    `blocker`: one ATTENTION line of 100,176 characters, three of them, in
+    the block whose entire job is telling an operator what to do now — and in
+    the log a scheduled run redirects to disk. `MAX_LOG_ERROR` (600) is the
+    cap this project already chose for exactly this shape, and the truncation
+    is visible, so the line still names the Project and the evidence file
+    that holds the whole text.
     """
-    return redact(one_line(text))
+    return bounded(redact(one_line(text)))
 
 
 def _one_per_event(items, key):
@@ -3430,6 +3445,76 @@ def _queue_age_days(added_at: str, now: datetime) -> float | None:
     return (_comparable(now, added) - added).total_seconds() / 86400
 
 
+#: The variables `notion/config.py` requires before any projection runs.
+_NOTION_REQUIRED = ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID")
+
+
+def _notion_credentials_present_but_unexported() -> tuple[str, ...]:
+    """Names that `.env` fills in and this process cannot see.
+
+    **Never returns, reads back, logs or compares a value.** Only whether the
+    line has one, and only for the two names above — `.env` is the one file
+    in this tree that holds a real credential, and a status view is the last
+    place that should be handling one.
+
+    Why it exists (C90). `.env` is deliberately not auto-loaded — the
+    template says so and this project has kept it that way. The cost was
+    invisible: with working credentials sitting in `.env`, `from_env()`
+    raises, `run_company_ops.py` prints "Notion 미설정 … 건너뜁니다", and the
+    Run Manifest records `notion_sync: SKIPPED`. The screen then tells an
+    operator **미설정** — *not configured* — while they are looking at a
+    `.env` that is configured, and their Notion projection quietly stops
+    being written.
+
+    Measured on this deployment: `.env` held a valid token and database id,
+    the PROJECTS database was reachable and 15 days behind the Control
+    Tower, and every run had reported the same untroubling word.
+
+    "Missing" and "present but not exported" need opposite reactions, and
+    only one of them is a configuration decision. This tells them apart.
+    """
+    # `RUNTIME_DIR.parent`, never `PROJECT_ROOT`. They are the same directory
+    # in production and they are **not** the same under a test or a probe:
+    # `RUNTIME_DIR` is the knob this view is redirected by (see `_agent_dir()`
+    # and `RuntimeDirIsTheOnlyKnobTests`), and `PROJECT_ROOT` freezes at
+    # import. The first draft of this function used `PROJECT_ROOT` and twelve
+    # existing tests failed at once — every one of them a fixture that had no
+    # `.env` reading this repository's real one. That is C31's incident, and
+    # C88 added a gate for it three cycles ago; this function walked straight
+    # into it anyway, which is the argument for the gate rather than against.
+    try:
+        lines = (RUNTIME_DIR.parent / ".env").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except (OSError, ValueError):
+        # No `.env`, or one this process cannot read: nothing to say. A
+        # status view must not fail because a file it merely hoped for is
+        # absent.
+        return ()
+    filled = set()
+    for line in lines:
+        stripped = line.strip()
+        # No `startswith("#")` test, and that is measured rather than
+        # forgotten (the same finding as C84's bool guard). A commented line
+        # yields the name `"# NOTION_API_TOKEN"`, which is not one of the two
+        # names below, so the comment can never change this function's
+        # answer. A mutation removing the check failed nothing; the branch
+        # was unreachable. `test_comments_are_not_settings` asserts the
+        # answer instead of guarding a path nothing can take.
+        if not stripped or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        # `.strip()` on the value only to decide "is there anything here" —
+        # the value itself is dropped on the next line and never leaves.
+        if name.strip() in _NOTION_REQUIRED and value.strip():
+            filled.add(name.strip())
+    return tuple(
+        name
+        for name in _NOTION_REQUIRED
+        if name in filled and not os.environ.get(name)
+    )
+
+
 def _print_notion(now: datetime) -> list[str]:
     """The two Notion queues — and the two fields they write that nothing read.
 
@@ -3557,6 +3642,20 @@ def _print_notion(now: datetime) -> list[str]:
                     f"열이 모자란 Database가 흔한 원인이며 그 경우 "
                     f"docs/13 §3-⑧-4가 고치는 명령이다"
                 )
+
+    unexported = _notion_credentials_present_but_unexported()
+    if unexported:
+        print(
+            "  자격증명            : .env에 있으나 이 프로세스에 전달되지 않았다 "
+            f"({', '.join(unexported)}) — Notion 단계는 '미설정'으로 건너뛴다"
+        )
+        attention.append(
+            f"Notion 자격증명이 .env에 있는데 환경변수로 전달되지 않았다 "
+            f"({', '.join(unexported)}) — 그래서 모든 실행이 Notion 단계를 "
+            "'미설정'으로 건너뛰었고 Notion의 Control Tower는 그만큼 오래됐다. "
+            ".env는 자동으로 읽히지 않는다(.env.example 머리말); 셸에서 export하거나 "
+            "실행 스크립트가 직접 읽어야 한다"
+        )
 
     attention.extend(_same_instant_skips_from_the_last_run())
     return attention

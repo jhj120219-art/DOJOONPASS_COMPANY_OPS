@@ -16,10 +16,12 @@ quietly re-processed an orphan would be deciding A-20 by implementation.
 """
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -599,6 +601,207 @@ class TwoIdsThatDifferOnlyInCaseTests(unittest.TestCase):
         self.assertEqual(len(reported), 2, reported)
         self.assertNotIn("trip", reported)
 
+
+class WhichMemberOfACollisionSurvivedTests(unittest.TestCase):
+    """C102. The group size was right; the **name** was the sort order.
+
+    C89 established that at most one member of a colliding group can own the
+    Candidate file, so the rest are orphaned no matter what the filesystem
+    says. That settles *how many*. It does not settle *which*, and the code
+    answered that by taking `members[0]` — the member whose file in
+    `processed/` sorts first.
+
+    Those two orders are unrelated. `processed/` filenames are chosen by
+    whoever wrote the Event file (the Agent's outbox names them from the
+    `event_id`, but the Desktop 4 reporter and an operator both write
+    `incoming/` directly, and C89's own reproduction used `evtNN.json`).
+    The Candidate that survived is whichever one step 5 reached before the
+    collision aborted the loop.
+
+    Measured on HEAD before this class, `twin` + `TWIN` with
+    `HIST-twin.json` the file that exists and `TWIN`'s Event file sorting
+    first:
+
+        orphaned=['twin']     <- the Event that IS in Company History
+        `TWIN`                <- permanently lost, reported as fine
+
+    C89's own measurement was right, and only because its surviving member
+    happened to sort first — which is why the tests above did not catch it.
+
+    The line an operator reads names an `event_id` and sends them to go and
+    find it (`ops_status.py`'s "수집됐지만 History에 들어가지 못한 Event"),
+    so naming the wrong member costs the whole message twice over: it hides
+    the loss, and it sends the person after an Event they will find rendered
+    and backed up.
+
+    A directory listing carries the name that was actually written, which is
+    the one thing `is_file()` cannot report on a filesystem that folds the
+    two (docs/11). It is read only once a group exists — an ordinary tree
+    pays nothing, which `test_no_directory_is_listed_without_a_collision`
+    pins.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.processed = self.root / "processed"
+        self.keep = self.root / "keep"
+        self.review = self.root / "review"
+        for directory in (self.processed, self.keep, self.review):
+            directory.mkdir(parents=True)
+        self._files: dict[str, str] = {}
+
+    def _event(self, event_id):
+        payload = {
+            "schema_version": "1.0",
+            "event_id": event_id,
+            "timestamp": "2026-08-18T10:00:00+09:00",
+            "source": "DESKTOP_1",
+            "role": "CTO_BACKEND",
+            "project_id": "PRJ-A",
+            "event_type": "MILESTONE_COMPLETED",
+            "status": "IN_PROGRESS",
+            "summary": f"work {event_id}",
+            "milestone": "M",
+            "blocker": None,
+            "evidence": [],
+            "history_candidate": True,
+        }
+        # Same reason as `TwoIdsThatDifferOnlyInCaseTests._event()`: a
+        # fixture the filesystem folds cannot demonstrate a fold. The
+        # numbering also makes the sort order explicit, which is the whole
+        # subject here.
+        self._files[event_id] = f"evt{len(self._files):02d}.json"
+        (self.processed / self._files[event_id]).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+
+    def _candidate_for(self, event_id):
+        from history import FileHistoryRepository
+
+        payload = json.loads(
+            (self.processed / self._files[event_id]).read_text(encoding="utf-8")
+        )
+        candidate = HistoryFilter().evaluate(Event.from_dict(payload)).candidate
+        FileHistoryRepository(keep_dir=self.keep, review_dir=self.review).save(
+            candidate, overwrite=True
+        )
+
+    def _skip_unless_folded(self):
+        if not (self.keep / "HIST-twin.json").exists():
+            return
+        if not (self.keep / "HIST-TWIN.json").exists():
+            self.skipTest("case-sensitive filesystem; E-22 does not arise here")
+
+    def _run(self):
+        return find_orphaned_events(
+            processed_dir=self.processed,
+            keep_dir=self.keep,
+            review_dir=self.review,
+        )
+
+    def test_the_survivor_is_the_file_on_disk_not_the_first_in_sort_order(self):
+        """The measurement. `TWIN` sorts first; `twin` owns the file."""
+        self._event("TWIN")
+        self._event("twin")
+        self._candidate_for("twin")
+        self._skip_unless_folded()
+
+        reported = sorted(o.event_id for o in self._run().orphaned)
+
+        self.assertEqual(
+            reported, ["TWIN"],
+            "the Event named as lost is the one that sorted first, not the "
+            "one whose Candidate is missing",
+        )
+
+    def test_the_event_that_owns_the_file_is_never_named(self):
+        """The other half of the same inversion: naming the survivor is a
+        false alarm on an Event that is in Company History."""
+        self._event("TWIN")
+        self._event("twin")
+        self._candidate_for("twin")
+        self._skip_unless_folded()
+
+        self.assertNotIn("twin", {o.event_id for o in self._run().orphaned})
+
+    def test_the_count_is_the_same_whichever_member_owns_the_file(self):
+        """C89's invariant is untouched — this only ever changes the name."""
+        for owner in ("twin", "TWIN"):
+            with self.subTest(owner=owner):
+                self.setUp()
+                self._event("TWIN")
+                self._event("twin")
+                self._candidate_for(owner)
+                self._skip_unless_folded()
+
+                self.assertEqual(len(self._run().orphaned), 1)
+
+    def test_a_three_way_collision_names_the_two_that_do_not_own_the_file(self):
+        """The member that survives can be last as easily as first."""
+        for event_id in ("trip", "TRIP", "TriP"):
+            self._event(event_id)
+        self._candidate_for("TriP")
+        if not (self.keep / "HIST-trip.json").exists():
+            self.skipTest("case-sensitive filesystem")
+
+        reported = sorted(o.event_id for o in self._run().orphaned)
+
+        self.assertEqual(reported, ["TRIP", "trip"], reported)
+
+    def test_a_casing_no_member_claims_falls_back_without_changing_the_count(self):
+        """A third casing on disk — a hand-restored file, say — is not an
+        answer to "which member wrote this", so the previous answer stands.
+        What must not change is how many are reported lost."""
+        self._event("TWIN")
+        self._event("twin")
+        (self.keep / "HIST-TwIn.json").write_text("{}", encoding="utf-8")
+        self._skip_unless_folded()
+
+        self.assertEqual(len(self._run().orphaned), 1)
+
+    def test_an_unlistable_candidate_directory_still_reports_the_group(self):
+        """The listing decides a name, never a count, so refusing to answer
+        must cost the report nothing it already had. Injected rather than
+        reasoned about: an antivirus or a sync client holding the directory
+        is the ordinary way this happens."""
+        self._event("TWIN")
+        self._event("twin")
+        self._candidate_for("twin")
+        self._skip_unless_folded()
+
+        real_scandir = os.scandir
+
+        def refuse(path=".", *args, **kwargs):
+            if Path(path) == self.keep:
+                raise PermissionError("directory is locked")
+            return real_scandir(path, *args, **kwargs)
+
+        with mock.patch("os.scandir", refuse):
+            result = self._run()
+
+        self.assertEqual(len(result.orphaned), 1)
+
+    def test_no_directory_is_listed_without_a_collision(self):
+        """The cost claim. An ordinary tree has no colliding group, and the
+        listing must not become a per-run scan of `keep/` — that directory
+        never shrinks (BACKLOG B-6)."""
+        self._event("ordinary")
+
+        real_scandir = os.scandir
+        listed: list[Path] = []
+
+        def record(path=".", *args, **kwargs):
+            listed.append(Path(path))
+            return real_scandir(path, *args, **kwargs)
+
+        with mock.patch("os.scandir", record):
+            result = self._run()
+
+        self.assertEqual([o.event_id for o in result.orphaned], ["ordinary"])
+        self.assertNotIn(self.keep, listed)
+        self.assertNotIn(self.review, listed)
 
 
 if __name__ == "__main__":

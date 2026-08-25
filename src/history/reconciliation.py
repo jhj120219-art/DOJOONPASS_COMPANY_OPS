@@ -64,6 +64,32 @@ from .result import HistoryDecision
 _READ_WORKERS = max(4, min(16, (os.cpu_count() or 4) * 2))
 
 
+def _on_disk_name(path: Path, listings: dict[Path, dict[str, str]]) -> str | None:
+    """The name `path` really carries on disk, or None if it cannot be told.
+
+    `Path.is_file()` answers case-insensitively on the deployment filesystem
+    (docs/11), which is exactly why `find_orphaned_events()` cannot use it to
+    tell a collision group's members apart. A directory *listing* can: the
+    entry carries the name that was actually written.
+
+    `listings` is the caller's cache, populated only when a group is found —
+    an ordinary tree has no collisions and reads no directory here.
+
+    An unreadable directory yields None rather than raising: this function
+    only decides *which* member of a group is named, never *how many* are
+    orphaned, so refusing to answer costs the report nothing it already had.
+    """
+    directory = path.parent
+    listing = listings.get(directory)
+    if listing is None:
+        try:
+            listing = {entry.name.casefold(): entry.name for entry in os.scandir(directory)}
+        except OSError:
+            listing = {}
+        listings[directory] = listing
+    return listing.get(path.name.casefold())
+
+
 @dataclass(frozen=True)
 class OrphanedEvent:
     """An Event that was consumed but never became a Candidate."""
@@ -220,8 +246,38 @@ def find_orphaned_events(
     # rather than by asking the filesystem again, because the filesystem is
     # what cannot tell them apart.
     #
-    # No extra reads: the group is built from Events this pass already
-    # parsed, keyed by the path it already computed.
+    # No extra reads on an ordinary tree: the group is built from Events this
+    # pass already parsed, keyed by the path it already computed. The one
+    # directory listing below happens only once a group actually exists.
+    #
+    # **Which member survives is a fact on disk, not a position in this
+    # list.** How many are orphaned needs no filesystem answer — that is the
+    # paragraph above and it is unchanged — but *which* one is named does,
+    # and taking `members[0]` was reading the sort order of `processed/`
+    # filenames as though it were the write order of `keep/`. Those are
+    # unrelated: `processed/` names are chosen by whoever wrote the Event
+    # file, and the Candidate that survived is whichever one step 5 reached
+    # before the collision aborted it.
+    #
+    # Measured, `twin` + `TWIN` with `HIST-twin.json` the file that exists
+    # and `TWIN`'s Event file sorting first:
+    #
+    #     before   orphaned=['twin']     <- the Event that IS in Company
+    #                                       History, and `TWIN` reported fine
+    #     after    orphaned=['TWIN']
+    #
+    # The count was right in both. C89's own measurement was right too, and
+    # only because its surviving member happened to sort first. An operator
+    # reading ATTENTION is sent to find a named `event_id`, so naming the
+    # wrong one costs the whole line: it hides the permanent loss behind an
+    # Event they will find safe and rendered.
+    #
+    # The listing gives the entry's real name, which is the only thing that
+    # can tell `HIST-twin.json` from `HIST-TWIN.json` on a filesystem that
+    # folds them (docs/11). No exact match — a third casing, or a directory
+    # that will not list — falls back to the previous answer, so this can
+    # only ever improve the name and never change the count.
+    listings: dict[Path, dict[str, str]] = {}
     for members in claimed.values():
         if len(members) < 2:
             continue
@@ -229,8 +285,15 @@ def find_orphaned_events(
             # The same id twice is a duplicate *file*, not a collision of two
             # Events, and `rollup.DuplicateEvent` is where that is reported.
             continue
-        # The first is the one the file can belong to; the rest cannot.
-        for event, event_path, decision, expected in members[1:]:
+        owner = 0
+        actual = _on_disk_name(members[0][3], listings)
+        if actual is not None:
+            for index, (_e, _p, _d, expected) in enumerate(members):
+                if expected.name == actual:
+                    owner = index
+                    break
+        survivors = members[:owner] + members[owner + 1:]
+        for event, event_path, decision, expected in survivors:
             orphaned.append(
                 OrphanedEvent(
                     event_id=event.event_id,

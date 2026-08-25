@@ -1470,6 +1470,95 @@ class ParallelReadDeterminismTests(CompanyActivityTestCase):
         self.assertGreaterEqual(module._READ_WORKERS, 4)
         self.assertLessEqual(module._READ_WORKERS, 16)
 
+    def test_the_reads_really_do_overlap(self):
+        """C87. The pool is a **measured** decision and this is what stops it
+        being optimised away by a warm-cache benchmark.
+
+        Measured on this machine, `_read_one` over freshly written files:
+
+            warm local   500 files   serial  23 ms   pool16   32 ms
+            warm local  2000 files   serial  83 ms   pool16  126 ms
+            cold local   500 files   serial 547 ms   pool16   93 ms   5.9x
+            cold local  2000 files   serial 7537 ms  pool16  890 ms   8.5x
+
+        Warm, the pool costs about 40 ms at two thousand files. Cold — the
+        first read of files that just arrived, which is the ordinary case for
+        a Runner and for an operator opening the dashboard after a reboot —
+        it saves **seconds**. Three trials with the order alternated gave
+        5.9x, 5.9x and 9.4x, so the direction is not an artefact of who ran
+        first.
+
+        And `_attribute()` runs this over `transport/`, which is the OneDrive
+        Sync Folder (AGENT.md section 1). A simulated per-file latency of
+        0.1 ms already makes the pool 6.6x faster; real OneDrive was not
+        measured, deliberately — see BACKLOG.
+
+        Asserted as overlap rather than as `ThreadPoolExecutor` appearing in
+        the source, because what matters is that the reads happen at the same
+        time, not how.
+        """
+        import app.desktop_activity as module
+        import threading
+
+        for index in range(24):
+            self.add_event(
+                source="DESKTOP_1",
+                role="CTO_BACKEND",
+                timestamp="2026-08-09T10:00:00+09:00",
+                event_id=f"OVERLAP-{index:03d}",
+            )
+        paths = sorted(self.processed.glob("*.json"))
+        self.assertGreaterEqual(len(paths), 24)
+
+        lock = threading.Lock()
+        live = 0
+        peak = 0
+        real = module._read_one
+
+        def watched(path):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            try:
+                time.sleep(0.01)          # long enough for overlap to show
+                return real(path)
+            finally:
+                with lock:
+                    live -= 1
+
+        module._read_one = watched
+        try:
+            result = module._read_all(paths)
+        finally:
+            module._read_one = real
+
+        self.assertEqual(len(result), len(paths))
+        self.assertGreater(
+            peak, 1, "_read_all read the files one at a time — the pool is "
+            "gone, and the cold path costs seconds again"
+        )
+
+    def test_order_is_preserved_even_though_the_reads_overlap(self):
+        """The property the pool must not cost. `unreadable_events` is
+        reported in sorted order and `first`/`last` tie-breaking depends on
+        it, so a pool that returned completion order would change answers
+        rather than only timings."""
+        import app.desktop_activity as module
+
+        for index in range(12):
+            self.add_event(
+                source="DESKTOP_1",
+                role="CTO_BACKEND",
+                timestamp="2026-08-09T10:00:00+09:00",
+                event_id=f"ORDER-{index:03d}",
+            )
+        paths = sorted(self.processed.glob("*.json"))
+
+        returned = [path for path, _result in module._read_all(paths)]
+
+        self.assertEqual(returned, paths)
+
 
 class StateConsistencyInStatusTests(unittest.TestCase):
     """docs/10 §48's check finally has a caller.
@@ -8064,6 +8153,143 @@ class RuntimeDirIsTheOnlyKnobTests(unittest.TestCase):
         self.assertIn("Agent가 설정되어 있지 않다", buffer.getvalue())
         self.assertEqual(attention, [])
 
+    @staticmethod
+    def _live_identifiers():
+        """Every string that appears **only** in this repository's real
+        `processed/` — both the filename and the `event_id` inside it.
+
+        Both, because they are not the same string here: several files are
+        named `fi-crash.json` while carrying `event_id` `FI-CRASH-1`, and the
+        blocks print the id rather than the filename. The first draft of this
+        detector collected filenames alone and
+        `test_the_leak_detector_would_actually_notice` failed it immediately
+        — which is what that test is for.
+        """
+        import json
+
+        processed = (
+            Path(__file__).resolve().parents[1] / "runtime" / "events" / "processed"
+        )
+        found = set()
+        for path in processed.glob("*.json"):
+            found.add(path.stem)
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            # `project_id` as well as `event_id`: the CONTROL TOWER block
+            # prints counts and Project names and no ids at all, so an
+            # id-only detector looks for something that block never emits.
+            for field in ("event_id", "project_id"):
+                if isinstance(data.get(field), str):
+                    found.add(data[field])
+        # Short strings would collide with ordinary words in the output.
+        return sorted(i for i in found if len(i) >= 8)
+
+    @staticmethod
+    def _mentions(text, identifier):
+        """Whether `text` names `identifier` as a whole token.
+
+        A plain `in` is not enough and this is measured, not theoretical: the
+        first draft flagged `_print_history` for leaking `COMPANY_OPS` into an
+        empty fixture. It had not — the output contains the **environment
+        variable name** `COMPANY_OPS_HISTORY_START_DATE`, and every count in
+        the block was 0. A substring match turned a correct block into a
+        reported leak, which is the shape of false alarm that gets a real
+        detector switched off.
+        """
+        import re
+
+        return re.search(
+            r"(?<![A-Za-z0-9_])" + re.escape(identifier) + r"(?![A-Za-z0-9_])",
+            text,
+        ) is not None
+
+    def test_every_block_stays_inside_the_fixture_not_just_the_agent_one(self):
+        """C88. The class above proves the seam for **one** block.
+
+        That is the half a split would slip through. `ops_status.py` is 4,940
+        lines and the obvious cleanup is to move the six block renderers into
+        modules of their own — measured, the coupling allows it: 33 of the 38
+        helpers the blocks reach belong to exactly one block and only five are
+        shared. What the coupling number does not show is that a moved block
+        would read **its own** module's `RUNTIME_DIR`, so
+        `ops_status.RUNTIME_DIR = tmp` — which 99 sites across nine test files
+        and `dashboard_server.py` do — would stop reaching it. The moved block
+        would quietly report the developer's live `runtime/` while everything
+        around it reported the fixture.
+
+        That is C31's incident again (this class's own docstring), and the
+        existing tests would not catch it: they redirect and then assert on
+        the AGENT block alone.
+
+        So this runs **all six** against an empty tree and asserts that none
+        of them names anything only the real repository runtime contains.
+        Generic rather than block-specific on purpose — a seventh block added
+        later is covered without anyone remembering to add it here.
+        """
+        import contextlib
+
+        real_ids = self._live_identifiers()
+        if not real_ids:
+            self.skipTest("no live runtime evidence to be leaked into the fixture")
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "events" / "processed").mkdir(parents=True)
+        (runtime / "local_master" / "daily").mkdir(parents=True)
+
+        module = self._module(runtime)
+        renderers = (
+            "_print_company", "_print_history", "_print_control_tower",
+            "_print_last_run", "_print_notion", "_print_agent",
+        )
+
+        for name in renderers:
+            with self.subTest(block=name):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    module._block(name, getattr(module, name), NOW)
+                printed = buffer.getvalue()
+
+                leaked = [i for i in real_ids if self._mentions(printed, i)]
+                self.assertEqual(
+                    leaked, [],
+                    f"{name} reported {leaked} — evidence that exists only in "
+                    "the repository's real runtime/, so this block did not "
+                    "follow RUNTIME_DIR into the fixture",
+                )
+
+    def test_the_leak_detector_would_actually_notice(self):
+        """Guards the guard. The assertion above is a `not in` over strings,
+        which passes trivially if the block prints nothing at all or if the
+        real tree happens to be empty. This drives the same detector at a
+        tree that **does** contain the ids and shows it fails."""
+        real_processed = (
+            Path(__file__).resolve().parents[1] / "runtime" / "events" / "processed"
+        )
+        real_ids = self._live_identifiers()
+        if not real_ids:
+            self.skipTest("no live runtime evidence to detect")
+
+        import contextlib
+
+        module = self._module(real_processed.parents[1])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            for name in ("_print_company", "_print_history", "_print_control_tower"):
+                module._block(name, getattr(module, name), NOW)
+
+        self.assertTrue(
+            any(self._mentions(buffer.getvalue(), i) for i in real_ids),
+            "pointed at the real tree the blocks printed none of its "
+            "identifiers — the check above is looking for something that "
+            "never appears, and would pass over a real leak",
+        )
+
     def test_the_agent_lock_path_follows_it_too(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
@@ -8094,16 +8320,24 @@ class RuntimeDirIsTheOnlyKnobTests(unittest.TestCase):
             names = {
                 sub.id for sub in ast.walk(node.value) if isinstance(sub, ast.Name)
             }
-            if "RUNTIME_DIR" in names:
+            # `PROJECT_ROOT` as well as `RUNTIME_DIR`, measured (C88). A
+            # mutation that froze one block's path as
+            # `_FROZEN = PROJECT_ROOT / "runtime"` — which is exactly the
+            # shape a module split produces — walked straight past a check
+            # that knew only the `RUNTIME_DIR` spelling. Both names lead to
+            # the same directory and only one of them was guarded.
+            if names & {"RUNTIME_DIR", "PROJECT_ROOT"}:
                 frozen.extend(
-                    t.id for t in node.targets if isinstance(t, ast.Name)
+                    t.id
+                    for t in node.targets
+                    if isinstance(t, ast.Name) and t.id != "RUNTIME_DIR"
                 )
 
         self.assertEqual(
             frozen,
             [],
-            "these freeze a path from RUNTIME_DIR at import time; derive them "
-            f"in a function instead (see `_agent_dir()`): {frozen}",
+            "these freeze a runtime path at import time; derive them in a "
+            f"function instead (see `_agent_dir()`): {frozen}",
         )
 
 
@@ -13554,6 +13788,214 @@ class TheAttentionBlockCannotPushItselfOffTheTopTests(unittest.TestCase):
         self.assertIn("source", summary)
 
 
+class CredentialsInDotEnvAreNotCredentialsInTheProcessTests(unittest.TestCase):
+    """C90: the screen said 미설정 to an operator who had configured it.
+
+    `.env` is deliberately not auto-loaded — the template says so and this
+    project has kept it that way. The cost was invisible: with a valid token
+    and database id sitting in `.env`, `NotionConfig.from_env()` raises,
+    `run_company_ops.py` prints "Notion 미설정 … 건너뜁니다", and the Run
+    Manifest records `notion_sync: SKIPPED`. The NOTION block said nothing.
+
+    Measured on this deployment: `.env` held credentials that worked — they
+    were used to write four Project rows into the live PROJECTS database —
+    and that database was **15 days behind** the Control Tower, while every
+    run reported the same untroubling word.
+
+    "Missing" and "present but not exported" need opposite reactions, and
+    only the first is a configuration decision.
+
+    Two rules this must not break: it reports **names, never values**, and
+    it follows `RUNTIME_DIR` like everything else in this view.
+    """
+
+    def _module(self, root):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_dotenv_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = root / "runtime"
+        return module
+
+    def _tree(self, dotenv=None):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "runtime" / "state").mkdir(parents=True)
+        if dotenv is not None:
+            (root / ".env").write_text(dotenv, encoding="utf-8")
+        return root
+
+    FILLED = ("NOTION_API_TOKEN=ntn_" + "A" * 24 + chr(10)
+              + "NOTION_PROJECTS_DATABASE_ID=" + "b" * 32 + chr(10))
+
+    def test_a_filled_dotenv_with_nothing_exported_is_reported(self):
+        module = self._module(self._tree(self.FILLED))
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertEqual(
+                module._notion_credentials_present_but_unexported(),
+                ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID"),
+            )
+
+    def test_an_exported_variable_is_not_reported(self):
+        """The control. Reporting a variable the process already has would
+        send an operator to fix something that is not broken."""
+        module = self._module(self._tree(self.FILLED))
+        with mock.patch.dict(
+            module.os.environ,
+            {"NOTION_API_TOKEN": "x", "NOTION_PROJECTS_DATABASE_ID": "y"},
+            clear=True,
+        ):
+            self.assertEqual(module._notion_credentials_present_but_unexported(), ())
+
+    def test_a_blank_value_is_not_a_credential(self):
+        """`.env.example` ships every key with an empty value. Treating that
+        as configured would fire this on every fresh checkout."""
+        blank = "NOTION_API_TOKEN=" + chr(10) + "NOTION_PROJECTS_DATABASE_ID=   " + chr(10)
+        module = self._module(self._tree(blank))
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertEqual(module._notion_credentials_present_but_unexported(), ())
+
+    def test_no_dotenv_at_all_says_nothing(self):
+        module = self._module(self._tree(dotenv=None))
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertEqual(module._notion_credentials_present_but_unexported(), ())
+
+    def test_comments_are_not_settings(self):
+        """Recorded rather than guarded. A commented line parses to the name
+        `"# NOTION_API_TOKEN"`, which is not one of the two required names,
+        so a `startswith("#")` check cannot change the answer — a mutation
+        removing it failed nothing. Both spellings are asserted here so the
+        property is pinned without keeping an unreachable branch."""
+        commented = ("# NOTION_API_TOKEN=ntn_commented_out" + chr(10)
+                     + "#NOTION_PROJECTS_DATABASE_ID=abc" + chr(10))
+        module = self._module(self._tree(commented))
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertEqual(module._notion_credentials_present_but_unexported(), ())
+
+    def test_it_never_returns_a_value_only_a_name(self):
+        """The rule that must not rot. This function touches the one file in
+        the tree that holds a real credential."""
+        secret = "ntn_" + "Z" * 24
+        module = self._module(self._tree("NOTION_API_TOKEN=" + secret + chr(10)))
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            result = module._notion_credentials_present_but_unexported()
+
+        self.assertEqual(result, ("NOTION_API_TOKEN",))
+        for item in result:
+            self.assertNotIn(secret, item)
+
+    def test_it_follows_runtime_dir_and_not_the_frozen_project_root(self):
+        """The defect this function shipped with for one test run. Reading
+        `PROJECT_ROOT / .env` made twelve existing tests fail at once —
+        every one a fixture with no `.env` reading the repository's real
+        one. C31 again, and C88 had just added the gate for it."""
+        module = self._module(self._tree(dotenv=None))
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertEqual(module._notion_credentials_present_but_unexported(), ())
+
+    def test_an_unreadable_dotenv_does_not_break_the_block(self):
+        """A status view must not fail because a file it merely hoped for
+        cannot be read."""
+        root = self._tree(dotenv=None)
+        (root / ".env").mkdir()
+        module = self._module(root)
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            self.assertEqual(module._notion_credentials_present_but_unexported(), ())
+
+class AuthoredTextIsBoundedAsWellAsRedactedTests(unittest.TestCase):
+    """C80: C71 bounded how MANY risk lines reach ATTENTION, not how LONG one is.
+
+    `_RISKS_IN_ATTENTION` caps the RISKS panel at five lines per kind, and
+    the comment above it explains why: a block that tells an operator what to
+    do now is useless when it cannot be read. Five is a small number
+    multiplied by an unbounded one — nothing bounds `blocker`, `summary` or
+    `project_id`. docs/02 gives them no maximum and `validate_event()` only
+    type-checks (`test_notion_sync.py` asserts exactly that, from the other
+    side).
+
+    Measured before this, three blocked Projects each carrying a
+    100,000-character `blocker`: three ATTENTION lines of 100,176 characters
+    — on the screen, and in the file a scheduled run redirects its output to.
+
+    `_authored()` is where this belongs because it is already the one place
+    an Event-authored value is prepared for a human to read, and
+    `oplog.bounded()` is already the cap this project chose for the same
+    shape (`append_line()`: nothing logged is unbounded).
+    """
+
+    def _authored(self):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import ops_status
+
+        return ops_status._authored
+
+    def test_a_short_value_is_untouched(self):
+        """The control. A bound that shortened ordinary values would be
+        visible in every message this project prints."""
+        authored = self._authored()
+
+        self.assertEqual(authored("SEARCH_BACKEND"), "SEARCH_BACKEND")
+
+    def test_an_unbounded_value_is_cut_to_the_projects_own_cap(self):
+        from oplog import MAX_LOG_ERROR
+
+        authored = self._authored()
+
+        result = authored("A" * 100_000)
+
+        self.assertLessEqual(len(result), MAX_LOG_ERROR + 3)
+        self.assertTrue(result.endswith("..."))
+
+    def test_the_cut_happens_after_redaction_and_not_before(self):
+        """Order matters, and the assertion has to be about a **fragment**.
+
+        `bounded(redact(x))` redacts the whole string and then cuts, so a
+        credential anywhere in it is already `[REDACTED]`.
+        `redact(bounded(x))` cuts first, and a credential straddling the
+        boundary is split -- `ntn_A` survives, because `SECRET_PATTERNS`
+        needs ten characters after the prefix to recognise one.
+
+        The first draft of this test asserted `assertNotIn(secret, result)`
+        and **passed under both orders**: the full 28-character string is
+        absent either way, since one of them cut it in half. A mutation
+        swapping the two was what showed that -- the test was decorative for
+        the property it was named after. The fragment is the subject.
+        """
+        from oplog import MAX_LOG_ERROR
+
+        secret = "ntn_" + "A" * 24
+        authored = self._authored()
+
+        # A space before it: `SECRET_PATTERNS` anchors on ``, so a prefix
+        # glued to a preceding word is a different case (not this one's).
+        result = authored("x" * (MAX_LOG_ERROR - 6) + " " + secret + " tail")
+
+        # The fragment is the whole subject: under the wrong order the tail
+        # reads `... ntn_A...`, which is the front of a live credential.
+        self.assertNotIn(secret, result)
+        self.assertNotIn("ntn_", result)
+
+        # `[REDACTED]` is deliberately NOT asserted on that string: the
+        # marker itself lands on the boundary and comes back as `[REDA...`.
+        # Asserted here instead, where the secret sits well inside the cap,
+        # so "redaction happened" is checked rather than assumed.
+        inside = authored(f"waiting for {secret} to be rotated")
+
+        self.assertIn("[REDACTED]", inside)
+        self.assertNotIn("ntn_", inside)
+
+    def test_a_newline_still_cannot_forge_a_line(self):
+        """The bound must not displace the other two rules `_authored()`
+        applies."""
+        authored = self._authored()
+
+        self.assertNotIn("\n", authored("a\nb"))
+
 class AnIdIsAlsoAuthoredTextTests(unittest.TestCase):
     """C47: the ATTENTION sink's stated reason for not redacting was wrong.
 
@@ -14690,6 +15132,393 @@ class ASignalNoDateWillEverReadIsCountedTests(unittest.TestCase):
         self.assertEqual(len(alert), 1, dirty)
         self.assertIn("signals/<YYYY-MM-DD>", alert[0])
 
+
+class ADirectoryTheScanCannotListCountsRatherThanVanishesTests(unittest.TestCase):
+    """C102. Three of the four "cannot list this" paths answered **zero**.
+
+    `_count_unreachable_signals()`'s own docstring promises *"Errors count
+    rather than vanish, in both directions"*, and the branch for a date
+    directory that will not list spells out why:
+
+        "`continue`ing in silence here would have made the number *smaller*
+         for a tree that got harder to read -- the direction that reads as
+         reassurance"
+
+    The same function's `_all_json_below()` did exactly that. `except
+    OSError: return total` handed back whatever had been counted so far,
+    which for a directory that refuses on the first call is 0.
+
+    A line-coverage pass is what found it: every one of these branches was
+    unexecuted, so the direction claim above was prose in all four places
+    and code in one. Measured, three misfiled Signals with `os.scandir()`
+    refusing one directory:
+
+        whole non-date dir unlistable        healthy 3  ->  0
+        subtree under a non-date dir          healthy 3  ->  0
+        a nested dir inside a date dir        healthy 3  ->  0
+        a date dir itself                     healthy 0  ->  1
+
+    What an operator saw for the first three: `읽힐 수 없는 Signal : 0` and
+    no ATTENTION — for Signals no date will ever read, in a directory
+    nothing can look inside. Same shape as C62, C68 and C101's M5.
+
+    Reachable without anything exotic. `signals/` is a directory a person
+    files into by hand (BACKLOG A-11), and on Windows a restored ACL, an
+    antivirus scanner or a sync client holding a handle all produce exactly
+    this — as does the directory being removed between the parent's listing
+    and this call.
+
+    The root of `signals/` is deliberately NOT changed and still answers 0:
+    there the *existence* of anything at all is unknown, so 1 would be a
+    fabricated count rather than a refused one.
+    `ASignalNoDateWillEverReadIsCountedTests::
+    test_a_missing_or_unreadable_signals_directory_answers_zero` pins that,
+    and this class pins the difference.
+    """
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.signals = root / "agent" / "signals"
+        self.signals.mkdir(parents=True)
+
+    @staticmethod
+    def _signal(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "event_type": "MILESTONE_COMPLETED", "project_id": "PRJ",
+                "status": "IN_PROGRESS", "summary": "typed by a person",
+                "milestone": "M", "history_candidate": True,
+            }),
+            encoding="utf-8",
+        )
+
+    def _count(self):
+        from agent.status import _count_unreachable_signals
+
+        return _count_unreachable_signals(self.signals)
+
+    @contextlib.contextmanager
+    def _refusing(self, directory):
+        """`os.scandir()` refuses exactly `directory`, delegating otherwise.
+
+        Narrow on purpose. `Path.glob`, `shutil.rmtree` and the temp-file
+        machinery all reach `os.scandir` too, and a blanket refusal would
+        make the assertion below true for a reason that has nothing to do
+        with this function.
+        """
+        import agent.status as status_module
+
+        real = os.scandir
+
+        def refusing(path, *args, **kwargs):
+            if Path(path) == Path(directory):
+                raise PermissionError(13, "Access is denied")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(status_module.os, "scandir", refusing):
+            yield
+
+    def test_each_unlistable_directory_is_counted_instead_of_dropped(self):
+        """The measurement, all three shapes. The fixture holds THREE
+        Signals so a healthy scan answers 3 — a 0 can then only come from
+        the error path, and a 1 can only come from the refusal being
+        counted. (C87's lesson: an injection over an empty tree proves
+        nothing, because 0 was already the honest answer.)"""
+        # Relative parts, resolved AFTER `setUp()` rebuilds the tree — a
+        # first draft computed the paths once, against the temp directory of
+        # the *previous* subtest, and every fixture assertion read 0.
+        cases = {
+            "a non-date directory": ("august-21",),
+            "a subtree below a non-date directory": ("august-21", "sub"),
+            "a directory nested inside a date directory": ("2026-08-21", "sub"),
+        }
+        for label, parts in cases.items():
+            with self.subTest(unlistable=label):
+                self.setUp()
+                directory = self.signals.joinpath(*parts)
+                for index in range(3):
+                    self._signal(directory / f"s{index}.json")
+                self.assertEqual(
+                    self._count(), 3, "the fixture itself is wrong"
+                )
+
+                with self._refusing(directory):
+                    self.assertEqual(
+                        self._count(), 1,
+                        "a directory that cannot be listed was reported as "
+                        "nothing to look at",
+                    )
+
+    def test_it_never_answers_zero_where_a_working_scan_answers_more(self):
+        """The direction, stated as the property rather than as a number.
+        Any future re-implementation may count differently; none of them may
+        count *down to nothing*."""
+        directory = self.signals / "august-21"
+        for index in range(3):
+            self._signal(directory / f"s{index}.json")
+
+        with self._refusing(directory):
+            refused = self._count()
+
+        self.assertGreater(refused, 0)
+        self.assertLessEqual(refused, 3)
+
+    def test_a_date_directory_that_will_not_list_still_counts_one(self):
+        """The one branch that was already right, pinned so the fix above
+        cannot be undone by making all four consistent in the wrong
+        direction."""
+        directory = self.signals / "2026-08-21"
+        self._signal(directory / "s.json")
+        self.assertEqual(self._count(), 0, "a filed Signal is reachable")
+
+        with self._refusing(directory):
+            self.assertEqual(self._count(), 1)
+
+    def test_a_healthy_tree_is_untouched_by_the_change(self):
+        """The false-alarm direction. Widening a data-loss counter without
+        pinning this is how C26's "alert nobody reads" gets built."""
+        self._signal(self.signals / "2026-08-21" / "s.json")
+        self._signal(self.signals / "2026-08-22" / "s.json")
+
+        self.assertEqual(self._count(), 0)
+
+    def test_a_signal_nested_two_levels_below_a_non_date_directory_is_counted(self):
+        """`_all_json_below()`'s own recursion, which nothing executed. The
+        existing cases all stop one level down, so the line that descends
+        was covered by no test at all."""
+        self._signal(self.signals / "august-21" / "a" / "b" / "s.json")
+
+        self.assertEqual(self._count(), 1)
+
+    def test_an_entry_whose_type_cannot_be_read_is_counted_at_every_depth(self):
+        """`entry.is_dir()` raising is a third shape, and it has its own
+        `+= 1` at three separate depths. Injected on the DirEntry rather
+        than on `scandir`, because that is the call that fails."""
+        import agent.status as status_module
+
+        deep = self.signals / "august-21" / "sub"
+        inside_date = self.signals / "2026-08-21" / "sub"
+        top = self.signals / "2026-08-22"
+        for directory in (deep, inside_date):
+            self._signal(directory / "s.json")
+        top.mkdir(parents=True, exist_ok=True)
+
+        refuse_for = {str(deep), str(inside_date), str(top)}
+        real = os.scandir
+
+        class _Entry:
+            def __init__(self, entry):
+                self.name = entry.name
+                self.path = entry.path
+                self._entry = entry
+
+            def is_dir(self, *args, **kwargs):
+                if self.path in refuse_for:
+                    raise PermissionError(13, "Access is denied")
+                return self._entry.is_dir(*args, **kwargs)
+
+        @contextlib.contextmanager
+        def wrapping(path, *args, **kwargs):
+            with real(path, *args, **kwargs) as entries:
+                yield [_Entry(entry) for entry in entries]
+
+        with mock.patch.object(status_module.os, "scandir", wrapping):
+            counted = self._count()
+
+        self.assertEqual(counted, 3, "an entry of unknown type was dropped")
+
+
+class TheClosedDateCounterErrorPathsActuallyRunTests(unittest.TestCase):
+    """C102, the sibling. Six branches of
+    `_count_undelivered_signals_in_closed_dates()` had never executed.
+
+    The two counters in `agent/status.py` are one family and they make the
+    same promise — a refused entry counts, it never quietly becomes a clean
+    one. `ADirectoryTheScanCannotListCountsRatherThanVanishesTests` found
+    that promise broken in the other one, in the branch whose neighbour
+    argued *for* it. So this one was measured rather than read.
+
+    **All six are correct, and this class is what makes that a measurement
+    instead of a reading.** Every number below was taken by injection
+    against a closed date holding three undelivered Signals — a fixture that
+    answers 3 when nothing is refused, so neither 0 nor a coincidental 1
+    could be mistaken for a pass:
+
+        a date entry whose is_dir() refuses      healthy 3  ->  1
+        a date directory that will not list      healthy 3  ->  1
+        two of three signal is_file() refuse     healthy 3  ->  3
+        a FILE named like a date directory       0 (it is not a date dir)
+        a non-.json file in a closed date        1 (only the .json counts)
+        a DIRECTORY named `x.json`               1 (is_file(), not exists())
+
+    C101 closed this shape once already, on the `sent/` side
+    (`_entry_is_file()`, its M5). The `signals/` side is the other half and
+    it was still prose.
+    """
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.agent = root / "agent"
+        for rel in ("signals", "sent"):
+            (self.agent / rel).mkdir(parents=True)
+        self.closed = self.agent / "signals" / "2026-08-21"
+
+    @staticmethod
+    def _signal(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "event_type": "MILESTONE_COMPLETED", "project_id": "PRJ",
+                "status": "IN_PROGRESS", "summary": "typed by a person",
+                "milestone": "M", "history_candidate": True,
+            }),
+            encoding="utf-8",
+        )
+
+    def _count(self):
+        from agent.status import _count_undelivered_signals_in_closed_dates
+
+        return _count_undelivered_signals_in_closed_dates(
+            self.agent / "signals",
+            self.agent / "sent",
+            source="DESKTOP_1",
+            collected_through=date(2026, 8, 22),
+        )
+
+    def _three_undelivered(self):
+        for index in range(3):
+            self._signal(self.closed / f"s{index}.json")
+        self.assertEqual(self._count(), 3, "the fixture itself is wrong")
+
+    @contextlib.contextmanager
+    def _refusing_scandir(self, directory):
+        import agent.status as status_module
+
+        real = os.scandir
+
+        def refusing(path, *args, **kwargs):
+            if Path(path) == Path(directory):
+                raise PermissionError(13, "Access is denied")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(status_module.os, "scandir", refusing):
+            yield
+
+    @contextlib.contextmanager
+    def _refusing_type_of(self, *paths):
+        """`DirEntry.is_dir()` / `is_file()` refuse for exactly these paths.
+
+        Wrapping the entries rather than the call, because the entry is what
+        fails: an antivirus or an ACL answers the listing and then refuses
+        the stat behind one name in it.
+        """
+        import agent.status as status_module
+
+        refuse = {str(Path(p)) for p in paths}
+        real = os.scandir
+
+        class _Entry:
+            def __init__(self, entry):
+                self.name = entry.name
+                self.path = entry.path
+                self._entry = entry
+
+            def is_dir(self, *args, **kwargs):
+                if self.path in refuse:
+                    raise PermissionError(13, "Access is denied")
+                return self._entry.is_dir(*args, **kwargs)
+
+            def is_file(self, *args, **kwargs):
+                if self.path in refuse:
+                    raise PermissionError(13, "Access is denied")
+                return self._entry.is_file(*args, **kwargs)
+
+        class _Listing(list):
+            """Iterable *and* a context manager. This function reads
+            `sent/` with `with os.scandir(...)` and the date directories
+            with `list(os.scandir(...))`, so a stand-in that supports only
+            one of the two fails for a reason the test has no opinion
+            about."""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        def wrapping(path, *args, **kwargs):
+            with real(path, *args, **kwargs) as entries:
+                return _Listing(_Entry(entry) for entry in entries)
+
+        with mock.patch.object(status_module.os, "scandir", wrapping):
+            yield
+
+    def test_a_date_entry_whose_type_cannot_be_read_is_counted(self):
+        self._three_undelivered()
+
+        with self._refusing_type_of(self.closed):
+            self.assertEqual(self._count(), 1)
+
+    def test_a_closed_date_directory_that_will_not_list_is_counted(self):
+        self._three_undelivered()
+
+        with self._refusing_scandir(self.closed):
+            self.assertEqual(self._count(), 1)
+
+    def test_a_signal_whose_type_cannot_be_read_is_counted_as_undelivered(self):
+        """The `sent/` half of this is C101's M5. This is the `signals/`
+        half: an entry that cannot be stat-ed is not evidence that the
+        Signal was delivered."""
+        self._three_undelivered()
+
+        with self._refusing_type_of(self.closed / "s0.json", self.closed / "s1.json"):
+            self.assertEqual(self._count(), 3)
+
+    def test_a_file_named_like_a_date_directory_is_not_a_closed_date(self):
+        """It is not a date *directory*, so `load_signals()` will never read
+        it and this counter is not the one that owns it — the same split the
+        `continue` above it names."""
+        (self.agent / "signals" / "2026-08-21").write_text("{}", encoding="utf-8")
+
+        self.assertEqual(self._count(), 0)
+
+    def test_a_directory_that_is_not_a_date_belongs_to_the_other_counter(self):
+        """The two counters partition the tree and neither may double-report.
+
+        Added because the mutation that deletes the `_is_date_directory_name`
+        guard survived every other test in this class — the file-shaped case
+        above falls through the `is_dir()` check anyway, so it proved
+        nothing about the guard.
+
+        Both shapes matter and they fail differently without it. `2026-8-21`
+        is accepted by `date.fromisoformat()` on this interpreter, so it
+        would silently become a second report of a Signal
+        `_count_unreachable_signals()` already owns. `august-21` is not, so
+        it would raise `ValueError` out of a read-only status view.
+        """
+        for name in ("2026-8-21", "august-21"):
+            with self.subTest(directory=name):
+                self.setUp()
+                self._signal(self.agent / "signals" / name / "s.json")
+
+                self.assertEqual(self._count(), 0)
+
+    def test_a_non_json_file_in_a_closed_date_is_not_a_signal(self):
+        self._signal(self.closed / "s0.json")
+        (self.closed / "notes.txt").write_text("a note", encoding="utf-8")
+
+        self.assertEqual(self._count(), 1)
+
+    def test_a_directory_wearing_a_signal_name_is_not_a_signal(self):
+        """`is_file()`, not `exists()` — the same rule `is_sent()` records on
+        the delivery side, applied on the reading side."""
+        self._signal(self.closed / "s0.json")
+        (self.closed / "dir.json").mkdir()
+
+        self.assertEqual(self._count(), 1)
 
 
 class TheDecisionContextAlertDoesNotStopAtTheReassuringHalfTests(unittest.TestCase):

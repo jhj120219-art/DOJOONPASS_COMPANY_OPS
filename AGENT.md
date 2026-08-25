@@ -103,6 +103,15 @@ NOTION_OPS_RUNS_DATABASE_ID=                # 없으면 Operations Dashboard만 
 `tests/test_repository_hygiene.py`가 코드와 양방향으로 대조한다. Notion Workspace를
 처음 세우는 절차는 `docs/13_NOTION_ENVIRONMENT_SETUP.md`다.
 
+Notion Workspace를 처음 세울 때 한 번 돌리는 것이 **`init_notion.py`**다 —
+Runtime 파이프라인의 일부가 아니고(Runner는 import하지 않는다) PROJECTS Database에
+**없는 Property만** 만들며 기존 Property는 그대로 둔다. 여러 번 돌려도 안전하다.
+절차와 무엇이 만들어지는지는 위 docs/13에 있다.
+
+```powershell
+python init_notion.py
+```
+
 `.env`는 **자동으로 읽히지 않는다.** 셸에서 export하거나 실행 스크립트가 직접
 읽어야 한다(`.env.example` 머리말).
 
@@ -298,8 +307,9 @@ runtime/agent/
 ## 6. 확인 방법
 
 ```powershell
-python ops_status.py     # 먼저 이것부터 — 사람이 할 일이 있는지 한 화면에
-python run_agent.py      # 수동 1회 실행
+python ops_status.py       # 먼저 이것부터 — 사람이 할 일이 있는지 한 화면에
+python dashboard_server.py # 같은 내용을 브라우저에서 (⇒ 6d)
+python run_agent.py        # 수동 1회 실행
 ```
 
 `ops_status.py`는 아무것도 쓰지 않고 lock도 잡지 않는다. Runner나 Agent가
@@ -574,6 +584,58 @@ Scheduler가 날짜마다 **파일이 이미 있는지 먼저 보고**(`is_file(
 — 복구한 날짜를 다시 만들고 있다는 뜻이므로 — **즉시 멈추고 원격을 확인해야
 한다.** (C39 전에는 둘이 한 숫자였고, 복구 직후 실행이 "5일 생성"이라고 보고했다.
 없는 Candidate로 만들었을 리 없는 5일이다.)
+
+---
+
+### 6d. 브라우저에서 보기 (Control Tower Dashboard)
+
+```powershell
+python dashboard_server.py
+```
+
+→ **http://127.0.0.1:8765/** 를 연다. 종료는 Ctrl+C.
+
+`ops_status.py`와 **같은 사실을 같은 순서로** 보여준다. 새로 계산하는 것은
+없다 — ATTENTION 목록은 `ops_status.py`가 만드는 그 목록이고(비어 있으면
+exit 0에 해당), 운영 블록 다섯은 그 화면의 출력을 그대로 싣는다. Control Tower만
+패널·KPI로 다시 그리고, 터미널 텍스트도 접힌 채로 같이 둔다 — 둘이 같은 말을
+하는지 사람이 직접 대조하라고.
+
+`ops_status.py`와 똑같이 **아무것도 쓰지 않고 lock도 잡지 않는다.** GET만
+답하고 나머지는 405다. Runner나 Agent가 도는 중에 열어도 안전하다.
+
+읽는 법:
+
+| 보이는 것 | 뜻 |
+|---|---|
+| 우상단 빨간 배지 | ATTENTION이 있다 (= `ops_status.py` exit 3) |
+| `증거가 하나도 없다` | 0은 "일이 없었다"가 아니라 **"셀 Event가 없다"** |
+| `UNSOURCED` 점선 패널 | 비어 있는 것이 아니라 **물어볼 곳이 없다** |
+| `해당 없음` (실선 패널) | 원천은 있고, 이 기간에 하나도 없었다 |
+| `불완전` / `확인 못 함` | 화면의 숫자가 전부가 아니다. 사유가 배너에 적혀 있다 |
+| 각 행의 `증거 N건` | 펼치면 그 숫자가 나온 Event ID와 파일 이름 |
+| `3시간 12분 전 기준` (노랑) | **이 화면은 스스로 갱신하지 않는다.** 새로고침은 사람이 |
+| `63ms에 생성` | 페이지를 만드는 데 걸린 시간. Event 수에 비례해 늘어난다 |
+
+`127.0.0.1`에만 바인딩하며 바꿀 수 없고, `Host` 헤더가 loopback 이름이 아니면 **403**이다 (DNS rebinding — 바인딩은 다른 머신의 패킷만 막고, 이 머신의 브라우저는 못 막는다).
+이 화면에는 다른 Desktop에서 사람이
+입력한 `blocker` 문장과 `project_id`가 실린다. 다른 머신에서 보려면 인증·TLS가
+필요한 **배포 결정**이고, 그래서 `--host` 플래그가 없다.
+
+기간을 좁히려면 화면 위쪽 `기간` 칸에 날짜를 넣거나 URL로 직접 준다.
+
+```
+http://127.0.0.1:8765/?since=2026-08-01&until=2026-08-07
+```
+
+Event의 **작업일** 기준으로 자른다(파일이 도착한 날이 아니라 — docs/06 §12).
+잘못된 날짜·거꾸로 된 기간·모르는 조건은 **거절(400)**한다. 조용히 전체 기간을
+보여주면 운영자는 한 주를 본다고 믿으면서 전체를 보게 된다.
+**이 기간은 위쪽 KPI·패널에만 적용된다** — 아래 `운영 상태` 블록은
+`ops_status.py`의 출력이고 기간 개념이 없다(언제나 현재 상태).
+
+포트가 이미 쓰이고 있으면 `COMPANY_OPS_DASHBOARD_PORT`로 바꾼다. 명령줄 인자는
+받지 않는다(다른 도구와 같다).
 
 ---
 

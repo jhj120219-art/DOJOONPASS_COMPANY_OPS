@@ -471,6 +471,32 @@ def _read_all(paths: list[Path]) -> list[tuple[Path, tuple]]:
     `unreadable_events` lists filenames in sorted order, and `first`/`last`
     tie-breaking behaves exactly as the previous serial loop did. Threads
     change only how long the reads take, never what they produce.
+
+    Why a pool at all, measured (C87)
+    ---------------------------------
+    A warm-cache benchmark says the pool is a loss, and that benchmark is
+    the wrong one. Measured on this machine over `_read_one`:
+
+        warm local    500 files   serial   23 ms   pool16    32 ms
+        warm local   2000 files   serial   83 ms   pool16   126 ms
+        cold local    500 files   serial  547 ms   pool16    93 ms   5.9x
+        cold local   2000 files   serial 7537 ms   pool16   890 ms   8.5x
+
+    Warm, the pool costs about 40 ms at two thousand files. Cold — the
+    first read of files that have just arrived, which is the ordinary case
+    for a Runner and for anyone opening a status view after a reboot — it
+    saves **seconds**. Three trials with the order alternated gave 5.9x,
+    5.9x and 9.4x, so the direction is not an artefact of who ran first.
+
+    And `_attribute()` runs this over `transport/`, the OneDrive Sync
+    Folder (AGENT.md section 1). A *simulated* 0.1 ms per-file latency
+    already makes the pool 6.6x faster; at 1 ms it is 14x. Real OneDrive
+    was deliberately not measured — writing a thousand probe files into an
+    operator's cloud account is not a benchmark to run uninvited (BACKLOG).
+
+    This note exists because the warm number was recorded on its own once
+    (C78) and read as "the pool is a pessimisation". It is not.
+    `test_the_reads_really_do_overlap` is the gate.
     """
     if not paths:
         return []
