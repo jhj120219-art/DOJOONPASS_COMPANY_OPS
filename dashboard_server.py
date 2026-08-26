@@ -2,6 +2,22 @@
 
     python dashboard_server.py            http://127.0.0.1:8765
 
+Three paths, and nothing else (everything else is 404):
+
+    /                     the page
+    /api/dashboard.json   the same facts as JSON — `to_payload()`, verbatim
+    /healthz              `ok`, for "is it up?" and nothing more
+
+`/healthz` is answered **before** the period filter is parsed, so it stays
+`200 ok` even when the query string is nonsense — a liveness check that
+turned red because someone typed a bad date would be reporting on the wrong
+thing. It is behind the same `Host` gate as everything else, and it costs
+2 bytes and ~2ms against the page's ~25 KB and ~9ms (measured, C115), which
+is the reason to point a script at it rather than at `/`.
+
+It was undocumented until C115 — present, tested, and named nowhere a person
+looks, which is the same as absent for anyone deciding how to monitor this.
+
 Takes no command-line arguments, like every other tool here (`src/cli.py`
 says why). The one knob is `COMPANY_OPS_DASHBOARD_PORT`, and it exists for
 the one thing an operator cannot work around: another process already on the
@@ -24,7 +40,11 @@ HTML. It derives nothing, measures nothing, and writes nothing.
 
 Read-only, and provably so
 --------------------------
-Only GET is answered; everything else gets 405. Nothing here opens a file for
+Only GET is answered; everything else gets 405 — including HEAD, OPTIONS and
+TRACE, which used to reach `BaseHTTPRequestHandler`'s own 501 because the
+refusal was a hand-written roster of four method names and this sentence was
+a claim about all of them (C115). A HEAD refusal carries the headers and no
+body. Nothing here opens a file for
 writing, acquires a lock, or contacts Notion, so it is safe to run while a
 Runner or an Agent is working — the same guarantee `ops_status.py` makes at
 the top of its own docstring, for the same reason (it is the same code).
@@ -1233,7 +1253,14 @@ class _Handler(BaseHTTPRequestHandler):
         # Tower showing yesterday, which is worse than showing nothing.
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        # A HEAD response carries the headers a GET would and no body
+        # (RFC 9110 §9.3.2). `Content-Length` above still describes what a
+        # GET *would* return, which is the point of the method. Python's own
+        # `send_error()` makes exactly this exception for exactly this
+        # reason; writing the bytes anyway leaves a client reading a body
+        # the status line promised was not coming.
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _host_allowed(self) -> bool:
         """Whether `Host` names this machine's loopback interface."""
@@ -1301,9 +1328,36 @@ class _Handler(BaseHTTPRequestHandler):
         # wrong. What must never leak is the body of a GET.
         self._send(405, b"read-only", "text/plain; charset=utf-8")
 
-    do_PUT = do_POST
-    do_DELETE = do_POST
-    do_PATCH = do_POST
+    def __getattr__(self, name: str):
+        """Any method that is not GET is refused with 405 — by construction.
+
+        This used to be a hand-written roster (`do_PUT = do_DELETE =
+        do_PATCH = do_POST`), and this module's own docstring makes the
+        universal claim above it: *"Only GET is answered; everything else
+        gets 405."* Measured against the running server, that claim was
+        false for three methods, because `BaseHTTPRequestHandler` answers a
+        `do_*` it cannot find with its own 501:
+
+            GET 200 · POST/PUT/DELETE/PATCH 405 · **HEAD/OPTIONS/TRACE 501**
+
+        The one that costs something is HEAD: `curl -I <url>` is the most
+        common way anyone checks whether a local server is up, and it
+        replied `501 Unsupported method ('HEAD')` — which reads as "this
+        program is broken", not "this program is read-only".
+
+        The roster was the defect, so the roster is gone rather than
+        extended by three. `handle_one_request()` dispatches by
+        `hasattr(self, "do_" + command)`, so answering here makes the
+        docstring's claim structurally true for every method that exists
+        now and every one that does not exist yet.
+
+        Scoped strictly to the `do_` prefix: a catch-all `__getattr__` on a
+        handler would swallow genuine `AttributeError`s from the rest of
+        this class, turning a typo into a silent 405.
+        """
+        if name.startswith("do_"):
+            return self.do_POST
+        raise AttributeError(name)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"  {self.address_string()} {fmt % args}\n")

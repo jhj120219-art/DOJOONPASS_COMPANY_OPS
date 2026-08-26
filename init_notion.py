@@ -50,6 +50,7 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from notion import (  # noqa: E402
+    BootstrapReadiness,
     NotionAPIError,
     NotionClient,
     NotionConfig,
@@ -175,10 +176,28 @@ def main(argv: Sequence[str] = ()) -> int:
     # the Dashboard is an independent, optional layer.
     print()
     print("Operations Dashboard 준비 상태:")
-    diagnosis = diagnose_dashboard_bootstrap(client)
+    # A client bound to OPS_RUNS when the deployment has one, so the
+    # diagnosis can look at the database instead of assuming it is absent.
+    # `config.ops_runs_database_id` is None when the variable is unset, and
+    # the diagnosis then answers exactly as it always has.
+    #
+    # Measured (C114): on this workspace the variable WAS set, OPS_RUNS did
+    # exist with all 22 columns correct, and this line printed "the creation
+    # step is yours to perform. Then set NOTION_OPS_RUNS_DATABASE_ID" —
+    # an instruction that creates a duplicate database nothing can delete.
+    ops_runs_client = (
+        NotionClient(transport=transport, database_id=config.ops_runs_database_id)
+        if config.ops_runs_database_id
+        else None
+    )
+    diagnosis = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
     print(f"  readiness      : {diagnosis.readiness.value}")
     print(f"  reference 부모 : {_safe(diagnosis.reference_parent_type)}")
-    if diagnosis.hostable_pages:
+    # The Page list answers one question — "where would the database go?" —
+    # and ALREADY_CREATED is the answer that it goes nowhere, because it is
+    # already somewhere. Printing 5-of-168 candidate Pages under that heading
+    # invites exactly the creation this readiness exists to prevent.
+    if diagnosis.hostable_pages and diagnosis.readiness is not BootstrapReadiness.ALREADY_CREATED:
         print("  사용 가능한 Page:")
         for page in diagnosis.hostable_pages[:5]:
             print(f"    - {_safe(page.title)} ({_safe(page.page_id)})")

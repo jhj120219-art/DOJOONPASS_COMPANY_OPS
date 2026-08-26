@@ -329,6 +329,19 @@ class BootstrapReadiness(enum.Enum):
     NEEDS_PARENT_CHOICE = "NEEDS_PARENT_CHOICE"
     # Nothing usable is shared with the integration yet.
     NEEDS_SHARED_PAGE = "NEEDS_SHARED_PAGE"
+    # `NOTION_OPS_RUNS_DATABASE_ID` is set and the database it names answers.
+    # There is nothing to create, and the three values above would all tell
+    # the operator to create it (C114).
+    ALREADY_CREATED = "ALREADY_CREATED"
+    # The variable is set and the database it names does **not** answer. Not
+    # the same as unset: unset means "decide whether you want a Dashboard",
+    # this means "the one you have is pointed somewhere broken".
+    CONFIGURED_BUT_UNREACHABLE = "CONFIGURED_BUT_UNREACHABLE"
+    # The variable is set, the database answers, and it is not an OPS_RUNS —
+    # PROJECTS being the overwhelmingly likely one. Reachable and wrong is
+    # not the same as unreachable, and the difference matters: the repair for
+    # every other answer here would write OPS_RUNS' columns into it.
+    CONFIGURED_TO_THE_WRONG_DATABASE = "CONFIGURED_TO_THE_WRONG_DATABASE"
 
 
 @dataclass(frozen=True)
@@ -353,6 +366,14 @@ class BootstrapDiagnosis:
     hostable_pages: tuple[HostablePage, ...]
     search_available: bool
     required_action: str
+    # `OPS_RUNS` columns the schema is missing, when the database was
+    # inspected (readiness ALREADY_CREATED). Empty both when nothing is
+    # missing and when nothing was inspected — `readiness` is what tells
+    # those apart, and only ALREADY_CREATED means this field was computed.
+    #
+    # Defaulted so that every existing construction of this dataclass — in
+    # this module and in tests — keeps working unchanged.
+    ops_runs_missing_properties: tuple[str, ...] = ()
 
 
 def _page_title(page: Mapping[str, Any]) -> str:
@@ -365,7 +386,9 @@ def _page_title(page: Mapping[str, Any]) -> str:
     return "(untitled)"
 
 
-def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
+def diagnose_dashboard_bootstrap(
+    client: NotionClient, *, ops_runs_client: NotionClient | None = None
+) -> BootstrapDiagnosis:
     """Work out, from the real Workspace, whether the OPS_* databases can be
     created — and if not, exactly what the operator has to do.
 
@@ -373,6 +396,28 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
     the integration can see. It never creates a Page or a Database, and it
     never raises for an unusable workspace — an unusable workspace IS the
     answer it is meant to report.
+
+    `ops_runs_client` — a client bound to `NOTION_OPS_RUNS_DATABASE_ID`, when
+    a deployment has set it. **Omitted, this function behaves exactly as it
+    did**, which is why it is optional: every existing caller and test keeps
+    its answer.
+
+    Why it was added (C114). Measured against the live workspace: `OPS_RUNS`
+    existed, its 22 columns matched `DASHBOARD_DATABASES[OPS_RUNS]` name for
+    name and type for type, `NOTION_OPS_RUNS_DATABASE_ID` named it, and six
+    rows had been written into it through `record_run()`. This function
+    answered `NEEDS_PARENT_CHOICE` and `init_notion.py` printed its
+    `required_action` verbatim under **다음 할 일**:
+
+        "... the creation step is yours to perform. Then set
+         NOTION_OPS_RUNS_DATABASE_ID."
+
+    Both halves were already done. The instruction is not merely stale — it
+    is *irreversible* if followed: `bootstrap_dashboard_databases()` creates
+    unconditionally, this module has no delete path by design, and the result
+    is two databases named OPS_RUNS with nothing able to say which one the
+    variable points at. The diagnosis reached that answer honestly, because
+    it never looked at the database it was diagnosing. This gives it eyes.
     """
     try:
         parent = client.get_database_parent()
@@ -417,6 +462,153 @@ def diagnose_dashboard_bootstrap(client: NotionClient) -> BootstrapDiagnosis:
         for page in raw_pages
         if (page.get("parent") or {}).get("type") != "database_id"
     )
+
+    # Asked here, after `parent` and `search_pages()`, and not at the top of
+    # the function. Two reasons, both about not printing something untrue:
+    #
+    #  - The unreachable-reference early return above must keep winning. If
+    #    the token cannot read PROJECTS, that is the thing to fix first, and
+    #    "your OPS_RUNS is fine" would be an answer to a question nobody has.
+    #  - Every field below is filled from calls that have now actually
+    #    happened. Returning early would leave `search_available=False` on a
+    #    workspace that searches perfectly well, and `init_notion.py` prints
+    #    that field as "이 integration은 Workspace 검색 권한이 없어" — a
+    #    fabricated permissions problem, which is the class of bug this whole
+    #    change exists to remove.
+    #
+    # The cost is the search call, which this function was making anyway.
+    if ops_runs_client is not None:
+        try:
+            # The parse is inside the `try`, not after it, and that placement
+            # is measured rather than tidy. `get_database_schema()` returns
+            # `database.get("properties", {})`, and `.get(k, {})` yields
+            # **None** — not `{}` — when Notion sends `"properties": null`
+            # explicitly. `None.items()` is an AttributeError, raised past
+            # this function's stated contract that it never raises for an
+            # unusable workspace. Injected both shapes and confirmed the
+            # crash before moving these two lines in:
+            #
+            #     "properties": null            AttributeError: 'NoneType' ... 'items'
+            #     {"Run ID": "not-a-dict"}      AttributeError: 'str' ... 'get'
+            #
+            # A malformed response from Notion is exactly when an operator
+            # runs the diagnostic, so it is the worst possible moment for the
+            # diagnostic to be the thing that breaks. Same family as the
+            # null-properties crash this repository already fixed once in
+            # `notion.bootstrap`.
+            schema = ops_runs_client.get_database_schema()
+            present = {
+                name: definition.get("type") for name, definition in schema.items()
+            }
+        except Exception as exc:  # noqa: BLE001  (진단은 절대 실패하지 않는다)
+            return BootstrapDiagnosis(
+                readiness=BootstrapReadiness.CONFIGURED_BUT_UNREACHABLE,
+                reference_parent_type=parent_type,
+                resolved_parent_page_id=resolved_parent_page_id,
+                hostable_pages=hostable,
+                search_available=search_available,
+                required_action=(
+                    f"NOTION_OPS_RUNS_DATABASE_ID is set, but the database it "
+                    f"names could not be read: {exc}. Do NOT create a new "
+                    "OPS_RUNS to get past this — that leaves two, and nothing "
+                    "here can delete either. Check that the id is the right "
+                    "one and that the database is still shared with this "
+                    "integration (Share -> Connections). Until it answers, "
+                    "every run records the Dashboard step as failed rather "
+                    "than skipped."
+                ),
+            )
+
+        # Is this an OPS_RUNS at all? Asked before anything is recommended,
+        # because of what the recommendation below is.
+        #
+        # This check exists because the fix above created a worse bug than
+        # the one it removed, and it was caught by asking C82's question of
+        # it — "what does my own change make possible?" — against the live
+        # API rather than in the abstract.
+        #
+        # Measured: point NOTION_OPS_RUNS_DATABASE_ID at the PROJECTS id (one
+        # transposed variable in a shell profile — the single most likely
+        # operator typo, and `NotionConfig` cannot tell the two ids apart)
+        # and the database answers perfectly. Every one of the 22 columns is
+        # "missing", so the branch below tells the operator to run
+        # `bootstrap_dashboard_properties()` "against a client bound to this
+        # database" — which would add 22 OPS_RUNS columns to the live
+        # PROJECTS database. docs/13 §3-⑧ already warns that that command
+        # has no way to check what it is bound to; before this change nothing
+        # pointed at it, and the fix above started pointing at it.
+        #
+        # Notion gives every database exactly one Title, and the Title is the
+        # one property that cannot be added later (`_bootstrap_title_property`
+        # renames instead, for that reason). So it identifies the database:
+        #
+        #     "Run ID"  -> an OPS_RUNS this code has already shaped
+        #     "Name"    -> a fresh database, Notion's default, step ⑧-4's case
+        #     anything  -> some other database. PROJECTS' Title is "Project".
+        #
+        # A response with no Title at all is not treated as wrong — that
+        # shape should not occur, and guessing "wrong database" from an
+        # unexpected response would refuse a correct setup.
+        title_property = next(
+            (name for name, type_ in present.items() if type_ == "title"), None
+        )
+        if title_property is not None and title_property not in (RUN_ID_PROPERTY, "Name"):
+            return BootstrapDiagnosis(
+                readiness=BootstrapReadiness.CONFIGURED_TO_THE_WRONG_DATABASE,
+                reference_parent_type=parent_type,
+                resolved_parent_page_id=resolved_parent_page_id,
+                hostable_pages=hostable,
+                search_available=search_available,
+                required_action=(
+                    "NOTION_OPS_RUNS_DATABASE_ID names a database that answers, "
+                    f"but its Title column is {title_property!r} — an OPS_RUNS "
+                    f"has {RUN_ID_PROPERTY!r}, and a brand-new one has 'Name'. "
+                    "This is some other database, most likely PROJECTS. Do NOT "
+                    "run bootstrap_dashboard_properties() against it: that "
+                    "command cannot tell what it is bound to and would add the "
+                    "OPS_RUNS columns to whatever this is. Point the variable "
+                    "at the right id, or create OPS_RUNS if there is none "
+                    "(docs/13_NOTION_ENVIRONMENT_SETUP.md step 8)."
+                ),
+            )
+
+        # Name and type both, because a column of the right name and the
+        # wrong type is rejected by the same 400 as a missing one, and an
+        # operator who built the database by hand from docs/13 step 8 is
+        # exactly who gets the type wrong.
+        missing = tuple(
+            name
+            for name, definition in DASHBOARD_DATABASES[OPS_RUNS].items()
+            if present.get(name) != next(iter(definition))
+        )
+        if missing:
+            action = (
+                "OPS_RUNS already exists and NOTION_OPS_RUNS_DATABASE_ID "
+                "names it — there is nothing to create, and creating one "
+                f"would leave two. But {len(missing)} column(s) the code "
+                f"writes are missing or the wrong type: {', '.join(missing)}. "
+                "Every run is rejected with a 400 until they exist. Run "
+                "bootstrap_dashboard_properties() against a client bound to "
+                "this database (docs/13_NOTION_ENVIRONMENT_SETUP.md step 8) — "
+                "it only adds what is absent and never reshapes a column."
+            )
+        else:
+            action = (
+                "Nothing to do. OPS_RUNS exists, NOTION_OPS_RUNS_DATABASE_ID "
+                "names it, and every column the code writes is present with "
+                "the right type. Do NOT run bootstrap_dashboard_databases() — "
+                "it creates unconditionally and this module has no delete "
+                "path, so a second run leaves two databases named OPS_RUNS."
+            )
+        return BootstrapDiagnosis(
+            readiness=BootstrapReadiness.ALREADY_CREATED,
+            reference_parent_type=parent_type,
+            resolved_parent_page_id=resolved_parent_page_id,
+            hostable_pages=hostable,
+            search_available=search_available,
+            required_action=action,
+            ops_runs_missing_properties=missing,
+        )
 
     if resolved_parent_page_id is not None:
         return BootstrapDiagnosis(

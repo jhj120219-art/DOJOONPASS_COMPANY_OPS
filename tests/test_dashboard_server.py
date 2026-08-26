@@ -1127,6 +1127,33 @@ class ThePageIsReadOnlyTests(PageTestCase):
         with urllib.request.urlopen(self.url + path, timeout=30) as response:
             return response.status, response.read().decode("utf-8")
 
+    def _raw_request(self, method, path="/"):
+        """One request, one socket, and the bytes exactly as they arrived.
+
+        `urllib` is the right tool everywhere else in this class, and the
+        wrong one for any assertion about whether a body was *sent*: it
+        applies HTTP's own rules on the client side and hides a HEAD body
+        that a broken server did send.
+        """
+        import socket
+
+        host, _, port = self.url.rpartition(":")
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=30)
+        try:
+            connection.sendall(
+                f"{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii")
+            )
+            received = b""
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+        finally:
+            connection.close()
+        head, _, body = received.partition(b"\r\n\r\n")
+        return head, body
+
     def test_the_page_is_served(self):
         status, body = self._get("/")
 
@@ -1142,13 +1169,88 @@ class ThePageIsReadOnlyTests(PageTestCase):
         self.assertEqual(data["model"]["events_read"], 1)
 
     def test_every_writing_method_is_refused(self):
-        for method in ("POST", "PUT", "DELETE", "PATCH"):
+        """The module docstring's claim, not the handler's roster.
+
+        This list used to be exactly `("POST", "PUT", "DELETE", "PATCH")` —
+        the same four names the handler aliased — so the test asserted the
+        roster it was handed rather than the invariant above it, and passed
+        while three methods did something else. Measured against the running
+        server: HEAD, OPTIONS and TRACE all answered `501 Unsupported
+        method`, because `BaseHTTPRequestHandler` handles a `do_*` it cannot
+        find before this class ever sees the request.
+
+        `FROBNICATE` is in the list on purpose. It is not a method anyone
+        will send; it is the one entry a future roster cannot be quietly
+        extended to cover, so it fails if the refusal ever stops being
+        structural.
+        """
+        for method in (
+            "HEAD", "POST", "PUT", "DELETE", "PATCH",
+            "OPTIONS", "TRACE", "FROBNICATE",
+        ):
             with self.subTest(method=method):
                 request = urllib.request.Request(self.url + "/", method=method)
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(request, timeout=30)
 
-                self.assertEqual(caught.exception.code, 405)
+                self.assertEqual(
+                    caught.exception.code,
+                    405,
+                    f"{method} was not refused the way the module docstring "
+                    f"says every non-GET method is",
+                )
+
+    def test_a_head_request_answers_without_a_body(self):
+        """`curl -I <url>` is how anyone checks a local server is up.
+
+        It used to answer `501 Unsupported method ('HEAD')`, which reads as
+        "this program is broken" rather than "this program is read-only".
+        It now answers 405 — and a 405 that carries a body would be a
+        response contradicting its own status line (RFC 9110 §9.3.2: a HEAD
+        response has no content), so both halves are pinned here.
+
+        Read off a raw socket rather than through `urllib`, and that is not
+        fussiness: `urllib` discards the body of a HEAD response on the
+        client side, so an assertion made through it passes whether or not
+        the server sent one. Measured — deleting the server's suppression
+        left this test green until it was rewritten this way. The bytes on
+        the wire are the only witness to what the server actually wrote.
+        """
+        head, body = self._raw_request("HEAD")
+
+        self.assertIn(b"405", head.splitlines()[0])
+        self.assertEqual(body, b"")
+        # The headers a GET would carry are still described.
+        self.assertIn(b"Cache-Control: no-store", head)
+        # Content-Length still describes what a GET would return, which is
+        # the whole point of the method.
+        self.assertIn(b"Content-Length: 9", head)
+
+    def test_a_refusal_that_is_not_head_still_carries_its_body(self):
+        """The control for the test above: the suppression must be keyed on
+        the method, not applied to every 405."""
+        head, body = self._raw_request("POST")
+
+        self.assertIn(b"405", head.splitlines()[0])
+        self.assertEqual(body, b"read-only")
+
+    def test_a_get_still_carries_its_body(self):
+        """The HEAD suppression is keyed on the method, and a bug there
+        would silently empty the page rather than fail anything above."""
+        status, body = self._get("/")
+
+        self.assertEqual(status, 200)
+        self.assertIn("DOJOONPASS Control Tower", body)
+        self.assertGreater(len(body), 1000)
+
+    def test_the_handler_does_not_swallow_real_attribute_errors(self):
+        """`__getattr__` answers `do_*` and nothing else. A catch-all would
+        turn a typo anywhere in this class into a silent 405."""
+        handler = dashboard_server._Handler.__new__(dashboard_server._Handler)
+
+        self.assertTrue(callable(handler.do_ANYTHING))
+        with self.assertRaises(AttributeError):
+            handler.definitely_not_a_handler_method
 
     def test_an_unknown_path_is_not_the_dashboard(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:

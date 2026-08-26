@@ -523,6 +523,138 @@ class AProjectRowCarriesItsOwnEvidenceTests(unittest.TestCase):
     def test_a_project_with_no_source_gets_no_blocks(self):
         self.assertEqual(build_project_row_blocks(_payload(), "NOT_A_PROJECT"), [])
 
+    # --- the branches a project with actual work takes -------------------
+    #
+    # C115, from a full-suite coverage sweep: `notion_page.py` lines 871-885
+    # and 895-904 — the `else:` halves of both sections below — were never
+    # executed by any test. Every existing case reaches the empty branch,
+    # because `_payload()`'s ACTIVITY rows carry no `project_id` (so the
+    # filter never matches) and its PROJECTS row carries no `evidence`.
+    #
+    # That is the inverse of the usual coverage gap: what went untested is
+    # not an error path but the **normal** one. These blocks are what
+    # `publish_project_rows()` writes into a real PROJECTS row page in the
+    # live Workspace for every project that has done anything, so a
+    # regression here is invisible locally and lands in Notion.
+    #
+    # Measured before pinning: both render correctly today. Nothing is fixed
+    # here — the point is that nothing was watching.
+
+    @staticmethod
+    def _busy_payload(activity_rows, evidence, evidence_count):
+        payload = _payload()
+        panels = {p["key"]: p for p in payload["model"]["panels"]}
+        panels["ACTIVITY"]["rows"] = [
+            {"values": dict(values), "evidence": [], "evidence_count": 0}
+            for values in activity_rows
+        ]
+        project = panels["PROJECTS"]["rows"][0]
+        project["evidence"] = list(evidence)
+        project["evidence_count"] = evidence_count
+        return payload
+
+    @staticmethod
+    def _activity(count, project_id="ALPHA"):
+        return [
+            {
+                "at": f"2026-08-10T{index % 24:02d}:00:00+09:00",
+                "source": "DESKTOP_4",
+                "event_type": "PROGRESS",
+                "summary": f"summary-{index}",
+                "event_id": f"E{index}",
+                "project_id": project_id,
+            }
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _evidence(count):
+        return [
+            {
+                "path": f"processed/e{index}.json",
+                "event_id": f"E{index}",
+                "at": "2026-08-10T15:00:00+09:00",
+            }
+            for index in range(count)
+        ]
+
+    def _tables(self, blocks):
+        return [b for b in blocks if b.get("type") == "table"]
+
+    def test_a_projects_own_events_are_rendered_as_a_table(self):
+        payload = self._busy_payload(self._activity(3), self._evidence(2), 2)
+
+        blocks = build_project_row_blocks(payload, "ALPHA")
+        tables = self._tables(blocks)
+        text = "\n".join(_all_text(blocks))
+
+        self.assertEqual(len(tables), 1)
+        table = tables[0]["table"]
+        # Five columns, and one row per event plus the header.
+        self.assertEqual(table["table_width"], 5)
+        self.assertEqual(len(table["children"]), 3 + 1)
+        self.assertIn("summary-0", text)
+        self.assertIn("E2", text)
+        # Nothing was dropped, so nothing claims anything was.
+        self.assertNotIn("만 표시했다", text)
+
+    def test_only_this_projects_events_reach_its_own_page(self):
+        """The filter is the whole reason this page is per-project. A row
+        page carrying another project's events would be worse than an empty
+        one — it reads as evidence."""
+        payload = self._busy_payload(
+            self._activity(2) + self._activity(2, project_id="BETA"),
+            self._evidence(1),
+            1,
+        )
+
+        blocks = build_project_row_blocks(payload, "ALPHA")
+        table = self._tables(blocks)[0]["table"]
+
+        self.assertEqual(len(table["children"]), 2 + 1)
+
+    def test_more_events_than_the_table_holds_says_how_many_it_dropped(self):
+        """`MAX_TABLE_ROWS` is a cap, and a cap that does not announce itself
+        turns "20 events" into what a reader believes is all of them."""
+        payload = self._busy_payload(
+            self._activity(MAX_TABLE_ROWS + 5), self._evidence(1), 1
+        )
+
+        blocks = build_project_row_blocks(payload, "ALPHA")
+        table = self._tables(blocks)[0]["table"]
+        text = "\n".join(_all_text(blocks))
+
+        self.assertEqual(len(table["children"]), MAX_TABLE_ROWS + 1)
+        self.assertIn(f"{MAX_TABLE_ROWS + 5}건 중 {MAX_TABLE_ROWS}건만 표시했다", text)
+
+    def test_evidence_files_are_listed_one_per_bullet(self):
+        payload = self._busy_payload(self._activity(1), self._evidence(3), 3)
+
+        blocks = build_project_row_blocks(payload, "ALPHA")
+        bullets = [b for b in blocks if b.get("type") == "bulleted_list_item"]
+        text = "\n".join(_all_text(blocks))
+
+        self.assertEqual(len(bullets), 3)
+        self.assertIn("processed/e0.json", text)
+        # path · event_id · at — all three, so a reader can go find the file.
+        self.assertIn("E0", text)
+        self.assertIn("2026-08-10T15:00:00+09:00", text)
+        # The payload carried every ref it counted; no shortfall to report.
+        self.assertNotIn("만 실렸다", text)
+
+    def test_the_evidence_note_reports_the_true_total_not_the_listed_count(self):
+        """`evidence_count` is the true number; the list is capped upstream
+        at `dashboard.EVIDENCE_IN_PAYLOAD`. The note has to name both, or the
+        page reads as "this project produced 5 files"."""
+        payload = self._busy_payload(self._activity(1), self._evidence(5), 31)
+
+        blocks = build_project_row_blocks(payload, "ALPHA")
+        bullets = [b for b in blocks if b.get("type") == "bulleted_list_item"]
+        text = "\n".join(_all_text(blocks))
+
+        self.assertEqual(len(bullets), 5)
+        self.assertIn("증거 31건 중 5건만 실렸다", text)
+
     def test_the_first_block_says_it_is_machine_written(self):
         """The permission slip. Without it the tool cannot tell its own work
         from a person's, and would eventually delete somebody's notes."""

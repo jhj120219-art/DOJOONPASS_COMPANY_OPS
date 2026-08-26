@@ -1530,8 +1530,15 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         # under their own heading rather than filed beside the entries that
         # are waiting on a decision.
         "do_GET",
-        "do_POST",
         "log_message",
+        # `do_POST` left this list in C115, and the direction is worth
+        # recording: it is not that the detector got weaker, it is that the
+        # code got more visible. The refusal used to be a hand-written roster
+        # (`do_PUT = do_DELETE = do_PATCH = do_POST`), and a bare name on the
+        # right of an assignment is neither a Call nor an Attribute, so this
+        # scanner could not see it. `__getattr__` now returns `self.do_POST`,
+        # which *is* an attribute access — so the one method that every
+        # non-GET request reaches is now reachable by grep too.
     }
 
     def _production_files(self):

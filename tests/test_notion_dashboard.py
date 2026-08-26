@@ -1190,6 +1190,374 @@ class BootstrapDiagnosisTests(unittest.TestCase):
         self.assertEqual(transport._pages, {})
 
 
+class _PerDatabaseSchemaTransport(InMemoryNotionTransport):
+    """A workspace where two databases have two different schemas.
+
+    The shared double answers `retrieve_database()` from one
+    `_schema_properties` regardless of the id asked for. That is fine for
+    every test that holds one database, and it is exactly wrong here: the
+    defect under test is a diagnosis that confuses "the database I am bound
+    to" with "the database I am asking about", and a double that returns the
+    same schema for both ids cannot fail the way production fails.
+    """
+
+    def __init__(self, schemas, **kwargs):
+        super().__init__(**kwargs)
+        self._schemas = dict(schemas)
+
+    def retrieve_database(self, database_id):
+        database = dict(super().retrieve_database(database_id))
+        if database_id in self._schemas:
+            database["properties"] = dict(self._schemas[database_id])
+        return database
+
+
+def _ops_runs_schema(omit=()):
+    """The live OPS_RUNS schema shape, as Notion reports it.
+
+    Notion echoes a Property definition back with a `"type"` key naming the
+    type; `DASHBOARD_DATABASES` writes it in the request shape (`{"number":
+    {}}`). The diagnosis has to read the response shape, so the double must
+    produce the response shape or it proves nothing.
+    """
+    return {
+        name: {"type": next(iter(definition)), next(iter(definition)): {}}
+        for name, definition in DASHBOARD_DATABASES[OPS_RUNS].items()
+        if name not in omit
+    }
+
+
+class TheDiagnosisLooksAtTheDatabaseItIsDiagnosingTests(unittest.TestCase):
+    """C114. Measured against the live workspace, not imagined.
+
+    `OPS_RUNS` existed. All 22 columns matched `DASHBOARD_DATABASES[OPS_RUNS]`
+    by name and by type. `NOTION_OPS_RUNS_DATABASE_ID` named it. Six rows had
+    been written into it through `record_run()`. And this diagnosis answered
+    `NEEDS_PARENT_CHOICE`, whose `required_action` — printed verbatim by
+    `init_notion.py` under **다음 할 일** — reads:
+
+        "... the creation step is yours to perform. Then set
+         NOTION_OPS_RUNS_DATABASE_ID."
+
+    Both halves were already done, and following the instruction is not
+    recoverable: `bootstrap_dashboard_databases()` creates unconditionally,
+    this module has no delete path by design, and two databases named
+    OPS_RUNS leave nothing able to say which one the variable points at.
+
+    The failure was honest — the function never looked at the database. What
+    is pinned below is that it looks now, and that it still answers exactly
+    as it used to when there is nothing to look at.
+    """
+
+    def _clients(self, transport):
+        return (
+            NotionClient(transport=transport, database_id="projects-db"),
+            NotionClient(transport=transport, database_id="ops-runs-db"),
+        )
+
+    def _shared_page_transport(self, schemas):
+        transport = _PerDatabaseSchemaTransport(schemas)
+        transport.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+        return transport
+
+    def test_an_existing_ops_runs_is_not_reported_as_something_to_create(self):
+        """The measured defect, in one assertion."""
+        transport = self._shared_page_transport({"ops-runs-db": _ops_runs_schema()})
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.ALREADY_CREATED)
+        self.assertEqual(d.ops_runs_missing_properties, ())
+        # The two instructions that were wrong, named rather than paraphrased.
+        self.assertNotIn("creation step is yours", d.required_action)
+        self.assertNotIn("Then set NOTION_OPS_RUNS_DATABASE_ID", d.required_action)
+        # And the irreversible action is refused by name, not merely omitted.
+        self.assertIn("Do NOT run bootstrap_dashboard_databases()", d.required_action)
+
+    def test_the_answer_is_unchanged_when_no_ops_runs_client_is_given(self):
+        """The parameter is optional, and every caller that does not pass it
+        — including a deployment with no Dashboard at all — must get the
+        answer it got before this change."""
+        transport = self._shared_page_transport({"ops-runs-db": _ops_runs_schema()})
+        client, _ = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.NEEDS_PARENT_CHOICE)
+        self.assertEqual(d.ops_runs_missing_properties, ())
+
+    def test_a_configured_but_unreadable_ops_runs_is_its_own_answer(self):
+        """Not the same as unset. Unset asks the operator to decide whether
+        they want a Dashboard; this tells them the one they have points
+        somewhere that does not answer — and that creating a fresh one to
+        get past it is the move that leaves two."""
+
+        class _Unreachable(_PerDatabaseSchemaTransport):
+            def retrieve_database(self, database_id):
+                if database_id == "ops-runs-db":
+                    raise NotionAPIError("Notion API returned 404: Not Found", status_code=404)
+                return super().retrieve_database(database_id)
+
+        transport = _Unreachable({})
+        transport.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.CONFIGURED_BUT_UNREACHABLE)
+        self.assertIn("404", d.required_action)
+        self.assertIn("Do NOT create a new OPS_RUNS", d.required_action)
+
+    def test_a_stale_ops_runs_names_the_columns_that_would_reject_every_run(self):
+        """docs/13 step 8 records that the schema has grown 13 -> 22 columns.
+        A database created at an earlier size answers, so it is neither
+        absent nor broken — and every run against it is rejected with a 400.
+        The diagnosis has the schema in its hand at that moment; saying
+        nothing about it would be the same silence this cycle is closing."""
+        transport = self._shared_page_transport(
+            {"ops-runs-db": _ops_runs_schema(omit=("Role Mismatches", "Desktops Reporting"))}
+        )
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.ALREADY_CREATED)
+        self.assertEqual(
+            sorted(d.ops_runs_missing_properties), ["Desktops Reporting", "Role Mismatches"]
+        )
+        self.assertIn("Role Mismatches", d.required_action)
+        # The repair is the additive one, never the creating one.
+        self.assertIn("bootstrap_dashboard_properties()", d.required_action)
+        self.assertNotIn("Do NOT run bootstrap_dashboard_databases()", d.required_action)
+
+    def test_a_column_of_the_right_name_and_wrong_type_counts_as_missing(self):
+        """Notion rejects `{"Accepted": {"number": 3}}` against a rich_text
+        column with the same 400 it uses for a column that is not there. A
+        check that compared names only would call that database complete and
+        leave the operator with a green diagnosis and a red run."""
+        schema = _ops_runs_schema()
+        schema["Accepted"] = {"type": "rich_text", "rich_text": {}}
+        transport = self._shared_page_transport({"ops-runs-db": schema})
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.ops_runs_missing_properties, ("Accepted",))
+
+    def test_the_diagnosis_still_creates_nothing_on_the_new_paths(self):
+        """The contract that outranks everything above."""
+        transport = self._shared_page_transport({"ops-runs-db": _ops_runs_schema()})
+        client, ops_runs_client = self._clients(transport)
+
+        diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(transport.created_databases, {})
+
+    def test_an_unreachable_reference_database_still_wins(self):
+        """Ordering, asserted rather than assumed. If the token cannot read
+        PROJECTS, that is the thing to fix, and "your OPS_RUNS is fine" is an
+        answer to a question nobody is asking."""
+
+        class _NoReference(_PerDatabaseSchemaTransport):
+            def retrieve_database(self, database_id):
+                if database_id == "projects-db":
+                    raise NotionAPIError("Notion API returned 401: Unauthorized", status_code=401)
+                return super().retrieve_database(database_id)
+
+        transport = _NoReference({"ops-runs-db": _ops_runs_schema()})
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.reference_parent_type, "unreachable")
+        self.assertIn("NOTION_API_TOKEN", d.required_action)
+
+    def test_the_projects_id_in_the_ops_runs_variable_is_refused_not_repaired(self):
+        """C114 §2 — the defect the first half of C114 created.
+
+        `NOTION_OPS_RUNS_DATABASE_ID` holding the PROJECTS id is one
+        transposed variable in a shell profile, and `NotionConfig` cannot
+        tell two opaque ids apart. That database answers perfectly, so the
+        column check finds all 22 "missing" and the fix above recommended
+        `bootstrap_dashboard_properties()` "against a client bound to this
+        database" — **which would add the 22 OPS_RUNS columns to the live
+        PROJECTS database.** Confirmed against the real API before it
+        shipped, not reasoned about: readiness ALREADY_CREATED, 22 missing,
+        and that sentence.
+
+        docs/13 §3-⑧ already warned that the command cannot check what it is
+        bound to. Nothing pointed at it before; the first half of this cycle
+        started pointing at it. The bug a fix creates is the fix's problem.
+        """
+        projects_schema = {
+            "Project": {"type": "title", "title": {}},
+            "Status": {"type": "select", "select": {}},
+        }
+        transport = self._shared_page_transport({"ops-runs-db": projects_schema})
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.CONFIGURED_TO_THE_WRONG_DATABASE)
+        # The repair that would have damaged PROJECTS is refused by name.
+        self.assertIn("Do NOT run bootstrap_dashboard_properties()", d.required_action)
+        # And it must not be quietly reported as a fixable stale schema.
+        self.assertNotEqual(d.readiness, BootstrapReadiness.ALREADY_CREATED)
+        self.assertEqual(d.ops_runs_missing_properties, ())
+
+    def test_a_brand_new_database_is_repairable_not_rejected(self):
+        """Notion names a fresh database's Title `Name`, and step ⑧-4 exists
+        precisely to rename it and add the rest. The wrong-database guard
+        must not swallow the case it was built to leave alone."""
+        transport = self._shared_page_transport(
+            {"ops-runs-db": {"Name": {"type": "title", "title": {}}}}
+        )
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.ALREADY_CREATED)
+        self.assertIn("bootstrap_dashboard_properties()", d.required_action)
+        self.assertIn(RUN_ID_PROPERTY, d.ops_runs_missing_properties)
+
+    def test_a_response_without_a_title_is_not_guessed_to_be_the_wrong_database(self):
+        """Every Notion database has exactly one Title, so this shape should
+        not occur. Refusing a correct setup because a response surprised us
+        is a worse failure than saying nothing about it."""
+        schema = _ops_runs_schema()
+        schema["Run ID"] = {"type": "rich_text", "rich_text": {}}  # no title anywhere
+        transport = self._shared_page_transport({"ops-runs-db": schema})
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.ALREADY_CREATED)
+        self.assertEqual(d.ops_runs_missing_properties, (RUN_ID_PROPERTY,))
+
+    def test_a_null_properties_response_does_not_break_the_diagnostic(self):
+        """C114 §4 — the second defect this cycle's own fix introduced.
+
+        `get_database_schema()` returns `database.get("properties", {})`, and
+        `.get(k, {})` yields **None**, not `{}`, when Notion sends
+        `"properties": null` explicitly. The parse sat after the `try`, so
+        `None.items()` raised an AttributeError straight through a function
+        whose docstring promises it "never raises for an unusable workspace"
+        — and a malformed response from Notion is precisely when an operator
+        reaches for the diagnostic.
+        """
+
+        class _NullProperties(_PerDatabaseSchemaTransport):
+            def retrieve_database(self, database_id):
+                database = dict(super().retrieve_database(database_id))
+                if database_id == "ops-runs-db":
+                    database["properties"] = None
+                return database
+
+        transport = _NullProperties({})
+        transport.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.CONFIGURED_BUT_UNREACHABLE)
+
+    def test_a_property_definition_that_is_not_a_mapping_does_not_break_it_either(self):
+        """The contract is about the caller, not about which shape Notion
+        chose to be wrong in — the same argument
+        `test_an_unexpected_exception_type_is_also_absorbed` already makes
+        for the reference-database lookup."""
+
+        class _WeirdDefinition(_PerDatabaseSchemaTransport):
+            def retrieve_database(self, database_id):
+                database = dict(super().retrieve_database(database_id))
+                if database_id == "ops-runs-db":
+                    database["properties"] = {"Run ID": "not-a-mapping"}
+                return database
+
+        transport = _WeirdDefinition({})
+        transport.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertEqual(d.readiness, BootstrapReadiness.CONFIGURED_BUT_UNREACHABLE)
+
+    def _run_setup_cli(self, transport, *, ops_runs_id):
+        """`init_notion.py` end to end, which is where the wrong sentence was
+        actually printed. A unit test of the diagnosis would not have caught
+        the original defect either: the function returned its answer
+        correctly and honestly, and the entrypoint simply never gave it the
+        one input that would have changed it."""
+        import contextlib
+        import importlib
+        import io
+
+        init_notion = importlib.import_module("init_notion")
+        out, err = io.StringIO(), io.StringIO()
+        original_factory = init_notion.RealNotionTransport
+        original_environ = dict(os.environ)
+        try:
+            init_notion.RealNotionTransport = lambda **kwargs: transport
+            os.environ["NOTION_API_TOKEN"] = "ntn_" + "testtokenvalue0000"
+            os.environ["NOTION_PROJECTS_DATABASE_ID"] = "projects-db"
+            if ops_runs_id is not None:
+                os.environ["NOTION_OPS_RUNS_DATABASE_ID"] = ops_runs_id
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                init_notion.main()
+        finally:
+            init_notion.RealNotionTransport = original_factory
+            os.environ.clear()
+            os.environ.update(original_environ)
+        return out.getvalue()
+
+    def test_the_setup_cli_stops_telling_the_operator_to_create_what_exists(self):
+        transport = _PerDatabaseSchemaTransport(
+            {"ops-runs-db": _ops_runs_schema()},
+            initial_properties={"Project": {"type": "title", "title": {}}},
+        )
+        transport.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+
+        stdout = self._run_setup_cli(transport, ops_runs_id="ops-runs-db")
+
+        self.assertIn("ALREADY_CREATED", stdout)
+        self.assertNotIn("creation step is yours", stdout)
+        self.assertNotIn("Then set NOTION_OPS_RUNS_DATABASE_ID", stdout)
+        # The Page list answers "where would it go?", and there is no longer
+        # such a question. Offering candidates invites the duplicate.
+        self.assertNotIn("사용 가능한 Page", stdout)
+        # It still creates nothing, which outranks everything above.
+        self.assertEqual(transport.created_databases, {})
+
+    def test_the_setup_cli_is_unchanged_for_a_deployment_with_no_dashboard(self):
+        """The overwhelming majority of installs. `NOTION_OPS_RUNS_DATABASE_ID`
+        unset must reach exactly the output it reached before C114."""
+        transport = _PerDatabaseSchemaTransport(
+            {}, initial_properties={"Project": {"type": "title", "title": {}}}
+        )
+        transport.searchable_pages = [_page("page-1", "Company Ops", "workspace")]
+
+        stdout = self._run_setup_cli(transport, ops_runs_id=None)
+
+        self.assertIn("NEEDS_PARENT_CHOICE", stdout)
+        self.assertIn("creation step is yours", stdout)
+        self.assertIn("사용 가능한 Page", stdout)
+
+    def test_an_already_created_answer_does_not_invent_a_permissions_problem(self):
+        """`search_available` is printed by `init_notion.py` as "이
+        integration은 Workspace 검색 권한이 없어". Returning the new answer
+        early — before the search that this function makes anyway — would
+        have set that flag False on a workspace that searches perfectly well,
+        fabricating a permissions problem while fixing a duplication one."""
+        transport = self._shared_page_transport({"ops-runs-db": _ops_runs_schema()})
+        client, ops_runs_client = self._clients(transport)
+
+        d = diagnose_dashboard_bootstrap(client, ops_runs_client=ops_runs_client)
+
+        self.assertTrue(d.search_available)
+        self.assertEqual([p.page_id for p in d.hostable_pages], ["page-1"])
+
+
 class OpsRunPropertyTests(unittest.TestCase):
     def test_overall_is_ok_for_a_clean_run(self):
         props = build_ops_run_properties(
@@ -2344,12 +2712,39 @@ class DiagnosisNeverRaisesTests(unittest.TestCase):
         self.assertIsNone(diagnosis.resolved_parent_page_id)
 
     def test_the_setup_cli_actually_calls_the_diagnosis(self):
-        """The gap that made all of the above moot."""
+        """The gap that made all of the above moot.
+
+        The assertion used to be the literal `"diagnose_dashboard_bootstrap(
+        client)"`, which C114 had to change in order to pass the OPS_RUNS
+        client through. Changing a gate to admit one's own edit is the move
+        this repository refuses, so the property is asserted instead of the
+        spelling — and it is asserted *more* strictly than before: the call
+        must exist **and** must be handed the second client, because a
+        diagnosis that is called with only `client` is precisely the blind
+        one C114 found telling an operator to duplicate a live database.
+        """
+        import ast
+
         entrypoint = (
             Path(__file__).resolve().parents[1] / "init_notion.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("diagnose_dashboard_bootstrap(client)", entrypoint)
+        tree = ast.parse(entrypoint)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None))
+            == "diagnose_dashboard_bootstrap"
+        ]
+
+        self.assertEqual(len(calls), 1, "the setup CLI must call the diagnosis exactly once")
+        self.assertEqual(
+            [kw.arg for kw in calls[0].keywords],
+            ["ops_runs_client"],
+            "the diagnosis must be given the OPS_RUNS client, or it cannot "
+            "see a database that already exists",
+        )
 
     def test_the_setup_cli_does_not_create_anything_from_the_diagnosis(self):
         """Read-only and advisory: choosing a parent Page is an operator

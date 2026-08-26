@@ -135,6 +135,29 @@ readiness = READY                  이 Page 밑에 만들 수 있다
             NEEDS_SHARED_PAGE      integration에 공유된 Page가 하나도 없다
 ```
 
+> **먼저 readiness부터 읽는다. `ALREADY_CREATED`이면 이 절은 건너뛴다.**
+> `NOTION_OPS_RUNS_DATABASE_ID`가 설정돼 있으면 `init_notion.py`는 그 Database를
+> 실제로 조회한 뒤 답한다(C114):
+>
+> | readiness | 뜻 | 할 일 |
+> |---|---|---|
+> | `ALREADY_CREATED` | OPS_RUNS가 있고 변수가 그것을 가리킨다 | **아래 2번을 실행하지 않는다.** 열 누락이 함께 보고되면 ⑧-4(`bootstrap_dashboard_properties()`)만 |
+> | `CONFIGURED_BUT_UNREACHABLE` | 변수는 설정됐는데 그 Database가 응답하지 않는다 | id가 맞는지, 공유가 살아 있는지 확인. **새로 만들지 않는다** — 그러면 둘이 된다 |
+> | `CONFIGURED_TO_THE_WRONG_DATABASE` | 응답하지만 OPS_RUNS가 아니다 (Title이 `Run ID`도 `Name`도 아니다 — 대개 PROJECTS) | 변수를 올바른 id로 고친다. **⑧-4를 실행하지 않는다** — 아래 경고 참고 |
+> | `NEEDS_*` / `READY` | 아직 없다 | 아래 순서대로 |
+>
+> `CONFIGURED_TO_THE_WRONG_DATABASE` 줄이 필요한 이유는 §3-⑧-4가 이미 적어 둔 것이다: `bootstrap_dashboard_properties()`는
+> **자기가 어느 Database에 묶여 있는지 확인할 방법이 없다.** `NOTION_OPS_RUNS_DATABASE_ID`에
+> PROJECTS의 id가 들어가면(셸 프로필에서 변수 하나를 바꿔 쓰면 그만이고, `NotionConfig`는
+> 두 id를 구별하지 못한다) 그 Database는 멀쩡히 응답하고 22개 열이 전부 "없음"으로 나온다.
+> 그 상태에서 ⑧-4를 돌리면 **살아 있는 PROJECTS에 OPS_RUNS의 22개 열이 추가된다.**
+> C114의 첫 수정이 정확히 그 문장을 출력했고(실 API로 확인), 그래서 진단이 Title을 보고
+> 먼저 거른다.
+>
+> 이 표가 존재하는 이유는 아래 §4 상태표에 적혀 있다: 그 표가 "미완료"라고 말하는
+> 동안 Workspace에는 이미 OPS_RUNS가 있었고, 2번을 따랐다면 **삭제할 수 없는 중복**이
+> 생겼을 것이다. 문서는 낡지만 진단은 실행할 때마다 다시 측정한다.
+
 `NEEDS_SHARED_PAGE`가 나오는 가장 흔한 이유는, PROJECTS Database가 **Workspace 루트**에 있고(=부모가 Page가 아니고) integration에는 그 Database만 공유돼 있는 경우다. Notion API는 Workspace 루트에 Database를 만들 수 없고, 이 저장소는 Page를 만들지 않는다(운영자 지시: "새로운 Page 생성 금지"). 따라서:
 
 1. **Page 공유** — Notion에서 Company Ops용 Page 하나를 열고 Share → Connections에서 이 integration을 추가한다. 어느 Page를 쓸지는 운영자 결정이라 코드가 고르지 않는다.
@@ -380,13 +403,23 @@ docstring이 근거 없다고 적은 일이라, 둘 다 승인이 필요하다(B
 | **Environment** | Secret이 Git에 커밋되지 않음 확인(`.gitignore`) | ✅ `tests/test_repository_hygiene.py::SecretExposureGuardTests`가 전 tracked 파일을 검사 |
 | **Environment** | `COMPANY_OPS_HISTORY_START_DATE` 설정 | ❌ **미설정** — `.env`·User·Machine 어디에도 없다. 이 상태에서 `run_company_ops.py`는 첫 줄에서 exit 1이며 **Runner가 아예 뜨지 않는다** |
 | **Environment** | `COMPANY_OPS_PROFILE` / `_AGENT_SYNC_FOLDER` / `_AGENT_START_DATE` | ❌ **미설정** — `run_agent.py` 구성 불가. `scripts/install_agent_task.ps1`이 User 환경에 심는 세 값이다 |
-| **Dashboard** | integration에 Page 공유 (⑧-1) | ❌ **미완료** — `readiness = NEEDS_SHARED_PAGE`, hostable pages = 0, PROJECTS의 부모는 `workspace` |
-| **Dashboard** | `OPS_RUNS` Database 생성 (⑧-2) | ❌ 미완료 (선행: ⑧-1) |
-| **Dashboard** | `NOTION_OPS_RUNS_DATABASE_ID` 설정 (⑧-3) | ❌ 미설정 — Dashboard 기록은 매 실행 SKIPPED |
+| **Dashboard** | integration에 Page 공유 (⑧-1) | ✅ 완료 (C114 실측 2026-08-26: hostable pages = **168**, `readiness = NEEDS_PARENT_CHOICE`. PROJECTS 자신의 부모는 여전히 `workspace`이며, 그것과 "공유된 Page가 있는가"는 다른 질문이다) |
+| **Dashboard** | `OPS_RUNS` Database 생성 (⑧-2) | ✅ 완료 (C114 실측: 존재하고, **22개 열이 `DASHBOARD_DATABASES[OPS_RUNS]`와 이름·타입 모두 일치**하며, 누락 0) |
+| **Dashboard** | `NOTION_OPS_RUNS_DATABASE_ID` 설정 (⑧-3) | ✅ 값은 `.env`에 있다 — 다만 **`.env`에 있다는 것과 entrypoint가 본다는 것은 다른 일이다(§2.1)**. 그 상태에서만 Dashboard 기록이 SKIPPED다 |
 | **Acceptance** | §66 Phase 3 완료 기준 13개 항목, 실제 Workspace 기준 | ⬜ 미착수 |
 | **Rollback** | Notion Workspace/Integration을 잘못 만들었을 때 원복 방법 | 아래 §6 참고 |
 
-즉 **Notion Sync는 실제로 연결돼 있고, Operations Dashboard는 한 번도 실행된 적이 없으며, Runner 자체가 이 머신에서는 환경변수 때문에 실행되지 않는다.** 앞의 둘은 Notion UI에서의 운영자 작업(⑧-1)이 선행 조건이고, 셋째는 §2.1의 세 방법 중 하나다.
+즉 **Notion Sync도 Operations Dashboard도 실제로 연결돼 있고, Runner 자체는 이 머신에서 환경변수 때문에 실행되지 않는다.** OPS_RUNS에는 `record_run()`이 쓴 행 **6개**가 들어 있으며 전부 `ENGPROBE-*` — 즉 **Engineering Probe이고 실제 업무 실행이 아니다.**
+
+> **이 세 줄은 C114 이전까지 셋 다 ❌였고, 셋 다 틀려 있었다.** 그것이 무해한 오차가
+> 아닌 이유: ⑧-2의 지시는 `bootstrap_dashboard_databases()`를 부르라는 것이고, 그
+> 함수는 **조건 없이 생성하며 이 모듈에는 삭제 경로가 없다**(설계상 그렇다). 이미
+> 존재하는 Workspace에 대고 이 문서를 따르면 `OPS_RUNS`가 **둘**이 되고, 어느 쪽을
+> `NOTION_OPS_RUNS_DATABASE_ID`가 가리키는지 말할 수 있는 것이 아무것도 없다.
+> 그래서 C114는 이 표만 고치지 않았다 — **문서가 다시 낡아도 사람이 그 실수를 하지
+> 않도록** `diagnose_dashboard_bootstrap()`이 OPS_RUNS를 실제로 들여다보고
+> `ALREADY_CREATED`를 답하게 했다(§3-⑧ 참고). 이 표는 측정한 날의 사실이고,
+> 그 진단은 실행하는 날의 사실이다.
 
 ---
 
@@ -409,10 +442,21 @@ Company Ops 측:
 
 Notion **Sync**에 필요한 환경변수는 `NOTION_API_TOKEN`, `NOTION_PROJECTS_DATABASE_ID` 두 개뿐이고, 이 배포에서는 둘 다 설정돼 있으며 실제로 동작한다(§5). 이 문서는 그 두 값을 발급·확인하는 절차(①~⑦), Operations Dashboard를 켜는 절차(⑧), 값이 채워진 뒤 수행할 검증 순서, Release 판단에 필요한 Checklist를 정리한다.
 
-남은 것은 셋이고 전부 운영 작업이다:
+남은 것은 **하나**이고 운영 작업이다:
 
 1. **Runner 환경변수** — `COMPANY_OPS_HISTORY_START_DATE`(+ Agent용 3개). 없으면 Runner도 Agent도 실행되지 않는다. `.env`에 적는 것만으로는 부족하다(§2.1).
-2. **Dashboard용 Page 공유** — Notion UI에서만 할 수 있고, 어느 Page를 쓸지는 운영자 결정이다(⑧-1).
-3. **`OPS_RUNS` 생성 + id 설정** — ⑧-2, ⑧-3.
 
-코드 쪽은 완성돼 있고 전체 회귀는 통과한다. 지금 상태에서 Notion에 반영되는 것은 PROJECTS의 Current State뿐이고, 실행 단위 운영 기록(Operations Dashboard)은 위 2·3이 끝나기 전까지 매 실행 건너뛰어진다.
+~~2. **Dashboard용 Page 공유** (⑧-1)~~ · ~~3. **`OPS_RUNS` 생성 + id 설정** (⑧-2, ⑧-3)~~ —
+**C114에서 실측으로 반증됐다.** Page는 공유돼 있고(hostable 168), `OPS_RUNS`는 존재하며
+22개 열이 스키마와 정확히 일치하고, `NOTION_OPS_RUNS_DATABASE_ID`는 `.env`에 있다.
+그 Database에는 `record_run()`이 쓴 행 6개가 들어 있다 — 전부 `ENGPROBE-*`, 즉
+**Engineering Probe이며 실제 업무 실행이 아니다.**
+
+이 세 줄은 실제로 완료된 뒤에도 "미완료"로 남아 있었다. BACKLOG의 여러 항목이 이
+줄을 근거로 SKIP돼 있었고, C76이 남긴 교훈("환경 의존으로 기록된 항목은 근거보다
+오래 살아남는다")의 세 번째 사례다. **다음에 이 문서를 읽는 사람이 같은 함정에
+빠지지 않도록, 판정을 문서가 아니라 `init_notion.py`의 readiness가 하게 했다(§3-⑧).**
+
+코드 쪽은 완성돼 있고 전체 회귀는 통과한다. 지금 Notion에 반영되는 것은 PROJECTS의
+Current State와 OPS_RUNS의 실행 기록 둘 다이며, 후자가 실제 업무 실행으로 채워지려면
+위 1번이 끝나 이 머신에서 Runner가 실제로 떠야 한다.

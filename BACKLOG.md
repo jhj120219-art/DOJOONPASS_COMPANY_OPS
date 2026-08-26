@@ -7,6 +7,65 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
+마지막 갱신: 2026-08-26 (C114 — **문서가 "미완료"라고 말하는 동안 Workspace에는 이미 있었다.
+그리고 그것을 고친 수정이 더 나쁜 결함을 만들었다.**
+
+**시작은 C76의 교훈을 이 파일 자신에게 적용한 것이다** — "환경 의존으로 기록된 항목은 근거보다
+오래 살아남는다". 이 파일의 B절 5번과 docs/13 §4 상태표가 `NOTION_OPS_RUNS_DATABASE_ID`를
+**미설정**, `OPS_RUNS`를 **미생성**이라고 적고 있었고, 여러 SKIP이 그것을 근거로 삼고 있었다.
+실 API로 물었다:
+
+    OPS_RUNS          존재. 22개 열이 DASHBOARD_DATABASES[OPS_RUNS]와 이름·타입 전부 일치, 누락 0
+    행                6개 — 전부 ENGPROBE-* (**Engineering Probe이며 실제 업무 실행이 아니다**)
+    PROJECTS          8행 / 14 property. 그중 3행이 ENGINEERING_PROBE_*
+    Control Tower     66블록, 20:46 갱신, Event 16건 — C113이 비웠다 복구한 그 페이지가 온전하다
+    hostable pages    168 (상태표는 0이라고 적고 있었다)
+
+**세 줄 다 틀렸고, 무해한 오차가 아니었다(P1).** docs/13 ⑧-2의 지시는
+`bootstrap_dashboard_databases()`를 부르라는 것이고 그 함수는 **조건 없이 생성하며 이 모듈에는
+삭제 경로가 없다**(설계상). 게다가 문서만의 문제가 아니었다 — `diagnose_dashboard_bootstrap()`이
+**진단 대상을 한 번도 들여다보지 않았다.** 실측:
+
+    readiness       NEEDS_PARENT_CHOICE
+    required_action "... the creation step is yours to perform.
+                     Then set NOTION_OPS_RUNS_DATABASE_ID."
+
+둘 다 이미 끝난 일이고, `init_notion.py`는 그 문장을 **다음 할 일**로 그대로 찍는다. 따르면
+`OPS_RUNS`가 둘이 되고 어느 쪽을 변수가 가리키는지 말할 수 있는 것이 없다. 진단은 정직하게
+틀렸다 — 보지 않았으니까. 눈을 달았다: `ops_runs_client`(선택)를 받아 실제로 조회하고
+`ALREADY_CREATED` / `CONFIGURED_BUT_UNREACHABLE`을 답한다. 인자를 안 주면 **동작이 한 글자도
+바뀌지 않는다** — 기존 호출자와 테스트가 전부 그대로다.
+
+**그리고 그 수정이 C82를 반복할 뻔했다(P1, 내 결함).** 방금 한 수정에 같은 질문을 던졌다 —
+"내 변경은 무엇을 가능하게 하는가". `NOTION_OPS_RUNS_DATABASE_ID`에 **PROJECTS의 id**가 들어간
+경우를 실 API로 넣어 봤다(셸 프로필에서 변수 하나 바꿔 쓰면 그만이고 `NotionConfig`는 두 opaque
+id를 구별하지 못한다):
+
+    readiness       ALREADY_CREATED
+    missing         22개 전부
+    required_action "Run bootstrap_dashboard_properties() against a client
+                     bound to this database"
+
+**살아 있는 PROJECTS에 OPS_RUNS의 22개 열을 추가하라는 지시다.** docs/13 §3-⑧-4가 "그 명령은
+자기가 어디에 묶였는지 확인할 방법이 없다"를 이미 적어 두었는데, **거기를 가리키는 것이 전에는
+없었고 내 수정이 가리키기 시작했다.** 배포 전에 잡았다. Notion은 Database마다 Title이 정확히
+하나이고 Title은 나중에 추가할 수 없는 유일한 property이므로 그것이 신분증이다 —
+`Run ID`=이미 shape된 OPS_RUNS, `Name`=갓 만든 것(⑧-4의 대상), 그 외=다른 Database
+(PROJECTS의 Title은 `Project`). `CONFIGURED_TO_THE_WRONG_DATABASE`로 먼저 거른다.
+
+**게이트 하나를 통과시키려 하지 않고 더 강하게 만들었다.** `test_the_setup_cli_actually_calls_
+the_diagnosis`가 리터럴 `"diagnose_dashboard_bootstrap(client)"`를 단정하고 있어 내 변경에
+걸렸다. 철자를 넓히는 대신 **성질**로 바꿨다(ast): 호출이 정확히 1회 존재하고 **`ops_runs_client`가
+반드시 넘어가야 한다** — `client` 하나로만 부르는 것이 바로 C114가 찾은 눈먼 진단이므로, 전보다
+좁다.
+
+**측정.** mutation **M1~M10 전부 DETECTS**. 신규 회귀 15건.
+docs/13은 상태표 3줄 + §7 남은 순서 + ⑧ 절 머리의 readiness 표를 실측으로 갱신했다.
+**Notion에 쓴 것은 없다** — 이 Cycle의 실 API 접근은 전부 읽기 전용이고, 가짜 업무 Event도
+만들지 않았다. 자세한 기록은 아래 `## C114.` 절에 있다.
+
+아래는 C91 기록이다.)
+
 마지막 갱신: 2026-08-25 (C91 — **Notion 실패 경로와 10k 규모를 실측했다. 결함 0건, 코드 변경 0줄.**
 지시된 우선 조사 영역 중 아직 재현으로 확인하지 않은 둘을 닫았다.
 
@@ -513,6 +572,12 @@ role 불일치 / Company History를 읽을 수 없음 / 증거보다 오래된 H
 `cli.unexpected_arguments()`로, `finally`를 없애고(그 roster는 lock 전용이다), 파생 roster 둘과
 `.env.example`에 등록. `do_GET`/`do_POST`/`log_message`는 프레임워크가 이름으로 디스패치하므로
 dead-capability 목록에 **자체 항목으로** 기록했다(죽은 것이 아니라 호출 지점이 이 저장소에 없다).
+
+> **갱신 (C115): `do_POST`는 이 목록에서 빠졌다.** 탐지기가 약해진 것이 아니라 코드가
+> 보이게 된 것이다. 거절이 손으로 쓴 명부(`do_PUT = do_DELETE = do_PATCH = do_POST`)였을
+> 때는 대입문 오른쪽의 맨 이름이라 Call도 Attribute도 아니어서 스캐너가 볼 수 없었다.
+> 지금은 `__getattr__`이 `self.do_POST`를 돌려주고, 그것은 attribute 접근이므로 잡힌다.
+> 명부를 없앤 부수 효과이며, 그 명부가 바로 C115가 고친 결함이었다.
 전체 회귀 **3739 passed, 8 skipped**(skip 8건은 전부 환경 — symlink 권한, autocrlf).
 
 **SKIP / 남은 결정**
@@ -2692,8 +2757,25 @@ history candidate saved: True
 
 **핵심 발견:** Dashboard 실패를 견디려고 만든 pending 재시도 메커니즘이
 **아예 도달되지 않는다.** 그래서 그 실행의 Dashboard row는 다음 실행에서
-복구되지 않고 **영구히 비어 있다.** Manifest에도 `dashboard` component가
-없다(9개가 아니라 8개) — 건너뛰었다는 사실조차 기록되지 않는다.
+복구되지 않고 **영구히 비어 있다.** ~~Manifest에도 `dashboard` component가
+없다(9개가 아니라 8개) — 건너뛰었다는 사실조차 기록되지 않는다.~~
+
+**갱신 (C114) — 마지막 문장은 더 이상 참이 아니고, 이 항목은 더 이상 가설이
+아니다.** Manifest에 component가 없는 것은 그대로지만, `ops_status.py`가
+**Manifest에 없는 단계를 이름으로 지목한다**(`never_started`, 그 주석이 A-18을
+직접 인용한다). 그리고 그것이 **실 배포에서 실제로 발화하고 있다** — 2026-08-26
+Notion의 Control Tower 페이지를 읽은 결과(읽기 전용):
+
+    ! 마지막 실행에서 시작조차 되지 못한 단계: dashboard — 앞 단계가 중단시켰다.
+      그 단계의 결과는 이번 실행에서 기록되지 않았고 자동으로 재시도되지도 않는다
+    ! Runner가 9.4일째 실행되지 않았다 (마지막 실행 2026-08-17T12:07:42+09:00)
+
+즉 이 항목이 기술하는 손실은 이미 한 번 일어났다. **그래도 여전히 SKIP이다** —
+바뀐 것은 관측이지 정책이 아니다. "건너뛴 사실이 안 보인다"는 절반은 닫혔고,
+남은 절반("run_once()가 흡수해야 하는가")은 그대로 반환 계약 변경이다.
+**A-18을 SKIP으로 둔 판단 자체는 그때도 지금도 옳다** — 이 항목이 근거로 든
+"보이지 않는다"가 낡았을 뿐이고, 그것을 고치지 않으면 다음 사람이 이미 있는
+탐지기를 다시 만든다(C113이 실제로 그럴 뻔했다).
 
 **손실 규모:** Operations Projection의 row 1개. **데이터는 안전하다** —
 History Candidate는 저장되고 Manifest도 기록된다(RULE 5: Notion/Dashboard는
@@ -3055,9 +3137,22 @@ C95가 탐지를 붙였다. 남은 것은 “그래서 어떻게 할 것인가�
    자격증명은 `.env`에 있고 작동한다. C103이 실 API에 대고 health check,
    자격증명 4상태 구별, 코퍼스 전체 dry-run, 쓰기->되읽기->재전송 멱등성,
    Dashboard<->Notion 대조를 전부 실행했다. 그 왕복에서 결함 둘이 나왔다
-   (E-26, E-27). **남은 미검증은 Workspace가 아니라 `NOTION_OPS_RUNS_DATABASE_ID`
+   (E-26, E-27). ~~**남은 미검증은 Workspace가 아니라 `NOTION_OPS_RUNS_DATABASE_ID`
    하나** — Operations Dashboard는 여전히 미설정이며, 그 Database를 만드는 것은
-   승인 대상이다(A절).
+   승인 대상이다(A절).~~ **C114에서 반증됐다.** `OPS_RUNS`는 존재하고, 22개 열이
+   스키마와 이름·타입 전부 일치하며, 변수는 `.env`에 있고, `record_run()`이 쓴 행이
+   6개 들어 있다(전부 `ENGPROBE-*` — Engineering Probe이며 실제 업무 실행이 아니다).
+   승인 대상이던 "Database를 만드는 일"은 **이미 일어났다.**
+
+   **이 줄이 이 절에서 두 번째로 같은 실수를 했다.** 바로 위 5번이 "환경 의존으로
+   기록된 항목은 근거보다 오래 살아남는다"(C76)를 인용하며 자격증명 항목을 반증해
+   놓고, **그 반증문 자신이 다음 문장에서 다시 낡은 사실을 적었다.** 그래서 C114는
+   이 줄을 고치는 데 그치지 않고 판정을 문서 밖으로 옮겼다 —
+   `diagnose_dashboard_bootstrap()`이 실행할 때마다 Workspace에 직접 묻는다.
+   **다음에 이 줄이 또 낡아도 사람이 중복 Database를 만들지는 않는다.**
+
+   남은 미검증은 이제 Workspace가 아니라 **이 머신의 Runner 환경변수**다
+   (`COMPANY_OPS_HISTORY_START_DATE` — docs/13 §7).
 
    C76의 교훈이 그대로 적용됐다: "환경 의존"으로 기록된 항목은 근거보다 오래
    살아남는다. 이 줄은 자격증명이 도착한 뒤에도 그대로 있었다.
@@ -3468,6 +3563,18 @@ C22에서 전수 대조했다: 테스트 docstring이 참조하는 결함 식별
 고정하고 있는 사용자 대면 문구다(`test_agent.py` 2건, `test_observability.py` 1건 이상). 화면
 문구를 바꾸는 것은 표현에 대한 결정이지 결함 수정이 아니다 — 이 파일에 기록하고 남긴다.
 
+**갱신 (C115) — 범위가 이 항목이 적은 것보다 넓다. 결정은 그대로 둔다.**
+이 항목은 무대를 `ops_status.py`의 ATTENTION 블록으로 적고 있지만, 실제 Notion Control
+Tower 페이지를 읽어 확인했다(읽기 전용, 2026-08-26):
+
+    ! Runner가 9.4일째 실행되지 않았다 (...)          <- 한국어
+    ! agent has not run for 15 day(s)                  <- 영어, **Notion 페이지 위에서**
+
+즉 이 네 문자열은 터미널에만 남는 것이 아니라 **공유된 Workspace의 페이지로 발행된다.**
+C109가 "같은 문장이 터미널에 남을 때와 Notion에 갈 때는 다른 문장이다"를 기록한 그 경로다.
+여전히 표현 결정이므로 **SKIP은 유지한다** — 다만 결정할 때의 무대가 콘솔 하나가 아니라는
+사실은 이 항목에 없었다.
+
 ### 이 조사가 드러낸 구조적 문제
 
 E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록이 저장소보다 오래
@@ -3482,6 +3589,323 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 
 
 ---
+
+## C115. GET만 답한다는 문장이 세 method에 대해 거짓이었다 — 그리고 그것을 지키는 테스트가 같은 명부를 베끼고 있었다
+
+### 1. 어떻게 찾았는가 — 실제로 띄우고 실제 HTTP로 두드렸다
+
+`dashboard_server.py`를 실제로 실행(포트 8791)하고 curl로 표면 전체를 쳤다. 정상 경로,
+빈 데이터, 잘못된 입력, 보안 경계, 동시성 순서다.
+
+**대부분 아주 좋았다.** 빈 데이터 렌더링은 모범적이다 — 이 머신의 `runtime/`은 비어 있는데
+화면이 **"증거가 하나도 없다"**, **"아래의 0은 '일이 없었다'가 아니라 '셀 Event가 없다'는
+뜻이다"**라고 먼저 말하고 KPI마다 `증거 파일 없음`을 붙인다. 동시 24요청(HTML 12 + JSON 12)
+전부 200에 **바이트 수까지 동일**(25243 / 17861) — 섞임 없음. 위조 `Host` → **403**(DNS
+rebinding 방어 작동), 잘못된 날짜·거꾸로 된 기간·모르는 파라미터 → 각각 이유를 말하는 400,
+`<script>` 주입 시도는 **`text/plain`으로 반사**되어 실행 불가.
+
+### 2. 결함 P2 — 모듈 docstring의 보편 주장이 거짓이었다
+
+    Only GET is answered; everything else gets 405.
+
+실측:
+
+    GET 200 · POST/PUT/DELETE/PATCH 405 · **HEAD 501 · OPTIONS 501 · TRACE 501**
+
+`_Handler`의 거절이 **손으로 쓴 명부**였다(`do_PUT = do_DELETE = do_PATCH = do_POST`).
+`BaseHTTPRequestHandler`는 찾지 못한 `do_*`를 자기 501로 답하므로, 명부에 없는 method는
+전부 그리로 샜다.
+
+**비용이 있는 것은 HEAD다.** `curl -I <url>`은 로컬 서버가 떠 있는지 확인하는 가장 흔한
+방법이고, 답이 `501 Unsupported method ('HEAD')`였다 — 운영자에게 **"이 프로그램은
+고장났다"**로 읽히지 **"이 프로그램은 읽기 전용이다"**로 읽히지 않는다.
+
+**명부가 결함이므로 명부를 없앴다.** 셋을 더 추가하면 다음에 또 드리프트한다.
+`handle_one_request()`는 `hasattr(self, "do_" + command)`로 디스패치하므로 `do_` 접두사에만
+한정한 `__getattr__`이 답하면 docstring의 주장이 **구조적으로** 참이 된다 — 지금 존재하는
+method도, 아직 존재하지 않는 method도(실측: 지어낸 `FROBNICATE`도 405). 접두사 한정은
+의도적이다: 무제한 `__getattr__`은 이 클래스의 진짜 `AttributeError`를 삼켜 오타를 조용한
+405로 만든다(M3에서 실제로 21건이 깨졌다).
+
+HEAD 응답은 헤더만 보내고 본문을 보내지 않게 했다(RFC 9110 §9.3.2). `Content-Length`는
+GET이 돌려줄 크기를 그대로 말한다 — 그것이 이 method의 요점이다.
+
+### 3. 결함 P2 — 그 결함을 지키던 테스트가 같은 명부를 베끼고 있었다
+
+`test_every_writing_method_is_refused`가 순회하던 목록이 정확히
+`("POST","PUT","DELETE","PATCH")` — **핸들러가 alias한 그 네 이름**이었다. 즉 테스트는
+docstring의 불변식이 아니라 **자기가 받아 든 명부**를 단정하고 있었고, 그래서 세 method가
+다른 답을 하는 동안 초록이었다. C80이 기록한 모양 그대로다.
+
+목록을 불변식으로 바꾸고 `FROBNICATE`를 넣었다 — 아무도 보내지 않을 method이고, 바로 그래서
+**미래의 명부가 조용히 커버할 수 없는 유일한 항목**이다.
+
+### 4. False Positive 하나 — 그리고 내 테스트가 공허했다
+
+**`urllib`은 HEAD 응답의 본문을 클라이언트 쪽에서 버린다.** 그래서 "본문이 없다"를
+`urllib`으로 단정하면 서버가 본문을 보냈든 말든 통과한다. **M2(본문 억제 제거)가 실제로
+살아남았고**, 그때서야 알았다. raw socket으로 다시 쓰니 M2가 죽었다. 와이어의 바이트만이
+서버가 무엇을 썼는지에 대한 증인이다.
+
+### 5. 문서 결함 — `/healthz`가 어디에도 적혀 있지 않았다
+
+존재하고, 테스트도 2건 있고, **AGENT.md·README·docs/·자기 모듈 docstring 어디에도 없다.**
+떠 있는지 확인할 방법을 찾는 사람이 닿을 수 없으면 없는 것과 같다. 실측:
+
+    /healthz   200 "ok"   2 bytes    ~2ms     기간 파싱보다 먼저 답한다(?since=엉터리에도 ok)
+    /          200        25243 B    ~9ms     Host 게이트는 둘 다 동일(위조 → 403)
+
+모듈 docstring에 경로 셋을 표로 넣고 AGENT.md §6d에 `curl` 예시를 넣었다. `curl -I`가 왜
+405인지, 그러면 무엇을 써야 하는지도 같이 적었다.
+
+### 6. 부수 효과 — dead-capability 목록이 **줄었다**
+
+`do_POST`가 목록에서 빠졌다. 탐지기가 약해진 게 아니라 코드가 보이게 된 것이다: 대입문
+오른쪽의 맨 이름은 Call도 Attribute도 아니라 스캐너가 볼 수 없었고, `self.do_POST`는 보인다.
+게이트가 변화를 감지해 "BACKLOG C31 §17을 갱신하라"고 말했고, 그대로 했다.
+
+### 7. 측정
+
+    mutation  M1 손으로 쓴 명부로 복귀(원 결함)       DETECTS (3건)
+              M2 HEAD 본문 억제 제거                  DETECTS (1건, raw socket 재작성 후)
+              M3 __getattr__를 무제한 catch-all로     DETECTS (21건)
+              M4 억제를 HEAD가 아닌 GET 기준으로      DETECTS (17건)
+              M5 명부를 세 이름으로 되돌림            DETECTS (3건)
+    신규 회귀  5건 (raw-socket helper 포함)
+    실행 검증  실 HTTP — method 9종, 동시 24요청, 위조 Host, 잘못된 입력 4종, XSS 반사
+    전체 회귀  **4010 passed / 32 failed / 2 skipped** (824s)
+               32건은 C114가 확인한 그 집합 그대로 — 이 머신이 Python 3.9.7이라
+               `test_observability.py`의 `enterContext`(3.11+)가 31건, 선언 런타임 게이트가 1건.
+               **신규 실패 0.** 시작 4001 + dashboard 4 + notion_page 5 = 4010
+
+**Evidence:** `tests/test_dashboard_server.py::ThePageIsReadOnlyTests` (재작성 1 + 신규 4).
+Notion에는 아무것도 쓰지 않았고 가짜 업무 Event도 만들지 않았다.
+
+### 8. 전 모듈 coverage sweep — 그리고 **정상 경로**가 테스트되지 않은 곳
+
+전체 suite를 coverage로 한 번 돌렸다(`--source=src`, 17분): **98% (6042 stmt, 106 miss)**,
+64개 파일이 100%다. 남은 구멍은 대부분 추상 `raise NotImplementedError`와 C113이 이미 조사한
+`backup/working_copy.py`의 방어 분기다.
+
+**하나는 달랐다. `controltower/notion_page.py` 871-885 · 895-904** —
+`build_project_row_blocks()`의 두 `else:` 절, 즉 **Event가 있는 Project와 Evidence가 있는
+Project를 렌더하는 코드**가 어떤 테스트에서도 실행된 적이 없다.
+
+    빈 분기   "해당 없음 — 이 기간에 이 Project의 Event가 없다"   <- 기존 테스트가 전부 여기로 간다
+    비어있지 않은 분기   표 + "N건 중 M건만 표시했다" / bullet + "증거 N건 중 M건만 실렸다"   <- 0회 실행
+
+원인은 fixture다: `_payload()`의 ACTIVITY row에 `project_id`가 없어서 필터가 영원히 안 맞고,
+PROJECTS row에 `evidence`가 없다. **평소의 coverage 구멍과 반대 방향이다 — 실행되지 않은 것이
+오류 경로가 아니라 정상 경로다.** 그리고 이 블록들은 `publish_project_rows()`가 **실
+Workspace의 각 PROJECTS row page에 쓰는 내용**이므로, 회귀가 로컬에서는 보이지 않고 Notion에
+가서야 보인다.
+
+**결함은 없었다 — 렌더해서 확인했다.** 25 Event / evidence_count 31로 주입하니
+표 width=5·21행(헤더 1 + 상한 20), `25건 중 20건만 표시했다`, bullet 5개,
+`증거 31건 중 5건만 실렸다`. 상한 둘 다 자기 존재를 말한다(C71의 규칙).
+
+**False Positive 하나 — 내 것.** evidence 절의 상한 비교가
+`total > len(evidence)`인 것을 보고 "슬라이스는 `[:MAX_TABLE_ROWS]`인데 비교는 `evidence`
+길이와 하니 20건 초과 시 조용히 잘린다"고 판단했다. **상수를 확인하니 틀렸다** —
+`dashboard.EVIDENCE_IN_PAYLOAD = 5`이고 `MAX_TABLE_ROWS = 20`이라 그 슬라이스는 아무것도
+버릴 수 없고, `evidence_count`가 진짜 총계이므로 비교가 정확하다. **주장하기 전에 상수를
+읽어서 막았다.**
+
+    mutation  M1 표 상한 제거                    DETECTS (1건)
+              M2b project 필터 제거              DETECTS (1건, 정확히 해당 테스트)
+              M3 evidence 상한 고지 제거          DETECTS (1건)
+              M4 표 상한 고지 제거               DETECTS (1건)
+    신규 회귀  5건
+    coverage  notion_page.py 94% -> **96%**, 문제의 두 블록은 목록에서 사라졌다
+
+**Evidence:** `tests/test_controltower_notion_page.py::AProjectRowCarriesItsOwnEvidenceTests` 5건.
+
+
+## C114. 문서가 "미완료"라고 말하는 동안 Workspace에는 이미 있었다 — 그리고 그 수정이 더 나쁜 결함을 만들었다
+
+### 1. 어떻게 시작했는가 — 이 파일 자신에게 C76을 적용했다
+
+C76의 교훈은 "**환경 의존**으로 기록된 항목은 근거보다 오래 살아남는다"이다. B절 5번과
+docs/13 §4 상태표가 `NOTION_OPS_RUNS_DATABASE_ID`를 **미설정**, `OPS_RUNS`를 **미생성**으로
+적고 있었고, 여러 SKIP이 그 두 줄을 근거로 삼고 있었다. 추측하지 않고 물었다 —
+`.env`는 이 프로세스에만 로드했고 값은 한 번도 출력하지 않았다(이름과 길이만).
+
+    OPS_RUNS          존재. title='OPS_RUNS', 22 property
+                      DASHBOARD_DATABASES[OPS_RUNS]와 대조: 누락 0 / 초과 0 / 타입 불일치 0
+    OPS_RUNS 행       6 — ENGPROBE-C92-RUN, ENGPROBE-C92C-IDEM-A/B, ENGPROBE-C92C-PART-1/2/3
+                      **전부 Engineering Probe. 실제 업무 실행이 아니다.**
+    PROJECTS          8행 / 14 property (spec 11 + Notion 기본 Date/Notes/Tags)
+                      그중 ENGINEERING_PROBE_* 3행
+    Control Tower     child_page 'Control Tower' 66블록, 마지막 갱신 20:46, "읽은 Event: 16건"
+                      -> C113이 실측 중 비웠다가 복구한 그 페이지가 **온전하다**
+    hostable pages    168   (상태표는 `NEEDS_SHARED_PAGE`, 0개라고 적고 있었다)
+
+이 저장소(HEAD `84b4502`)에는 `ENGPROBE` 문자열이 **한 번도 나오지 않는다.** stash 둘에도
+없고 origin/main도 HEAD와 같다. 즉 그 작업은 다른 머신에서 일어났고 **기록이 여기 도달한 적이
+없다.** 이 머신의 `runtime/`은 비어 있어(Event 0건) Dashboard↔Notion 대조는 여기서 불가능하다 —
+Control Tower 페이지가 16건을 읽었다고 말하는 것이 그 증거다.
+
+### 1b. 왜 낡았는가 — 한 Sprint의 저장소 쪽 산출물이 통째로 없다 (**운영 P1**)
+
+문서가 낡은 이유를 추적했더니 문서 문제가 아니었다. `ENGPROBE-C92C`라는 Run ID가
+가리키는 Cycle(C92 / C92b / C92c)의 **저장소 쪽 산출물이 이 저장소에 하나도 없다.**
+`git log --all`에도, stash 둘에도, origin/main에도 없다(origin과 HEAD는 동일):
+
+    scripts/run_company_ops.ps1     없음  (scripts/에는 install_agent_task.ps1 하나뿐)
+    notion_reconcile.py             없음
+    normalise_page_id()             없음  (저장소 전체 grep 0건)
+    verify_parent_page()            없음  (저장소 전체 grep 0건)
+    BACKLOG A-30                    없음  (이 파일의 A절은 A-29에서 끝난다)
+    "ENGPROBE" 문자열                없음  (BACKLOG·docs·AGENT.md 전부 0건)
+
+**그런데 그 Cycle의 *효과*는 살아 있다.** 실 Workspace에 `OPS_RUNS`가 있고,
+`record_run()`이 쓴 행 6개가 `ENGPROBE-C92*`라는 이름으로 들어 있으며,
+`NOTION_OPS_RUNS_DATABASE_ID`가 `.env`에 추가돼 있다. 즉 **코드는 사라지고 그 코드가
+바꾼 외부 상태만 남았다.**
+
+이것이 §1의 문서 드리프트의 **원인**이다. docs/13 상태표가 게을러서 낡은 게 아니라,
+그것을 갱신했을 Cycle의 기록이 저장소에 도달한 적이 없다. 그래서 저장소만 읽으면
+"⑧-2 미완료"가 여전히 저장소 안에서는 **정합적인** 문장이고, 오직 실 API에 물어야만
+틀렸다는 것을 알 수 있다.
+
+**이 저장소가 이미 아는 실패 모드의 세 번째 사례다** — stash에 13 Sprint 동안 남아
+있던 수정(C64), 아직 적용되지 않은 Sprint를 담은 `stash@{0}`, 그리고 이번 것.
+앞의 둘은 적어도 git 안에 있었다. **이번 것은 git 안에 없다.**
+
+**SKIP(승인/범위):** 잃은 것을 되살리는 것은 이번 범위가 아니다.
+`scripts/run_company_ops.ps1`은 자격증명을 다루는 스크립트이고(그 Cycle이 거기서
+`-WhatIf`가 값을 출력하는 결함을 한 번 냈다), `notion_reconcile.py`는 새 entrypoint다 —
+둘 다 "다시 쓸 것인가"가 먼저 결정될 사항이다. **여기서 한 일은 사실을 기록한 것과,
+그 사실이 또 낡아도 사람이 다치지 않게 §2·§3의 진단을 넣은 것이다.**
+
+**다음 사람이 먼저 할 일:** Notion/Workspace에 대한 "현재 상태" 주장은 이 파일이 아니라
+**실 API에 물어서** 확인한다. 이 파일은 저장소가 아는 것만 알고, 저장소는 뒤처져 있다.
+
+### 2. 결함 P1 — 진단이 진단 대상을 한 번도 보지 않았다
+
+실 Workspace에 대고 `diagnose_dashboard_bootstrap()`을 돌렸다:
+
+    readiness       NEEDS_PARENT_CHOICE
+    required_action "... the creation step is yours to perform.
+                     Then set NOTION_OPS_RUNS_DATABASE_ID."
+
+**두 지시 다 이미 끝난 일이다.** 그리고 `init_notion.py`는 그 문장을 **다음 할 일**로 그대로
+찍는다. 이것이 낡은 문장에 그치지 않는 이유:
+
+| | |
+|---|---|
+| `bootstrap_dashboard_databases()` | **조건 없이 생성한다** |
+| 이 모듈의 삭제 경로 | **없다**(설계상, docstring이 명시) |
+| 따랐을 때의 결과 | `OPS_RUNS` **둘**. 어느 쪽을 변수가 가리키는지 말할 수 있는 것이 없다 |
+
+함수는 정직하게 틀렸다 — **자기가 진단하는 Database를 보지 않았으니까.** `search_pages()`는
+`object == "page"`로 필터하므로 구조적으로 Database를 볼 수 없다.
+
+**수정:** `ops_runs_client`(선택 인자)를 받아 실제로 조회한다. **인자를 안 주면 동작이 한 글자도
+바뀌지 않는다** — 기존 호출자와 테스트 전부 그대로이고, 그것이 이 인자가 선택인 이유다.
+호출 위치는 parent 조회와 search **뒤**다: 앞에서 반환하면 `search_available=False`가 되고
+`init_notion.py`가 "이 integration은 Workspace 검색 권한이 없어"를 찍는다 — **없는 권한 문제를
+지어내면서 중복 문제를 고치는 것**이라, 이 변경이 없애려는 바로 그 부류의 결함이다.
+
+### 3. 결함 P1 (내 결함) — 그 수정이 C82를 반복할 뻔했다
+
+방금 한 수정에 같은 질문을 던졌다(C82의 방법): **내 변경은 무엇을 가능하게 하는가.**
+`NOTION_OPS_RUNS_DATABASE_ID`에 **PROJECTS의 id**를 넣고 실 API로 돌렸다:
+
+    readiness       ALREADY_CREATED
+    missing         22개 전부
+    required_action "Run bootstrap_dashboard_properties() against a client
+                     bound to this database"
+
+**살아 있는 PROJECTS에 OPS_RUNS의 22개 열을 추가하라는 지시다.** 도달 경로는 이국적이지 않다 —
+셸 프로필에서 변수 하나를 바꿔 쓰면 그만이고, `NotionConfig`는 두 opaque id를 구별하지 못한다.
+docs/13 §3-⑧-4가 "그 명령은 자기가 어느 Database에 묶였는지 확인할 방법이 없다"를 **이미
+적어 두었는데**, 거기를 가리키는 것이 전에는 없었고 **내 수정이 가리키기 시작했다.**
+
+**신분증은 Title이다.** Notion은 Database마다 Title이 정확히 하나이고, Title은 나중에 추가할 수
+없는 유일한 property다(`_bootstrap_title_property`가 추가 대신 rename하는 이유가 그것이다).
+
+    "Run ID"   이미 이 코드가 shape한 OPS_RUNS
+    "Name"     갓 만든 Database — Notion 기본값, ⑧-4가 존재하는 이유
+    그 외       다른 Database. PROJECTS의 Title은 "Project"
+
+`CONFIGURED_TO_THE_WRONG_DATABASE`로 먼저 거른다. Title이 아예 없는 응답은 **틀렸다고 하지
+않는다** — 그 모양은 나올 수 없고, 예상 못 한 응답을 근거로 올바른 설정을 거절하는 것이 더 나쁜
+실패다.
+
+### 4. 결함 P2 (내 결함, 두 번째) — 내 코드가 "절대 raise하지 않는다"를 깼다
+
+같은 질문을 한 번 더 던졌다. `diagnose_dashboard_bootstrap()`의 docstring은 **"쓸 수 없는
+Workspace 때문에 절대 raise하지 않는다 — 쓸 수 없다는 것 자체가 이 함수가 보고할 답이다"**를
+명시하고, `DiagnosisNeverRaisesTests`가 reference database 경로에 대해 그것을 고정하고 있다. 내가 더한
+경로는 `try`가 **조회만** 감싸고 파싱은 그 밖에 있었다:
+
+    "properties": null          AttributeError: 'NoneType' object has no attribute 'items'
+    {"Run ID": "not-a-dict"}    AttributeError: 'str' object has no attribute 'get'
+
+`get_database_schema()`는 `database.get("properties", {})`인데 **`.get(k, {})`는 값이
+명시적 `null`이면 `{}`가 아니라 `None`을 준다.** 이 저장소가 `notion.bootstrap`에서 이미 한 번
+고친 null-properties 결함과 같은 계열이다. 그리고 **Notion이 이상한 응답을 주는 순간이 바로
+운영자가 이 진단을 실행하는 순간**이라, 진단이 깨지기에 가장 나쁜 때다.
+
+파싱을 `try` 안으로 옮겼다. 둘 다 이제 `CONFIGURED_BUT_UNREACHABLE`로 **보고**된다.
+M10(파싱을 다시 밖으로) DETECTS 2건.
+
+### 5. 게이트를 통과시키지 않고 더 좁게 만들었다
+
+`test_the_setup_cli_actually_calls_the_diagnosis`가 리터럴
+`"diagnose_dashboard_bootstrap(client)"`를 단정하고 있어 내 변경에 걸렸다. **철자를 넓히지
+않았다.** ast로 성질을 검사한다 — 호출이 정확히 1회 존재하고, **`ops_runs_client`가 반드시
+넘어가야 한다.** `client` 하나로만 부르는 것이 바로 C114가 찾은 눈먼 진단이므로 **전보다 좁다.**
+
+### 6. 측정
+
+    mutation   M1 진단이 ops_runs_client를 무시            DETECTS (4건)
+               M2 이름만 비교하고 타입 무시                 DETECTS (1건)
+               M3 ALREADY_CREATED가 검색 권한 문제를 지어냄  DETECTS (1건)
+               M4 도달 불가를 ALREADY_CREATED로 보고         DETECTS (1건)
+               M6 wrong-database 가드 제거                  DETECTS (1건)
+               M7 가드가 갓 만든 'Name'까지 거절(⑧-4 파괴)   DETECTS (1건)
+               M8 Title 없는 응답까지 거절                   DETECTS (1건)
+               M9 entrypoint가 OPS_RUNS client를 안 넘김     DETECTS (1건)
+               M10 파싱을 try 밖으로(never-raises 위반)       DETECTS (2건)
+    신규 회귀   15건 (+ 기존 게이트 1건을 성질 검사로 강화)
+    실 API     전부 **읽기 전용**. Notion에 쓴 것 없음, 가짜 업무 Event 만들지 않음
+    전체 회귀   이 머신: **4001 passed / 32 failed / 2 skipped** (831s, 최종 실측)
+
+**그 32건은 전부 이 머신의 Python 버전 때문이고, 내 변경과 무관하다 — 추정이 아니라
+대조로 확인했다.** 내 변경 5파일을 stash하고 같은 모듈을 돌린 결과가 **똑같이 32건**이었다:
+
+    tests/test_observability.py      31건  AttributeError: 'TestCase' object has no attribute
+                                           'enterContext'  <- enterContext는 Python 3.11+
+    선언 런타임 게이트                 1건  (3, 13) != (3, 9)
+
+이 머신은 **3.9.7**이고 저장소가 선언한 런타임은 **3.13**이다. 두 번째 실패는 그 사실을
+보고하라고 만든 게이트이므로 **정상 발화**다. C113이 기록한 baseline(4012 passed)은 3.13에서
+잰 값이며, 여기서 재현할 수 없다 — [[memory: 기록된 baseline을 믿지 말고 다시 잰다]]는
+이 저장소가 이미 세 번 배운 규칙이다.
+
+**내가 낸 회귀 1건은 잡아서 고쳤다.** 첫 전체 실행이 33 failed였고, 늘어난 1건은
+`BacklogEvidenceLinksResolveTests::test_every_cited_test_class_exists`였다 — 내가 위 §4에
+**존재하지 않는 테스트 클래스 이름을 인용**했다(실제 이름은 `DiagnosisNeverRaisesTests`).
+BACKLOG가 backtick으로 인용한 모든 `*Tests` 이름이 실제로 존재하는지 대조하는 게이트가
+있고, 그것이 내 오타를 잡았다.
+
+그리고 이 문단을 처음 쓸 때 **틀린 이름을 예시로 backtick 안에 다시 넣어 게이트를 또
+빨갛게 만들었다.** 게이트가 옳다 — 인용은 예시든 아니든 인용이다. 게이트를 느슨하게
+하는 대신 문장에서 그 이름을 뺐다.
+
+**문서:** docs/13 상태표 3줄(⑧-1/⑧-2/⑧-3)이 전부 ❌였고 전부 틀려 있었다 — 실측으로 갱신했다.
+§7 "남은 것은 셋"을 "하나"로 줄였고, ⑧ 절 머리에 **readiness를 먼저 읽으라는 표**를 넣었다.
+표만 고치지 않은 이유가 이 Cycle의 요점이다: **문서는 낡지만 진단은 실행할 때마다 다시 측정한다.**
+
+**Evidence:** `tests/test_notion_dashboard.py::TheDiagnosisLooksAtTheDatabaseItIsDiagnosingTests`
+15건(그중 2건은 `init_notion.py` `main()`을 끝까지 돌려 **운영자가 실제로 읽는 출력**을 단정한다 —
+원래 결함은 진단이 아니라 entrypoint가 입력을 안 준 것이었으므로 단위 테스트로는 잡히지 않았다)
++ 성질 검사로 강화된 `test_the_setup_cli_actually_calls_the_diagnosis`.
+M9는 ast 게이트가 아니라 그 end-to-end 2건이 잡았다 — 게이트는 키워드의 **존재**를,
+end-to-end는 그 **값**을 고정한다.
+
 
 ## C113. 이미 있는 탐지기를 다시 만들 뻔했다 — 그리고 페이지를 비우고 아무 말도 하지 않는 창
 
@@ -22344,6 +22768,26 @@ Company History는 계속 기록된다). 그런데 삼킨 실패가 **어디에�
 인터프리터와 대조한다. 올라가거나 내려가면 그 테스트가 실패하며, 고치는 방법은
 이 줄을 갱신하는 것이다 — 그리고 **capability를 다시 확인하는 것**이다. 그 재확인이
 아래 C76 항목이다.
+
+**C114 측정 — 이 게이트가 실제로 발화하는 머신에서 무엇이 함께 일어나는가.**
+Desktop 1(Python **3.9.7** / Windows 10 Pro 10.0.19042)에서 전체 회귀를 돌리면
+**32건이 실패하고, 32건 전부가 이 한 가지 사실 때문이다:**
+
+    31건   tests/test_observability.py
+           AttributeError: 'TestCase' object has no attribute 'enterContext'
+           unittest.TestCase.enterContext()는 **Python 3.11+**이다 (C111이 도입)
+     1건   이 마커 게이트 자신 — (3, 13) != (3, 9)
+
+**게이트는 정상 발화이고 31건은 결함이 아니다.** 확인 방법도 남긴다: 변경분을 stash하고
+같은 모듈을 돌리면 숫자가 똑같이 32다. 이 사실이 적혀 있지 않으면, 3.9 머신에 앉은
+사람은 **빨간 테스트 32개와 그것을 설명하지 않는 게이트 하나**를 보게 된다.
+
+**SKIP(정책) — 어느 머신이 "기록의 런타임"인가.** 위 문단은 고치는 방법이 이 줄을
+갱신하는 것이라고 말하지만, 3.9로 내리면 이번엔 **실제 배포 머신이 빨개진다** — 오늘
+20:46에 Notion Control Tower를 발행한 것이 그 머신이고(C114 §1), C113의 baseline
+4012 passed도 거기서 잰 값이다. 그리고 3.9를 지원하려면 `enterContext`를 쓰는 4곳을
+`addCleanup`으로 되돌려야 하는데, 그것은 **테스트를 환경에 맞춰 낮추는 것**이라
+이 저장소가 명시적으로 금하는 방향이다. 한 줄을 뒤집는 대신 사실을 적는다.
 
 **이 절의 과거 숫자는 재작성하지 않는다.** 아래 측정 중 상당수는 Python 3.9.7 /
 Windows 10 머신에서 잰 것이고, 그 표기는 그대로 둔다 — 잰 적 없는 수를 현재
