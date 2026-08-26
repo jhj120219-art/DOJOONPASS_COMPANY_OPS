@@ -1305,5 +1305,196 @@ class AnEmptyEventIdIsAnIdentityCollisionTests(unittest.TestCase):
         )
 
 
+class NotionFloorsLastUpdatedToTheMinuteTests(unittest.TestCase):
+    """The fact everything below depends on, pinned at the double.
+
+    Measured against the live Notion API on 2026-08-26, through this
+    project's own production code path (`ExecutionPlanSync` ->
+    `RealNotionTransport`) and the contracted PROJECTS database:
+
+        sent      2026-08-26T09:54:40+09:00
+        read back 2026-08-26T09:54:00.000+09:00
+
+    `properties._date()` sends `event.timestamp` verbatim, so the loss is
+    Notion's. `InMemoryNotionTransport` used to keep the seconds, which is
+    the same infidelity its own docstring names for `rich_text` -- a double
+    that keeps what the API discards cannot fail for the reason production
+    fails.
+    """
+
+    def test_the_double_floors_seconds_the_way_notion_does(self):
+        sync, client, _ = _make_sync()
+        sync.sync(_event(timestamp="2026-08-05T18:04:40+09:00"))
+
+        stored = client.find_project("SEARCH_FRONTEND")["properties"]
+        self.assertEqual(
+            stored["Last Updated"]["date"]["start"][:19], "2026-08-05T18:04:00"
+        )
+
+    def test_a_value_already_on_the_minute_is_untouched(self):
+        sync, client, _ = _make_sync()
+        sync.sync(_event(timestamp="2026-08-05T18:04:00+09:00"))
+
+        stored = client.find_project("SEARCH_FRONTEND")["properties"]
+        self.assertEqual(
+            stored["Last Updated"]["date"]["start"], "2026-08-05T18:04:00+09:00"
+        )
+
+    def test_a_date_only_value_is_passed_through_rather_than_refused(self):
+        """docs/04 section 43: humans write in this database too, and Notion
+        accepts a date with no time. Inventing a failure the real API does
+        not have would be a worse double, not a stricter one."""
+        _sync, _client, transport = _make_sync()
+        page = transport.create_page(
+            "DB-1", {"Last Updated": {"date": {"start": "2026-08-05"}}}
+        )
+        self.assertEqual(
+            page["properties"]["Last Updated"]["date"]["start"], "2026-08-05"
+        )
+
+
+class TheLateEventGuardCannotOrderWithinOneMinuteTests(unittest.TestCase):
+    """BACKLOG E-26 -- characterisation, not an endorsement.
+
+    docs/04 section 29-30: an Event with a past-or-equal timestamp must not
+    move Current State. The guard compares the incoming Event against the
+    value it reads *back* from Notion, and that value is floored to the
+    minute (`NotionFloorsLastUpdatedToTheMinuteTests`). So inside one
+    wall-clock minute the stored value no longer orders two Events.
+
+    Reproduced against live Notion before it was reproduced here -- same
+    database, same code path:
+
+        wrote  :40  -> Last Updated 09:54:00
+        synced :10  -> NOTION_UPDATED, Current State now the OLDER Event
+
+    Which way to resolve the ambiguity is a decision, and both answers lose
+    something real: proceeding lets an older Event win (this), and skipping
+    the whole minute widens E-23's lost-update case from "same instant" to
+    "same minute". So the behaviour is left alone and these tests fix it as
+    an **observation** -- the day E-26 is decided, they fail and say so.
+    """
+
+    def _sync_two(self, first, second):
+        sync, client, _ = _make_sync()
+        sync.sync(_event(timestamp=first, event_id="FIRST"))
+        result = sync.sync(
+            _event(
+                timestamp=second,
+                event_id="SECOND",
+                event_type="BLOCKED",
+                status="BLOCKED",
+                blocker="late",
+            )
+        )
+        return result, client.find_project("SEARCH_FRONTEND")
+
+    def test_an_older_event_in_the_same_minute_still_overwrites_current_state(self):
+        result, page = self._sync_two(
+            "2026-08-05T18:04:40+09:00", "2026-08-05T18:04:10+09:00"
+        )
+
+        self.assertEqual(result.status, SyncStatus.NOTION_UPDATED)
+        self.assertEqual(page["properties"]["Status"]["select"]["name"], "BLOCKED")
+        self.assertEqual(
+            page["properties"]["Last Event ID"]["rich_text"][0]["text"]["content"],
+            "SECOND",
+            "the older Event won -- section 29-30 says it must not",
+        )
+
+    def test_that_overwrite_is_reported_rather_than_silent(self):
+        """The half C103 did close. The guard cannot tell which Event is
+        older; it can tell that it cannot tell, and say so -- the same
+        answer this module already gives an uncomparable stored value."""
+        result, _page = self._sync_two(
+            "2026-08-05T18:04:40+09:00", "2026-08-05T18:04:10+09:00"
+        )
+
+        self.assertIsNotNone(result.error, "an unguarded Update must leave a trace")
+        self.assertIn("indeterminate", result.error)
+        self.assertIn("E-26", result.error)
+
+    def test_an_earlier_minute_is_still_ordered_and_still_skipped(self):
+        result, page = self._sync_two(
+            "2026-08-05T18:04:40+09:00", "2026-08-05T18:03:59+09:00"
+        )
+
+        self.assertEqual(result.status, SyncStatus.NOTION_SKIPPED_OLD_EVENT)
+        self.assertEqual(page["properties"]["Status"]["select"]["name"], "IN_PROGRESS")
+
+    def test_a_later_minute_is_ordered_and_carries_no_note(self):
+        result, page = self._sync_two(
+            "2026-08-05T18:04:40+09:00", "2026-08-05T18:05:00+09:00"
+        )
+
+        self.assertEqual(result.status, SyncStatus.NOTION_UPDATED)
+        self.assertEqual(page["properties"]["Status"]["select"]["name"], "BLOCKED")
+        self.assertIsNone(
+            result.error, "an ordered comparison must not be reported as ambiguous"
+        )
+
+    def test_the_same_instant_case_is_not_swallowed_by_the_new_branch(self):
+        """E-23's branch must keep answering. The predicate's lower bound is
+        strict for exactly this reason: `== stored` is not the ambiguous
+        case, it is the one section 29-30 already decides."""
+        result, page = self._sync_two(
+            "2026-08-05T18:04:00+09:00", "2026-08-05T18:04:00+09:00"
+        )
+
+        self.assertEqual(result.status, SyncStatus.NOTION_SKIPPED_OLD_EVENT)
+        self.assertIn("same-instant skip", result.error or "")
+        self.assertEqual(page["properties"]["Status"]["select"]["name"], "IN_PROGRESS")
+
+    def test_the_window_is_one_minute_and_no_wider(self):
+        """A whole-minute window is already a lot of blast radius; a wrong
+        bound here would either under-report (a silent overwrite survives)
+        or over-report (a permanent note on ordinary syncs, which is the
+        alert nobody reads)."""
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
+
+        from notion.sync import NOTION_DATE_RESOLUTION, _ordering_is_indeterminate
+
+        stored = _dt.fromisoformat("2026-08-05T18:04:00+09:00")
+        self.assertEqual(NOTION_DATE_RESOLUTION, _td(minutes=1))
+        self.assertFalse(_ordering_is_indeterminate(stored, stored))
+        self.assertTrue(
+            _ordering_is_indeterminate(stored + _td(microseconds=1), stored)
+        )
+        self.assertTrue(_ordering_is_indeterminate(stored + _td(seconds=59), stored))
+        self.assertFalse(_ordering_is_indeterminate(stored + _td(minutes=1), stored))
+        self.assertFalse(_ordering_is_indeterminate(stored - _td(seconds=1), stored))
+
+
+class TheIndeterminateNoteReachesTheRunnersLogTests(unittest.TestCase):
+    """A note only a return value carries is a note a scheduled Runner loses.
+
+    `_log_notion_sync()` already writes `error` for a *successful* sync, and
+    its docstring says why -- so that a run which proceeded with the Late
+    Event guard off leaves a trace. This checks the new note actually
+    travels that path rather than only existing in `SyncResult`.
+    """
+
+    def test_the_note_is_written_to_notion_sync_log(self):
+        import tempfile
+
+        from app.runner import _log_notion_sync
+
+        sync, _client, _ = _make_sync()
+        sync.sync(_event(timestamp="2026-08-05T18:04:40+09:00", event_id="FIRST"))
+        result = sync.sync(
+            _event(timestamp="2026-08-05T18:04:10+09:00", event_id="SECOND")
+        )
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log_path = Path(tmp.name) / "notion_sync.log"
+        _log_notion_sync(log_path, result)
+
+        written = log_path.read_text(encoding="utf-8")
+        self.assertIn("SECOND", written)
+        self.assertIn("indeterminate", written)
+
+
 if __name__ == "__main__":
     unittest.main()

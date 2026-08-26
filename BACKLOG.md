@@ -3051,8 +3051,16 @@ C95가 탐지를 붙였다. 남은 것은 “그래서 어떻게 할 것인가�
    `runtime/backup_working_copy`가 로컬 bare 원격에 실제로 push하고 있고
    원격에 Daily History가 들어 있다. 남은 것은 `origin`을 실제 GitHub
    Private URL로 바꾸는 것 하나이며 자격증명이 필요하다.
-5. **실제 Notion Workspace** — 자격증명 필요. `init_notion.py`가 준비돼
-   있고 미설정 시 Sync/Dashboard를 건너뛰는 경로는 검증돼 있다.
+5. ~~**실제 Notion Workspace** — 자격증명 필요.~~ **C103에서 반증됨.**
+   자격증명은 `.env`에 있고 작동한다. C103이 실 API에 대고 health check,
+   자격증명 4상태 구별, 코퍼스 전체 dry-run, 쓰기->되읽기->재전송 멱등성,
+   Dashboard<->Notion 대조를 전부 실행했다. 그 왕복에서 결함 둘이 나왔다
+   (E-26, E-27). **남은 미검증은 Workspace가 아니라 `NOTION_OPS_RUNS_DATABASE_ID`
+   하나** — Operations Dashboard는 여전히 미설정이며, 그 Database를 만드는 것은
+   승인 대상이다(A절).
+
+   C76의 교훈이 그대로 적용됐다: "환경 의존"으로 기록된 항목은 근거보다 오래
+   살아남는다. 이 줄은 자격증명이 도착한 뒤에도 그대로 있었다.
 
 ### 남은 승인 없는 후보
 
@@ -3261,6 +3269,113 @@ test_only_the_case_of_a_secret_filename_decides_whether_it_leaks` (+ 대조 1건
 `tests/test_observability.py::…::test_a_case_variant_already_in_history_is_reported`
 (+ 과다 매칭 가드 1건). 게이트가 case-insensitive해지면 앞의 둘이 실패하므로
 이 항목이 함께 갱신된다.
+
+### E-26. Notion이 초 단위를 버려서 Late Event 보호가 1분 창 안에서 무력하다 (C103 신규, **데이터 정합성**)
+
+**실측(실 Notion API, 계약된 PROJECTS Database, 이 저장소의 production 코드 경로).**
+`ExecutionPlanSync` -> `RealNotionTransport`로 보낸 값과 되읽은 값:
+
+    보냄      2026-08-26T09:54:40+09:00
+    되읽음    2026-08-26T09:54:00.000+09:00
+
+초가 **버려진다**(반올림이 아니라 내림). `properties._date()`는 `event.timestamp`를
+그대로 보내므로 손실은 Notion 쪽이다.
+
+**그 손실이 무엇을 깨뜨리는가.** docs/04 §29-30의 Late Event 보호는 들어온 Event를
+**되읽은** 값과 비교한다(`sync._update()`). 한 wall-clock 분 안에서 그 값은 두
+Event를 더 이상 정렬하지 못한다. 같은 Database에 대고 두 번 재현했다:
+
+    :40 Event 기록  -> Last Updated 09:54:00
+    :10 Event 동기화 -> NOTION_UPDATED, Current State가 **더 오래된** Event로 덮였다
+
+즉 **최대 59초 창 안에서 과거 Event가 Current State를 되돌린다.** §29-30이 막으려던
+바로 그 회귀다. 도달 경로는 이국적이지 않다 — 같은 분에 두 Desktop이 같은 Project에
+대해 보고하거나, Retry Queue가 뒤늦게 drain되면 그대로 발생한다.
+
+**왜 SKIP(동작 변경분).** 두 답이 모두 실제로 무언가를 잃는다.
+
+| 후보 | 잃는 것 |
+|---|---|
+| 그대로 진행(현재) | 과거 Event가 이긴다 — 위 실측 |
+| 분 단위로 잘라 비교 | E-23의 lost-update가 "같은 instant"에서 **"같은 분"**으로 넓어진다 |
+
+어느 쪽을 택할지는 §29-30의 의미를 정하는 결정이고, 이 모듈이 지나가는 길에 내릴
+것이 아니다. 세 번째 후보(초를 담을 Property 신설)는 docs/04 §43의 Property 집합
+변경이라 더 큰 결정이다.
+
+**C103이 승인 없이 한 것 — 보이게 만들었다.** 동작은 한 글자도 바꾸지 않았다.
+`_ordering_is_indeterminate()`가 "이 비교는 버려진 초가 결정한다"를 판정하고,
+그 사실을 `SyncResult.error`에 적는다 — 비교 불가능한 저장값을 이미 그렇게
+처리하고 있었고(`comparison_note`), `app.runner._log_notion_sync()`는 *성공한*
+sync의 `error`도 로그에 쓴다. 바로 이런 경우를 위해서다.
+
+**Double이 이 결함을 숨기고 있었다.** `InMemoryNotionTransport`는 초를 보존했다 —
+`rich_text` 상한에 대해 자기 docstring이 지적한 것과 같은 종류의 불충실이다
+(API가 버리는 것을 유지하는 double은 production이 실패하는 이유로 실패할 수 없다).
+docs §57-65 Mock Test 전부가 초를 가진 채 통과하고 있었다. C103에서 double이
+실측한 대로 내림하도록 고쳤고 **기존 테스트는 한 건도 깨지지 않았다** — 초 단위
+정밀도에 의존하던 테스트가 없었다는 뜻이고, 곧 이 수정 비용이 0이었다는 뜻이다.
+
+**Evidence:** `tests/test_notion_sync.py::NotionFloorsLastUpdatedToTheMinuteTests`
+3건, `::TheLateEventGuardCannotOrderWithinOneMinuteTests` 6건,
+`::TheIndeterminateNoteReachesTheRunnersLogTests` 1건. 그중
+`test_an_older_event_in_the_same_minute_still_overwrites_current_state`가 현재
+동작을 **관측으로** 고정하므로, E-26이 어느 쪽으로 정해지든 그 날 실패한다.
+
+### E-27. 상태 화면은 Notion에 닿을 수 있는지 알 수 없다 (C103 신규, **관측성**)
+
+**SKIP 사유: "이 도구가 무엇인가"의 변경.** `dashboard_server.py`의 docstring이
+이 화면은 "Notion에 접속하지 않는다"를 명시적으로 약속하고(페이지 footer에도
+적혀 있다), `ops_status.py` 첫 줄은 읽기 전용·비차단을 약속한다. 상태 화면에
+네트워크 호출을 넣는 것은 그 약속을 바꾸는 일이다 — 타임아웃, 실패 시 동작,
+Runner와 동시 실행 시 영향이 전부 새 결정이다.
+
+**측정된 비용.** C90이 "`.env`는 설정됐는데 프로세스가 못 본다"를 닫았다. 그
+**다음** 상태가 더 조용하다. 두 변수를 export하고 이 화면을 열면:
+
+    NOTION — Retry Queue
+      대기 중 Event       : 0
+      Dashboard 밀린 기록 : 0
+
+ATTENTION 없음. 그 측정에서 쓴 토큰은 **무효**였다 — 실 API가 `401 Unauthorized`로
+답했고 `sync.PERMANENTLY_REFUSING_STATUS_CODES`가 "재시도로 낫지 않는다"로 분류하는
+값이다. 자격증명 미전달은 시끄럽고 **거부당한** 자격증명은 조용하다. 순서가
+거꾸로다 — 전자는 예약 Runner가 스스로 회복하지 못할 뿐이고, 후자는 사람이 필요하다.
+
+**구조적인 이유.** 이 블록의 두 숫자는 전부 *실행이 남긴* 파일에서 온다(Retry
+Queue, dashboard_pending). 새 자격증명으로 첫 실행이 돌기 전에는 아무 일도 없었기
+때문에 비어 있는데, 정상도 똑같이 비어 있다.
+
+**결정에 필요한 비용 실측(C103).** 실 API 왕복은 `health_check` med **278ms**
+(min 213 / max 489)다. `ops_status.py` 전체 실행이 med **288ms**이므로, 살아 있는
+확인 하나를 넣으면 이 명령이 **대략 두 배**가 된다 — 그리고 Notion이 응답하지 않을 때
+무엇을 할지(타임아웃 값, 그때의 exit code)가 그 결정에 딸려 온다.
+
+**같은 결정이 막고 있는 두 번째 것 — 원천 없는 Notion Row.** C103 실측:
+
+    Control Tower Project : 4  (전부 status/Last Event ID/Last Updated 일치)
+    Notion PROJECTS Row   : 8  (일치 4 + **원천 없음 4**)
+
+넷 중 셋은 이름이 `ENGINEERING_PROBE_*`이고 하나는 `COMPANY_OPS_E2E_VERIFICATION`
+(더 이상 `processed/`에 없는 Event 코퍼스의 잔재)이다. `NotionTransport.list_pages()`의
+docstring이 이 실패 모드를 이미 적어 두었다 — "주체가 사라진 Row를 find-then-update는
+영원히 다시 방문하지 않는다". `controltower/notion_projection.py`에 reconciliation이
+있지만 그것은 CT_* Database용이고 PROJECTS에는 적용되지 않는다. 판정하려면 Notion을
+읽어야 하므로 **정확히 같은 결정**에 걸린다.
+
+**C103이 승인 없이 한 것.** 네트워크는 건드리지 않고, 화면이 **모른다고 말하게**
+했다. `_notion_credentials_exported_but_never_exercised()` — 두 이름이 이 프로세스에
+설정돼 있고(값은 절대 읽지 않는다) 마지막 실행의 `notion_sync`가 SKIPPED이거나
+Manifest 자체가 없으면, 두 숫자가 "정상의 근거가 아니다"라고 적고 ATTENTION을 낸다.
+**어떤 실행이든 Notion 단계를 실제로 시도한 뒤에는 즉시 침묵한다** — 실패한 시도는
+Retry Queue와 LAST RUN이 이미 보고하고, 이미 답한 질문에 두 번째 목소리를 내는 것이
+사람이 화면을 흘려 읽게 만드는 방식이다.
+
+**Evidence:** `tests/test_observability.py::ExportedCredentialsAreNotEvidenceOfAReachableNotionTests`
+10건. 그중 `test_a_working_notion_leaves_the_block_exactly_as_it_was`가 정상
+배포에서 이 줄이 나오지 않음을 고정하고,
+`test_it_never_handles_the_value_only_its_presence`가 이 함수가 bool만 반환한다는
+것 — 자격증명을 절대 밖으로 내보내지 않는 가장 강한 형태 — 을 고정한다.
 ---
 
 ## F. 테스트가 고정했지만 BACKLOG에 없던 미수정 항목 (C22 전수 조사)
@@ -3367,6 +3482,1103 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 
 
 ---
+
+## C113. 이미 있는 탐지기를 다시 만들 뻔했다 — 그리고 페이지를 비우고 아무 말도 하지 않는 창
+
+### 1. backup / transport / history 감사 (미착수 3모듈)
+
+coverage로 시작했다: **97% (824 stmt, 20 miss, 186 branch, 8 partial)**. 미실행
+줄은 `backup/working_copy.py`의 방어 분기에 몰려 있었고 — symlink 거부, `OSError`
+복구 — 나머지는 추상 `raise NotImplementedError`다.
+
+C102의 방식대로 **주입해서 실행**했다.
+
+**측정 1 — file symlink는 이 머신에서 만들 수 없다.** `os.symlink()`가
+`WinError 1314`(권한 없음). BACKLOG가 기록한 skip 사유가 그대로 확인된다.
+
+**측정 2 — directory junction은 권한 없이 만들어지고, Python은 그것을 symlink라고
+하지 않는다.**
+
+    mklink /J master/daily/ext  <outside>
+    Python: is_symlink=False  is_dir=True
+
+**측정 3 — 그래서 walk가 들어간다.** 실제 `sync_to_working_copy()`로 끝까지:
+
+    Working Copy: daily/2026-08-01.md
+    Working Copy: daily/ext/notes.md      <- Local Master 밖의 파일
+    scan_for_secrets(master) -> ()
+    scan_for_secrets(wc)     -> ()        <- 이름 기반이라 notes.md는 통과
+
+### 2. 그런데 이것은 이미 알려져 있었다 (**False Positive — 내 것**)
+
+탐지기를 만들어 `ops_status.py`에 붙였다. 그리고 실행하니 **내 줄 옆에 다른 줄이
+같이 나왔다** — `junction daily/ext -> ...`.
+
+**`_is_junction()` / `_junctions_in_scope()`가 이미 있었다(C70).** 그리고 내 것보다
+엄격하게 낫다: 내 구현은 reparse-point **비트**를 봤는데, C70의 것은 **태그**를 본다.
+그 docstring이 이유를 적어 두었다 — 비트는 symlink에도 서므로 비트만 보는 탐지기는
+symlink를 junction이라 부르고, 그것은 **backup이 실제로 갖지 않은 노출을 보고하는
+것**이다(`_relative_files()`는 symlink를 정말로 제외한다).
+
+**내 것을 전부 되돌렸다**(함수 63줄 + 보고 블록 20줄). 저장소가 금하는 "두 번째
+의견"을 내가 만들 뻔했다. 교훈: **없다고 확인하기 전에 만들지 않는다.**
+
+### 3. 그래도 남은 진짜 결함 — docstring이 거짓을 말하고 있었다 (P2)
+
+`_relative_files()`의 docstring:
+
+    "A symlink/junction is excluded even when it resolves to a file"
+
+**junction 쪽 절반이 거짓이다.** 노출 자체는 새 소식이 아니다 — A-19가 Master 쪽,
+E-21이 Working Copy 쪽, C70이 탐지기를 적어 두었다. 이 문장이 한 일은 **그 셋이
+열어 둔 것을 walk가 이미 처리한다고 독자에게 말한 것**이다. 그것이 결함이다.
+
+**walk는 바꾸지 않았다.** junction 제외는 동작 변경이고, Daily History 디렉터리를
+junction으로 넣어 쓰는 배포는 백업이 조용히 줄어든다 — E-15가 더 나쁜 실패로
+기록한 바로 그 거짓 양성이다. 문장을 고치고 측정을 고정했다
+(`JunctionsAreNotExcludedFromTheWalkTests` 5건).
+
+### 4. 성능 감사 — 측정했고, 최적화는 정당화되지 않는다
+
+    events    rollup  dashboard  to_payload  CT blocks  summary   total
+       200      11ms       0ms        14ms        0ms      0ms     26ms
+     2,000     122ms       0ms        14ms        0ms      0ms    136ms
+    10,000     662ms       0ms        14ms        0ms      0ms    676ms
+
+**rollup만 선형으로 자라고 나머지는 전부 평평하다.** `to_payload`가 이벤트 수와
+무관하게 14ms 고정인 것은 패널이 상한을 갖기 때문이다 — 설계가 옳았다는 측정이다.
+
+10,000건 프로파일: `read_events` 0.789s / 0.950s, 그 안에서 `read_text` 0.516s ·
+`_io.open` 0.292s. **지배 비용은 파일 열기**이고 파싱(`from_json` 0.213s,
+`validate_event` 0.108s)은 부차적이다.
+
+**바꾸지 않는다.** 676ms는 사람이 새로고침하는 화면에 충분하고, 현재 실제 배포는
+**16건**(10,000건의 1/625)이다. 그리고 이 비용을 없애려면 캐시나 인덱스가 필요한데
+그것은 이 아키텍처가 금지하는 두 번째 진실 원천이다.
+
+### 5. 운영 장애 시나리오 — 넷 실행, 하나에서 결함 (P2)
+
+| 시나리오 | 운영자가 보는 것 | exit |
+|---|---|---|
+| 잘못된 토큰 | `401 Unauthorized ... API token is invalid` | 1 |
+| 없는 Database | `404 ... Make sure the relevant pages and databases are shared` | 1 |
+| 자격증명 없음 | `Notion 미설정 — ... .env는 자동으로 읽히지 않는다` | 1 |
+| **publish 도중 실패** | **API 오류만. 페이지는 0블록** | 1 |
+
+앞의 셋은 health check에서 멈추므로 페이지가 66블록 그대로다. **넷째가 결함이다.**
+
+archive-then-write 순서는 옳다(반대로 하면 Control Tower가 두 벌이 되고, archive가
+실패하면 영구히 그렇다). 그러나 *"briefly empty"* 의 **briefly는 누군가 다시
+실행한다는 가정**이고, 그때까지 아무것도 그 사실을 말하지 않았다. 실측: 실제
+페이지가 **0블록**이 됐고 호출자는 API 오류만 찍었다. Notion을 연 사람은 빈 Control
+Tower를 보고 **회사에 상태가 없는 것인지 도구가 먹은 것인지 알 방법이 없다.**
+
+**순서는 그대로, 없던 사실만 더했다:**
+
+    페이지 본문을 다시 쓰던 중 실패했다 — 기존 블록 65개는 이미 보관됐으므로
+    지금 이 페이지는 **비어 있다**. 원인을 해결한 뒤 publish_control_tower.py를
+    다시 실행하면 복구된다. 원인: ...
+
+실측으로 비운 실제 페이지는 즉시 복구했다(66블록 확인).
+
+### 6. 실측
+
+    전체 suite   4012 passed, 8 skipped, 5940 subtests (0 failed, 494s)
+                 C113 이전 baseline 4001
+    신규 회귀    11건 (junction 특성화 5 + mid-publish 6)
+    coverage     backup/transport/history 97%
+
+**Evidence:** 위 전부 실제 실행. junction은 실 `mklink /J` + 실
+`sync_to_working_copy()`, 성능은 실제 200/2,000/10,000 파일 트리, 장애 시나리오는
+실 Notion API.
+
+
+## C112. 감사 셋을 끝냈고 셋 다 "결함 없음"이었다 — 숫자만 남긴다
+
+C111이 남긴 세 항목을 소진했다. **셋 다 아무것도 찾지 못했고, 그것도 결과다**
+(C63의 규칙). 중요한 것은 각각을 *어떻게* 확인했는가다.
+
+### 1. 환경변수 전수 감사 — 완료, 결함 0
+
+C111은 `NOTION_*` 둘만 봤다. 이 프로젝트가 읽는 변수는 **여덟 개**다.
+
+첫 설계는 변수마다 전체 suite를 한 번씩(9회, 80분+) 돌리는 것이었는데 느렸고,
+내가 옆에서 다른 pytest를 돌려 서로 굶겼다. **여덟 개를 동시에 설정하고 한 번
+돌리는 쪽으로 바꿨다** — 실패를 찾는 조건으로는 더 강하고(어느 하나라도 깨지면
+드러난다) 9분이면 끝난다. 귀속이 필요하면 그때 이분한다.
+
+    8개 동시 설정 + 전체 suite : 4001 passed, 8 skipped, 0 failed (528s)
+
+**C111의 수정이 여덟 개 전부에 대해 유효하다.** 그리고 별도로 4개
+`COMPANY_OPS_*`를 개별 설정해 관련 3파일에 대고 확인했다 — 전부 838 passed.
+
+**구조적 스캔은 다섯 클래스를 지목했고 전부 오탐이었다.**
+`_print_agent()`를 호출하지만 환경을 고정하지 않는 클래스들인데, 실측하니 하나도
+깨지지 않는다. C111에서 배운 것이 그대로 반복됐다 — **구조 스캔은 과다 보고하고,
+고치기 전에 실측한다.** 미션의 규칙("False Positive가 발견되면 코드를 함부로
+수정하지 말고 Audit 자체가 틀렸는지 먼저 검증한다")대로 손대지 않았다.
+
+**C111 결함의 심각도 근거 하나 추가.** `docs/11 §101 Release Environment Check`의
+2단계가 `python -m pytest`다. `docs/13`의 Notion 설정을 마친 운영자는 그 둘을
+export한 상태이므로, C111 이전에는 **릴리스 게이트가 올바로 설정된 머신에서
+실패했다.**
+
+### 2. Double 충실도 sweep — 완료, 신규 결함 0
+
+이 저장소의 double은 셋이다.
+
+| double | 판정 |
+|---|---|
+| `InMemoryNotionTransport` | **결함 3건, 이미 수정됨** — 초 내림(C103), `rich_text` 상한(기존), block id(C105) |
+| `InMemoryTransport` | **결함 없음 — 계약이 더 좁다** |
+| `InMemorySeenEventStore` | **결함 없음 — 같은 이유** |
+
+`InMemoryTransport`가 판단이 갈린 곳이라 근거를 적는다. 실물
+`OneDriveTransport.send()`는 sync 폴더에 `overwrite=False`로 쓰므로 **목적지가
+이미 있으면 조용히 건너뛰고 예외 없이 반환한다**(`_write_atomic`의
+`final_path.exists()` 단락). double은 무조건 `sent`에 append한다.
+
+모사하도록 바꿔 봤다 — **회귀 0건**(209 passed). C103의 초 내림처럼 비용이 없다.
+**그런데도 바꾸지 않았다.**
+
+C103/C105의 double들은 *API 제약을 강제한다고 주장하면서* 하지 않았다.
+`InMemoryTransport`의 docstring은 *"Collects sent Events in a local list"* 뿐이고
+sync 폴더를 모사한다고 주장한 적이 없다. 그리고 이 시스템은 애초에
+`send()`가 배달을 뜻한다고 **가정하지 않는다** — `agent/delivery.py`가 존재하는
+이유가 정확히 그것이고("`sent/` means exactly one thing: `transport.send()`
+returned without raising"), E-9b가 실측한 그 구멍을 그 모듈이 덮는다.
+
+즉 "실물보다 관대한 double"이 아니라 **"실물보다 좁은 계약을 가진 double"**이다.
+측정이 변경을 정당화하지 못하므로 바꾸지 않는다.
+
+`InMemorySeenEventStore`도 같다 — 인터페이스는 set 위의 순수 메서드 셋이고, 실물의
+추가 동작(영속성, 손상 감지)은 double이 모사할 수 없고 모사해서도 안 되는 것이다.
+
+### 3. E-26 / E-27 재검증 — 상태 변화 없음, 재작업 안 함
+
+    E-26  NOTION_DATE_RESOLUTION / _ordering_is_indeterminate 존재,
+          동작은 여전히 "진행하고 보고" — 결정 대기 그대로
+    E-27  _notion_credentials_exported_but_never_exercised /
+          _last_run_notion_outcome 존재 — 네트워크 확인은 여전히 결정 대기
+
+둘 다 **코드로 우회할 수 없는 열린 결정**이라는 상태가 유지된다. 미션의 규칙대로
+재작업하지 않고 재검증만 했다.
+
+### 4. Notion 운영 사이클 — 7단계 전부 실행
+
+    1 health check      ok=True 300ms
+    2 객체/권한         PROJECTS 14 property, parent=workspace, rows=8 (truncated=False)
+    3 Dashboard payload events_read=16 projects=4 attention=9
+    4-6 publish/read-back  Control Tower 66 blocks, description 521자
+    7 대조              ATTENTION 9건 누락 0 · Notes 4/4 · Row본문 4/4 ·
+                        원천없는 Row 미접촉 4/4 · secret 패턴 0건(14,081자)
+
+### 5. False Positive 셋
+
+- **구조 스캔의 5개 클래스** (§1)
+- **"1 error"** — 8변수 동시 실행에서 한 번 나왔으나 재현되지 않았다. 직전에 내가
+  `Stop-Process`로 pytest를 강제 종료한 뒤였고, 죽은 프로세스가 잡고 있던 임시
+  디렉터리의 teardown 실패다. **내 개입의 산물이지 코드가 아니다.** 깨끗한 재실행:
+  4001 passed, 0 error.
+- **`InMemoryTransport`** (§2) — 결함처럼 보였고 아니었다.
+
+**Evidence:** 전체 suite `4001 passed, 8 skipped, 5942 subtests` (0 failed) —
+8개 환경변수 전부 설정, 528s. 변수 없는 조건도 동일하게 `4001 passed`(C111 실측).
+
+
+## C111. 규칙을 적어 둔 함수가 자기 규칙을 세 번 어기고 있었다 — 그리고 내가 5 Cycle 동안 틀린 Backlog를 들고 있었다
+
+### 1. `_authored()`의 규칙을 파일에 대고 세어 봤다
+
+그 함수의 docstring은 이렇게 끝난다: *"every site that prints an
+Event-authored identifier calls this, and the sink stays as it is."* 그것은 67개
+호출부에 대한 주장인데 **아무도 세어 본 적이 없다.**
+
+    authored 값을 보간하는 attention 사이트 : 24
+      안전 래퍼 있음                      : 9
+      래퍼 없음                          : 15
+
+15건 중 대부분은 오탐이었다 — `_runner_lock_path()`처럼 **이 프로젝트가 소유한
+경로**이거나(그건 `_authored()`가 명시적으로 감싸지 말라고 한 것이다), 산문에
+`event_id`라는 단어만 들어 있거나, `one_line()`이 **대입문 쪽**에 있어 내 스캐너가
+못 본 경우(3008)다.
+
+**진짜는 셋이었다.**
+
+| 줄 | 무엇을 흘리는가 |
+|---|---|
+| 2518 | 읽을 수 없는 KEEP Candidate의 **파일 이름** |
+| 2538 | Daily 미반영 KEEP의 **`event_id`** |
+| 2584 | Decision Context 미반영의 **review Candidate id** |
+
+**파일 이름 경로가 가장 덜 뻔하고 가장 직접적이다.**
+`file_repository.safe_candidate_filename()`은 id가 파일시스템에 안전하면
+`f"{history_id}.json"`을 **그대로** 돌려주고, `history_id`는 Event에서 온다 — 다른
+Desktop이 쓰고 `validate_event()`는 타입만 본다.
+
+**재현:** `event_id`가 `ntn_…` 형태인 Candidate를 두고 `_print_history()` 실행 →
+ATTENTION에 `ntn_ZZZ….json` 원문. 수정 후 → `[REDACTED].json`, 확장자는 남아
+운영자는 여전히 어느 파일인지 안다.
+
+**심각도 P2**, 그리고 이유가 중요하다: C109가 이미 **외부 sink(Notion)** 경계를
+막았다. 남아 있던 것은 터미널과 loopback Dashboard — `_authored()`가 의도적으로
+받아들인 신뢰 경계다. sink 자체는 건드리지 않았다(`test_the_sink_itself_is_still_not_redacting`).
+
+### 2. 내가 5 Cycle 동안 틀린 Backlog를 들고 있었다 (자기 정정)
+
+C104부터 C110까지 남은 Backlog에 **"backup working copy 부재 — 모든 실행이
+BACKUP_PENDING"** 을 적어 왔다. **틀렸다.**
+
+    runtime/backup_working_copy/.git      존재
+    origin                                runtime/backup_remote.git
+    working copy HEAD                     4159893…
+    remote HEAD                           4159893…   (동일 — push 성공)
+    remote tree의 daily 파일               6
+    backup_state.json                     BACKUP_SUCCESS @ 2026-08-24
+
+**백업은 내내 정상이었다.** 내가 본 `BACKUP_PENDING`은 임시 디렉터리를 향한
+**probe 실행의 manifest**였고(C103 §4에서 관측만 하고 남겨 둔 바로 그것), 나는 그
+manifest를 production 상태로 읽었다. 이전 보고서를 사실로 간주하지 말라는 규칙이
+내 자신의 보고서에도 적용된다는 것을 이번에 실측으로 배웠다.
+
+### 3. 그 오독은 화면 자체에도 있었다 (P2)
+
+같은 실행의 `ops_status.py` 출력이 **서로 반대되는 말을 한다:**
+
+    HISTORY   마지막 성공 백업    : 2026-08-24T09:44:37+09:00 (BACKUP_SUCCESS)
+    LAST RUN  ! backup: BACKUP_PENDING [DEGRADED/RETRYABLE]
+
+둘 다 참이다. 하나는 내구 state 파일을 읽고, 하나는 낡은 manifest를 읽는다. 그리고
+**경보 쪽이 낡은 쪽**이다. 화면에는 어느 쪽이 현재인지 말하는 것이 없었다.
+
+`RETRYABLE`이라 ATTENTION에는 오르지 않는다(그래서 P1이 아니다) — 그러나 `!`가
+붙은 줄을 읽은 운영자는 고장나지 않은 백업을 찾으러 간다.
+
+**수정:** 그 줄 옆에 사실을 세운다.
+
+    ! backup: BACKUP_PENDING [DEGRADED/RETRYABLE]
+        (그 뒤 2026-08-24 09:44:37.453391+09:00 에 백업이 성공했다 —
+         state/backup_state.json. 이 실패는 지나간 것이다)
+
+**말하되 지우지 않는다.** 지나간 실패를 계속 출력할지는 LAST RUN의 의미에 대한
+판단이고, 그 실패는 실제로 일어났다. 없던 것은 줄이 아니라 **그 옆에 서 있어야 할
+사실**이다. `backup`만 이렇게 검사할 수 있다 — 자기 실행보다 오래 사는 state 파일을
+가진 유일한 component다.
+
+### 4. 게이트 둘이 발화했고 둘 다 옳았다
+
+- **`BackupLogIsNeverPersistedTests`** 가 내 새 줄을 잡았다. f-string 안에
+  `state/backup_state.json`을 적었는데, 그 탐지기는 E-14의 짓지 않은 Backup Log가
+  실수로 지어지는 것을 막으려고 `backup`이 든 **경로 모양 표현**을 훑는다. 자기 규칙대로
+  옳게 발화했다 — 메시지가 경로를 언급하는 것과 코드가 경로를 만드는 것을 구별할 수
+  없기 때문이다. 파일 이름을 f-string 밖 평문 리터럴로 빼서 해소했다. 게이트는
+  약화시키지 않았다.
+- **내가 쓴 roster 테스트의 실패 메시지가 읽을 수 없었다.** `assertNotIn(fragment,
+  source)`는 실패 시 300KB 모듈 전체를 찍는다. 줄 번호를 보고하도록 고쳤다 —
+  `Lists differ: [2527] != []`. 아무도 읽지 않는 실패 메시지는 증거가 아니다.
+
+### 5. 그리고 가장 큰 것 — 테스트 스위트가 운영자의 셸에 의존하고 있었다 (P2, 내 회귀)
+
+`publish_control_tower.py`를 돌린 **직후** pytest를 돌렸더니 10건이 실패했다. 조금
+전 전체 suite는 초록이었다. 재현했다 — 두 번 다 같은 10건.
+
+원인은 publish가 아니라 그 명령이 export한 **환경변수**다.
+
+    NOTION_* 없이  : 10 passed
+    NOTION_* 있이  : 3 failed
+
+`.env.example`, `AGENT.md` §6e, 그리고 `ops_status.py` 자신의 ATTENTION 줄이 전부
+운영자에게 그 둘을 export하라고 말한다. **그대로 따른 사람의 머신에서는 suite가
+실패한다.**
+
+**내 회귀다.** C103/C104가 NOTION 블록에 `os.environ`을 읽는 자격증명 분기 둘을
+넣었고, 그 블록의 텍스트를 단언하는 기존 테스트들은 환경을 고정하지 않는다. 그리고
+이 세션에서 내가 기록한 모든 "전체 suite 초록"은 **그 변수가 없는 셸에서** 잰
+것이었다. 설정 안내를 따르지 않은 사람에게만 통과하는 suite는 코드에 대한 증거가
+아니다.
+
+**테스트 쪽을 고쳤다** — 블록의 동작은 옳고 의도된 것이다. 큐 텍스트를 단언하는
+테스트가 pytest를 띄운 셸까지 함께 단언해서는 안 된다.
+
+**그리고 게이트를 세웠더니 경험적 실행이 놓친 것을 두 개 더 찾았다.**
+`_print_notion()`을 렌더하면서 환경을 고정하지 않는 클래스를 AST로 세는
+`TheSuiteDoesNotDependOnTheOperatorsShellTests`가 `SameInstantSkipReachesTheOperatorTests`와
+`SameInstantSkipEndToEndTests`를 지목했다 — 실패하지는 않았지만 구조적으로 같은
+구멍이다. 게이트가 실측보다 넓게 본 사례다.
+
+    수정 후: NOTION_* 없이 4001 passed / NOTION_* 있이 4001 passed (동일)
+
+### 6. 실측
+
+    재현 전/후    ATTENTION에 토큰 원문 True -> False, `[REDACTED].json`
+    게이트 발화   authored 무력화 -> 3건 실패 / superseded 무력화 -> 1건 실패
+    backup 실증   local HEAD == remote HEAD, remote에 daily 6개, BACKUP_SUCCESS
+    화면          LAST RUN이 더 이상 HISTORY와 모순되지 않는다
+
+**Evidence:** 전체 suite **두 조건 모두** `4001 passed, 8 skipped` (0 failed) —
+`NOTION_*` 없이 536s, 있이 507s. C111 이전 baseline은 `3988 passed`이며, 그것은
+환경변수 없는 셸에서만 유효한 숫자였다.
+
+
+## C110. "sync"라는 한 단어가 두 가지를 가리키고 있었다
+
+권한부터 다시 쟀다(보고서를 믿지 않는다). 이번엔 **왜** 안 되는지까지 API가
+말해 주었다.
+
+    POST /pages  parent={"type":"workspace"}
+    -> 400 "Provide a `parent.page_id` or `parent.database_id` parameter to
+            create a page, or use a public integration with `insert_content`
+            capability."
+
+**"권한 문제"라는 추측이 아니라 정확한 조건이다.** workspace 루트에 Page를 만들려면
+Integration이 **public + `insert_content`** 여야 한다. 현재는 internal이므로 지금
+구조(COMPANY_OPS Row 안의 하위 페이지)가 이 권한에서의 최대치다. 그리고 search가
+보는 객체는 10개 — PROJECTS + Row 8 + C105가 만든 Control Tower 페이지다.
+
+### 1. 찾은 것 — 한 단어가 가린 두 사건
+
+미션이 요구한 항목 중 `동기화 상태`·`마지막 동기화 시각`이 페이지에 **없었다.**
+그런데 그것을 채우려다 더 중요한 것이 나왔다: **이 시스템에는 "sync"가 둘이고,
+페이지는 그 둘을 구분하지 않았다.**
+
+    Runner Notion Sync   PROJECTS **Row**에 Event 상태를 쓴다. Runner 일정.
+    이 페이지의 publish   **페이지**를 다시 쓴다. 사람이 명령을 실행할 때만.
+
+**앞의 것이 며칠 멈춰 있어도 뒤의 것은 계속 성공한다.** 페이지는 완벽하게
+렌더되고, 그 아래 Row 데이터는 낡는다. 페이지에는 "마지막 갱신"이 하나뿐이었으므로
+독자는 그 하나를 양쪽 모두로 읽게 된다.
+
+**이 배포가 정확히 그 상태다.** 페이지는 분 단위로 최신이고, Runner의 Notion 단계는
+이 자격증명으로 **한 번도 시도된 적이 없다**. 한 시각만 보여 주는 화면은 그것을
+"정상"으로 읽히게 한다.
+
+### 2. 수정 — 두 시각을 다른 것으로 이름 붙였다
+
+    ## 동기화 상태
+    - 이 페이지가 쓰인 시각: 2026-08-26T16:00:20+09:00 (publish_control_tower.py 실행 시각)
+      Runner의 Notion Sync — PROJECTS Row에 Event 상태를 쓰는 쪽:
+    -   대기 중 Event       : 0
+    -   Dashboard 밀린 기록 : 0
+    -   자격증명            : 이 프로세스에 전달돼 있으나, 이 자격증명으로
+                              Notion 단계를 시도한 실행이 아직 없다
+      두 시각은 다른 것이다. 이 페이지는 사람이 명령을 실행할 때 갱신되고,
+      PROJECTS Row는 Runner가 돌 때 갱신된다 — 한쪽이 며칠 멈춰 있어도
+      다른 쪽은 정상으로 보인다.
+
+**새 유도가 없다.** Runner 쪽 사실은 `gather()`가 이미 payload에 싣고 있는
+`ops_status.py`의 NOTION 블록 캡처 그대로다.
+
+**줄 단위로 렌더한다.** 캡처된 블록을 한 run으로 넣으면 `one_line()`이 개행을
+리터럴 `\\n`으로 escape해 읽을 수 없는 한 줄이 된다. 줄마다 문단을 만들면
+구조도 살고 `_safe()`도 그대로 적용된다.
+
+**`blocks`도 `to_payload()`를 지나지 않는다** — C109의 ATTENTION과 같은 출처
+문제다. 그래서 같은 `_safe()` 경계를 통과시킨다.
+
+**읽지 못하면 그렇게 말한다.** Runner 쪽 상태를 못 읽으면 *"이 페이지가 최신이어도
+Row 데이터는 오래됐을 수 있다"* 를 낸다 — 부재는 "정상"이 아니다.
+
+### 3. 실측
+
+    페이지 블록      57 -> 66
+    동기화 상태 절    존재, 두 sync 구분 문장 포함
+    5표면 대조       **32항목, 불일치 0**
+    보안 재스캔      살아 있는 Notion 14,081자, secret 패턴 **0건**
+    Date / Tags     8개 Row 전부 빈칸 유지 · schema 14개 불변
+    게이트 발화      sync 줄 redact 무력화 -> 1건 정확히 실패
+
+### 4. 결함 0 (제품) — 그리고 이번에도 게이트는 발화했다
+
+C110 신규 코드에서 제품 결함 0건. False Positive도 0건.
+
+**Evidence:** 전체 suite `3988 passed, 8 skipped, 5934 subtests` (0 failed, 482s).
+C110 이전 baseline은 `3980 passed`.
+
+
+## C109. 같은 문장이 터미널에 남을 때와 Notion에 갈 때는 다른 문장이다 (P1, **보안**)
+
+이번 goal의 전제 둘(`Notes/Tags/Date 비어 있음`, `Dashboard 접근정보 미노출`)을
+살아 있는 Notion으로 먼저 재검증했다 — **둘 다 C107/C108에서 이미 닫혔다**
+(설명에 주소 있음, Row 본문 4/8에 주소, Control Tower 링크 4개, Notes 4/8 채움,
+Tags/Date는 근거를 남기고 의도적으로 빈칸). 그래서 새 감사 영역으로 옮겼다:
+**이번 세션에 내가 쓴 Notion 쓰기 경로의 보안.**
+
+### 1. 검증한 주장
+
+`controltower/notion_page.py`의 자기 docstring이 이렇게 적고 있었다:
+
+> "Reading `to_payload()` also inherits its security property … every authored
+> value has already been through `redact(one_line(...))`, so this side never
+> handles an un-redacted string."
+
+**주장을 믿지 않고 실행으로 쟀다.** 실제 파이프라인(Event 파일 → rollup →
+DashboardModel → `to_payload()` → 블록 빌더)에 적대적 authored 값을 흘렸다:
+토큰 형태 문자열, 개행, 마크다운 링크, 멘션, 9,000자.
+
+### 2. 주장은 절반만 참이었다
+
+Model 쪽은 정확했다 — `blocker`의 토큰도 secret 형태 `project_id`도 전부
+`[REDACTED]`로 나갔고, 개행은 리터럴 `\n`으로 이스케이프됐다.
+
+**그러나 `attention`은 `to_payload()`를 지나지 않는다.** `ops_status.py`가 만들어
+`dashboard_server.gather()`에 모델과 **나란히** 건네는 리스트다. 그리고 그 리스트는
+내 두 sink로 그대로 들어갔다 — ATTENTION 불릿과 **Database 설명**.
+
+**`ops_status.py`도 redact하지 않는다. 그것은 의도다.** `_authored()`의 docstring이
+이유를 적어 두었다: sink는 모든 메시지에 `one_line()`만 적용하고 `redact()`는 하지
+않는데, *"거의 모든 메시지가 경로·id·개수로 만들어지고, 운영자가 열어 봐야 할
+경로를 과다 redact하는 비용이 보호하는 것보다 크다"* 는 것이다.
+
+**터미널에는 옳은 거래다.** 내 모듈이 그 문장들에 **두 번째 sink**를 준 순간
+틀린 거래가 됐고, 그때 아무도 그것을 다시 재지 않았다. 한 데스크톱의 터미널에
+머무는 문장이 여기서는 **공유 Notion 워크스페이스로 나간다.** 같은 문장, 다른
+폭발 반경.
+
+### 3. 도달 가능성 — 논증이 아니라 측정
+
+    ops_status.py의 attention.append/extend : 67곳
+      그중 redact()를 지나는 것            : **0곳**
+      그중 authored 필드를 보간하는 것      : 21곳
+
+그리고 `ops_status.py:2539`(KEEP Candidate 줄)는 `event_id`를 **원문 그대로**
+보간한다 — `_authored()`를 부르지 않는다. `event_id`는 Event를 쓴 Desktop이 정하고
+`validate_event()`는 타입만 본다. 즉 secret 형태 `event_id` 하나면 Notion까지 그대로
+간다. `_authored()`의 docstring이 **이 형태가 여기서 이미 한 번 발견됐다**고 적고
+있다("the *orphan* line two blocks above printed the same Event's id raw").
+
+지금 살아 있는 Dashboard의 그 줄이 `RUNNER-PROD-E2E-002-FAILTEST`를 그대로 싣고
+있다. 오늘은 무해하고, 무해한 이유는 우연이다.
+
+### 4. 수정 — 경계가 redact한다, 호출자가 아니라
+
+`notion_page._safe()` 하나를 추가하고 ATTENTION 불릿·Database 설명·`model_error`
+셋에 적용했다. `ops_status.py`는 **한 글자도 바꾸지 않았다** — 그쪽 거래는 그쪽
+sink에 대해 여전히 옳고, 위로 올리면 운영자가 열어야 할 경로를 뭉갠다.
+
+이것이 `transport._error_detail()`이 자기 출력에 대해 이미 편 논거다: *"an error
+message should not depend on every future caller remembering to."* 67개 호출부는
+그중 하나가 잊어버릴 것을 보장하는 숫자다.
+
+**이 sink에서는 과다 redact가 옳은 방향이다.** Notion 페이지는 요약이고, redact되지
+않은 경로가 필요한 운영자에게는 그 경로를 가진 머신 위의 `ops_status.py`가 있다.
+
+### 5. False Positive 하나 — 내 probe였다
+
+probe가 "authored 값에서 개행이 제거되지 않았다" 2건을 보고했다. 추적하니 하나는
+**내가 Database 설명의 줄 구분자로 직접 넣은 개행**이고, 하나는
+`controltower/dashboard.py`의 소스 상수인 패널 `note`였다. authored Event 텍스트는
+`to_payload()`가 정확히 리터럴 `\n`으로 이스케이프하고 있었다. **결함 아님** —
+probe의 검사 대상이 너무 넓었다.
+
+### 6. 실측
+
+    수정 전 probe : 토큰 2회 도달 (ATTENTION 불릿 + Database 설명)
+    수정 후 probe : 0회, `[REDACTED]` 확인
+    게이트 발화   : redact를 무력화 → 3건 정확히 실패
+    살아 있는 Notion 전수 스캔 : 13,661자(설명+페이지+8 Row 본문+Notes),
+                                secret 패턴 매치 **0건**, `ntn_` 0회
+    ATTENTION 9건 전부 페이지 도달 : True (과다 redact로 잃은 것 없음)
+
+**Evidence:** 전체 suite `3980 passed, 8 skipped, 5934 subtests` (0 failed, 485s).
+C109 이전 baseline은 `3973 passed`.
+
+
+## C108. 링크가 하나도 없었다 — 그리고 빈 열 둘은 채우지 않기로 했다
+
+실측부터 다시 했다(보고서를 믿지 않는다). 살아 있는 Notion을 훑으니 셋이 나왔다.
+
+    description       498자, Dashboard 주소 포함 — 그러나 href 개수 **0**
+    Row 본문 4개       Evidence는 있는데 **밖으로 나가는 길이 없다**
+    Date / Tags       8개 Row 전부 빈칸, 쓰는 코드 없음
+
+### 1. 링크가 실제로 되는지부터 쟀다
+
+가정하지 않고 API로 확인했다. `text.link.url`을 실어 PATCH → 200, 되읽으니
+`href`가 붙어 돌아온다. **링크가 조용히 평문으로 떨어지면** 독자는 따라갈 수도,
+깨진 줄 알 수도 없으므로 쓰기 전에 재는 편이 옳다.
+
+### 2. Row 본문에 나가는 길을 냈다
+
+한 숫자를 확인하러 Project를 클릭한 사람은 Evidence까지 한 걸음이고 **그 밖으로는
+0걸음**이었다. 전사 현황도 실시간 화면도 다른 곳에 있는데, 무엇의 상세인지 말하지
+않는 페이지는 독자에게 기억으로 길을 찾게 한다.
+
+    ────────
+    ← 전사 Control Tower (전체 현황)     ← 진짜 링크 (href 확인)
+    실시간 화면: http://127.0.0.1:8765/ (Dashboard 서버를 켠 그 컴퓨터에서만 열린다)
+
+**둘 중 하나만 링크다.** Control Tower 페이지는 누가 어디서 열어도 열리므로 링크,
+`127.0.0.1`은 서버를 켠 그 컴퓨터에서만 열리므로 **평문**이다. 다른 기기의 모든
+독자에게 죽은 링크를 건네는 것은 시스템에 대해 거짓을 말하는 일이다.
+
+**Description은 링크로 만들지 않았다.** `description`은 rich-text 배열 하나이고
+`_split()`이 Notion의 항목당 상한을 지키려고 아무 데서나 자를 수 있다 — 링크 run이
+잘리면 절반이 평문으로 남는다. 링크는 블록이 따로 서는 Row 본문에 둔다.
+
+### 3. `publish()`가 갱신 때 주소를 몰랐다 (P2, 수정)
+
+`create_child_page()`는 url을 **생성 때 한 번만** 돌려준다. 첫 실행 이후 모든
+실행은 갱신 분기를 타므로, 방금 쓴 페이지의 주소를 링크로 걸 수가 없었다 —
+즉 production의 매 실행이 그랬다. `retrieve_page()`를 transport 세 구현에 추가하고
+갱신 분기가 그것으로 주소를 되찾게 했다.
+
+**id로 주소를 조립하지 않았다.** 오늘은 통하지만 그것은 Notion URL 형식에 대한
+추측이다. 묻는 것은 추측이 아니다. 조회가 실패하면 링크 없이 페이지를 낸다 —
+렌더된 페이지가 링크보다 크다.
+
+### 4. `Date` / `Tags` — 채우지 않는다. 그것이 결정이다
+
+미션이 "무조건 채우지 않는다. 계약상 필요한지 먼저 확인한다"고 요구했고, 근거가
+문서에 이미 있었다.
+
+**docs/13 §5:** *"Notion 기본 `Date`/`Notes`/`Tags` 3개가 남아 있으나 **무해**"* —
+PROJECTS는 Notion 기본 템플릿으로 만들어졌고 이 셋은 그 **잔재**다. docs/04 §8의
+11개 계약 Property가 아니고, §44(COO 판단)·§45(CEO 권한)의 보호 대상도 아니다.
+
+**그러나 잔재가 곧 빈자리는 아니다.**
+
+| 열 | 판정 | 이유 |
+|---|---|---|
+| `Date` | **비워 둔다** | `Last Updated`와 `Completed Date`가 이미 이 시스템이 아는 날짜를 나른다. 의미가 정의되지 않은 세 번째 날짜 열은 정보가 아니라 독자가 매번 풀어야 할 모호함이다 |
+| `Tags` | **비워 둔다** | 옵션이 하나도 없는 `multi_select`다. 채우려면 옵션을 만들어야 하고 그것은 이 프로젝트가 소유하지 않은 Database의 **스키마 변경**이다. 게다가 그 분류는 `Notes`가 이미 문장으로 말한다 |
+| `Notes` | **쓴다**(C107) | 표 화면에서 클릭 없이 "이 Project가 나를 필요로 하는가"에 답하는 유일한 자리이고, 자유 텍스트이며, 아무도 주장하지 않았다. `[CT]`로 시작하지 않는 값은 덮어쓰지 않는다 |
+
+`TheDefaultNotionColumnsAreNotFilledTests`가 이 결정을 고정한다 — 발행 코드에
+`"Date"`/`"Tags"` 문자열이 없는지, `Notes` 발행이 다른 Property를 건드리지 않는지,
+그리고 **이 근거가 BACKLOG에 남아 있는지**까지 본다. 커밋 메시지에만 사는 결정은
+다음 사람이 처음부터 다시 내리는 결정이다.
+
+### 5. 실측
+
+    링크 href       Row 4개 각 1개 (전사 Control Tower) · 원천 없는 Row 4개는 0개
+    publish 갱신    url 복구됨 — https://app.notion.com/p/Control-Tower-3c8e…
+    Date / Tags     8개 Row 전부 빈칸 유지 · schema 14개 불변
+    PROJECTS Row    8개 불변
+
+**Evidence:** 전체 suite `3973 passed, 8 skipped` (0 failed).
+C108 이전 baseline은 `3963 passed`.
+
+
+## C107. 표 화면이 조용했다 — 그리고 화면 안내에 주소가 없었다
+
+C106이 표면 셋을 만들었다. 이번엔 **그 셋이 실제로 답하지 못하는 질문 둘**을 찾았다.
+
+### 1. "이 Project가 나를 필요로 하는가" — 표 화면이 답하지 못했다
+
+Notion에서 Database를 열면 나오는 것은 **표**다. 거기 있는 Property는 Runner가
+Event Sync로 채우는 11개(docs/04 §43)뿐이고, 그것들은 *"이 Project는 어떤
+상태인가"*에 답한다. 답하지 못하는 것은 *"나를 필요로 하는가"* — `days_idle`,
+Blocker 경과일, Event 수는 전부 Control Tower의 유도값이고 **Notion 어디에도
+없었다.** 알려면 Project를 하나씩 열어야 했다.
+
+    Search Backend    IN_PROGRESS   [CT] · ⚠ 18일째 조용함 · Event 1건 · IN_PROGRESS · 갱신 08-26 14:40
+    Company Ops       IN_PROGRESS   [CT] · ⚠ 16일째 조용함 · Event 11건 · IN_PROGRESS · 갱신 08-26 14:40
+
+**`Notes` 열을 쓴 근거.** docs/04 §43의 자동화 11개에 없고, §44(COO 판단)와
+§45(CEO 권한)의 보호 목록에도 없다. 어디에도 배정되지 않았고, 실측상 8개 Row 전부
+비어 있으며, 이 저장소의 어떤 코드도 쓰지 않는다.
+
+**"배정 안 됨"이 "우리 것"은 아니다.** `NOTE_MARKER = "[CT]"`로 시작하지 않는 값은
+덮어쓰지 않는다. 실측: `SEARCH_BACKEND.Notes`에 *"COO 메모: 이 프로젝트는 보류
+결정됨. 지우지 말 것."* 을 넣고 실행 → `Notes 열 3건 갱신` + `사람이 쓴 Notes가
+있어 건드리지 않은 Row: SEARCH_BACKEND`, 메모 그대로. 되돌린 뒤 다시 4건.
+
+`SILENT_AFTER_DAYS`는 `ops_status.py`의 값을 그대로 쓴다. 라이브러리가 진입점을
+import하면 계층이 뒤집히므로 값을 다시 적되, `test_the_quiet_threshold_matches_ops_status`가
+원본과 대조한다 — 두 화면이 "조용함"의 기준을 두고 갈라지는 것이 어느 임계값보다
+나쁘다.
+
+### 2. "그 Dashboard는 어디 있는가" — 페이지가 말하지 않았다
+
+Control Tower 페이지는 Dashboard를 여러 번 언급하면서 **주소를 한 번도 적지
+않았다.** 미션이 명시적으로 요구한 "Dashboard 접근정보"이고, 실제로 없었다.
+
+    ## 실시간 화면(Dashboard)에 가려면
+    [🖥] http://127.0.0.1:8765/ — 단, 이 주소는 Dashboard 서버를 켠 그 컴퓨터에서만
+         열린다. 127.0.0.1(loopback) 전용이며 다른 기기에서는 열리지 않는다.
+    그 컴퓨터에서 실행: python dashboard_server.py  (종료는 Ctrl+C)
+    같은 사실을 터미널에서만 보려면: python ops_status.py (ATTENTION이 있으면 exit 3)
+    이 Notion 페이지를 지금 상태로 갱신하려면: python publish_control_tower.py
+
+**링크로 만들지 않았다.** `dashboard_server.py`는 127.0.0.1에만 바인딩하고 바꿀 수
+없다(자기 docstring이 이유를 적어 두었다). 클릭 가능한 링크는 다른 기기의 모든
+독자에게 **죽은 링크**가 되고, 죽은 링크를 건네는 화면은 시스템에 대해 거짓을 말한
+것이다. 주소와 제약을 나란히 적는 편이 정직하다.
+
+포트는 `dashboard_server.DEFAULT_PORT`와 `PORT_ENV_VAR`에서 읽는다 — 둘 중 어느
+쪽도 여기에 다시 적지 않는다. 두 번째 사본이 곧 아무도 듣지 않는 주소를 광고하기
+시작하는 지점이다.
+
+### 3. 실측 — 4표면 정합성
+
+**25항목, 불일치 0.**
+
+    A 설명    498자 · ATTENTION 9건 · Dashboard 주소 · Probe 경고 · schema 14개 유지
+    B 페이지  57블록 · Event 16건 · 주소+제약 · ATTENTION 9건 전문
+    C Notes  원천 있는 4개 채워짐+status 일치 / 원천 없는 4개 비어 있음 유지
+    D Row    원천 있는 4개 본문 status 일치 / 원천 없는 4개 blocks 0 유지
+
+### 4. 결함 0 — 게이트는 발화했다
+
+C107 신규 코드에서 **제품 결함 0건**. 회귀 게이트 정상 발화 확인: `Notes` 가드를
+무력화하니 `test_a_hand_written_note_is_skipped_and_named` 하나가 정확히 실패했다.
+
+### 5. 여전한 병목
+
+Integration에 공유된 최상위 객체가 PROJECTS 하나라는 사실은 그대로다. 다만 C107로
+**사용자가 추가 설정을 하지 않아도 되는 범위가 한 단계 더 넓어졌다** — 이제 Notion을
+열면 표 화면에서 클릭 없이 어느 Project가 사람을 기다리는지 보인다.
+
+**Evidence:** 전체 suite `3963 passed, 8 skipped, 5931 subtests` (0 failed, 471s).
+C107 이전 baseline은 `3948 passed`.
+
+
+## C106. 권한을 다시 재고, 표면 두 개를 더 찾았다
+
+C105는 하위 페이지 하나를 만들었다. 이번엔 **그 권한으로 또 무엇이 가능한지**를
+코드가 아니라 API로 전수 조사했다.
+
+### 1. 읽기 전용 능력 조사 — 무엇이 실제로 되는가
+
+    top-level 객체        : PROJECTS Database 1개 (변함 없음)
+    PROJECTS.description  : 키는 있고 값은 **비어 있음** (len=0)
+    Row 8개의 blocks      : 전부 GET 200 (COMPANY_OPS만 child_page 1개)
+    is_inline             : True
+
+쓰기 권한은 **의도적으로 잘못된 body**로 확인했다 — 400이면 엔드포인트는 허용,
+403/404면 거부다. 아무것도 쓰지 않고 권한만 잰다.
+
+    PATCH /databases (description)  400  PERMITTED
+    PATCH /pages (properties)       400  PERMITTED
+    PATCH /blocks/{id}/children     400  PERMITTED
+    POST  /pages (row)              400  PERMITTED
+
+**넷 다 허용돼 있었다.** 그리고 가장 눈에 띄는 자리가 비어 있었다.
+
+### 2. 표면 A — Database 설명
+
+이 워크스페이스에서 사람이 Notion을 열면 닿는 것은 PROJECTS 하나다. 그 **설명**은
+Database 제목 바로 아래에 렌더링된다 — 즉 **탐색 없이 읽히는 유일한 문장**이고,
+비어 있었으며, 이 저장소의 어떤 코드도 그것을 쓸 수 없었다.
+
+    [Control Tower] 주의 9건 — 사람이 확인해야 한다.
+    마지막 갱신 2026-08-26T13:45:40+09:00
+    Event 16건 (2026-08-05~2026-08-10) · Project 4 · 열린 Blocker 0
+    이 Row들이 실제 업무인지 Engineering Probe인지 이 시스템은 구별하지 못한다 …
+    가장 먼저: 3일 이상 아무것도 오지 않은 Desktop: DESKTOP_1, …
+    전체 화면: 이 Database의 COMPANY_OPS Row 안 'Control Tower' 하위 페이지.
+    이 설명은 publish_control_tower.py를 실행할 때만 갱신된다 …
+
+**요약이 캐비앳을 버리지 않는다.** 전체 화면이 지고 있는 두 개의 "모른다"
+(Probe 구별 불가, 스스로 갱신 안 됨)를 요약에서 빼면 그것은 정직한 보고의
+자신 있는 절반만 남긴 것이다. 실측 상한은 항목당 2,000자이고, 넘치면 자르지 않고
+쪼갠다.
+
+`set_database_description()`은 `update_database()`와 **별도 메서드**다. 같은 PATCH
+엔드포인트를 공유하지만 하나는 문장이고 하나는 스키마이며, 합치면 한 문장을 쓰려던
+호출이 열을 재정의할 수 있다. (실측: 갱신 후에도 property 14개 그대로.)
+
+### 3. 표면 C — Project Row 본문
+
+Row의 *Property*는 Status·Owner·Last Event를 이미 나른다(Runner가 매 sync마다
+쓴다). 나르지 못하는 것은 **왜**다 — 어떤 Event가 그 상태를 만들었고 어느 파일에서
+왔는가. 사람이 상태를 의심하는 바로 그 순간 찾는 것이고, Notion에서 Project를
+클릭하면 **빈 페이지**가 나왔다.
+
+    [🤖] 이 내용은 publish_control_tower.py가 자동으로 씁니다 · 마지막 갱신 …
+    상태 IN_PROGRESS · 팀 CTO_BACKEND · Event 1건 · 마지막 … · 18일째 조용함
+    ### 이 Project의 Event      (at | source | event_type | summary | event_id)
+    ### Evidence (파일)          LOCKFIX-VERIFY-001.json · … · …
+
+**안전장치 셋, 전부 실측으로 확인했다.**
+
+| 규칙 | 실측 |
+|---|---|
+| 사람이 쓴 본문은 이긴다 | Row에 문단 하나 타이핑 → 그 Row 건너뜀, 메모 보존, 이름 보고 |
+| 하위 페이지는 절대 보관 처리 안 함 | COMPANY_OPS Row 재렌더 후에도 Control Tower 페이지 51블록 그대로 |
+| 원천 없는 Row는 손대지 않음 | `ENGINEERING_PROBE_*` 3개 + `COMPANY_OPS_E2E_VERIFICATION` = blocks 0 유지 |
+
+세 번째가 특히 중요하다. 이 시스템이 만들지 않은 Row에 "증거 없음"을 적는 것은
+남의 데이터에 대한 권한을 주장하는 일이다. 그래서 **적지 않고 이름만 보고한다.**
+
+### 4. 실측 — Dashboard ↔ Notion 3표면 대조
+
+**32항목, 불일치 0.**
+
+    A 설명   존재·ATTENTION 9건·Event 16건·Probe 경고·schema 14개 유지
+    B 페이지  51블록·ATTENTION 9건 전문·PROJECTS/TEAMS/DESKTOPS 각 4행
+    C Row    원천 있는 4개 status+Event ID 전부 일치 / 원천 없는 4개 blocks=0
+
+멱등성: 2회차 `Project Row 4건 갱신 (블록 보관 27)` — 보관 수 = 기록 수, 본문 크기
+불변.
+
+### 5. 이번엔 결함 0 — 그러나 게이트는 발화했다
+
+C105에서 넣은 코드에 결함 셋이 있었고(exit code, double의 block id, 잘못된 클래스에
+붙은 필드) 전부 그 Sprint에서 잡혔다. C106의 신규 코드에서는 **제품 결함 0건**이다.
+숫자만 남긴다 — 아무것도 찾지 못한 감사도 결과다(C63).
+
+다만 회귀 게이트는 정상 발화를 확인했다: 사람-내용 가드를 무력화하니
+`test_a_hand_written_row_is_skipped_and_named` 하나가 정확히 실패했다.
+
+### 6. 아직 사용자 조작이 필요한 것 — 변함 없음
+
+Integration에 공유된 최상위 객체가 PROJECTS 하나라는 사실은 그대로다. **Page를
+하나 만들어 Integration에 공유하면** Control Tower 페이지를 Project Row 밖으로
+옮길 수 있고 OPS_RUNS Database도 만들 수 있다. 그 전까지 이번 세 표면이 이 권한
+안에서 도달 가능한 최대치다.
+
+**Evidence:** 전체 suite `3948 passed, 8 skipped, 5930 subtests` (0 failed, 478s).
+C106 이전 baseline은 `3929 passed`.
+
+
+## C105. Notion에 사람이 읽는 Control Tower가 생겼다 — 그리고 그것을 만들 코드는 아예 없었다
+
+C103·C104는 Notion **Row의 Property**를 검증했다. 이번 목표는 다른 것이다:
+사람이 Notion을 열어 회사 상태를 읽는 화면.
+
+### 1. 먼저 잰 것 — 무엇이 실제로 가능한가
+
+`search`로 Integration이 보는 것을 전수 조사했다.
+
+    page      Engineering Probe Notion Write Verify   parent=database_id
+    page      Company Ops                             parent=database_id
+    ... (총 8개, 전부 PROJECTS의 Row)
+    database  PROJECTS                                parent=workspace
+
+**최상위 객체는 PROJECTS Database 하나뿐이다.** 독립된 Company Ops Page는
+공유돼 있지 않다. 그리고 Notion API는 `workspace`를 부모로 하는 페이지 생성을
+거부하므로, 만들 수 있는 페이지는 **Integration이 이미 권한을 가진 페이지의
+자식**뿐이다.
+
+**코드 쪽은 더 비어 있었다.** `NotionTransport`의 메서드 9개는 전부 Database Row의
+*Property*를 다룬다. 페이지 **본문**(block)을 다루는 것은 하나도 없었다.
+`controltower/notion_projection.py`는 Database 5개에 Row를 project하는 설계이고
+(docs/14 §1의 계약 밖), 어느 쪽도 "읽을 수 있는 페이지"를 만들지 못한다.
+
+즉 이 능력은 *배선이 안 된* 것이 아니라 **존재하지 않았다.**
+
+### 2. 만든 것
+
+| 파일 | 내용 |
+|---|---|
+| `src/notion/transport.py` | block 연산 4개 — `create_child_page` / `list_block_children` / `append_block_children` / `delete_block`. 추상 + Real + double 셋 다 |
+| `src/controltower/notion_page.py` (신규) | payload → Notion block 렌더러 + 멱등 upsert |
+| `publish_control_tower.py` (신규 진입점) | 실행 도구 |
+| `tests/test_controltower_notion_page.py` (신규) | 회귀 22건 |
+
+**하나의 Model, 두 개의 sink.** 페이지는 `dashboard_server.gather()`가 만드는
+payload에서 렌더링한다 — 브라우저 화면이 쓰는 바로 그 dict다. rollup을 다시
+유도하지 않는 것이 요점이다: 두 유도에서 나온 두 화면은 회사에 대해 서로 다른 말을
+할 수 있고, 그러면 Control Tower가 둘이 되고 어느 쪽이 거짓말인지 알 방법이 없다.
+`to_payload()`를 읽으면 `notion_projection.py`가 명시한 보안 속성도 그대로
+따라온다 — 저자 입력값은 이미 `redact(one_line(...))`를 거쳤다.
+
+**어디에 쓰는가 — 설정이 아니라 발견.** PROJECTS의 `Project ID = COMPANY_OPS`
+Row 안에 `Control Tower` 하위 페이지. 환경변수를 하나도 늘리지 않았다. 붙여넣은
+id는 조용히 낡지만, 조회 실패는 어느 Row가 없는지 말해 준다.
+
+**Database를 만들지 않았고 PROJECTS에 Row를 더하지 않았다.**
+
+### 3. 실측 — 4회 실행
+
+    1회차  생성   블록 51  보관 0
+    2회차  갱신   블록 51  보관 51
+    3회차  갱신   블록 51  보관 51
+    4회차  갱신   블록 51  보관 51
+    ----
+    하위 페이지 1개 · 페이지 블록 51개 고정 · PROJECTS Row 8개 불변
+
+**Dashboard ↔ Notion 대조 16항목, 불일치 0** (읽은 Event 수, ATTENTION 건수,
+증거 범위 양끝, PROJECTS/TEAMS/DESKTOPS 각 4행, ATTENTION 9건 전문).
+
+**Dashboard 적대적 HTTP 14건, 실패 0**: 정상/healthz/JSON, 빈 기간(200),
+거꾸로 된 기간(400), 잘못된 날짜(400), 모르는 파라미터(400), 없는 경로(404),
+POST/PUT/DELETE(405), `Host: evil.example.com`(403), localhost·127.0.0.1(200).
+
+### 4. 지어내지 않은 것 — 이것이 이 페이지의 계약이다
+
+미션이 요구한 항목 중 **원천이 없는 둘**은 답을 만들지 않고 없다고 적는다.
+
+- **"이 데이터는 실제 업무인가"** — `events.Event`에 Event가 실제 업무인지
+  Engineering Probe인지 표시하는 필드가 **없다.** 이름으로 분류하면 그것은 이
+  모듈의 추측이다. 그래서 **구별 불가능을 1급 사실로 보고하고** Project ID 목록을
+  실어 사람이 판단하게 한다. `UNSOURCED`가 없는 계층에 주는 답과 같은 답이다.
+- **"승인 병목 · 다음 작업"** — 사람이 BACKLOG.md에 적는 판단이다. Event에서
+  유도하면 이 화면의 첫 번째 지어낸 사실이 된다.
+
+그리고 **0은 결코 판정이 아니다.** 네 가지 부재가 각각 다른 문장을 갖는다:
+`원천 없음` / `기간 내 Event 없음` / `아직 입력되지 않음` / `해당 없음`.
+`test_the_four_sentences_are_all_different`가 넷이 실제로 다른 문장인지 고정한다 —
+같은 문자열을 내는 네 분기는 위 테스트를 전부 통과하면서 운영자에게 아무것도
+말하지 않는다.
+
+ATTENTION이 비었을 때도 "회사가 잘 돌아간다"고 하지 않는다: *"자동 점검이 문제를
+찾지 못했다. 이것은 '확인된 항목이 없다'는 뜻이며 회사가 잘 돌아간다는 뜻은 아니다."*
+
+### 5. 테스트가 찾아낸 결함 둘 (둘 다 내가 이번에 넣은 것)
+
+**P2 — 진입점이 인자 거절에 exit 2를 냈다.** `src/cli.py`가
+`CONFIG_ERROR_EXIT = 1`을 소유하고 모든 도구가 그것을 import하는데,
+`publish_control_tower.py`는 상수를 **직접 적었다.** 게이트
+(`test_an_argument_is_refused_before_anything_happens`)가 `2 != 1`로 잡았다.
+`cli`에서 import하도록 고쳤다 — 그 숫자의 두 번째 사본이 곧 두 도구가 "1"의 뜻을
+두고 갈라지기 시작하는 지점이다.
+
+**P2 — double이 block에 id를 주지 않았다.** Notion은 block이 존재하는 순간 id를
+준다. `InMemoryNotionTransport.create_child_page()`는 넘겨받은 children을 그대로
+저장했고, 재렌더가 `block["id"]`를 읽는 순간 **double에서만** `KeyError`가 났다
+(실 API에서는 4회 전부 정상 동작했다). C103의 초 내림, C104의 `rich_text` 상한과
+**같은 종류의 불충실**이다 — API보다 덜 유지하는 double은 production이 실패하는
+방식으로 실패하지 못하고, 여기서는 production이 실패하지 않는 방식으로 실패했다.
+
+덤으로 세 번째: `archived_blocks`를 double에 넣으려던 편집이 `replace(...,1)` 때문에
+**RealNotionTransport에 먼저 붙었다.** 죽은 상태 필드이고, Real transport가 archive를
+추적한다고 오해하게 만든다. 옮겼다.
+
+### 6. 게이트가 요구한 명부 갱신
+
+새 도구 하나가 게이트 6개를 발화시켰다 — 정확히 그러라고 있는 것들이다.
+`EnvironmentContractTests.ENTRYPOINTS`, 진입점 명부 2곳,
+"Notion 변수를 광고하는 도구 집합"(둘 → 셋), `.env.example` 머리말,
+그리고 `AGENT.md`가 그 도구를 설명하는지(§6e 신설).
+
+### 7. SKIP — 실제 외부 조작이 필요한 것
+
+**OPS_RUNS Database.** docs/14 §1의 계약 **안**에 있으므로 만드는 것 자체는 결정이
+아니다. 막는 것은 둘 다 코드 밖이다: (a) Database에도 부모 페이지가 필요한데
+Integration이 보는 후보는 PROJECTS의 Row뿐이고 운영 Database를 Project Row 안에 두는
+것은 잘못된 자리다, (b) 만든 뒤 `NOTION_OPS_RUNS_DATABASE_ID`를 사용자가 `.env`에
+넣어야 한다. **필요한 조작: Notion에서 Page 하나를 Integration에 공유.** 그러면
+Control Tower 페이지도 그 아래로 옮길 수 있어 Project Row 안에 있지 않아도 된다.
+
+**Evidence:** 전체 suite `3929 passed, 8 skipped, 5929 subtests` (0 failed, 475s).
+C105 이전 baseline은 `3907 passed`.
+
+
+## C104. Runner의 Notion 배선이 처음으로 실제 API에 대고 돌았다 — 그리고 Manifest는 결과를 말할 수 없었다
+
+C103이 다음 Sprint 1번으로 적어 둔 것을 실행했다: **자격증명과 함께 Runner를
+실제로 돌린다.** 이 배포가 기록한 모든 실행은 `notion_sync: SKIPPED`였으므로,
+`_build_notion_clients()`가 만든 살아 있는 client로 `run_once()`가 도는 것은
+이번이 처음이다.
+
+**격리해서 돌렸다.** runtime 트리는 실제 `events/`를 복사한 임시 디렉터리이고,
+저장소의 `runtime/`은 읽지도 쓰지도 않았다. Notion만 실물이며 계약된 PROJECTS
+Database 하나뿐이다 — Database는 만들지 않았다.
+
+### 1. 결과 — 배선은 동작한다
+
+    collector        SUCCESS  accepted=16 duplicate=1
+    notion_sync      SUCCESS  processed=16
+    history_filter   SUCCESS  kept_dates=5
+    daily            SUCCESS  generated_days=25
+    backup           FAILED   BACKUP_PENDING   (sandbox에 git repo 없음 — 예상된 것)
+    retry queue      (없음 — 실패한 Event 0)
+
+`notion_sync.log` 16줄 전부 `NOTION_SKIPPED_OLD_EVENT`. **C103의 dry-run 예측과
+정확히 일치한다**(17 파일 중 1건은 duplicate라 sync에 닿지 않는다 → 16). 서로
+다른 두 방법이 같은 답을 냈다.
+
+`WorkingCopyNotAGitRepositoryError`가 `run_once()` 밖으로 전파되는 것은 문서화된
+기존 gap이다. 확인한 것: 그것이 `GitOperationError`의 하위 클래스이므로
+`run_company_ops.py`의 `except GitOperationError`가 잡는다 — 운영자는 raw
+traceback을 보지 않는다. **결함 아님.**
+
+### 2. 그 실행이 드러낸 것 — Manifest가 "Notion이 바뀌었는가"에 답할 수 없다
+
+    notion_sync SUCCESS {"processed": 16}
+
+16건 **전부 skip**이었다. Row는 하나도 바뀌지 않았다. 그런데 16개 Row를 전부
+새로 쓴 실행도 **같은 바이트**를 쓴다. `processed`는 시도 횟수이고, 결과를 세는
+것은 아무것도 없었다.
+
+이것이 중요한 이유는 Manifest의 위치다. 기계가 읽는 기록이고(`ops_status.py`가
+읽고, Task Scheduler 배포가 보관하고, `notion_sync.log`가 회전한 뒤에도 남는다),
+"Notion이 실제로 바뀌었는가"를 알려면 **로그를 한 줄씩 읽어야 했다** — Manifest가
+없애 주기로 되어 있는 바로 그 노동이다.
+
+**승인 불필요, C40의 형태 그대로.** status는 추가하지 않았고(docs/04 §32-37이
+열거하며 추가는 Spec 변경) 동작은 움직이지 않았다. `RunComponent.metrics`는
+docs/14가 제약하지 않는 자유형 `Mapping[str, Any]`이고, 거기에 키를 더하는 것이
+결정이 아니라는 것은 C40이 `same_instant_skips`로 이미 세워 둔 선례다.
+
+    notion_sync SUCCESS {"processed": 16, "created": 0, "updated": 0, "skipped_old": 16}
+
+**0을 남긴다 — `same_instant_skips`와 반대 선택이고 이유가 다르다.** 그쪽은 드문
+divergence를 보고하므로 부재가 "일어나지 않았다"를 뜻한다. 여기서는 `created=0,
+updated=0`이 **정보가 있는 쪽**이다. 그것이 "Notion은 이미 최신이다"와 "아무것도
+Notion에 닿지 않았다"를 한눈에 구별시키는 유일한 장치다.
+
+`skipped_old`는 `same_instant_skips`를 **포함한다**(same-instant skip은
+NOTION_SKIPPED_OLD_EVENT를 반환하므로 양쪽에 세어진다). 네 숫자를 더해
+`processed`보다 크게 나온 독자가 어느 하나를 틀렸다고 결론짓지 않도록 적어 둔다.
+
+### 3. 그 숫자가 E-27의 절반을 닫았다
+
+C103은 이 블록에 **의심**을 가르쳤다(시도된 적 없는 자격증명의 두 0은 정상의
+근거가 아니다). 가르치지 못한 것은 **확인**이다.
+`_notion_credentials_exported_but_never_exercised()`는 어떤 실행이든 Notion 단계를
+시도하면 즉시 침묵하는데 — 실패한 시도는 다른 곳이 보고하므로 옳다 — **성공한
+시도도 아무 줄을 내지 않았다.** 즉 시스템이 있을 수 있는 가장 좋은 상태("실행이
+Notion에 닿았고 무엇을 썼는지 여기 있다")가 이 블록이 한 번도 언급하지 않는
+유일한 상태였다.
+
+    마지막 Notion 반영  : Row 생성 0 / 갱신 0 / 넘어감(더 오래된 Event) 16 (run …)
+                          (그 실행은 Notion을 바꾸지 않았다 — 이미 최신이었거나
+                           도착한 Event가 모두 더 오래됐다)
+
+**ATTENTION은 내지 않는다.** "Notion이 이미 최신"은 Event가 그치면 나오는 정상
+정상상태이고, 평범한 경우에 울리는 경보는 사람이 읽기를 그만두는 경보다.
+
+**E-27의 결정은 여전히 열려 있다.** 이것은 네트워크 호출이 아니라 실행 자신이 쓴
+로컬 파일을 읽는 것이므로 그 결정에 손대지 않는다. 아직 못 하는 것은 그대로다:
+*실행이 없는 동안* Notion에 닿을 수 있는지, 그리고 원천 없는 Notion Row 4건.
+
+**C104 이전 Manifest는 0이 아니라 부재로 다룬다.** `processed`만 있는 Manifest에
+`created=0`을 지어내면, 실제로는 많이 썼을 수 있는 실행에 대해 "아무것도 쓰지
+않았다"고 말하는 셈이다 — 침묵보다 강하고 더 틀린 주장이다.
+
+### 4. 결함을 찾지 못한 감사 셋 (숫자만 남긴다)
+
+**Python 3.9.7 호환성 — 결함 0.** 이 머신에는 3.13.14뿐이라 suite가 3.10+ 기능을
+잡을 수 없다. `src/` + `tests/` + 진입점 **141 파일**을 AST로 훑었다: `match`,
+`except*`, PEP 695, `__future__` 없는 `X | Y` 주석, 런타임 타입 union,
+3.10~3.13 신규 stdlib(`pairwise`/`bit_count`/`tomllib`/`Self`/`batched`/
+`override`/`file_digest`/`contextlib.chdir` 등). **실제 결함 0.**
+
+이 결과를 믿기 전에 **감사기를 쏴 봤다** — 7개 구문을 심은 파일에 대고 7개 전부
+검출했다. 첫 실행은 156건을 보고했는데 그중 122건이 `ast.walk`와 `override`라는
+지역 변수였다(내 규칙이 이름만 봤다). 수신자와 실제 import를 보도록 좁힌 뒤 36건,
+그중 실제 결함 0 — 나머지는 `import ast as ast_module` 2건과 "주석은 있지만
+`from __future__ import annotations`가 없는 테스트 모듈" 34건(그 모듈들의 주석에
+`X | Y`가 없다는 것은 같은 스캔이 확인했다).
+
+**Dashboard 동시성 — 결함 0.** `gather()`는 블록 텍스트를 캡처하려고 프로세스
+전역 `sys.stdout`을 바꾸고 `_CAPTURE_LOCK`이 그것을 직렬화한다. 실 HTTP로
+24 thread × 6 round = **144 요청**(HTML/JSON 절반씩): 전부 200, 찢어진 캡처 0,
+블록 간 누출 0.
+
+여기서도 쏴 봤다. `_CAPTURE_LOCK`을 in-process로 no-op으로 바꾸니 **즉시 찢어졌고**
+(다른 블록의 출력이 실제 stdout으로 새어 나왔다), 되돌리니 다시 깨끗했다. 즉 lock은
+실제로 하중을 받고 있고 이 측정은 그 차이를 볼 수 있다. 기존
+`OneRequestCannotStealAnothersOutputTests`가 주장하던 것을 독립된 방법으로 확인한
+셈이다.
+
+**Notion 쓰기 — 이 Sprint에서 0건.** 16건 전부 skip이었으므로 Row 수는 8 그대로다.
+
+### 5. False Positive 둘 — 둘 다 내 probe였다
+
+- **동시성 probe.** `block["key"]`가 소문자 키라고 가정했는데 실제로는 제목
+  문자열이다. 144 응답 전부가 "block set wrong"으로 나왔다. 측정 대상과 어긋난
+  probe는 그 대상에 대해 아무것도 보고하지 않는다 — 실제 payload에서 키를 읽도록
+  고친 뒤 문제 0.
+- **3.9 감사기 1차.** 위 §4의 122건.
+
+둘 다 **제품 결함이 아니다.**
+
+### 6. 이번에도 못 한 것
+
+- **브라우저 실렌더링.** C103과 동일한 환경 제약(Chrome 확장이 loopback 이동을
+  허용하지 않아 요청이 서버에 닿지 않는다). curl로는 200/정상 렌더/새 줄까지 확인.
+- **3.9.7 실행.** 정적 감사로 대체했다(위 §4).
+- **실제 배포 runtime에 대고 Runner 실행.** 격리 sandbox로 대체했다. 실제
+  `runtime/`은 backup working copy가 git repo가 아니어서 어차피 같은
+  BACKUP_PENDING에 걸린다.
+
+**Evidence:** 전체 suite `3907 passed, 8 skipped, 5908 subtests` (0 failed, 489s).
+C104 이전 baseline은 `3892 passed`.
+
+
+## C103. 자격증명이 있었다 — 그리고 그것으로 잰 것 둘 다 조용히 틀렸다
+
+**시작점은 낡은 한 줄이었다.** B절 "환경 의존" 5번이 *"실제 Notion Workspace —
+자격증명 필요"* 라고 적혀 있었다. C76이 남긴 경고가 정확히 이것을 겨눈다: 게이트
+둘이 발화했는데 코드 회귀가 아니라 **배포 머신이 옮겨간 것**이었고, "이 목록의
+'환경 의존' 항목들도 같은 이유로 낡아 있을 수 있다."
+
+낡아 있었다. `.env`에 실제 토큰과 Database id가 들어 있고, health check가 통과하고,
+PROJECTS Database가 workspace 루트에 14개 Property를 갖고 실재한다. **그래서 이번
+Sprint는 계약된 Database에 대고 실제로 왕복하며 잰다.**
+
+### 1. 무엇을 실제로 실행했는가
+
+| 측정 | 방법 | 결과 |
+|---|---|---|
+| Notion 도달 | `health_check()` (실 API) | ok |
+| 자격증명 4상태 | 부재/공백/무효/미공유 | config 거부 / config 거부 / **401** / **404**, 넷 다 구별됨 |
+| Sync 멱등성 | `processed/` 17건 전부 dry-run(쓰기 금지 transport) | **17/17 NOTION_SKIPPED_OLD_EVENT** — 재실행은 진짜 no-op |
+| 쓰기 -> 되읽기 | 기존 probe Row 1개에 실제 UPDATE | NOTION_UPDATED, 되읽은 값 일치, **Row 수 8 -> 8** |
+| 같은 Event 재전송 | 위 Event 그대로 다시 | NOTION_SKIPPED_OLD_EVENT, page_id 동일, 중복 0 |
+| Dashboard HTTP | 실제 GET (`/`, `/healthz`, `/api/dashboard.json`) | 200 / ok / JSON |
+| Dashboard <-> Notion | 양쪽 live 대조 | Project 4건 **전부 일치**, Notion에만 있는 Row **4건** |
+
+멱등성은 두 층에서 확인됐다: 코퍼스 전체가 no-op이고, 한 Event를 두 번 보내도
+Row가 늘지 않는다.
+
+### 2. 그 왕복이 드러낸 것 — Notion이 초를 버린다 (E-26)
+
+되읽기가 아니었으면 보이지 않았을 결함이다. 보낸 `09:54:40`이 `09:54:00`으로
+돌아왔고, Late Event 보호는 **되읽은** 값과 비교한다. 재현: `:40` 다음에 `:10`을
+동기화하면 더 오래된 Event가 Current State를 덮는다 — docs/04 §29-30이 막으려던
+바로 그것이, 최대 59초 창에서.
+
+동작 선택은 결정이라 남겼다(E-26). **보이게 만드는 것은 결정이 아니었고**, 그것이
+C19/C22/C23/C24가 굳혀 온 형태다 — 아무것도 고치지 않고 아무것도 정하지 않은 채,
+조용하던 것을 시끄럽게 만든다.
+
+**그리고 double이 이 결함을 4개월간 숨기고 있었다.** `InMemoryNotionTransport`가
+초를 보존했다. 실측대로 내림하도록 고쳤더니 **기존 테스트가 한 건도 깨지지 않았다** —
+비용 0이었고, 다만 아무도 재 보지 않았을 뿐이다.
+
+### 3. 그리고 화면이 조용히 틀린 두 번째 자리 (E-27)
+
+C90은 "`.env`는 설정됐는데 프로세스가 못 본다"를 시끄럽게 만들었다. 그 **다음**
+상태를 재 보니 더 조용했다: 두 변수를 export하고 화면을 열면 `대기 중 Event 0 /
+Dashboard 밀린 기록 0`, ATTENTION 없음. 그 측정의 토큰은 **무효**였다(실 API가 401).
+
+미전달은 시끄럽고 거부당한 자격증명은 조용하다. 순서가 거꾸로다.
+
+네트워크 호출은 넣지 않았다 — 이 화면의 계약이다(E-27). 대신 화면이 **모른다고
+말하게** 했다: 두 숫자는 실행이 남긴 파일에서 오는데 그런 실행이 없었으므로
+"'정상'의 근거가 아니다".
+
+### 4. 정직성 — 이 시스템에 실제 회사 업무 데이터는 없다
+
+기록해 둔다. Notion PROJECTS의 Row 8개와 `processed/`의 Event 17건은 **전부**
+Engineering Probe / 테스트 픽스처다(`ENGINEERING_PROBE_*`, `*-VERIFY-*`,
+`fi-*`, `pushfail*`, `MD-D*`). 실제 회사 업무 Event는 하나도 없다. Dashboard의
+"움직인 Project 4"는 그러므로 **회사가 4개 프로젝트를 진행 중이라는 뜻이 아니다.**
+
+같은 방향의 관측 하나 더: `runtime/runs/last_run.json`이 기록한 마지막 실행의
+backup working copy 경로가 **더 이상 존재하지 않는 임시 디렉터리**
+(`.../Temp/tmplsrjeu6v/...`)다. 즉 LAST RUN 블록이 보여 주는 것은 production
+실행이 아니라 probe 실행이고, 화면에는 그렇다는 표시가 없다. 탐지는 넣지 않았다 —
+"Manifest가 probe의 것인지"를 무엇으로 판정할지가 또 하나의 판단이고, 이번에는
+조건만 정확히 적고 남긴다.
+
+### 5. False Positive 하나 — 내가 만들었고 내가 취소했다
+
+E-26의 note 문자열에 em-dash를 넣었다가 probe 콘솔(cp949)에서 `UnicodeEncodeError`가
+났다. `transport._error_detail()`이 *"ASCII separator on purpose"* 라고 적어 둔 것을
+방금 읽은 참이라 결함으로 보였다. **아니었다** — `oplog.append_line()`은
+`encoding="utf-8"`로 열고 `run_company_ops.py`는 stdout을 UTF-8로 강제한다. 깨진
+것은 내 일회용 probe였다. 문자열은 ASCII로 두었지만(그 모듈의 취향에 맞다) **결함으로
+보고하지 않는다.** 게이트도 넣지 않았다 — 이 저장소의 운영자용 문장은 대부분
+한국어이므로 일괄 ASCII 규칙은 틀린 규칙이다.
+
+### 6. 이번 Sprint에서 못 한 것
+
+- **브라우저 실렌더링.** curl로는 200/올바른 한국어/ATTENTION 배지까지 확인했으나,
+  Chrome 확장이 loopback 호스트로의 이동을 허용하지 않아 요청이 서버에 **닿지도
+  않았다**(서버 access log가 그대로인 것으로 확인). Dashboard 결함이 아니라 환경
+  제약이다.
+- **Python 3.9.7 실측.** 이 머신에는 3.13.14뿐이다. 3.9 호환성은 정적으로만
+  판단했다(`from __future__ import annotations`가 전 모듈에 있다).
+
+**Evidence:** 전체 suite 실측 `3892 passed, 8 skipped, 5908 subtests` (0 failed,
+484s). C103 이전 baseline은 `3872 passed`였다.
+
 
 ## C102. 잃은 것을 세는 탐지기 둘 — 하나는 **다른 이름**을 댔고, 하나는 **0**을 답했다
 

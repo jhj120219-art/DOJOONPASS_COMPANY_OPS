@@ -639,6 +639,99 @@ Event의 **작업일** 기준으로 자른다(파일이 도착한 날이 아니�
 
 ---
 
+### 6e. Notion에서 보기 (Control Tower 페이지)
+
+```powershell
+python publish_control_tower.py
+```
+
+Dashboard와 **같은 모델**(`dashboard_server.gather()`)을 Notion 페이지 하나로
+렌더링한다. 6d가 이 머신의 브라우저 한 자리라면, 이것은 워크스페이스를 가진
+사람 전부가 보는 자리다.
+
+읽는 값은 `NOTION_API_TOKEN`과 `NOTION_PROJECTS_DATABASE_ID` 둘뿐이다 —
+`init_notion.py`가 읽는 그 둘이고, 이 도구만의 환경변수는 **없다.**
+
+**어디에 쓰는가 — 세 군데다 (C106).**
+
+| 표면 | 무엇 | 사람이 언제 보는가 |
+|---|---|---|
+| PROJECTS **Database 설명** | 한 문단 요약 + Dashboard 주소 | Notion을 열면 **바로** — 이 Integration이 보는 최상위 객체가 PROJECTS 하나뿐이므로 |
+| PROJECTS **`Notes` 열** | Project별 한 줄 상태(`[CT] ⚠ 18일째 조용함 · Event 1건 · …`) | **표 화면에서 클릭 없이** — 정렬·필터도 된다 |
+| `COMPANY_OPS` Row 안 `Control Tower` **하위 페이지** | 전체 표·패널 + Dashboard 접근법 | 요약이 "가서 보라"고 할 때 |
+| 각 Project **Row 본문** | 그 Project의 Event·Evidence + **전사 Control Tower 링크** | Notion에서 Project를 클릭했을 때 |
+
+세 표면 모두 `dashboard_server.gather()`의 **같은 payload**에서 렌더링되므로
+서로 다른 말을 할 수 없다.
+
+**Row 본문은 원천이 있는 Project만.** Control Tower가 모르는 Row
+(`ENGINEERING_PROBE_*` 등)는 손대지 않는다 — 이 시스템이 만들지 않은 Row에
+"증거 없음"을 적는 것은 남의 데이터에 대한 권한을 주장하는 일이다.
+
+**사람이 쓴 내용은 이깁니다.** Row 본문 첫 줄에 기계가 썼다는 표시를 남기고,
+그 표시가 없는 본문은 **건드리지 않고 Row 이름을 보고한다.** (실측: Row에
+문단을 하나 타이핑하고 실행 → 그 Row는 건너뛰고 메모는 그대로 남았다.)
+Row 안의 하위 페이지도 절대 보관 처리하지 않는다 — 그렇게 하면 Control Tower
+페이지 자체가 함께 사라진다.
+
+**위치를 환경변수로 받지 않는 이유는 두 가지다.**
+Notion API는 workspace를 부모로 하는 페이지 생성을 거부하므로 Integration이 이미
+권한을 가진 페이지 안에만 만들 수 있고(실측: 이 워크스페이스에서 Integration이
+보는 최상위 객체는 PROJECTS Database 하나뿐이다), 붙여넣은 id는 조용히 낡지만
+조회 실패는 어느 Row가 없는지 말해 준다.
+
+**무엇을 만들지 않는가.** Database를 만들지 않고, PROJECTS에 Row를 더하지 않고,
+Event를 쓰지 않는다. 백 번 돌려도 페이지는 하나다 — 제목으로 찾아 본문만 다시
+쓴다(실측: 3회 실행 → 하위 페이지 1개, 블록 51개 고정, PROJECTS Row 8개 불변).
+
+**언제 갱신되는가.** 이 명령을 돌릴 때만. 스스로 갱신되지 않으며, 페이지 맨 위의
+`마지막 갱신`이 그 숫자들이 언제의 것인지 말한다. 예약 실행이 필요하면 Task
+Scheduler에 `run_company_ops.py`와 나란히 등록한다.
+
+| 페이지에 있는 것 | 뜻 |
+|---|---|
+| 상단 콜아웃 | ATTENTION 건수 (= `ops_status.py` exit 3) |
+| `이 화면의 범위` | 마지막 갱신·데이터 기간·읽은 Event 수·증거 범위 |
+| `이 데이터는 실제 업무인가` | **시스템은 구별하지 못한다.** Event Schema에 그 필드가 없다 |
+| `원천 없음` (회색) | 비어 있는 것이 아니라 물어볼 곳이 없다 |
+| `기간 내 Event 없음` | 원천은 있고, 그 기간에 없었다 |
+| `아직 입력되지 않음` | 수집된 Event가 0건이다 |
+| `승인 병목 · 다음 작업` | 자동화하지 않는다. 사람이 BACKLOG.md에 적는 판단이다 |
+| `동기화 상태` | **두 sync를 구분한다** — 이 페이지가 쓰인 시각(사람이 명령 실행)과 Runner의 Notion Sync 상태(PROJECTS Row) |
+
+실행하면 네 줄이 나온다 — `블록 기록/보관`(하위 페이지), `DB 설명 갱신`(글자 수),
+`Notes 열 N건 갱신`, `Project Row N건 갱신`. 건너뛴 Row가 있으면 그 이름과 이유도
+함께 나온다.
+
+**`Notes` 열은 왜 써도 되는가.** docs/04 §43이 자동화하는 Property 11개에 없고,
+§44(COO 판단)·§45(CEO 권한)의 보호 목록에도 없다. 어디에도 배정되지 않은 열이며
+실측상 8개 Row 전부 비어 있었다. 그래도 "배정 안 됨"이 "우리 것"은 아니므로
+`[CT]`로 시작하지 않는 값은 **절대 덮어쓰지 않는다** (실측: COO 메모를 넣고 실행 →
+그 Row만 건너뛰고 메모 그대로, 이름 보고).
+
+**`Date` / `Tags`는 비워 둔다.** docs/13 §5이 정체를 적어 두었다 — PROJECTS는
+Notion 기본 템플릿으로 만들어졌고 `Date`/`Notes`/`Tags` 셋은 그 잔재다("무해").
+docs/04 §8의 11개 계약에도, §44/§45의 보호 목록에도 없다. 그러나 **잔재가 곧
+빈자리는 아니다**: `Date`는 `Last Updated`·`Completed Date`가 이미 나르는 날짜에
+의미 없는 세 번째를 더할 뿐이고, `Tags`는 옵션이 없어 채우려면 스키마를 바꿔야
+하며 그 분류는 `Notes`가 이미 문장으로 말한다. `Notes`만 쓰는 이유가 그것이다.
+
+**"sync"라는 한 단어가 두 가지를 가리킨다.** Runner의 Notion Sync는 PROJECTS
+**Row**에 Event 상태를 쓰고 Runner 일정으로 돈다. 이 페이지의 publish는 **페이지**를
+다시 쓰고 사람이 명령을 실행할 때만 돈다. 앞의 것이 며칠 멈춰 있어도 뒤의 것은
+계속 성공하므로 — 페이지는 완벽하게 렌더되고 그 아래 Row 데이터는 낡는다. 그래서
+`동기화 상태` 절이 두 시각을 **다른 것으로 이름 붙여** 나란히 싣는다.
+
+**Dashboard 주소는 링크가 아니다.** `dashboard_server.py`는 127.0.0.1에만 바인딩하고
+바꿀 수 없으므로, 그 주소는 **서버를 켠 컴퓨터에서만** 열린다. 클릭 가능한 링크로
+넣으면 다른 기기의 모든 독자에게 죽은 링크가 된다 — 그래서 주소와 제약을 나란히
+적는다.
+
+**아무것도 쓰지 않는다 — 자기 페이지만 빼고.** Event도, `runtime/`도, Runner
+lock도, PROJECTS Row도 건드리지 않는다. Runner가 도는 중에 돌려도 안전하다.
+
+---
+
 ## 6b. 늦게 도착한 Event
 
 Desktop이 며칠 꺼져 있다가 켜지면, 이미 Daily Close가 끝난 날짜의 Event를

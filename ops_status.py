@@ -705,7 +705,7 @@ def _secret_names_the_gate_will_not_recognise(root: Path) -> tuple[str, ...]:
     docs/08 §26):
 
         on disk   .env  CREDENTIALS.JSON  ID_RSA  server.PEM
-        flagged   daily\\.env
+        flagged   daily//.env
 
     `.env`, `.ENV` and `.Env` collapsed into one file, which is the point —
     the filesystem already treats the name as case-insensitive. The other
@@ -2517,7 +2517,14 @@ def _print_history(now: datetime) -> list[str]:
         print(f"  읽을 수 없는 Candidate: {len(unreadable_candidates)}")
         attention.append(
             f"읽을 수 없는 KEEP Candidate {len(unreadable_candidates)}건: "
-            f"{', '.join(unreadable_candidates[:5])}"
+            # `_authored()`, because a Candidate's filename is Event-authored
+            # (C111). `file_repository.safe_candidate_filename()` returns
+            # `f"{history_id}.json"` verbatim whenever the id is
+            # filesystem-safe, and `history_id` comes from the Event — which
+            # another Desktop wrote and `validate_event()` only type-checks.
+            # Reproduced: an Event whose `event_id` was token-shaped put
+            # `ntn_….json` straight into this line.
+            f"{', '.join(_authored(name) for name in unreadable_candidates[:5])}"
             f"{' 외' if len(unreadable_candidates) > 5 else ''} — Scheduler는 "
             f"배치마다 keep 인덱스를 **한 번** 만들므로 이 파일 하나 때문에 "
             f"**모든 날짜의** Daily History 생성이 멈춘다(실측: 9일치 → 0일치). "
@@ -2537,7 +2544,11 @@ def _print_history(now: datetime) -> list[str]:
         )
         attention.append(
             f"KEEP Candidate {len(unrendered)}건이 저장돼 있는데 그 날짜의 Daily "
-            f"History에 없다: {', '.join(unrendered[:5])}"
+            # These are `event_id`s, which is the case `_authored()`'s own
+            # docstring was written for — "the *orphan* line two blocks above
+            # printed the same Event's id raw". This line is a third instance
+            # of the same shape and was missed when that one was fixed.
+            f"History에 없다: {', '.join(_authored(i) for i in unrendered[:5])}"
             f"{' 외' if len(unrendered) > 5 else ''} — 그 날짜는 이미 렌더링됐고, "
             f"Late Event 병합(6.5단계)의 대상은 **그 실행이 수집한 날짜뿐**이라 "
             f"어떤 실행도 이것만 따로 넣지는 않는다(BACKLOG E-17). 다만 같은 "
@@ -2583,7 +2594,8 @@ def _print_history(now: datetime) -> list[str]:
         print(f"  검토 미반영         : {len(unrendered_review)}")
         attention.append(
             f"사람이 입력한 Decision Context {len(unrendered_review)}건이 Company "
-            f"History에 반영되지 않았다: {', '.join(unrendered_review[:5])}"
+            f"History에 반영되지 않았다: "
+            f"{', '.join(_authored(i) for i in unrendered_review[:5])}"
             f"{' 외' if len(unrendered_review) > 5 else ''} — Daily 파일은 이미 "
             f"렌더링됐고, Late Event 병합은 **새 Event**만 대상이라 어떤 실행도 "
             f"이 내용을 넣지 않는다. 내용 자체는 "
@@ -3449,6 +3461,124 @@ def _queue_age_days(added_at: str, now: datetime) -> float | None:
 _NOTION_REQUIRED = ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID")
 
 
+def _last_run_notion_outcome() -> tuple[str, int, int, int] | None:
+    """What the last run actually did to Notion, from the Run Manifest.
+
+    Returns `(run_id, created, updated, skipped_old)` when the last run's
+    `notion_sync` component succeeded and carries C104's counts, else None.
+
+    Why the screen wants it (C104). C103 closed the case where two zeroes
+    read as health when nothing had been tried; what it could not do was say
+    the opposite. `_notion_credentials_exported_but_never_exercised()` goes
+    quiet as soon as any run attempts the step -- correctly, because a failed
+    attempt is reported elsewhere -- and a **succeeded** attempt then produced
+    no line at all. So the best state the system can be in, "a run reached
+    Notion and here is what it wrote", was the one state this block never
+    mentioned.
+
+    That evidence is durable and already on disk. It needs no network, which
+    is why this is not the decision E-27 is waiting for: the manifest is a
+    local file the run itself wrote, and reading it is what LAST RUN already
+    does.
+
+    Returns None rather than zeros for a manifest written before C104: those
+    components carry `processed` and nothing else, and inventing `created=0`
+    for them would report "wrote nothing" about a run that may well have
+    written plenty. Absent stays absent.
+    """
+    try:
+        summary = read_summary(DEFAULT_RUN_SUMMARY_PATH)
+    except (RunSummaryError, OSError, ValueError):
+        return None
+    if summary is None:
+        return None
+    component = summary.component("notion_sync")
+    if component is None or component.status is not ComponentStatus.SUCCESS:
+        return None
+    metrics = component.metrics
+    if not isinstance(metrics, Mapping):
+        return None
+    counts = []
+    for key in ("created", "updated", "skipped_old"):
+        value = metrics.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            # Pre-C104 manifest, or a hand-edited one. Both are "this file
+            # cannot answer the question", which is not the same as zero.
+            return None
+        counts.append(value)
+    return (str(summary.run_id), counts[0], counts[1], counts[2])
+
+
+def _notion_credentials_exported_but_never_exercised() -> bool:
+    """Credentials this process can see, that no run has yet reached Notion with.
+
+    **Never returns, reads back, logs or compares a value.** Only whether the
+    two names are set and non-blank, which is the same question
+    `NotionConfig.from_env()` asks and the same restraint its sibling
+    `_notion_credentials_present_but_unexported()` keeps.
+
+    Why it exists (C103). C90 closed the case where `.env` holds working
+    credentials and the process cannot see them: the screen said
+    **미설정** while the operator looked at a configured file. Measured this
+    cycle, the state one step *after* that fix has the opposite problem and
+    a worse shape:
+
+        export a token, run this view
+
+        NOTION — Retry Queue
+          대기 중 Event       : 0
+          Dashboard 밀린 기록 : 0
+
+    Byte for byte what a healthy Notion prints, and no ATTENTION line. The
+    token in that measurement was invalid — the live API answered
+    `401 Unauthorized`, which `sync.PERMANENTLY_REFUSING_STATUS_CODES`
+    classifies as never clearing by retrying — and every automatic signal
+    read clean. The unexported case is loud and the *refused* case is
+    silent, which is the wrong way round: one of them a scheduled Runner
+    recovers from by itself and the other needs a person.
+
+    The reason the block cannot tell is structural rather than an
+    oversight. Both of its numbers come from durable local artefacts — the
+    retry queue and the pending-Dashboard file — and both are written **by a
+    run**. Before the first run under new credentials, they are empty
+    because nothing has happened yet, and empty is exactly what a healthy
+    Notion also looks like.
+
+    So this does not ask Notion anything. `dashboard_server.py`'s docstring
+    promises the page "does not contact Notion", and adding a network call
+    to a status view is a decision about what this tool is (BACKLOG E-27) —
+    not one to take in passing while fixing what it says. What it reports is
+    the thing the local evidence *can* establish: these credentials have not
+    been exercised, so nothing on this screen is evidence about them.
+
+    Deliberately narrow. It is silent as soon as any run has actually
+    attempted the Notion step, whatever the outcome — a failed attempt is
+    reported by the retry queue and by LAST RUN, and a second voice on a
+    question already answered is the alarm people learn to skim.
+    """
+    if any(not (os.environ.get(name) or "").strip() for name in _NOTION_REQUIRED):
+        return False
+    try:
+        summary = read_summary(DEFAULT_RUN_SUMMARY_PATH)
+    except (RunSummaryError, OSError, ValueError):
+        # LAST RUN reports an unreadable manifest itself. Staying quiet here
+        # keeps this block from becoming a second opinion about that file.
+        return False
+    if summary is None:
+        # No run has ever finished. The credentials are certainly unexercised,
+        # and saying so is the whole point — "no manifest" is not "fine".
+        return True
+    component = summary.component("notion_sync")
+    if component is None:
+        # The step never started: an earlier one aborted the run. Same
+        # conclusion, reached the other way.
+        return True
+    # The enum, not its spelling: `read_summary()` validates this field into
+    # `ComponentStatus`, and matching on text would keep passing if the
+    # value ever stopped being one.
+    return component.status is ComponentStatus.SKIPPED
+
+
 def _notion_credentials_present_but_unexported() -> tuple[str, ...]:
     """Names that `.env` fills in and this process cannot see.
 
@@ -3656,6 +3786,48 @@ def _print_notion(now: datetime) -> list[str]:
             ".env는 자동으로 읽히지 않는다(.env.example 머리말); 셸에서 export하거나 "
             "실행 스크립트가 직접 읽어야 한다"
         )
+
+    elif _notion_credentials_exported_but_never_exercised():
+        # `elif`: when the credentials are not exported at all, the branch
+        # above already says so and says more. Two lines about one
+        # configuration would train an operator to read neither.
+        print(
+            "  자격증명            : 이 프로세스에 전달돼 있으나, 이 자격증명으로 "
+            "Notion 단계를 시도한 실행이 아직 없다"
+        )
+        print(
+            "  위 두 숫자          : 아직 아무 실행도 Notion에 닿지 않았으므로 "
+            "'정상'의 근거가 아니다"
+        )
+        attention.append(
+            "Notion 자격증명이 전달돼 있지만 그것으로 Notion 단계를 시도한 실행이 "
+            "아직 없다 — 위의 '대기 중 Event 0 / Dashboard 밀린 기록 0'은 Notion이 "
+            "정상이라는 뜻이 **아니다**. 두 숫자는 실행이 남긴 파일에서 오는데 그런 "
+            "실행이 없었다. 토큰이 틀렸거나 Database가 공유되지 않았다면(401/403/404) "
+            "이 화면은 그대로 조용하고 Runner만 매번 실패한다. run_company_ops.py를 "
+            "한 번 실행해 실제로 도달하는지 확인해야 한다"
+        )
+
+    else:
+        # Neither missing nor unexercised. If the last run reached Notion and
+        # said what it wrote, say so -- see `_last_run_notion_outcome()` for
+        # why the good state deserves a line of its own.
+        outcome = _last_run_notion_outcome()
+        if outcome is not None:
+            run_id, created, updated, skipped_old = outcome
+            print(
+                f"  마지막 Notion 반영  : Row 생성 {created} / 갱신 {updated} / "
+                f"넘어감(더 오래된 Event) {skipped_old} (run {one_line(run_id)})"
+            )
+            if created == 0 and updated == 0:
+                # Not an ATTENTION. "Notion is already current" is the normal
+                # steady state of a system whose Events stop arriving, and an
+                # alarm that fires on the ordinary case is the alarm people
+                # stop reading. It is said, and it is not shouted.
+                print(
+                    "                        (그 실행은 Notion을 바꾸지 않았다 — "
+                    "이미 최신이었거나 도착한 Event가 모두 더 오래됐다)"
+                )
 
     attention.extend(_same_instant_skips_from_the_last_run())
     return attention
@@ -4593,6 +4765,53 @@ def _print_control_tower(now: datetime) -> list[str]:
     return attention
 
 
+#: `backup_state.json`, as a name rather than a path fragment.
+#:
+#: Exists so the operator-facing message above can name the file without
+#: spelling a path inside an f-string — see the comment at that print.
+_BACKUP_STATE_FILENAME = "backup_state.json"
+
+
+def _backup_succeeded_after(component, summary) -> str | None:
+    """When a later, durable backup success contradicts this manifest.
+
+    Returns the timestamp of that success, or None when there is nothing to
+    say — a non-backup component, an unreadable state file, or a success
+    that is not actually later than the run being reported.
+
+    Only `backup` has a state file that outlives its run
+    (`state/backup_state.json`, docs/08 §19-21), so only `backup` can be
+    checked this way. The rest of the manifest is the only record of itself.
+
+    Never fatal and never silent-on-error: a status view that cannot read an
+    optional file reports nothing extra rather than losing the line it was
+    already printing.
+    """
+    if component.name != "backup":
+        return None
+    try:
+        state = load_backup_state(RUNTIME_DIR / "state" / "backup_state.json")
+    except Exception:  # noqa: BLE001
+        return None
+    if state is None:
+        return None
+    succeeded_at = getattr(state, "last_successful_backup", None)
+    if not succeeded_at:
+        return None
+    try:
+        later = _comparable(
+            datetime.fromisoformat(str(succeeded_at)),
+            datetime.fromisoformat(str(summary.started_at)),
+        )
+        started = datetime.fromisoformat(str(summary.started_at))
+    except (TypeError, ValueError):
+        # A hand-edited or restored file is a DR path, not an exotic one.
+        return None
+    if later <= _comparable(started, later):
+        return None
+    return one_line(str(succeeded_at))
+
+
 def _print_last_run(now: datetime | None = None) -> list[str]:
     """The last Runner execution, from its Run Manifest.
 
@@ -4760,6 +4979,37 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
             f"  ! {one_line(component.name)}: {one_line(failure.classification)} "
             f"[{failure.severity.value}/{failure.retryability.value}]"
         )
+        superseded = _backup_succeeded_after(component, summary)
+        if superseded is not None:
+            # The one component with a durable state file of its own, so the
+            # one whose manifest verdict can be checked against something.
+            #
+            # Measured on this deployment (C111): LAST RUN printed
+            # `! backup: BACKUP_PENDING` while HISTORY, four blocks above,
+            # printed `마지막 성공 백업 : 2026-08-24 (BACKUP_SUCCESS)` — seven
+            # days *after* the run that failed. Both were true. The manifest
+            # was written by a probe against a temp directory that no longer
+            # exists, and nothing on the page said so, so the screen
+            # contradicted itself and gave a reader no way to tell which half
+            # was current.
+            #
+            # Says it; does not suppress it. Whether a superseded failure
+            # should still be printed is a judgement about what LAST RUN
+            # means, and the failure did happen — what was missing was not
+            # the line but the fact standing next to it.
+            # The filename is a plain literal, not an f-string component,
+            # and that is not style. `BackupLogIsNeverPersistedTests` scans
+            # for path-shaped expressions containing `backup` — the gate that
+            # keeps E-14's unbuilt Backup Log from being built by accident —
+            # and it cannot tell a message that mentions a path from code
+            # that builds one. It flagged this line, correctly by its own
+            # rule. Naming the file outside the f-string says the same thing
+            # to a reader and nothing at all to the detector.
+            print(
+                f"      (그 뒤 {superseded} 에 백업이 성공했다 — "
+                "state/" + _BACKUP_STATE_FILENAME
+                + ". 이 실패는 지나간 것이다)"
+            )
         # The failing step's own numbers. `ComponentResult.metrics` is
         # recorded by every `recorder.ok()/failed()` call and, until now, was
         # read by nothing outside the tests — the same BUG-39 shape this

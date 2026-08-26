@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -6,7 +7,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from backup.working_copy import sync_to_working_copy  # noqa: E402
+from backup.working_copy import (  # noqa: E402
+    _relative_files,
+    scan_for_secrets,
+    sync_to_working_copy,
+)
 
 
 def _rel(*parts: str) -> str:
@@ -392,6 +397,121 @@ class LongPathBoundaryTests(unittest.TestCase):
         self.assertEqual(
             (working_copy_dir / "daily" / "2026-08-09.md").read_text(encoding="utf-8"), "x"
         )
+
+
+@unittest.skipUnless(sys.platform == "win32", "junctions are an NTFS feature")
+class JunctionsAreNotExcludedFromTheWalkTests(unittest.TestCase):
+    """Characterisation, not endorsement (C113).
+
+    `_relative_files()`'s docstring used to claim "A symlink/junction is
+    excluded even when it resolves to a file". Only the symlink half is
+    true: `Path.is_symlink()` answers **False** for a junction on Windows,
+    so the guard never sees one and `_walk()` descends it.
+
+    None of the exposure is news -- A-19 records junction-following as a
+    Local Master risk, E-21 the Working Copy side, and C70 built
+    `ops_status._junctions_in_scope()` to report it. What was wrong was the
+    sentence, which told a reader the walk already handled what those three
+    entries are open about.
+
+    The walk is deliberately unchanged: excluding junctions is a behaviour
+    change, and a deployment that junctions a directory of Daily History
+    into Local Master would find its backup silently shrink -- the false
+    positive E-15 records as the worse failure. So these tests fix the
+    measurement instead, and fail the day that decision lands.
+
+    Junctions rather than symlinks because a junction needs no privilege:
+    `os.symlink()` raises WinError 1314 on this machine, which is why the
+    symlink E2E tests skip.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.outside = self.root / "outside"
+        self.outside.mkdir()
+        (self.outside / "notes.md").write_text(
+            "# lives outside Local Master\n", encoding="utf-8"
+        )
+        self.master = self.root / "master"
+        (self.master / "daily").mkdir(parents=True)
+        (self.master / "daily" / "2026-08-01.md").write_text("# ok\n", encoding="utf-8")
+
+    def _junction(self, link: Path, target: Path) -> bool:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+        )
+        return result.returncode == 0 and link.exists()
+
+    def test_python_does_not_call_a_junction_a_symlink(self):
+        """The fact the whole thing rests on. If this ever changes, the
+        guard starts working and the tests below should fail."""
+        link = self.master / "daily" / "ext"
+        if not self._junction(link, self.outside):
+            self.skipTest("mklink /J unavailable")
+
+        self.assertFalse(link.is_symlink())
+        self.assertTrue(link.is_dir())
+
+    def test_the_walk_descends_a_junction(self):
+        link = self.master / "daily" / "ext"
+        if not self._junction(link, self.outside):
+            self.skipTest("mklink /J unavailable")
+
+        found = _relative_files(self.master)
+
+        self.assertIn(str(Path("daily") / "2026-08-01.md"), found)
+        self.assertIn(
+            str(Path("daily") / "ext" / "notes.md"),
+            found,
+            "a junction is followed -- pinned as a measurement, not endorsed",
+        )
+
+    def test_a_file_from_outside_reaches_the_working_copy(self):
+        """End to end through the real sync, which is what `git add -A`
+        then pushes."""
+        link = self.master / "daily" / "ext"
+        if not self._junction(link, self.outside):
+            self.skipTest("mklink /J unavailable")
+        working_copy = self.root / "wc"
+        working_copy.mkdir()
+
+        sync_to_working_copy(self.master, working_copy)
+
+        copied = working_copy / "daily" / "ext" / "notes.md"
+        self.assertTrue(copied.is_file())
+        self.assertIn("outside Local Master", copied.read_text(encoding="utf-8"))
+
+    def test_the_secret_gate_cannot_see_through_it(self):
+        """`scan_for_secrets()` matches filenames. The file that came
+        through was called `notes.md`, so the gate says nothing -- which is
+        correct behaviour for a filename matcher and exactly why the
+        detector C70 built reports the junction itself instead."""
+        link = self.master / "daily" / "ext"
+        if not self._junction(link, self.outside):
+            self.skipTest("mklink /J unavailable")
+        (self.outside / "notes.md").write_text(
+            "API_KEY=not-a-real-secret\n", encoding="utf-8"
+        )
+        working_copy = self.root / "wc"
+        working_copy.mkdir()
+        sync_to_working_copy(self.master, working_copy)
+
+        self.assertEqual(scan_for_secrets(self.master), ())
+        self.assertEqual(scan_for_secrets(working_copy), ())
+
+    def test_the_docstring_no_longer_claims_junctions_are_excluded(self):
+        """The half C113 did fix. A docstring that says the guard covers a
+        case it does not is worse than no docstring: it stops the next
+        reader from checking."""
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "backup" / "working_copy.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("A symlink/junction is excluded", source)
+        self.assertIn("A **directory junction is not**", source)
 
 
 if __name__ == "__main__":

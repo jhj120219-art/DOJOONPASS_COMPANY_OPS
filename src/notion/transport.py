@@ -14,12 +14,21 @@ import abc
 import json
 import urllib.error
 import urllib.request
-from typing import Any, Mapping
+from datetime import datetime
+from typing import Any, Mapping, Sequence
 
 from .properties import RICH_TEXT_LIMIT
 
 NOTION_API_BASE_URL = "https://api.notion.com/v1"
 NOTION_API_VERSION = "2022-06-28"
+
+#: How many cursor pages `list_block_children()` will follow.
+#:
+#: A page body this tool renders is a few dozen blocks, so one request
+#: covers it. The bound exists for the same reason `list_pages()` has
+#: one: a server that keeps answering `has_more` must not turn a status
+#: refresh into an unbounded loop.
+_MAX_BLOCK_PAGES = 20
 
 
 class NotionAPIError(Exception):
@@ -94,6 +103,88 @@ class NotionTransport(abc.ABC):
         Bootstrap) — ExecutionPlanSync never calls this."""
         raise NotImplementedError
 
+    # ------------------------------------------------------------- blocks
+    #
+    # Everything above this line moves *properties* -- the columns of a
+    # database row. These four move a page's **body**, which is the only
+    # part of Notion a person reads as a page rather than as a table.
+    #
+    # Why they are not abstract: every existing NotionTransport double
+    # predates them, and a page body is a capability rather than a
+    # requirement (`ExecutionPlanSync` will never call one). A transport
+    # that cannot do blocks inherits "I cannot", which the caller reports
+    # rather than crashes on -- the same shape `search_pages()` already has
+    # and for the same reason.
+
+    def retrieve_page(self, page_id: str) -> Mapping[str, Any]:
+        """One page, by id — for the `url` Notion assigns it.
+
+        `create_child_page()` hands the url back on creation and never
+        again, so a tool that re-renders an existing page has no way to
+        link to it. Constructing the address from the id works today and is
+        a guess about Notion's URL format; asking is not.
+        """
+        raise NotImplementedError("this transport cannot retrieve a page")
+
+    def set_database_description(
+        self, database_id: str, rich_text: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        """Replace a database's description — the paragraph Notion shows
+        directly under the database title.
+
+        Separate from `update_database()`, which sends `properties` and
+        means *schema*. These are different fields of the same PATCH and
+        conflating them would let a caller that meant to write one sentence
+        redefine a column.
+
+        Measured on the live API: `description` is a rich-text array, each
+        item capped at 2,000 characters like every other rich text, and
+        several items concatenate. It is the highest-visibility surface this
+        integration has — on a workspace where the only object shared with
+        it is one database, the description is the first thing a person
+        reads when they open Notion at all.
+        """
+        raise NotImplementedError("this transport cannot set a database description")
+
+    def create_child_page(
+        self,
+        parent_page_id: str,
+        title: str,
+        children: Sequence[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]:
+        """A new page nested inside an existing **page** (not a database).
+
+        Distinct from `create_page()`, which creates a database *row*, and
+        from `create_database()`. Notion's API refuses a `workspace` parent
+        for page creation, so the only pages this can create are children of
+        a page the integration has already been given access to.
+        """
+        raise NotImplementedError("this transport cannot create a child page")
+
+    def list_block_children(
+        self, block_id: str, *, page_size: int = 100
+    ) -> list[Mapping[str, Any]]:
+        """The blocks directly inside a page or block (read-only)."""
+        raise NotImplementedError("this transport cannot list block children")
+
+    def append_block_children(
+        self, block_id: str, children: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        """Append blocks to the end of a page or block."""
+        raise NotImplementedError("this transport cannot append block children")
+
+    def delete_block(self, block_id: str) -> Mapping[str, Any]:
+        """Archive one block.
+
+        Notion has no "replace the body" call, so a page whose content is
+        re-rendered must have its old blocks archived one at a time. Named
+        `delete` because that is the HTTP verb; Notion *archives*, and an
+        archived block is recoverable from the page's history -- which is
+        why re-rendering a page this tool wrote is an update rather than a
+        destruction.
+        """
+        raise NotImplementedError("this transport cannot delete a block")
+
     def search_pages(self) -> list[Mapping[str, Any]]:
         """Pages this integration can actually see (read-only).
 
@@ -165,6 +256,10 @@ class RealNotionTransport(NotionTransport):
         # while a caller that reconciles against a truncated *listing* would
         # retire every row it did not see.
         self.list_truncated = False
+        # Same flag for `list_block_children()`. It carries the weight
+        # `list_truncated` does: a re-render that did not see every
+        # existing block leaves those behind and the page doubles.
+        self.block_children_truncated = False
 
     def _request(
         self, method: str, path: str, body: Mapping[str, Any] | None = None
@@ -318,6 +413,71 @@ class RealNotionTransport(NotionTransport):
     # by `search_truncated` rather than hidden.
     _SEARCH_PAGE_LIMIT = 10
 
+    def retrieve_page(self, page_id: str) -> Mapping[str, Any]:
+        return self._request("GET", f"/pages/{page_id}")
+
+    def set_database_description(
+        self, database_id: str, rich_text: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        return self._request(
+            "PATCH", f"/databases/{database_id}", {"description": list(rich_text)}
+        )
+
+    def create_child_page(
+        self,
+        parent_page_id: str,
+        title: str,
+        children: Sequence[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]:
+        body: dict[str, Any] = {
+            "parent": {"type": "page_id", "page_id": parent_page_id},
+            "properties": {
+                "title": [{"type": "text", "text": {"content": title}}]
+            },
+        }
+        if children:
+            body["children"] = list(children)
+        return self._request("POST", "/pages", body)
+
+    def list_block_children(
+        self, block_id: str, *, page_size: int = 100
+    ) -> list[Mapping[str, Any]]:
+        """Every direct child, following Notion's cursor to the end.
+
+        Paged rather than one request, for `list_pages()`'s reason: a caller
+        that re-renders a page from a truncated listing leaves the blocks it
+        never saw behind, and the page grows a second copy of itself every
+        run.
+        """
+        results: list[Mapping[str, Any]] = []
+        cursor: str | None = None
+        # Bounded like `list_pages()`: a body this tool wrote is a few dozen
+        # blocks, and a runaway cursor must not become an unbounded loop.
+        for _ in range(_MAX_BLOCK_PAGES):
+            path = f"/blocks/{block_id}/children?page_size={int(page_size)}"
+            if cursor:
+                path += f"&start_cursor={cursor}"
+            response = self._request("GET", path)
+            results.extend(response.get("results") or [])
+            if not response.get("has_more"):
+                self.block_children_truncated = False
+                return results
+            cursor = response.get("next_cursor")
+            if not cursor:
+                break
+        self.block_children_truncated = True
+        return results
+
+    def append_block_children(
+        self, block_id: str, children: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        return self._request(
+            "PATCH", f"/blocks/{block_id}/children", {"children": list(children)}
+        )
+
+    def delete_block(self, block_id: str) -> Mapping[str, Any]:
+        return self._request("DELETE", f"/blocks/{block_id}")
+
     def search_pages(self) -> list[Mapping[str, Any]]:
         results: list[Mapping[str, Any]] = []
         cursor: str | None = None
@@ -466,6 +626,23 @@ class InMemoryNotionTransport(NotionTransport):
         # name "Name") — callers that want to simulate that pass
         # initial_properties={"Name": {"title": {}}}.
         self._schema_properties: dict[str, Any] = dict(initial_properties or {})
+        # Page bodies, keyed by the page/block whose children they are.
+        # Notion keeps a page's *properties* and its *body* in different
+        # places and reaches them through different endpoints; a double that
+        # merged them would let a test pass that the API refuses.
+        self._block_children: dict[str, list[dict[str, Any]]] = {}
+        # Child pages created with `create_child_page()`: id -> title. Kept
+        # apart from `_pages` because these are not database rows and
+        # `query_database()` must never answer with one.
+        self.child_pages: dict[str, str] = {}
+        self._next_block_id = 1
+        self.block_children_truncated = False
+        # What `delete_block()` archived, so a test can assert that a
+        # re-render replaced a body rather than quietly losing it.
+        self.archived_blocks: list[dict[str, Any]] = []
+        # The database description, as `set_database_description()` left
+        # it. Empty is what a real, untouched database reports.
+        self.database_description: list[dict[str, Any]] = []
 
     def _maybe_fail(self, method_name: str) -> None:
         if self.fail_next_method == method_name:
@@ -482,6 +659,10 @@ class InMemoryNotionTransport(NotionTransport):
             "id": database_id,
             "parent": dict(self._parent),
             "properties": dict(self._schema_properties),
+            # Present and empty on an untouched database, which is what the
+            # live API returns — not absent. A caller that distinguishes
+            # "no description" from "cannot tell" needs the difference.
+            "description": [dict(item) for item in self.database_description],
         }
 
     def update_database(
@@ -570,6 +751,53 @@ class InMemoryNotionTransport(NotionTransport):
                             status_code=400,
                         )
 
+    @staticmethod
+    def _floor_dates_to_the_minute(properties: Mapping[str, Any]) -> dict[str, Any]:
+        """Notion's `date` resolution, applied the way the API applies it.
+
+        Measured against the live API on 2026-08-26: a request carrying
+        `{"date": {"start": "2026-08-26T09:54:40+09:00"}}` reads back as
+        `2026-08-26T09:54:00.000+09:00`. Seconds are **floored**, not
+        rounded, and no error is raised — the caller is simply told
+        something different from what it sent.
+
+        This double kept the seconds, and that is the same class of
+        infidelity this class's own docstring names for `rich_text`: a
+        double which *keeps* what Notion discards hides every defect that
+        depends on the discarding. It hid one — `sync._update()`'s Late
+        Event guard compares the incoming Event against the value read
+        *back*, so inside one wall-clock minute an older Event overwrote
+        Current State, and all of docs §57-65's Mock Tests passed anyway
+        because here the comparison had seconds to work with.
+
+        Best effort by design: a value this cannot parse is passed through
+        untouched. Notion accepts date-only strings and humans write them
+        (docs/04 §43), and refusing one here would invent a failure the
+        real API does not have.
+        """
+        floored: dict[str, Any] = {}
+        for name, value in properties.items():
+            if not isinstance(value, Mapping) or "date" not in value:
+                floored[name] = value
+                continue
+            date_value = value.get("date")
+            if not isinstance(date_value, Mapping) or not date_value.get("start"):
+                floored[name] = value
+                continue
+            start = date_value["start"]
+            try:
+                parsed = datetime.fromisoformat(start)
+            except (TypeError, ValueError):
+                floored[name] = value
+                continue
+            if parsed.second == 0 and parsed.microsecond == 0:
+                floored[name] = value
+                continue
+            replaced = dict(date_value)
+            replaced["start"] = parsed.replace(second=0, microsecond=0).isoformat()
+            floored[name] = {**value, "date": replaced}
+        return floored
+
     def create_page(
         self, database_id: str, properties: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -577,7 +805,7 @@ class InMemoryNotionTransport(NotionTransport):
         self._refuse_over_long_text(properties)
         page_id = f"mock-page-{self._next_id}"
         self._next_id += 1
-        page = {"id": page_id, "properties": dict(properties)}
+        page = {"id": page_id, "properties": self._floor_dates_to_the_minute(properties)}
         self._pages[page_id] = page
         self._page_database[page_id] = database_id
         return page
@@ -589,8 +817,119 @@ class InMemoryNotionTransport(NotionTransport):
         self._refuse_over_long_text(properties)
         if page_id not in self._pages:
             raise NotionAPIError(f"unknown page_id: {page_id}", status_code=404)
-        self._pages[page_id]["properties"].update(properties)
+        self._pages[page_id]["properties"].update(
+            self._floor_dates_to_the_minute(properties)
+        )
         return self._pages[page_id]
+
+    def retrieve_page(self, page_id: str) -> Mapping[str, Any]:
+        self._maybe_fail("retrieve_page")
+        if page_id in self.child_pages:
+            return {
+                "object": "page",
+                "id": page_id,
+                "url": f"https://notion.example/{page_id}",
+            }
+        if page_id in self._pages:
+            return dict(self._pages[page_id])
+        raise NotionAPIError(f"unknown page_id: {page_id}", status_code=404)
+
+    def set_database_description(
+        self, database_id: str, rich_text: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        self._maybe_fail("set_database_description")
+        # The same 2,000-character refusal the real API gives, for the
+        # reason this class's docstring already states about `rich_text`: a
+        # double that accepts what Notion refuses is how an unbounded string
+        # reaches production.
+        for item in rich_text:
+            content = (item.get("text") or {}).get("content") or ""
+            if len(content) > RICH_TEXT_LIMIT:
+                raise NotionAPIError(
+                    "body failed validation: "
+                    f"body.description[0].text.content.length should be \u2264 "
+                    f"{RICH_TEXT_LIMIT}, instead was {len(content)}.",
+                    status_code=400,
+                )
+        self.database_description = [dict(item) for item in rich_text]
+        return self.retrieve_database(database_id)
+
+    def create_child_page(
+        self,
+        parent_page_id: str,
+        title: str,
+        children: Sequence[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]:
+        self._maybe_fail("create_child_page")
+        page_id = f"mock-child-{len(self.child_pages) + 1}"
+        self.child_pages[page_id] = title
+        self._block_children.setdefault(parent_page_id, []).append(
+            {
+                "object": "block",
+                "id": page_id,
+                "type": "child_page",
+                "child_page": {"title": title},
+            }
+        )
+        # Ids assigned here, not stored raw. Notion gives every block an id
+        # the moment it exists, and a caller that later re-renders the page
+        # reads `block["id"]` to archive it. The double stored the children
+        # exactly as handed in -- no id -- so a re-render raised `KeyError`
+        # against the double while working perfectly against the real API.
+        # Same class of infidelity as the `rich_text` cap and the date
+        # flooring this class already documents: a double that keeps less
+        # than the API does cannot fail the way production fails, and here
+        # it failed a way production does not.
+        self._block_children[page_id] = []
+        self.append_block_children(page_id, children)
+        return {
+            "object": "page",
+            "id": page_id,
+            "parent": {"type": "page_id", "page_id": parent_page_id},
+            "url": f"https://notion.example/{page_id}",
+            "properties": {
+                "title": {
+                    "type": "title",
+                    "title": [{"type": "text", "plain_text": title,
+                               "text": {"content": title}}],
+                }
+            },
+        }
+
+    def list_block_children(
+        self, block_id: str, *, page_size: int = 100
+    ) -> list[Mapping[str, Any]]:
+        self._maybe_fail("list_block_children")
+        return [dict(b) for b in self._block_children.get(block_id, [])]
+
+    def append_block_children(
+        self, block_id: str, children: Sequence[Mapping[str, Any]]
+    ) -> Mapping[str, Any]:
+        self._maybe_fail("append_block_children")
+        bucket = self._block_children.setdefault(block_id, [])
+        added = []
+        for child in children:
+            stored = dict(child)
+            stored.setdefault("object", "block")
+            stored["id"] = f"mock-block-{self._next_block_id}"
+            self._next_block_id += 1
+            bucket.append(stored)
+            added.append(stored)
+        return {"object": "list", "results": added}
+
+    def delete_block(self, block_id: str) -> Mapping[str, Any]:
+        """Archive, the way Notion archives: the block leaves its parent's
+        children and is not destroyed. A double that dropped it entirely
+        would make an over-eager re-render look lossless."""
+        self._maybe_fail("delete_block")
+        for parent, bucket in self._block_children.items():
+            for index, block in enumerate(bucket):
+                if block.get("id") == block_id:
+                    removed = bucket.pop(index)
+                    removed["archived"] = True
+                    self.archived_blocks.append(removed)
+                    return removed
+        raise NotionAPIError(f"unknown block_id: {block_id}", status_code=404)
 
     def search_pages(self) -> list[Mapping[str, Any]]:
         self._maybe_fail("search_pages")

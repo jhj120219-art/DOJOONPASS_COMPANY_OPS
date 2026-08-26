@@ -717,6 +717,11 @@ class EnvironmentContractTests(unittest.TestCase):
         # nothing checked against `.env.example` — which is the gap C80
         # closed for the two rosters below and the same gap in this one.
         "dashboard_server.py",
+        # C105. Reads the same two `NOTION_*` variables `init_notion.py`
+        # does and declares no variable of its own — deliberately: where the
+        # page goes is discovered from PROJECTS rather than pasted into a
+        # file (see its module docstring).
+        "publish_control_tower.py",
     )
 
     def _declared_variables(self) -> set[str]:
@@ -947,14 +952,26 @@ class EnvironmentContractTests(unittest.TestCase):
 
     def test_each_entrypoint_advertises_the_variables_it_needs(self):
         """Specific enough to fail on the exact regression that was found:
-        the two Notion tools have to name the two Notion variables."""
+        every Notion tool has to name the two Notion variables.
+
+        The set is spelled out rather than derived, which is the point: it
+        fails when a tool starts or stops reading them, and a person then
+        decides whether that was intended. C105 added the third member —
+        `publish_control_tower.py`, which reads the same two and declares
+        none of its own, because where its page goes is discovered from
+        PROJECTS rather than pasted into a file.
+        """
         advertised = self._advertised_variables()
 
         for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID"):
             with self.subTest(variable=name):
                 self.assertEqual(
                     advertised.get(name),
-                    {"init_notion.py", "run_company_ops.py"},
+                    {
+                        "init_notion.py",
+                        "run_company_ops.py",
+                        "publish_control_tower.py",
+                    },
                 )
         self.assertIn("run_company_ops.py", advertised["COMPANY_OPS_HISTORY_START_DATE"])
         self.assertIn("run_agent.py", advertised["COMPANY_OPS_PROFILE"])
@@ -1115,6 +1132,7 @@ class EntrypointOutputOrderingTests(unittest.TestCase):
                 "init_notion.py",
                 "ops_status.py",
                 "dashboard_server.py",
+                "publish_control_tower.py",
                 "src/review_cli.py",
             },
         )
@@ -2703,6 +2721,7 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
                 "init_notion.py",
                 "ops_status.py",
                 "dashboard_server.py",
+                "publish_control_tower.py",
                 "src/review_cli.py",
             },
         )

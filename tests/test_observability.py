@@ -9,6 +9,7 @@ about them, and what is pinned here:
     "needs attention" fires on real trouble and stays quiet otherwise
 """
 
+import ast
 import contextlib
 import io
 import json
@@ -9959,6 +9960,15 @@ class SameInstantSkipReachesTheOperatorTests(unittest.TestCase):
     def _module(self, runtime):
         import importlib.util
 
+        # Same reason as `NotionQueueVisibilityTests` (C111): the NOTION
+        # block reads `os.environ` for its credential lines, so a test that
+        # asserts on that block must pin them or it is also asserting on the
+        # shell that started pytest.
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
+                     "NOTION_OPS_RUNS_DATABASE_ID"):
+            os.environ.pop(name, None)
+
         path = Path(__file__).resolve().parents[1] / "ops_status.py"
         spec = importlib.util.spec_from_file_location("ops_status_e23", path)
         module = importlib.util.module_from_spec(spec)
@@ -10064,6 +10074,14 @@ class SameInstantSkipEndToEndTests(unittest.TestCase):
     """
 
     def setUp(self):
+        # Same reason as `NotionQueueVisibilityTests` (C111): this test drives
+        # a real Runner and then renders the NOTION block, which reads
+        # `os.environ` for its credential lines. Unpinned, it would also be
+        # asserting on the shell that started pytest.
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
+                     "NOTION_OPS_RUNS_DATABASE_ID"):
+            os.environ.pop(name, None)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
@@ -11913,6 +11931,21 @@ class NotionQueueVisibilityTests(unittest.TestCase):
     def _load(self, runtime_dir: Path):
         import importlib.util
 
+        # The NOTION block's credential lines read `os.environ` (C103/C104),
+        # so this block's text depends on the ambient environment unless a
+        # test pins it. Measured (C111): with `NOTION_API_TOKEN` and
+        # `NOTION_PROJECTS_DATABASE_ID` exported — which is exactly what
+        # `.env.example`, `AGENT.md` and this tool's own ATTENTION line tell
+        # an operator to do — eight tests in this file failed. The suite had
+        # only ever been run with them unset.
+        #
+        # Cleared rather than set: these classes are about the queue, and a
+        # test that asserts on queue text must not also be asserting on which
+        # credentials happen to be in the shell that started pytest.
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
+                     "NOTION_OPS_RUNS_DATABASE_ID"):
+            os.environ.pop(name, None)
         path = Path(__file__).resolve().parents[1] / "ops_status.py"
         spec = importlib.util.spec_from_file_location("ops_status_notion_queue", path)
         module = importlib.util.module_from_spec(spec)
@@ -12528,6 +12561,21 @@ class WrittenAndNeverReadFieldTests(unittest.TestCase):
     def _load_status(self, runtime_dir=None):
         import importlib.util
 
+        # The NOTION block's credential lines read `os.environ` (C103/C104),
+        # so this block's text depends on the ambient environment unless a
+        # test pins it. Measured (C111): with `NOTION_API_TOKEN` and
+        # `NOTION_PROJECTS_DATABASE_ID` exported — which is exactly what
+        # `.env.example`, `AGENT.md` and this tool's own ATTENTION line tell
+        # an operator to do — eight tests in this file failed. The suite had
+        # only ever been run with them unset.
+        #
+        # Cleared rather than set: these classes are about the queue, and a
+        # test that asserts on queue text must not also be asserting on which
+        # credentials happen to be in the shell that started pytest.
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
+                     "NOTION_OPS_RUNS_DATABASE_ID"):
+            os.environ.pop(name, None)
         path = Path(__file__).resolve().parents[1] / "ops_status.py"
         spec = importlib.util.spec_from_file_location("ops_status_unread", path)
         module = importlib.util.module_from_spec(spec)
@@ -15831,6 +15879,724 @@ class TwoProjectsUnderOneHistoryHeadingTests(unittest.TestCase):
         self.assertNotIn("title", called)
         self.assertNotIn("casefold", called)
 
+
+
+class ExportedCredentialsAreNotEvidenceOfAReachableNotionTests(unittest.TestCase):
+    """C103: the state one step after C90's fix, and it reads cleaner.
+
+    C90 closed "`.env` is configured and this process cannot see it" -- the
+    screen said 미설정 to an operator looking at a filled file. Export the
+    two variables and the NOTION block becomes:
+
+        NOTION -- Retry Queue
+          대기 중 Event       : 0
+          Dashboard 밀린 기록 : 0
+
+    with no ATTENTION line. Measured this cycle against the live API, that
+    is byte for byte what an **invalid** token also prints: the request
+    answered `401 Unauthorized`, which
+    `sync.PERMANENTLY_REFUSING_STATUS_CODES` classifies as never clearing by
+    retrying, and every automatic signal read healthy.
+
+    The block cannot tell, and the reason is structural: both of its numbers
+    come from files a *run* writes, so before the first run under new
+    credentials they are empty because nothing has happened -- which is also
+    what healthy looks like. So the fix is not a verdict about Notion. It is
+    the view refusing to let two zeroes stand as evidence for a question
+    they cannot answer.
+    """
+
+    MANIFEST = {
+        "schema_version": "1.0",
+        "run_id": "2026-08-20T09:00:00+09:00",
+        "started_at": "2026-08-20T09:00:00+09:00",
+        "finished_at": "2026-08-20T09:00:01+09:00",
+        "overall_status": "SUCCESS",
+        "exit_code": 0,
+        "components": [],
+    }
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_cred_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _with_manifest(self, module, components):
+        """Point the module at a manifest holding exactly `components`.
+
+        `None` means "no manifest file at all", which is a distinct state:
+        no run has ever finished, so the credentials are certainly
+        unexercised.
+        """
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        (root / "runtime" / "runs").mkdir(parents=True)
+        path = root / "runtime" / "runs" / "last_run.json"
+        if components is not None:
+            data = dict(self.MANIFEST, components=components)
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        module.DEFAULT_RUN_SUMMARY_PATH = path
+        return module
+
+    EXPORTED = {
+        "NOTION_API_TOKEN": "ntn_" + "A" * 24,
+        "NOTION_PROJECTS_DATABASE_ID": "b" * 32,
+    }
+
+    @staticmethod
+    def _component(status):
+        return {
+            "name": "notion_sync",
+            "status": status,
+            "metrics": {},
+            "artifact_refs": ["logs/notion_sync.log"],
+        }
+
+    def _ask(self, env, components):
+        module = self._with_manifest(self._module(), components)
+        with mock.patch.dict(module.os.environ, env, clear=True):
+            return module._notion_credentials_exported_but_never_exercised()
+
+    def test_exported_credentials_with_a_skipped_notion_step_are_reported(self):
+        """The measured case. The step was skipped because *earlier* runs had
+        no credentials; these ones have never been tried."""
+        self.assertTrue(self._ask(self.EXPORTED, [self._component("SKIPPED")]))
+
+    def test_no_manifest_at_all_is_reported_rather_than_treated_as_fine(self):
+        self.assertTrue(self._ask(self.EXPORTED, None))
+
+    def test_a_run_whose_notion_step_never_started_is_reported(self):
+        """An earlier component aborted the run, so the component is absent
+        from the manifest entirely -- same conclusion, reached the other
+        way."""
+        self.assertTrue(self._ask(self.EXPORTED, []))
+
+    def test_a_run_that_reached_notion_successfully_silences_this(self):
+        """The control. These credentials demonstrably work; a warning here
+        would be the alarm that never clears."""
+        self.assertFalse(self._ask(self.EXPORTED, [self._component("SUCCESS")]))
+
+    def test_a_run_that_reached_notion_and_failed_also_silences_this(self):
+        """Deliberate. A failed attempt is already reported -- by the retry
+        queue above and by LAST RUN below -- and this line only ever claimed
+        that *nothing had been tried*. Repeating a problem the screen states
+        elsewhere is how a page teaches people to skim it."""
+        self.assertFalse(self._ask(self.EXPORTED, [self._component("FAILED")]))
+
+    def test_unexported_credentials_are_left_to_the_other_detector(self):
+        """`_notion_credentials_present_but_unexported()` says more about
+        that state, including what to type. Two lines about one
+        configuration is worse than one."""
+        self.assertFalse(self._ask({}, [self._component("SKIPPED")]))
+
+    def test_a_blank_exported_value_is_not_a_credential(self):
+        """The same rule `NotionConfig.from_env()` applies: whitespace is
+        absence with an invisible character."""
+        blank = {"NOTION_API_TOKEN": "   ", "NOTION_PROJECTS_DATABASE_ID": "b" * 32}
+        self.assertFalse(self._ask(blank, [self._component("SKIPPED")]))
+
+    def test_it_never_handles_the_value_only_its_presence(self):
+        """The rule this function shares with its sibling: it reads the one
+        environment that holds a real credential and must never carry one
+        out. It returns a bool, which is the strongest possible form of that
+        guarantee -- pinned so a later 'helpful' widening to return names or
+        values fails here."""
+        module = self._with_manifest(self._module(), [self._component("SKIPPED")])
+        secret = "ntn_" + "Z" * 40
+        with mock.patch.dict(
+            module.os.environ,
+            {"NOTION_API_TOKEN": secret, "NOTION_PROJECTS_DATABASE_ID": "b" * 32},
+            clear=True,
+        ):
+            result = module._notion_credentials_exported_but_never_exercised()
+
+        self.assertIsInstance(result, bool)
+        self.assertNotIn(secret, repr(result))
+
+    def test_the_block_disclaims_its_own_two_zeroes(self):
+        """End to end through the printed block, because the defect was not
+        in a predicate -- it was in what a person reads. The two numbers
+        stay (they are true), and the line that says they are not evidence
+        is what was missing."""
+        module = self._with_manifest(self._module(), [self._component("SKIPPED")])
+        (module.RUNTIME_DIR / "state").mkdir(parents=True, exist_ok=True)
+        buffer = io.StringIO()
+        with mock.patch.dict(module.os.environ, self.EXPORTED, clear=True):
+            with contextlib.redirect_stdout(buffer):
+                attention = module._print_notion(
+                    datetime(2026, 8, 26, tzinfo=timezone(timedelta(hours=9)))
+                )
+
+        printed = buffer.getvalue()
+        self.assertIn("대기 중 Event       : 0", printed)
+        self.assertIn("시도한 실행이 아직 없다", printed)
+        self.assertIn("'정상'의 근거가 아니다", printed)
+        self.assertTrue(
+            any("Notion 자격증명이 전달돼 있지만" in line for line in attention),
+            f"the state must reach ATTENTION, got: {attention}",
+        )
+
+    def test_a_working_notion_leaves_the_block_exactly_as_it_was(self):
+        """The regression guard for everyone whose Notion is fine."""
+        module = self._with_manifest(self._module(), [self._component("SUCCESS")])
+        (module.RUNTIME_DIR / "state").mkdir(parents=True, exist_ok=True)
+        buffer = io.StringIO()
+        with mock.patch.dict(module.os.environ, self.EXPORTED, clear=True):
+            with contextlib.redirect_stdout(buffer):
+                attention = module._print_notion(
+                    datetime(2026, 8, 26, tzinfo=timezone(timedelta(hours=9)))
+                )
+
+        printed = buffer.getvalue()
+        self.assertNotIn("자격증명", printed)
+        self.assertEqual(
+            [a for a in attention if "자격증명" in a],
+            [],
+            "a healthy Notion must produce no credential line at all",
+        )
+
+
+class TheScreenCanSayNotionWasReachedTests(unittest.TestCase):
+    """C104: C103 taught the block to doubt; this teaches it to confirm.
+
+    `_notion_credentials_exported_but_never_exercised()` goes quiet the
+    moment any run attempts the Notion step -- deliberately, because a failed
+    attempt is already reported by the retry queue and by LAST RUN. What was
+    left over is that a **succeeded** attempt produced no line either. So the
+    best state the system can be in -- a run reached Notion, and here is what
+    it wrote -- was the one state the NOTION block never mentioned, and an
+    operator asking "is this thing working?" got the same silence either way.
+
+    The evidence is a local file the run itself wrote, so this is not the
+    network call E-27 is waiting on. Measured through the real Runner against
+    the live PROJECTS database:
+
+        notion_sync SUCCESS {"processed": 16, "created": 0,
+                             "updated": 0, "skipped_old": 16}
+    """
+
+    BASE = {
+        "schema_version": "1.0",
+        "run_id": "2026-08-26T10:53:38+09:00",
+        "started_at": "2026-08-26T10:53:38+09:00",
+        "finished_at": "2026-08-26T10:53:40+09:00",
+        "overall_status": "SUCCESS",
+        "exit_code": 0,
+        "components": [],
+    }
+
+    EXPORTED = {
+        "NOTION_API_TOKEN": "ntn_" + "A" * 24,
+        "NOTION_PROJECTS_DATABASE_ID": "b" * 32,
+    }
+
+    def _module(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_outcome_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _with(self, component):
+        module = self._module()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        module.RUNTIME_DIR = root / "runtime"
+        (root / "runtime" / "runs").mkdir(parents=True)
+        (root / "runtime" / "state").mkdir(parents=True, exist_ok=True)
+        path = root / "runtime" / "runs" / "last_run.json"
+        if component is not None:
+            data = dict(self.BASE, components=[component])
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        module.DEFAULT_RUN_SUMMARY_PATH = path
+        return module
+
+    @staticmethod
+    def _notion(status, **metrics):
+        return {
+            "name": "notion_sync",
+            "status": status,
+            "metrics": metrics,
+            "artifact_refs": ["logs/notion_sync.log"],
+        }
+
+    def _render(self, module):
+        buffer = io.StringIO()
+        with mock.patch.dict(module.os.environ, self.EXPORTED, clear=True):
+            with contextlib.redirect_stdout(buffer):
+                attention = module._print_notion(
+                    datetime(2026, 8, 26, tzinfo=timezone(timedelta(hours=9)))
+                )
+        return buffer.getvalue(), attention
+
+    def test_a_run_that_reached_notion_and_changed_nothing_says_both(self):
+        """The measured case. "Reached" and "changed nothing" are different
+        facts and the line must carry both -- reporting only the second reads
+        as a failure, only the first as an update that did not happen."""
+        module = self._with(
+            self._notion("SUCCESS", processed=16, created=0, updated=0, skipped_old=16)
+        )
+
+        printed, attention = self._render(module)
+
+        self.assertIn("마지막 Notion 반영", printed)
+        self.assertIn("생성 0", printed)
+        self.assertIn("갱신 0", printed)
+        self.assertIn("넘어감(더 오래된 Event) 16", printed)
+        self.assertIn("Notion을 바꾸지 않았다", printed)
+        self.assertEqual(
+            attention, [], "the ordinary steady state must not raise an alarm"
+        )
+
+    def test_a_run_that_wrote_rows_omits_the_changed_nothing_note(self):
+        module = self._with(
+            self._notion("SUCCESS", processed=3, created=1, updated=2, skipped_old=0)
+        )
+
+        printed, attention = self._render(module)
+
+        self.assertIn("생성 1", printed)
+        self.assertIn("갱신 2", printed)
+        self.assertNotIn("바꾸지 않았다", printed)
+        self.assertEqual(attention, [])
+
+    def test_a_pre_c104_manifest_is_absent_not_zero(self):
+        """A manifest written before the counts existed carries `processed`
+        and nothing else. Reporting `created=0` for it would say "wrote
+        nothing" about a run that may have written plenty -- which is a
+        stronger and more wrong claim than saying nothing."""
+        module = self._with(self._notion("SUCCESS", processed=16))
+
+        printed, _attention = self._render(module)
+
+        self.assertNotIn("마지막 Notion 반영", printed)
+
+    def test_a_failed_notion_step_produces_no_reassurance(self):
+        module = self._with(
+            self._notion("FAILED", processed=2, created=0, updated=0, skipped_old=0)
+        )
+
+        printed, _attention = self._render(module)
+
+        self.assertNotIn("마지막 Notion 반영", printed)
+
+    def test_a_skipped_notion_step_still_gets_c103s_doubt_line(self):
+        """The two branches must not both fire, and the doubting one wins
+        when the step was skipped -- that is the state C103 measured."""
+        module = self._with(self._notion("SKIPPED"))
+
+        printed, attention = self._render(module)
+
+        self.assertIn("시도한 실행이 아직 없다", printed)
+        self.assertNotIn("마지막 Notion 반영", printed)
+        self.assertTrue(attention)
+
+    def test_no_manifest_at_all_produces_no_reassurance(self):
+        module = self._with(None)
+
+        printed, _attention = self._render(module)
+
+        self.assertNotIn("마지막 Notion 반영", printed)
+
+    def test_a_non_integer_count_is_treated_as_unanswerable(self):
+        """A hand-edited or restored manifest is a DR path, not an exotic
+        one. `True` is an `int` in Python and would print as `1`, so the
+        guard rejects bool explicitly."""
+        module = self._with(
+            self._notion(
+                "SUCCESS", processed=1, created=True, updated="2", skipped_old=None
+            )
+        )
+
+        printed, _attention = self._render(module)
+
+        self.assertNotIn("마지막 Notion 반영", printed)
+
+    def test_unexported_credentials_still_win_over_everything(self):
+        """Ordering. When the two variables are not in the environment at
+        all, the operator needs the line that tells them what to type -- not
+        a report about a run that used different credentials."""
+        module = self._with(
+            self._notion("SUCCESS", processed=1, created=1, updated=0, skipped_old=0)
+        )
+        (module.RUNTIME_DIR.parent / ".env").write_text(
+            "NOTION_API_TOKEN=ntn_" + "A" * 24 + chr(10)
+            + "NOTION_PROJECTS_DATABASE_ID=" + "b" * 32 + chr(10),
+            encoding="utf-8",
+        )
+        buffer = io.StringIO()
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            with contextlib.redirect_stdout(buffer):
+                module._print_notion(
+                    datetime(2026, 8, 26, tzinfo=timezone(timedelta(hours=9)))
+                )
+
+        printed = buffer.getvalue()
+        self.assertIn("전달되지 않았다", printed)
+        self.assertNotIn("마지막 Notion 반영", printed)
+
+
+class EveryAuthoredIdentifierInAttentionIsRedactedTests(unittest.TestCase):
+    """C111 — the three sites `_authored()` promised covered and did not.
+
+    That function's docstring states the rule the file lives by: *"every site
+    that prints an Event-authored identifier calls this, and the sink stays
+    as it is."* It was written after exactly this bug — *"the *orphan* line
+    two blocks above printed the same Event's id raw"* — and the rule was
+    never counted against the file.
+
+    Counted (C111): 24 ATTENTION sites interpolate an authored-looking value,
+    9 wrap it, and three of the unwrapped ones carry genuinely Event-authored
+    content:
+
+        읽을 수 없는 KEEP Candidate …   Candidate **filenames**
+        Daily 미반영 KEEP …             `event_id`s
+        Decision Context 미반영 …       review Candidate ids
+
+    The filename case is the least obvious and the most direct.
+    `file_repository.safe_candidate_filename()` returns `f"{history_id}.json"`
+    verbatim whenever the id is filesystem-safe, and `history_id` comes from
+    the Event — written on another Desktop, type-checked only. A token-shaped
+    `event_id` becomes a token-shaped filename.
+
+    Severity is P2, not P1, and the reason is C109: the ATTENTION list's
+    external sink (Notion) already redacts at its own boundary. What was left
+    open is the terminal and the loopback Dashboard — the operator's own
+    machine, which is the trust boundary `_authored()` deliberately accepts.
+    """
+
+    TOKEN = "ntn_" + "Z" * 40
+
+    def _tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for part in (
+            "history_candidates/keep", "history_candidates/review", "daily",
+            "state", "events/processed", "logs", "runs", "locks", "local_master",
+        ):
+            (runtime / part).mkdir(parents=True, exist_ok=True)
+        return runtime
+
+    def _module(self, runtime):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_authored_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        return module
+
+    def _candidate(self, event_id):
+        return {
+            "schema_version": "1.0", "event_id": event_id,
+            "timestamp": "2026-08-05T10:00:00+09:00", "source": "DESKTOP_1",
+            "role": "CTO_BACKEND", "project_id": "P",
+            "event_type": "MILESTONE_COMPLETED", "status": "IN_PROGRESS",
+            "summary": "s", "history_candidate": True, "milestone": "m",
+            "evidence": [], "decision": "KEEP",
+        }
+
+    def _history_attention(self, runtime):
+        module = self._module(runtime)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            items = module._print_history(
+                datetime(2026, 8, 26, tzinfo=timezone(timedelta(hours=9)))
+            )
+        return "\n".join(items), buffer.getvalue()
+
+    def test_an_unreadable_candidate_filename_is_redacted(self):
+        """The reproduction, kept. A Candidate whose *name* is token-shaped
+        used to put that name straight into ATTENTION."""
+        runtime = self._tree()
+        (runtime / "history_candidates" / "keep" / f"{self.TOKEN}.json").write_text(
+            "{ broken", encoding="utf-8"
+        )
+
+        attention, _printed = self._history_attention(runtime)
+
+        self.assertNotIn(self.TOKEN, attention)
+        self.assertIn("[REDACTED]", attention)
+
+    def test_the_operator_can_still_tell_which_file(self):
+        """Over-redaction has a cost this project has measured: an alert that
+        cannot be acted on is worse than none. The extension survives, so the
+        line still points at a file."""
+        runtime = self._tree()
+        (runtime / "history_candidates" / "keep" / f"{self.TOKEN}.json").write_text(
+            "{ broken", encoding="utf-8"
+        )
+
+        attention, _printed = self._history_attention(runtime)
+
+        self.assertIn("[REDACTED].json", attention)
+        self.assertIn("읽을 수 없는 KEEP Candidate", attention)
+
+    def test_an_ordinary_candidate_name_is_untouched(self):
+        """The control. A filter that mangles ordinary names would send an
+        operator looking for a file that does not exist."""
+        runtime = self._tree()
+        (runtime / "history_candidates" / "keep" / "2026-08-05-abc.json").write_text(
+            "{ broken", encoding="utf-8"
+        )
+
+        attention, _printed = self._history_attention(runtime)
+
+        self.assertIn("2026-08-05-abc.json", attention)
+
+    def test_an_unrendered_keep_event_id_is_redacted(self):
+        """`event_id`s, which is the case `_authored()` was written for."""
+        runtime = self._tree()
+        (runtime / "history_candidates" / "keep" / "c1.json").write_text(
+            json.dumps(self._candidate(self.TOKEN), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (runtime / "daily" / "2026-08-05.md").write_text(
+            "# 2026-08-05\n\n## Metadata\n- Event Count: 0\n", encoding="utf-8"
+        )
+
+        attention, _printed = self._history_attention(runtime)
+
+        self.assertNotIn(self.TOKEN, attention)
+
+    def test_the_sink_itself_is_still_not_redacting(self):
+        """The decision that must not drift. `main()` applies `one_line()` to
+        every ATTENTION message and deliberately not `redact()` — over-
+        redacting a path the operator is about to open costs more than it
+        protects. The fix belongs at the sites that carry authored text, not
+        at the sink.
+        """
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        sink = source[source.index('print("ATTENTION")') :][:1200]
+
+        self.assertIn("one_line(", sink)
+        self.assertNotIn("redact(", sink)
+
+    def test_the_roster_of_unwrapped_authored_sites_is_empty(self):
+        """Structural, so the next site added gets caught at the shape rather
+        than by someone re-running C111's audit by hand.
+
+        Narrow on purpose: only the three list-joins this Sprint measured as
+        carrying Event-authored content. Paths this project owns
+        (`_runner_lock_path()`, `DEFAULT_RUN_SUMMARY_PATH`) are excluded for
+        `_authored()`'s stated reason — an operator has to go and open them.
+        """
+        lines = (
+            Path(__file__).resolve().parents[1] / "ops_status.py"
+        ).read_text(encoding="utf-8").splitlines()
+
+        for fragment in (
+            "', '.join(unreadable_candidates[:5])",
+            "', '.join(unrendered[:5])",
+            "', '.join(unrendered_review[:5])",
+        ):
+            with self.subTest(fragment=fragment):
+                # Reported as line numbers, not with `assertNotIn` against
+                # the whole file. That form prints the entire 300 KB module
+                # as the failure message, which is a failure nobody reads —
+                # the same "breaks on the wrong axis" complaint this suite
+                # already makes about over-pinned assertions.
+                hits = [n for n, line in enumerate(lines, 1) if fragment in line]
+                self.assertEqual(
+                    hits,
+                    [],
+                    f"ops_status.py:{hits} joins an authored id list without "
+                    f"_authored(): {fragment}",
+                )
+
+
+class AStaleFailureDoesNotContradictTheDurableStateTests(unittest.TestCase):
+    """C111 — the screen said two opposite things about backup.
+
+    Measured on this deployment. LAST RUN printed
+
+        ! backup: BACKUP_PENDING [DEGRADED/RETRYABLE]
+
+    while HISTORY, four blocks above, printed
+
+        마지막 성공 백업 : 2026-08-24T09:44:37+09:00 (BACKUP_SUCCESS)
+
+    seven days **after** the run that failed. Both were true: the manifest
+    was written by a probe against a temp directory that no longer exists,
+    and the durable state file had moved on. Nothing on the page said so, so
+    a reader had no way to tell which half was current — and the alarming
+    half was the stale one.
+
+    Verified alongside it: working-copy HEAD equals the bare remote's HEAD
+    and six Daily files are in the remote tree. Backup was working the whole
+    time.
+
+    Says it; does not suppress it. Whether a superseded failure should still
+    be printed is a judgement about what LAST RUN means, and the failure did
+    happen — what was missing was the fact standing next to it.
+    """
+
+    def _module(self, runtime):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_stale_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        return module
+
+    MANIFEST = {
+        "schema_version": "1.0",
+        "run_id": "2026-08-17T12:07:42+09:00",
+        "started_at": "2026-08-17T12:07:42+09:00",
+        "finished_at": "2026-08-17T12:07:42+09:00",
+        "overall_status": "DEGRADED",
+        "exit_code": 3,
+        "components": [{
+            "name": "backup", "status": "FAILED", "metrics": {},
+            "artifact_refs": ["backup_working_copy/"],
+            "failure": {"classification": "BACKUP_PENDING", "severity": "DEGRADED",
+                        "retryability": "RETRYABLE", "reason": "probe temp dir"},
+        }],
+    }
+
+    def _render(self, backup_state):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "runs").mkdir(parents=True)
+        (runtime / "state").mkdir(parents=True)
+        (runtime / "runs" / "last_run.json").write_text(
+            json.dumps(self.MANIFEST, ensure_ascii=False), encoding="utf-8"
+        )
+        if backup_state is not None:
+            (runtime / "state" / "backup_state.json").write_text(
+                json.dumps(backup_state, ensure_ascii=False), encoding="utf-8"
+            )
+        module = self._module(runtime)
+        module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_last_run(
+                datetime(2026, 8, 26, tzinfo=timezone(timedelta(hours=9)))
+            )
+        return buffer.getvalue()
+
+    SUCCESS_LATER = {
+        "last_successful_backup": "2026-08-24T09:44:37.453391+09:00",
+        "last_backup_commit": "5340acb", "backup_status": "BACKUP_SUCCESS",
+    }
+
+    def test_a_later_success_is_reported_beside_the_failure(self):
+        printed = self._render(self.SUCCESS_LATER)
+
+        self.assertIn("BACKUP_PENDING", printed)
+        self.assertIn("이 실패는 지나간 것이다", printed)
+        self.assertIn("2026-08-24", printed)
+
+    def test_the_failure_line_is_not_suppressed(self):
+        """The failure happened. Hiding it would be a different decision
+        than the one this fix takes."""
+        printed = self._render(self.SUCCESS_LATER)
+        self.assertIn("! backup", printed)
+
+    def test_an_earlier_success_says_nothing(self):
+        """A success *before* the failing run does not contradict it — that
+        is just the previous run, and every failure has one."""
+        printed = self._render({
+            "last_successful_backup": "2026-08-10T09:00:00+09:00",
+            "last_backup_commit": "abc", "backup_status": "BACKUP_FAILED",
+        })
+        self.assertNotIn("지나간 것이다", printed)
+
+    def test_a_missing_state_file_says_nothing(self):
+        """A status view that cannot read an optional file reports nothing
+        extra rather than losing the line it was already printing."""
+        printed = self._render(None)
+        self.assertIn("BACKUP_PENDING", printed)
+        self.assertNotIn("지나간 것이다", printed)
+
+    def test_only_backup_is_checked_this_way(self):
+        """`backup` is the one component with a state file that outlives its
+        run. The rest of the manifest is the only record of itself."""
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('if component.name != "backup":', source)
+
+
+class TheSuiteDoesNotDependOnTheOperatorsShellTests(unittest.TestCase):
+    """C111 — the suite required `NOTION_*` to be **absent**.
+
+    `.env.example`, `AGENT.md` §6e and `ops_status.py`'s own ATTENTION line
+    all tell an operator to export `NOTION_API_TOKEN` and
+    `NOTION_PROJECTS_DATABASE_ID` before running anything. Do that and then
+    run pytest:
+
+        8 failed  (NotionQueueVisibilityTests, WrittenAndNeverReadFieldTests)
+
+    Both classes render `_print_notion()` and assert on its text. C103/C104
+    gave that block two credential branches that read `os.environ`, so its
+    output became environment-dependent — and every "full suite green" this
+    project has recorded was measured in a shell that happened not to have
+    them set. A suite that passes only for people who did not follow the
+    setup instructions is not evidence about the code.
+
+    Fixed at the tests, not the block: the block's behaviour is correct and
+    deliberate. A test asserting on queue text must not also be asserting on
+    which credentials are in the shell that started pytest.
+
+    This is the structural half, so the next such test is caught at the
+    shape rather than by someone exporting a variable and noticing.
+    """
+
+    VARIABLES = ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID")
+
+    def test_every_notion_block_test_pins_the_environment(self):
+        """Any class that calls `_print_notion()` must control these."""
+        source = Path(__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            body = ast.unparse(node)
+            if "_print_notion(" not in body:
+                continue
+            if "NOTION_API_TOKEN" in body:
+                continue
+            offenders.append(node.name)
+
+        self.assertEqual(
+            offenders,
+            [],
+            f"these classes render the NOTION block without pinning "
+            f"{self.VARIABLES}: {offenders}",
+        )
+
+    def test_the_block_really_is_environment_dependent(self):
+        """Guards the guard. If the block ever stops reading `os.environ`,
+        the requirement above becomes cargo and should be removed rather
+        than kept because it passes.
+        """
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        for function in (
+            "_notion_credentials_present_but_unexported",
+            "_notion_credentials_exported_but_never_exercised",
+        ):
+            with self.subTest(function=function):
+                self.assertIn(f"def {function}", source)
+        self.assertIn("os.environ.get(name)", source)
 
 
 if __name__ == "__main__":

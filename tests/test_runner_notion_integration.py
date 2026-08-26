@@ -2600,5 +2600,170 @@ class SameInstantSkipReachesTheManifestTests(RunnerNotionTestCase):
         self.assertIn("TIE-RUNNER-2", text)
 
 
+class TheManifestSaysWhetherNotionChangedTests(RunnerNotionTestCase):
+    """C104: `processed` counted attempts, and nothing counted outcomes.
+
+    Measured through the real Runner against the live PROJECTS database. The
+    whole Event corpus synced, and the manifest said:
+
+        notion_sync SUCCESS {"processed": 16}
+
+    Every one of those sixteen was `NOTION_SKIPPED_OLD_EVENT` -- Notion
+    already held newer state, so **not one row changed**. A run that rewrote
+    all sixteen rows would have written the same bytes into the manifest.
+
+    That matters because of where the manifest sits. It is the
+    machine-readable record: `ops_status.py` reads it, a Task Scheduler
+    deployment keeps it, and it is what survives after `notion_sync.log`
+    rotates. Answering "did Notion actually change?" meant reading that log
+    line by line -- which is the work a manifest exists to remove.
+
+    No status was added (docs/04 section 32-37 enumerates those and adding one
+    is a spec change) and no behaviour moved. `RunComponent.metrics` is a
+    free-form `Mapping[str, Any]` that docs/14 does not constrain, and C40
+    already established that adding a key to it is not a decision.
+    """
+
+    def test_a_run_that_changes_nothing_says_so(self):
+        """The measured case, reproduced. First run creates; the identical
+        second run changes nothing, and the two manifests must differ."""
+        self._write_event(event_id="MET-NOOP-1", timestamp="2026-08-05T10:00:00+09:00")
+        first = self._run(notion_sync=self.notion_sync)
+        first_metrics = dict(first.summary.component("notion_sync").metrics)
+
+        second = self._run(
+            notion_sync=self.notion_sync, now=datetime(2026, 8, 5, 13, 0)
+        )
+        second_metrics = dict(second.summary.component("notion_sync").metrics)
+
+        self.assertEqual(first_metrics.get("created"), 1)
+        self.assertEqual(first_metrics.get("updated"), 0)
+        self.assertEqual(second_metrics.get("created"), 0)
+        self.assertEqual(second_metrics.get("updated"), 0)
+        self.assertNotEqual(
+            first_metrics,
+            second_metrics,
+            "a run that wrote a row and a run that wrote nothing must not "
+            "produce the same manifest -- that identity is the defect",
+        )
+
+    def test_a_created_row_is_counted_as_created(self):
+        self._write_event(event_id="MET-CREATE-1")
+
+        result = self._run(notion_sync=self.notion_sync)
+
+        metrics = result.summary.component("notion_sync").metrics
+        self.assertEqual(metrics["processed"], 1)
+        self.assertEqual(metrics["created"], 1)
+        self.assertEqual(metrics["updated"], 0)
+        self.assertEqual(metrics["skipped_old"], 0)
+
+    def test_an_updated_row_is_counted_as_updated(self):
+        """A second, strictly newer Event for the same project takes the
+        UPDATE branch (docs/04 section 6), which `created` must not absorb."""
+        self._write_event(event_id="MET-UPD-1", timestamp="2026-08-05T10:00:00+09:00")
+        self._run(notion_sync=self.notion_sync)
+
+        self._write_event(
+            event_id="MET-UPD-2",
+            event_type="MILESTONE_COMPLETED",
+            milestone="second",
+            summary="second",
+            timestamp="2026-08-05T11:00:00+09:00",
+        )
+        result = self._run(
+            notion_sync=self.notion_sync, now=datetime(2026, 8, 5, 13, 0)
+        )
+
+        metrics = result.summary.component("notion_sync").metrics
+        self.assertEqual(metrics["created"], 0)
+        self.assertEqual(metrics["updated"], 1)
+        self.assertEqual(metrics["skipped_old"], 0)
+
+    def test_an_older_event_is_counted_as_skipped_old(self):
+        self._write_event(event_id="MET-OLD-1", timestamp="2026-08-05T18:00:00+09:00")
+        self._run(notion_sync=self.notion_sync)
+
+        self._write_event(
+            event_id="MET-OLD-2",
+            event_type="MILESTONE_COMPLETED",
+            milestone="late",
+            summary="late",
+            timestamp="2026-08-04T09:00:00+09:00",
+        )
+        result = self._run(
+            notion_sync=self.notion_sync, now=datetime(2026, 8, 6, 13, 0)
+        )
+
+        metrics = result.summary.component("notion_sync").metrics
+        self.assertEqual(metrics["created"], 0)
+        self.assertEqual(metrics["updated"], 0)
+        self.assertEqual(metrics["skipped_old"], 1)
+
+    def test_the_three_counts_never_exceed_processed(self):
+        """The arithmetic an operator will do without being asked to.
+
+        `skipped_old` deliberately **includes** `same_instant_skips` -- a
+        same-instant skip returns NOTION_SKIPPED_OLD_EVENT and is counted by
+        both -- so the three new keys partition `processed` while the older
+        key overlaps one of them. Pinned here so the overlap stays a
+        documented property rather than being discovered as a discrepancy.
+        """
+        for i, stamp in enumerate(
+            ("2026-08-05T10:00:00+09:00", "2026-08-05T11:00:00+09:00")
+        ):
+            self._write_event(
+                event_id=f"MET-SUM-{i}",
+                event_type="MILESTONE_COMPLETED",
+                milestone=f"m{i}",
+                summary=f"m{i}",
+                timestamp=stamp,
+            )
+
+        result = self._run(notion_sync=self.notion_sync)
+
+        m = result.summary.component("notion_sync").metrics
+        self.assertEqual(
+            m["created"] + m["updated"] + m["skipped_old"],
+            m["processed"],
+            "every sync result must land in exactly one of the three",
+        )
+
+    def test_zeros_are_kept_rather_than_dropped(self):
+        """The opposite choice from `same_instant_skips`, on purpose.
+
+        That metric reports a rare divergence, so its absence means "did not
+        happen". Here `written = 0` is the *informative* case: it is how
+        "Notion is already current" stops being byte-identical to "nothing
+        reached Notion". Dropping the zero would restore the defect.
+        """
+        self._write_event(event_id="MET-ZERO-1")
+        self._run(notion_sync=self.notion_sync)
+
+        result = self._run(
+            notion_sync=self.notion_sync, now=datetime(2026, 8, 5, 13, 0)
+        )
+
+        m = result.summary.component("notion_sync").metrics
+        for key in ("created", "updated", "skipped_old"):
+            self.assertIn(key, m, f"{key} must be present even when it is 0")
+        self.assertEqual(m["created"], 0)
+
+    def test_the_failing_path_carries_the_counts_too(self):
+        """A partly-failed run is exactly when "how much of it landed"
+        decides whether a person must finish the job by hand."""
+        self._write_event(event_id="MET-FAIL-1")
+        self.transport.fail_next_call = True
+
+        result = self._run(notion_sync=self.notion_sync)
+
+        component = result.summary.component("notion_sync")
+        self.assertEqual(component.status, ComponentStatus.FAILED)
+        for key in ("created", "updated", "skipped_old"):
+            self.assertIn(key, component.metrics)
+        self.assertEqual(component.metrics["created"], 0)
+        self.assertGreaterEqual(component.metrics["queued"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

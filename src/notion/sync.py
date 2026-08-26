@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from events import Event
 
@@ -89,6 +89,55 @@ class SyncResult:
     def is_permanently_refused(self) -> bool:
         """Notion answered, and the answer will not change by retrying."""
         return self.status_code in PERMANENTLY_REFUSING_STATUS_CODES
+
+
+#: How much of a timestamp Notion actually keeps in a `date` property.
+#:
+#: Measured against the live API on 2026-08-26, not inferred: the request
+#: body carried `2026-08-26T09:54:40+09:00` and `retrieve`/`query` read the
+#: same property back as `2026-08-26T09:54:00.000+09:00`. Seconds are
+#: **floored**, not rounded, and `properties._date()` sends the Event's
+#: timestamp verbatim — so the loss is Notion's, not this project's.
+#:
+#: It matters here because §29-30's guard compares the incoming Event
+#: against the value read *back*. Inside one wall-clock minute that value
+#: no longer orders two Events, and the guard cannot tell which of them
+#: happened first. See `_ordering_is_indeterminate()`.
+NOTION_DATE_RESOLUTION = timedelta(minutes=1)
+
+
+def _ordering_is_indeterminate(event_timestamp: datetime, stored: datetime) -> bool:
+    """True when `stored`'s lost seconds are what decides the comparison.
+
+    Notion floors a `date` property to the minute (`NOTION_DATE_RESOLUTION`),
+    so a stored `09:54:00` stands for the half-open interval
+    `[09:54:00, 09:55:00)` — the true instant Current State was last set is
+    somewhere inside it and is not recoverable.
+
+    An Event in an earlier minute is older than every instant in that
+    interval, and one in a later minute is newer than every instant in it;
+    both compare correctly and this returns False. An Event **inside** the
+    interval is the only undecidable case, and it is exactly the case
+    measured to be wrong: an Event genuinely 30 seconds older than the one
+    that set Current State reads as newer than the floored value and
+    overwrites it, which is what §29-30 exists to prevent.
+
+    The lower bound is **strict**: an Event whose timestamp equals the
+    floored value is not ambiguous in a way this predicate should claim —
+    it is the E-23 same-instant case, which §29-30 already answers (skip),
+    and the branch below it must keep answering. Strictness here is what
+    lets the call site carry no comparison of its own, which also keeps
+    `NaiveAwareComparisonGuardTests` counting one site in this module
+    rather than two.
+
+    Deliberately a predicate and not a second verdict. Which way that
+    ambiguity should be resolved is a decision (see BACKLOG E-26): skipping
+    the whole minute stops the regression but widens E-23's lost-update case
+    from "same instant" to "same minute", and neither loss is this module's
+    to choose. What was missing was not the choice — it was any record that
+    the question had been asked, and the answer taken on that run.
+    """
+    return stored < event_timestamp < stored + NOTION_DATE_RESOLUTION
 
 
 def _as_comparable_timestamp(stored: str, against: str) -> datetime | None:
@@ -228,6 +277,37 @@ class ExecutionPlanSync:
                     f"Late Event guard skipped: stored Last Updated "
                     f"{current_last_updated!r} is not a comparable ISO-8601 "
                     f"timestamp with an offset"
+                )
+            elif _ordering_is_indeterminate(
+                datetime.fromisoformat(event.timestamp), stored
+            ):
+                # Notion floored the stored value to the minute, and this
+                # Event falls inside that minute — so `> stored` above is an
+                # artefact of the lost seconds, not evidence that this Event
+                # is newer. Measured against live Notion: an Event stamped
+                # `:10` overwrote Current State that had been set by one
+                # stamped `:40`, which is precisely the regression §29-30
+                # forbids.
+                #
+                # The Update still proceeds, and that is not this branch
+                # deciding it is right — it is this branch refusing to make
+                # the opposite decision silently. Skipping the whole minute
+                # instead would widen E-23's lost-update case from "same
+                # instant" to "same minute"; both losses are real and
+                # choosing between them changes docs/04 §29-30's meaning,
+                # so it is recorded as BACKLOG E-26 rather than taken here.
+                #
+                # Reported the way the uncomparable-stored-value case above
+                # already is: on `SyncResult.error`, which
+                # `app.runner._log_notion_sync()` writes to notion_sync.log
+                # for a *successful* sync precisely so a run that proceeded
+                # with the guard off leaves a trace.
+                comparison_note = (
+                    "Late Event guard indeterminate: Notion stores "
+                    f"Last Updated to the minute ({stored.isoformat()}), and "
+                    f"this Event's timestamp {event.timestamp} falls inside "
+                    "that minute, so it may be older than the Event that set "
+                    "Current State. Update applied (BACKLOG E-26)"
                 )
             elif datetime.fromisoformat(event.timestamp) <= stored:
                 # The decision is docs/04 §29-30's and is not touched here:

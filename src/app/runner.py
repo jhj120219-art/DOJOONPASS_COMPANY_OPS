@@ -816,6 +816,51 @@ def run_once(
                 and r.error
                 and r.error.startswith("same-instant skip:")
             )
+            # What the run actually did to Notion, as three numbers instead
+            # of one (C104).
+            #
+            # `processed` is every Event this run handed to `ExecutionPlanSync`
+            # and nothing more. Measured end to end against the live PROJECTS
+            # database, a run that changed **nothing** wrote:
+            #
+            #     notion_sync SUCCESS {"processed": 16}
+            #
+            # and a run that rewrote all sixteen rows would write the same
+            # bytes. The manifest is the machine-readable artefact — the one
+            # `ops_status.py` reads and the one a Task Scheduler deployment
+            # keeps — and it could not answer "did Notion change?". Answering
+            # it needed reading `notion_sync.log` line by line, which is
+            # exactly what a manifest exists to make unnecessary.
+            #
+            # This is the C40 shape and it is the same argument: no status is
+            # added (docs/04 §32-37 enumerates those, and adding one is a spec
+            # change), no behaviour moves, and `RunComponent.metrics` is a
+            # free-form `Mapping[str, Any]` that docs/14 does not constrain.
+            # Only the count that was already implied becomes legible.
+            #
+            # Zeros are kept rather than dropped, unlike `same_instant_skips`.
+            # The two metrics answer opposite questions: that one reports a
+            # rare divergence, so its absence means "did not happen", while
+            # `written=0` is the *informative* case here — it is how "Notion
+            # is already current" and "nothing reached Notion" become
+            # distinguishable at a glance instead of identical silence.
+            #
+            # `skipped_old` **includes** `same_instant_skips`: a same-instant
+            # skip returns NOTION_SKIPPED_OLD_EVENT and is counted by both.
+            # Said here because a reader who adds the four numbers up and
+            # gets more than `processed` would otherwise conclude one of them
+            # is wrong.
+            notion_created = sum(
+                1 for r in notion_sync_results if r.status is SyncStatus.NOTION_CREATED
+            )
+            notion_updated = sum(
+                1 for r in notion_sync_results if r.status is SyncStatus.NOTION_UPDATED
+            )
+            notion_skipped_old = sum(
+                1
+                for r in notion_sync_results
+                if r.status is SyncStatus.NOTION_SKIPPED_OLD_EVENT
+            )
             if queued or notion_unreadable:
                 # An unreadable file is an Event that did not reach Notion,
                 # which is what `NOTION_SYNC_INCOMPLETE` means — so it fails
@@ -880,6 +925,12 @@ def run_once(
                     reason=reason,
                     retryability=retryability,
                     processed=len(notion_sync_results),
+                    # On the failing path too, and for a sharper reason: a
+                    # partly-failed run is exactly when "how much of it landed"
+                    # decides whether an operator must do anything by hand.
+                    created=notion_created,
+                    updated=notion_updated,
+                    skipped_old=notion_skipped_old,
                     queued=len(queued),
                     unreadable=len(notion_unreadable),
                     # The status codes Notion actually answered with, so the
@@ -892,6 +943,9 @@ def run_once(
                 recorder.ok(
                     C_NOTION_SYNC,
                     processed=len(notion_sync_results),
+                    created=notion_created,
+                    updated=notion_updated,
+                    skipped_old=notion_skipped_old,
                     # BACKLOG E-23, made countable in C40. A Signal written
                     # without its own timestamp gets that date's midnight
                     # (docs/06 §12), the same value for every Signal of that

@@ -131,9 +131,40 @@ def _content_differs(src: Path, dst: Path) -> bool:
 def _relative_files(root: Path) -> set[str]:
     """Regular files only, in scope.
 
-    A symlink/junction is excluded even when it resolves to a file
+    A **symlink** is excluded even when it resolves to a file
     (`path.is_symlink()` checked before `path.is_file()`, since
-    `Path.is_file()` follows the link). Without this, a link placed under
+    `Path.is_file()` follows the link).
+
+    A **directory junction is not**, and this docstring used to say it was.
+    It claimed "symlink/junction"; only the symlink half is true (C113).
+
+        mklink /J master/daily/ext  <outside>
+        _relative_files(master) -> {'daily/2026-08-01.md',
+                                    'daily/ext/notes.md'}
+
+    `Path.is_symlink()` answers **False** for a junction on Windows, so the
+    guard below never sees one and `_walk()` descends it. Driven through the
+    real `sync_to_working_copy()`, a file living outside Local Master was
+    copied into the Working Copy verbatim -- from where `git add -A` pushes
+    it -- and `scan_for_secrets()` returned `()` for both trees, because it
+    matches on filenames and `notes.md` is not a secret-shaped name.
+
+    **None of that exposure is news; only this sentence was wrong.** A-19
+    records junction-following as a Local Master risk, E-21 records the
+    Working Copy side, and C70 built the detector that reports it
+    (`ops_status._junctions_in_scope()`, which reads `st_reparse_tag` so it
+    works on the 3.9.7 deployment interpreter and tells a junction's
+    MOUNT_POINT tag from a symlink's SYMLINK tag). What this docstring did
+    was tell a reader the walk already handled what those three entries are
+    open about.
+
+    Not fixed in the walk, for the reason E-15/E-21/A-19 all wait on:
+    excluding junctions is a **behaviour change**, and a deployment that
+    junctions a directory of Daily History into Local Master would find its
+    backup silently shrink -- the false positive E-15 records as the worse
+    failure.
+
+    Without the symlink check above, a link placed under
     `daily/`/`monthly/` pointing outside `root` would have its TARGET's
     content copied into the Working Copy and pushed to the git remote,
     while `scan_for_secrets()` — filename-based, see that function's
