@@ -1,3 +1,4 @@
+import ast
 import re
 import sys
 import tempfile
@@ -100,6 +101,141 @@ class OneDriveTransportPathSafetyTests(unittest.TestCase):
         content = onedrive_file.read_text(encoding="utf-8")
         forbidden = re.compile(r"^\s*(import|from)\s+(collector|reporter|daily|scheduler)\b", re.MULTILINE)
         self.assertIsNone(forbidden.search(content))
+
+
+class NoTestStagesIntoTheLiveRepositoryTests(unittest.TestCase):
+    """`outgoing_dir` defaults to this repository, and two tests took it (C123).
+
+    `OneDriveTransport.__init__` ends with
+
+        self.outgoing_dir = Path(outgoing_dir) if outgoing_dir is not None \
+            else DEFAULT_OUTGOING_DIR
+
+    and `DEFAULT_OUTGOING_DIR` is `PROJECT_ROOT / "runtime" / "events" /
+    "outgoing"` — the **live tree**, not a temp directory. Two tests built a
+    transport without it while carefully putting every other path under
+    `tempfile.mkdtemp()`, and `send()` never removes its staging file, so
+    each full run left a fabricated Event sitting in the operator's runtime:
+
+        runtime/events/outgoing/E1.json
+            {"event_id": "E1", "project_id": "P", "summary": "s", ...}
+        runtime/events/outgoing/3862cac2-....json
+            {"project_id": "PRJ", "milestone": "M", ...}
+
+    **Nothing corrupts Company History from there** — the Collector reads
+    `incoming/`, and `run_intake()` promotes `transport/`; no code path
+    promotes `outgoing/`. It was measured before this class was written
+    rather than assumed. What it does cost is real all the same: fabricated
+    Events in an operational directory, and a test suite that writes into the
+    tree it is supposed to only read.
+
+    **And the directory itself is stranger than the bug.** Measured:
+
+        who writes it in production   nobody — `run_agent.py` passes
+                                      `outgoing_dir=runtime/agent/outgoing`
+        who reads it                  nothing, anywhere in the repository
+        docs/14 §2 Artifact Taxonomy  `events/` is listed as
+                                      `transport|incoming|processed|rejected/`
+                                      — `outgoing/` is **not in it**, and that
+                                      section's own claim is "새 폴더를 만들지
+                                      않았다"
+
+    So the default's only effect in the whole system is to absorb the output
+    of a caller who forgot the argument. Whether it should exist at all is a
+    public-API decision (`DEFAULT_OUTGOING_DIR` is in `transport.__all__`) and
+    is recorded in BACKLOG rather than taken here. This class removes the way
+    it actually fires.
+    """
+
+    TESTS = Path(__file__).resolve().parents[0]
+
+    def _call_sites(self):
+        """Every `OneDriveTransport(...)` construction under `tests/`."""
+        for path in sorted(self.TESTS.glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "OneDriveTransport"
+                ):
+                    yield path, node
+
+    def test_the_scan_finds_the_call_sites_that_exist(self):
+        """Guards the guard. An AST walk that matched nothing — a rename, a
+        different import spelling — would make the check below vacuous."""
+        sites = list(self._call_sites())
+
+        self.assertGreater(len(sites), 10, "the scan found almost no call sites")
+        self.assertGreater(
+            len({path for path, _ in sites}),
+            5,
+            "the scan is only seeing one file",
+        )
+
+    def test_every_test_names_its_own_staging_directory(self):
+        offenders = []
+        for path, node in self._call_sites():
+            names = {keyword.arg for keyword in node.keywords}
+            # Positional: `OneDriveTransport(sync, outgoing)` gives two args.
+            if "outgoing_dir" in names or len(node.args) >= 2:
+                continue
+            offenders.append(f"{path.name}:{node.lineno}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a test built a OneDriveTransport without `outgoing_dir`, so its "
+            "staging write lands in this repository's own "
+            "runtime/events/outgoing/ and stays there — `send()` never "
+            "removes it:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_the_default_really_is_the_repository(self):
+        """The premise, asserted rather than believed. If this ever stops
+        being true the class above is guarding nothing."""
+        from transport.onedrive import DEFAULT_OUTGOING_DIR
+
+        repo = Path(__file__).resolve().parents[1]
+
+        self.assertEqual(DEFAULT_OUTGOING_DIR, repo / "runtime" / "events" / "outgoing")
+
+    def test_the_production_agent_does_not_use_that_default(self):
+        """Which is why nothing noticed. The one caller that matters passes
+        `runtime/agent/outgoing` — a different directory entirely."""
+        source = (Path(__file__).resolve().parents[1] / "run_agent.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("outgoing_dir=agent_dir / \"outgoing\"", source)
+
+    def test_nothing_outside_the_transport_package_uses_that_default(self):
+        """The other half of "stranger than the bug": a staging buffer whose
+        default nobody reaches for. Stated as a measurement, so the day
+        something does start using it, this says so and the record has to be
+        revisited rather than quietly outgrown."""
+        repo = Path(__file__).resolve().parents[1]
+        users = []
+        for path in list(repo.glob("*.py")) + sorted((repo / "src").rglob("*.py")):
+            relative = path.relative_to(repo).as_posix()
+            if relative.startswith("src/transport/"):
+                continue
+            if "DEFAULT_OUTGOING_DIR" in path.read_text(encoding="utf-8"):
+                users.append(relative)
+
+        self.assertEqual(users, [])
+
+    def test_that_sweep_can_see_the_package_that_does_use_it(self):
+        """Guards the guard: the exclusion above must not be excluding
+        everything."""
+        package = Path(__file__).resolve().parents[1] / "src" / "transport"
+        using = [
+            path.name
+            for path in sorted(package.glob("*.py"))
+            if "DEFAULT_OUTGOING_DIR" in path.read_text(encoding="utf-8")
+        ]
+
+        self.assertEqual(using, ["__init__.py", "onedrive.py"])
 
 
 if __name__ == "__main__":

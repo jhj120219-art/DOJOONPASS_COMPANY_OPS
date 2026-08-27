@@ -11,9 +11,12 @@ about them, and what is pinned here:
 
 import ast
 import contextlib
+import importlib
+import inspect
 import io
 import json
 import os
+import re
 import stat
 import shutil
 import subprocess
@@ -113,6 +116,13 @@ class AgentStatusTestCase(unittest.TestCase):
             outbox_dir=self.outbox,
             sent_dir=self.sent,
             rejected_signals_dir=self.rejected,
+            # C126: omitted, this defaults to the live
+            # `runtime/agent/signals/`. Measured — with a watermark past the
+            # dates on disk there, `undelivered_closed_signal_count` came
+            # back **5**, counting the operator's real Signal files. This
+            # class passed only because its fixtures happen to sit before
+            # them.
+            signals_dir=self.signals,
         )
 
     def touch(self, directory: Path, name: str):
@@ -613,7 +623,10 @@ class AgentStatusTests(AgentStatusTestCase):
         self.assertIsNone(snapshot.desktop_id)
         self.assertIsNone(snapshot.last_run)
         self.assertIsNone(snapshot.days_since_last_run(NOW))
-        self.assertIn("agent has never completed a run", snapshot.needs_attention(NOW))
+        self.assertIn(
+            "이 머신의 Agent가 한 번도 실행을 완료한 적이 없다",
+            snapshot.needs_attention(NOW),
+        )
 
     def test_a_healthy_agent_needs_no_attention(self):
         save_state(
@@ -645,7 +658,7 @@ class AgentStatusTests(AgentStatusTestCase):
         self.assertEqual(snapshot.outbox_count, 2)
         self.assertTrue(snapshot.has_undelivered_events)
         self.assertIn(
-            "2 event(s) created but not delivered", snapshot.needs_attention(NOW)
+            "만들어졌지만 전달되지 않은 Event 2건", snapshot.needs_attention(NOW)
         )
 
     def test_uncollected_dates_are_surfaced(self):
@@ -665,7 +678,7 @@ class AgentStatusTests(AgentStatusTestCase):
             (date(2026, 8, 6), date(2026, 8, 7), date(2026, 8, 8), date(2026, 8, 9)),
         )
         self.assertTrue(snapshot.has_uncollected_dates)
-        self.assertIn("4 date(s) not yet collected", snapshot.needs_attention(NOW))
+        self.assertIn("아직 수집되지 않은 날짜 4건", snapshot.needs_attention(NOW))
 
     def test_a_stale_agent_is_flagged_but_a_weekend_off_is_not(self):
         save_state(
@@ -690,7 +703,7 @@ class AgentStatusTests(AgentStatusTestCase):
         )
         stale = self.status()
         self.assertEqual(stale.days_since_last_run(NOW), 5)
-        self.assertIn("agent has not run for 5 day(s)", stale.needs_attention(NOW))
+        self.assertIn("이 머신의 Agent가 5일째 실행되지 않았다", stale.needs_attention(NOW))
 
     def test_rejected_signals_are_surfaced(self):
         save_state(
@@ -707,7 +720,7 @@ class AgentStatusTests(AgentStatusTestCase):
 
         self.assertEqual(snapshot.rejected_signal_count, 1)
         self.assertIn(
-            "1 signal(s) rejected and awaiting a human", snapshot.needs_attention(NOW)
+            "거부된 Signal 1건이 사람을 기다리고 있다", snapshot.needs_attention(NOW)
         )
 
     def test_a_corrupted_state_file_is_reported_not_raised(self):
@@ -722,7 +735,7 @@ class AgentStatusTests(AgentStatusTestCase):
         self.assertIsNotNone(snapshot.state_error)
         self.assertIsNone(snapshot.desktop_id)
         self.assertTrue(
-            any("unreadable" in reason for reason in snapshot.needs_attention(NOW))
+            any("읽을 수 없다" in reason for reason in snapshot.needs_attention(NOW))
         )
 
     def test_pending_dates_are_not_guessed_without_a_start_date(self):
@@ -2250,9 +2263,11 @@ class UnreadableLastRunTests(AgentStatusTestCase):
 
                 reasons = self.status().needs_attention(NOW)
 
-                self.assertNotIn("agent has never completed a run", reasons)
+                self.assertNotIn(
+                    "이 머신의 Agent가 한 번도 실행을 완료한 적이 없다", reasons
+                )
                 self.assertTrue(
-                    any("last_run is not a timestamp" in reason for reason in reasons),
+                    any("last_run이 timestamp가 아니다" in reason for reason in reasons),
                     reasons,
                 )
 
@@ -2274,7 +2289,7 @@ class UnreadableLastRunTests(AgentStatusTestCase):
 
         reasons = self.status().needs_attention(NOW)
 
-        self.assertIn("agent has never completed a run", reasons)
+        self.assertIn("이 머신의 Agent가 한 번도 실행을 완료한 적이 없다", reasons)
         self.assertFalse(any("not a timestamp" in reason for reason in reasons))
 
     def test_a_readable_last_run_is_unaffected(self):
@@ -2326,7 +2341,7 @@ class FutureCollectionDateTests(AgentStatusTestCase):
         self.assertEqual(snapshot.outbox_count, 0)
         reasons = snapshot.needs_attention(NOW)
         self.assertTrue(any("2027-01-01" in reason for reason in reasons))
-        self.assertTrue(any("future" in reason for reason in reasons))
+        self.assertTrue(any("미래" in reason for reason in reasons))
 
     def test_one_day_into_the_future_is_already_reported(self):
         """There is no benign version of this. Tomorrow's date means today
@@ -2334,7 +2349,7 @@ class FutureCollectionDateTests(AgentStatusTestCase):
         self._state(NOW.date() + timedelta(days=1))
 
         self.assertTrue(
-            any("future" in reason for reason in self.status().needs_attention(NOW))
+            any("미래" in reason for reason in self.status().needs_attention(NOW))
         )
 
     def test_today_is_not_a_false_positive(self):
@@ -2344,20 +2359,20 @@ class FutureCollectionDateTests(AgentStatusTestCase):
         self._state(NOW.date())
 
         self.assertEqual(
-            [r for r in self.status().needs_attention(NOW) if "future" in r], []
+            [r for r in self.status().needs_attention(NOW) if "미래" in r], []
         )
 
     def test_yesterday_is_not_a_false_positive(self):
         self._state(NOW.date() - timedelta(days=1))
 
         self.assertEqual(
-            [r for r in self.status().needs_attention(NOW) if "future" in r], []
+            [r for r in self.status().needs_attention(NOW) if "미래" in r], []
         )
 
     def test_a_never_run_agent_is_not_reported_as_future_dated(self):
         """No state file at all means no date, not a future one."""
         self.assertEqual(
-            [r for r in self.status().needs_attention(NOW) if "future" in r], []
+            [r for r in self.status().needs_attention(NOW) if "미래" in r], []
         )
 
     def test_the_future_date_is_reported_ahead_of_softer_reasons(self):
@@ -2369,8 +2384,8 @@ class FutureCollectionDateTests(AgentStatusTestCase):
 
         reasons = self.status().needs_attention(NOW)
 
-        future_at = next(i for i, r in enumerate(reasons) if "future" in r)
-        outbox_at = next(i for i, r in enumerate(reasons) if "not delivered" in r)
+        future_at = next(i for i, r in enumerate(reasons) if "미래" in r)
+        outbox_at = next(i for i, r in enumerate(reasons) if "전달되지 않은" in r)
         self.assertLess(future_at, outbox_at)
 
     def test_detection_does_not_change_what_catchup_would_do(self):
@@ -6212,7 +6227,8 @@ class RunnerHasNotRunTests(unittest.TestCase):
     re-registering it), a machine left asleep, the task deleted.
 
     Measured on this machine before the check existed: the last run was two
-    days old, and ATTENTION carried "agent has not run for 2 day(s)" and
+    days old, and ATTENTION carried "agent has not run for 2 day(s)"
+    (그때의 문구; C120에서 한국어로 바뀌었다) and
     nothing whatsoever about the Runner.
 
     Symmetric with the Agent Lock finding earlier this Sprint, in the
@@ -8115,7 +8131,8 @@ class RuntimeDirIsTheOnlyKnobTests(unittest.TestCase):
 
     Measured during C31, and not hypothetically — a probe pointed
     `RUNTIME_DIR` at a temp tree holding a future-dated `agent_state.json`,
-    read back "agent has not run for 3 day(s)" from this repository's own
+    read back "agent has not run for 3 day(s)" (그때의 문구; C120에서 한국어로 바뀌었다)
+    from this repository's own
     runtime, and nearly recorded a working check as missing.
 
     C13's 결함 2 in a second place, and its wording applies verbatim:
@@ -8536,7 +8553,7 @@ class FutureDatedStatePointerTests(unittest.TestCase):
 
         source = inspect.getsource(AgentStatusSnapshot.needs_attention)
 
-        self.assertIn("which is in the future", source)
+        self.assertIn("그 날짜는 미래다", source)
 
     # ---- the third member: a future timestamp that BLINDS a check --------
     #
@@ -14647,7 +14664,10 @@ class ASignalWrittenAfterItsDateClosedIsCountedTests(unittest.TestCase):
         )
         yesterday = date(2026, 8, 23)
         morning = datetime(2026, 8, 24, 8, 0).astimezone()
-        transport = OneDriveTransport(root / "sync")
+        # `outgoing_dir` explicitly: the default is this repository's own
+        # `runtime/events/outgoing/`, and this test was writing a fixture
+        # Event into the live tree on every run (C123).
+        transport = OneDriveTransport(root / "sync", outgoing_dir=root / "outgoing")
 
         self._signal(agent / "signals" / "2026-08-23" / "standup.json", "shipped it")
         first = run_once(transport=transport, agent_start_date=yesterday,
@@ -16597,6 +16617,503 @@ class TheSuiteDoesNotDependOnTheOperatorsShellTests(unittest.TestCase):
             with self.subTest(function=function):
                 self.assertIn(f"def {function}", source)
         self.assertIn("os.environ.get(name)", source)
+
+
+
+
+class DecisionContextIsTheThirdDoorTests(unittest.TestCase):
+    """Secret-shaped prose typed through `review_cli.py` (C125).
+
+    `_secret_shaped_event_content()`'s docstring writes down two ways text
+    reaches Company History, and what guards each:
+
+        Signal typed on this machine   `find_secret_material()` REFUSES it
+        Event from another Desktop     nothing reads the content; that
+                                       detector reports it
+
+    **There is a third, and it had neither.** Decision Context is entered by
+    a person through `review_cli.py`, stored on a `HistoryCandidate`, and
+    rendered into the Daily History markdown. Measured end to end in a temp
+    tree with a token typed into `decision_context`:
+
+        submit_review()                  accepted — nothing scanned
+        candidate JSON on disk           holds it
+        _secret_shaped_event_content()   blind: it reads `processed/`
+                                         Events, and this is a Candidate
+        Daily History markdown           **token present**, SECRET_RE matches
+
+    From there it is Company Repository -> Working Copy -> `git push` to the
+    backup remote, where `scan_for_secrets()` compares filenames and never
+    content. And it is the door a person is *most* likely to walk a
+    credential through, because the field is prose: "토큰을 교체했다, 새
+    값은 …" is an ordinary sentence to write in a lessons-learned note.
+
+    Reports, refuses nothing — the same posture the Event detector states
+    for itself, and `review_cli.py` warns at the moment of typing so the
+    person can retype rather than rotate.
+    """
+
+    TOKEN = "ntn_" + "N" * 44
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.keep = self.tmp / "keep"
+        self.review = self.tmp / "review"
+        self.keep.mkdir()
+        self.review.mkdir()
+
+    def _candidate(self, directory, history_id="HIST-1", **fields):
+        payload = {
+            "history_id": history_id,
+            "event_id": history_id,
+            "decision": "KEEP",
+            "category": "MILESTONE",
+            "project_id": "COMPANY_OPS",
+            "summary": "ordinary work",
+        }
+        payload.update(fields)
+        (directory / f"{history_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _detect(self):
+        """The rows only — `_unchecked()` asks for the other half."""
+        module = importlib.import_module("ops_status")
+        return module._secret_shaped_decision_context(self.keep, self.review)[0]
+
+    def _unchecked(self):
+        module = importlib.import_module("ops_status")
+        return module._secret_shaped_decision_context(self.keep, self.review)[1]
+
+    def test_a_token_typed_into_decision_context_is_reported(self):
+        self._candidate(self.keep, decision_context=f"새 값은 {self.TOKEN} 이다.")
+
+        self.assertEqual(self._detect(), (("HIST-1", "decision_context"),))
+
+    def test_all_four_typed_fields_are_watched(self):
+        """A person fills in four fields, not one, and a credential is as
+        likely to land in `lessons_learned` as anywhere."""
+        module = importlib.import_module("ops_status")
+        for field in module._DECISION_CONTEXT_FIELDS:
+            with self.subTest(field=field):
+                for path in self.keep.glob("*.json"):
+                    path.unlink()
+                self._candidate(self.keep, **{field: f"x {self.TOKEN}"})
+
+                self.assertEqual(self._detect(), (("HIST-1", field),))
+
+    def test_the_field_roster_is_the_one_review_cli_offers(self):
+        """The two lists are written in different files and mean the same
+        thing. A field added to the CLI and not here is a field nobody
+        watches."""
+        module = importlib.import_module("ops_status")
+        import review_cli
+
+        self.assertEqual(
+            set(module._DECISION_CONTEXT_FIELDS),
+            {name for name, _label in review_cli._REVIEW_FIELDS},
+        )
+
+    def test_a_review_candidate_counts_too(self):
+        """REVIEW is not a safer state — it is the same file one decision
+        away from the same Daily History."""
+        self._candidate(self.review, decision_context=f"{self.TOKEN}")
+
+        self.assertEqual(self._detect(), (("HIST-1", "decision_context"),))
+
+    def test_ordinary_prose_is_not_flagged(self):
+        """The control. A detector that fired on every review note would be
+        switched off within a week."""
+        self._candidate(
+            self.keep,
+            decision_context="Notion Integration 토큰을 교체했다.",
+            lessons_learned="다음에는 만료 전에 알림을 걸자.",
+        )
+
+        self.assertEqual(self._detect(), ())
+
+    def test_the_report_never_carries_the_secret_itself(self):
+        """`find_secret_material()`'s rule, at a second detector: a report of
+        a leaked credential must not become the second copy of it."""
+        self._candidate(self.keep, decision_context=f"새 값은 {self.TOKEN}")
+
+        self.assertNotIn(self.TOKEN, repr(self._detect()))
+
+    def test_an_unreadable_candidate_does_not_stop_the_scan(self):
+        """One damaged file must not hide every other Candidate's secret —
+        the silent-loss direction this project keeps removing."""
+        (self.keep / "broken.json").write_text("{not json", encoding="utf-8")
+        self._candidate(self.keep, history_id="HIST-2",
+                        decision_context=f"{self.TOKEN}")
+
+        self.assertEqual(self._detect(), (("HIST-2", "decision_context"),))
+
+    def test_an_unreadable_candidate_is_counted_not_dropped(self):
+        """"No secret found" is only true about the files that were opened.
+        A skipped file makes the number smaller, which is the direction that
+        reads as reassurance — C62/C68's shape, and the architecture gate
+        caught the first draft doing exactly it."""
+        (self.keep / "broken.json").write_text("{not json", encoding="utf-8")
+        (self.review / "notadict.json").write_text("[1, 2]", encoding="utf-8")
+
+        self.assertEqual(self._unchecked(), 2)
+
+    def test_a_healthy_tree_reports_nothing_unchecked(self):
+        """The antecedent: a counter that always fired would put a permanent
+        line on the screen, which C26 is about."""
+        self._candidate(self.keep, decision_context="평범한 회고")
+
+        self.assertEqual(self._unchecked(), 0)
+
+    def test_deeply_nested_json_is_counted_rather_than_fatal(self):
+        """`json.loads` raises `RecursionError`, not `ValueError`, on this —
+        the reason `_split_reviewed()` catches the same triple. Without it
+        one hand-written file takes the whole status view down."""
+        (self.keep / "deep.json").write_text("[" * 3000 + "]" * 3000, encoding="utf-8")
+
+        self.assertEqual(self._detect(), ())
+        self.assertEqual(self._unchecked(), 1)
+
+    def test_a_staged_write_is_not_a_candidate(self):
+        """`FileHistoryRepository.save()` stages `.tmp-…json` here, and
+        `_incomplete_writes()` already reports those. Two alarms for one
+        action is how a section stops being read."""
+        from history.file_repository import INCOMPLETE_WRITE_PREFIX
+
+        (self.keep / f"{INCOMPLETE_WRITE_PREFIX}x.json").write_text(
+            json.dumps({"history_id": "H", "decision_context": self.TOKEN}),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self._detect(), ())
+
+    def test_a_missing_directory_is_not_an_error(self):
+        """A deployment that has never produced a Candidate has neither
+        directory, and the status view must still print."""
+        shutil.rmtree(self.review)
+
+        self.assertEqual(self._detect(), ())
+
+    def test_the_detector_is_wired_into_the_history_block(self):
+        """Structural. Every assertion above calls the function directly and
+        none would notice `_print_history()` never calling it — the state
+        C7 named "a diagnosis nobody runs diagnoses nothing"."""
+        module = importlib.import_module("ops_status")
+        source = inspect.getsource(module._print_history)
+
+        self.assertIn("_secret_shaped_decision_context(", source)
+        self.assertIn("history_candidates", source)
+
+
+class EveryAttentionLineSpeaksTheSameLanguageTests(unittest.TestCase):
+    """ATTENTION is one list, and it was two languages (C120).
+
+    Found by reading the **published** Control Tower page, not the terminal.
+    `publish_control_tower.py` renders `ops_status`'s ATTENTION list as
+    bullets on a Notion page inside the PROJECTS row the whole workspace can
+    open, and it looked like this:
+
+        · 3일 이상 아무것도 오지 않은 Desktop: DESKTOP_1, DESKTOP_2, ...
+        · Collector가 거부한 Event 4건 (출처불명=4) — 사람이 확인해야 한다
+        · 읽을 수 없는 파일 transport 1건 — ...
+        · ... (5 more Korean bullets)
+        · agent has not run for 15 day(s)
+
+    Every one of the eight Korean lines comes from `ops_status.py` itself or
+    from `signal_attention` / `delivery_attention` / `lock_attention`. The
+    ninth came from `AgentStatusSnapshot.needs_attention()`, whose eight
+    messages were all English — and it is not a minor one: an Agent that has
+    stopped is the failure this whole status view exists to surface.
+
+    **Why a gate and not just a translation.** The strings are the easy half.
+    The reason the mix happened is that `needs_attention()` lives in
+    `src/agent/`, reads like an API returning reason codes, and has no
+    obvious tie to the surface it prints on. The next reason added there will
+    be written in whatever the author is thinking in unless something asks.
+
+    Drives the real function over states that reach **every** branch, rather
+    than reading the source for string literals: an f-string that interpolates
+    a Korean-free value would pass a source scan and fail a person.
+    """
+
+    #: Hangul syllables. Enough to tell "this sentence was written for the
+    #: operator" from "this is an identifier that happens to be ASCII".
+    HANGUL = re.compile(r"[\uac00-\ud7a3]")
+
+    def _reasons_covering_every_branch(self):
+        """One `(label, reasons)` pair per branch of `needs_attention()`."""
+        from agent.status import AgentStatusSnapshot
+
+        now = datetime(2026, 8, 20, 9, 0).astimezone()
+        base = dict(
+            desktop_id="DESKTOP_1",
+            last_run=now.isoformat(timespec="seconds"),
+            last_successful_collection_date=date(2026, 8, 19),
+            pending_dates=(),
+            outbox_count=0,
+            sent_count=0,
+            rejected_signal_count=0,
+        )
+        cases = {
+            "state_error": dict(base, state_error="not JSON"),
+            "future date": dict(base, last_successful_collection_date=date(2027, 1, 1)),
+            "outbox": dict(base, outbox_count=2),
+            "rejected signals": dict(base, rejected_signal_count=1),
+            "never ran": dict(base, last_run=None),
+            "unparseable last_run": dict(base, last_run="2026-08-0"),
+            "stale": dict(
+                base,
+                last_run=(now - timedelta(days=9)).isoformat(timespec="seconds"),
+            ),
+            "pending dates": dict(
+                base, pending_dates=(date(2026, 8, 18), date(2026, 8, 19))
+            ),
+        }
+        for label, fields in cases.items():
+            snapshot = AgentStatusSnapshot(**fields)
+            yield label, snapshot.needs_attention(now)
+
+    def test_every_branch_actually_produces_a_reason(self):
+        """The antecedent. A case that produced nothing would let the check
+        below pass over an empty tuple, which is the vacuous shape."""
+        for label, reasons in self._reasons_covering_every_branch():
+            with self.subTest(branch=label):
+                self.assertTrue(reasons, f"{label} produced no reason at all")
+
+    def test_no_reason_reaches_the_operator_in_another_language(self):
+        offenders = []
+        for label, reasons in self._reasons_covering_every_branch():
+            for reason in reasons:
+                if not self.HANGUL.search(reason):
+                    offenders.append(f"{label}: {reason}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a reason with no Korean in it. These strings are appended "
+            "verbatim to ops_status's ATTENTION list, which is rendered in "
+            "the terminal, on the Dashboard, and as bullets on the Notion "
+            "Control Tower page the whole workspace reads — every other line "
+            "in that list is Korean:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_the_check_would_notice_an_english_reason(self):
+        """Guards the guard: a pattern that matched everything, or a sweep
+        that produced no strings, would pass forever."""
+        self.assertIsNone(self.HANGUL.search("agent has not run for 15 day(s)"))
+        self.assertIsNotNone(
+            self.HANGUL.search("이 머신의 Agent가 15일째 실행되지 않았다")
+        )
+        # Not fooled by an identifier or a date inside an otherwise Korean
+        # sentence, and not satisfied by one either.
+        self.assertIsNone(self.HANGUL.search("DESKTOP_1 2026-08-20"))
+
+    def test_the_ops_status_side_of_the_same_list_is_korean_too(self):
+        """The other contributors, so this class covers the list rather than
+        one of its sources. `_print_agent()` returns
+        `needs_attention() + signal + delivery + lock`, and a future English
+        line in any of those three is the same defect."""
+        module = importlib.import_module("ops_status")
+        source = inspect.getsource(module._print_agent)
+
+        korean_literals = self.HANGUL.findall(source)
+        self.assertTrue(
+            korean_literals,
+            "_print_agent() carries no Korean at all — the block that "
+            "assembles the rest of this list has changed shape and this "
+            "check is no longer looking at it",
+        )
+
+
+class AClosedPipeIsNotDamagedEvidenceTests(unittest.TestCase):
+    """`ops_status.py` when the program reading its output ends first (C118).
+
+    Found by running it, and by the plainest invocation there is:
+
+        python ops_status.py | head -3
+
+        OSError: [Errno 22] Invalid argument   <- inside _print_history's print()
+        OSError: [Errno 22] Invalid argument   <- inside the handler for it
+        Exception ignored on flushing sys.stdout
+        exit 120
+
+    Two separate defects in three lines of output.
+
+    **The report said the wrong thing.** `_block()` catches `OSError` and
+    reports the section as `HISTORY — 읽지 못했다`, raising an ATTENTION line
+    that reads "디스크나 권한 문제이며 사람이 확인해야 한다". That contract is
+    about *damaged evidence* — its own docstring says so, and says a
+    `TypeError` from a rollup "must not be dressed up as a disk problem". A
+    write failure is that same mis-attribution wearing `OSError`'s type: the
+    evidence was perfectly readable, the reader left.
+
+    **And then the handler raised**, because the first thing it does is
+    `print()`. Hence the second traceback and `120` — the interpreter's "an
+    exception escaped at shutdown", which is not one of this project's codes.
+
+    `0` would have been worse than `120`. For this tool a `0` is the claim
+    "사람이 지금 할 일은 없다", and the report never finished being computed.
+
+    Driven with a stdout that fails the way a Windows pipe actually does —
+    `OSError(22)` on `flush()` — rather than with `BrokenPipeError`, because
+    `EPIPE` is exactly what this platform does **not** raise, and a fixture
+    that raised it would test a path the operator never reaches.
+    """
+
+    class _DeadPipe(io.StringIO):
+        """stdout whose reader has gone, modelled on the measurement.
+
+        The measurement, from a real `| head` on this machine, is the whole
+        reason this class does not simply raise on everything:
+
+            write("")     OK      <- buffered
+            write("x")    OK      <- buffered
+            flush()       raises  OSError(22, 'Invalid argument')
+            closed        False
+
+        So **writes keep working** after the pipe is gone, and only some of
+        them surface the error. That is what makes the defect reachable:
+        `_block()`'s handler prints `HISTORY — 읽지 못했다` and the print
+        *succeeds*, putting a false diagnosis into the buffer and a false
+        ATTENTION line into the return value.
+
+        `errno 22`, not `EPIPE` — this platform does not raise
+        `BrokenPipeError`, and a fixture that did would exercise a branch the
+        operator never reaches.
+        """
+
+        def __init__(self, fail_write=None):
+            super().__init__()
+            #: 1-based index of the single write that surfaces the error.
+            #: `None` means every write succeeds and only `flush()` tells.
+            self.fail_write = fail_write
+            self.writes = 0
+
+        def write(self, text):
+            self.writes += 1
+            if self.writes == self.fail_write:
+                raise OSError(22, "Invalid argument")
+            return super().write(text)
+
+        def flush(self):
+            # Always. `flush()` reaches the file descriptor every time, which
+            # is exactly why `output_is_gone()` uses it and why neither
+            # `write()` nor `closed` can answer this question.
+            raise OSError(22, "Invalid argument")
+
+    def _module(self):
+        import importlib
+
+        return importlib.import_module("ops_status")
+
+    def test_a_lost_pipe_is_not_reported_as_an_unreadable_section(self):
+        """The defect itself.
+
+        The pipe surfaces its error on one write inside the section, and
+        every write after that succeeds — which is what the real stream
+        does. Without the guard the handler's own three `print()` calls all
+        land, so the buffer ends up holding `HISTORY — 읽지 못했다` and the
+        return value holds an ATTENTION line blaming the disk, about
+        evidence that was never touched.
+
+        Asserting on **both** outputs on purpose. A first draft of this test
+        asserted only `assertRaises(OSError)`, and the mutation that removes
+        the guard kept passing it: without the guard the handler still
+        raises, just one `print()` later. A test that cannot tell those two
+        apart is testing that something went wrong, not what.
+        """
+        module = self._module()
+        dead = self._DeadPipe(fail_write=2)
+
+        with contextlib.redirect_stdout(dead):
+            with self.assertRaises(OSError):
+                attention = module._block("HISTORY", module._print_history, NOW)
+                self.fail(f"the handler ran and returned {attention!r}")
+
+        self.assertNotIn(
+            "읽지 못했다",
+            dead.getvalue(),
+            "a closed pipe was reported as a section that could not be read",
+        )
+
+    def test_a_real_read_failure_is_still_reported_as_one(self):
+        """The antecedent, and the half that must not regress. A `_block()`
+        that re-raised every `OSError` would delete the guarantee the class
+        above this one exists for."""
+        module = self._module()
+
+        def _raises(now):
+            raise PermissionError("refused: runtime/events/transport")
+            yield  # pragma: no cover - generator marker
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._block("HISTORY", _raises, NOW)
+
+        self.assertIn("읽지 못했다", buffer.getvalue())
+        self.assertTrue(any("읽지 못했다" in line for line in attention))
+
+    def test_the_stream_is_asked_rather_than_the_errno(self):
+        """The distinction the fix turns on. Both cases raise `OSError(22)`;
+        only one of them has a stdout that can still be flushed."""
+        from cli import output_is_gone
+
+        healthy = io.StringIO()
+        self.assertFalse(output_is_gone(healthy))
+        self.assertTrue(output_is_gone(self._DeadPipe()))
+
+    def test_the_exit_code_is_a_number_this_project_uses(self):
+        """`120` says nothing to a person or to a wrapper reading `$?`."""
+        from cli import OUTPUT_LOST_EXIT, run_entrypoint
+
+        def _main(argv):
+            raise OSError(22, "Invalid argument")
+
+        dead = self._DeadPipe()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(dead), contextlib.redirect_stderr(err):
+            code = run_entrypoint(_main, ("ops_status.py",))
+
+        self.assertEqual(code, OUTPUT_LOST_EXIT)
+        self.assertEqual(code, 2)
+        self.assertIn("파이프", err.getvalue())
+
+    def test_an_oserror_with_a_healthy_stdout_keeps_its_traceback(self):
+        """A disk or permission failure must not be renamed "the reader
+        left". This is the branch that makes the guard above safe to have."""
+        from cli import run_entrypoint
+
+        def _main(argv):
+            raise PermissionError("refused: C:/runtime/state")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(PermissionError):
+                run_entrypoint(_main, ("ops_status.py",))
+
+    def test_a_clean_run_is_returned_untouched(self):
+        """The other antecedent: `run_entrypoint()` is a boundary, not a
+        policy. Whatever `main()` decided is what comes back."""
+        from cli import run_entrypoint
+
+        for expected in (0, 1, 3):
+            with self.subTest(code=expected):
+                self.assertEqual(
+                    run_entrypoint(lambda argv: expected, ()), expected
+                )
+
+    def test_the_entrypoint_actually_goes_through_the_boundary(self):
+        """Structural. Every assertion above is about `run_entrypoint()`, and
+        none of them would notice `ops_status.py` calling `main()` directly
+        again — which is the state the defect was in."""
+        import inspect
+
+        source = inspect.getsource(self._module())
+        tail = source[source.rindex('if __name__ == "__main__":'):]
+
+        self.assertIn("run_entrypoint(main, sys.argv)", tail)
+        self.assertNotIn("SystemExit(main(", tail)
+
 
 
 if __name__ == "__main__":

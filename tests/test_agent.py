@@ -331,19 +331,49 @@ class SecretSafetyTests(unittest.TestCase):
             self.assertNotIn(secret, pattern)
 
     def test_the_detector_covers_the_repository_hygiene_patterns(self):
-        """tests/test_repository_hygiene.py enforces three patterns over
+        r"""tests/test_repository_hygiene.py enforces three patterns over
         tracked files. A Signal travels off this machine into Company
-        History, so it must be held to at least the same bar; this pins
-        that the two lists cannot silently drift apart."""
-        from agent.signals import _SECRET_PATTERNS
+        History, so it must be held to at least the same bar.
 
-        hygiene_patterns = (
-            r"\bntn_[A-Za-z0-9]{10,}",
-            r"\bsecret_[A-Za-z0-9]{10,}",
-            r"Bearer\s+[A-Za-z0-9._-]{20,}",
-        )
-        for pattern in hygiene_patterns:
-            self.assertIn(pattern, _SECRET_PATTERNS)
+        **Behaviour, not the pattern text (C124).** This used to assert that
+        three literal regex sources were `in` the tuple:
+
+            r"\bntn_[A-Za-z0-9]{10,}"
+            r"\bsecret_[A-Za-z0-9]{10,}"
+            r"Bearer\s+[A-Za-z0-9._-]{20,}"
+
+        which is the hand-written-roster shape C115 removed elsewhere: it
+        pins the *spelling* and says nothing about what the spelling catches.
+        It went red for a change that made the detector **stronger** — the
+        `\b` in the first two was a bypass, because `one_line()` renders a
+        newline as `\n` and the letter `n` is a word character, so a token
+        that began a line was not redacted at all.
+
+        The obligation is unchanged and is now checked as an obligation: for
+        every string `tests/test_repository_hygiene.py` would refuse in a
+        tracked file, this detector must also fire. A future rewrite of
+        either side is free, and a *weakening* of this one fails.
+        """
+        for field, text in (
+            ("summary", "ntn_" + "A" * 44),
+            ("summary", "secret_" + "B" * 30),
+            ("summary", "Bearer " + "C" * 40),
+            # The C124 placements: a Signal is JSON and a value may contain
+            # a newline, which is where the bypass lived.
+            ("summary", "context\nntn_" + "D" * 44),
+            ("blocker", "context\tntn_" + "E" * 44),
+        ):
+            with self.subTest(text=text[:26]):
+                self.assertTrue(
+                    find_secret_material({field: text}),
+                    f"a Signal carrying {text[:26]!r} was not flagged",
+                )
+
+    def test_the_detector_still_passes_ordinary_work_text(self):
+        """The control for the check above."""
+        for benign in ("intn_abcdefghijklmnop", "Bearer word", "토큰 회전 완료"):
+            with self.subTest(text=benign[:20]):
+                self.assertFalse(find_secret_material({"summary": benign}))
 
     def test_ordinary_work_text_is_not_flagged(self):
         for benign in (
@@ -2007,7 +2037,7 @@ class StalenessThresholdIsAKnobNobodyTurnsTests(unittest.TestCase):
         reports. Worth stating, because the sentence beside the default reads
         as though a Monday-morning two-day gap would not."""
         self.assertEqual(self._reasons(1), ())
-        self.assertEqual(self._reasons(2), ("agent has not run for 2 day(s)",))
+        self.assertEqual(self._reasons(2), ("이 머신의 Agent가 2일째 실행되지 않았다",))
 
     def test_the_message_carries_the_elapsed_days(self):
         self.assertTrue(any("3" in reason for reason in self._reasons(3)))
@@ -2018,7 +2048,7 @@ class StalenessThresholdIsAKnobNobodyTurnsTests(unittest.TestCase):
         self.assertEqual(self._reasons(1), ())
 
         self.assertEqual(
-            self._reasons(1, stale_after_days=1), ("agent has not run for 1 day(s)",)
+            self._reasons(1, stale_after_days=1), ("이 머신의 Agent가 1일째 실행되지 않았다",)
         )
 
     def test_a_looser_threshold_stays_quiet_longer(self):

@@ -808,9 +808,14 @@ class ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests(unittest.TestCase):
             ("scheduler.lock.held_since", "run.lock", lock_held_since),
             ("scheduler.lock.stale", "run.lock", stale_lock_cannot_be_cleared),
             ("agent.status.read_status", "agent_state.json",
+             # `signals_dir` is not optional decoration (C126). Omitted, it
+             # defaults to this repository's live `runtime/agent/signals/`,
+             # and the counters it feeds then describe the operator's own
+             # Signal files rather than this test's tree.
              lambda p: read_status(state_path=p, outbox_dir=p.parent / "outbox",
                                    sent_dir=p.parent / "sent",
-                                   rejected_signals_dir=p.parent / "rejected")),
+                                   rejected_signals_dir=p.parent / "rejected",
+                                   signals_dir=p.parent / "signals")),
         )
 
     #: Deep enough that `json.loads` gives up. The number is not tuned to the

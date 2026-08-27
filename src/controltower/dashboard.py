@@ -468,9 +468,27 @@ class DashboardModel:
                 # `bounded()` as well, for `oplog.append_line()`'s reason: an
                 # `except Exception` catches anything at all, and a report
                 # that can grow without limit is one that fills a disk.
+                #
+                # **`bounded()` runs LAST, and the order is the point (C127).**
+                # Inside `redact()`'s argument it cuts the string *before*
+                # anything looks for a secret in it, and every pattern here
+                # has a minimum length — `ntn_[A-Za-z0-9]{10,}`. Measured, a
+                # 48-character token straddling the 600-character cut:
+                #
+                #     surviving chars   bounded-first     redact-first
+                #      4               `ntn_`            `[RED`
+                #      8               `ntn_AAAA`        `[REDACTE`
+                #     13               `ntn_AAAAAAAAA`   `[REDACTED]`
+                #     20               `[REDACTED]`      `[REDACTED]`
+                #
+                # Bounding first leaks up to 13 characters of a live
+                # credential to a Notion property; bounding last can only
+                # truncate the marker, which is cosmetic. Whether a token was
+                # redacted must not depend on where it happens to sit
+                # relative to character 600.
                 {
                     "file": redact(one_line(name)),
-                    "reason": redact(one_line(bounded(str(reason)))),
+                    "reason": bounded(redact(one_line(str(reason)))),
                 }
                 for name, reason in self.unreadable
             ],

@@ -749,8 +749,29 @@ def _reason(exc: BaseException) -> str:
 
     `bounded()` too: an `except Exception` catches anything, and a result a
     caller may print must not be able to grow without limit.
+
+    **And it runs last, which it did not until C127.** Written
+    `redact(one_line(bounded(...)))`, the cut happened *before* anything
+    looked for a secret, and every pattern in `oplog.SECRET_PATTERNS` has a
+    minimum length. Measured, a 48-character token straddling the
+    600-character boundary:
+
+        surviving chars   bounded-first     redact-first
+         4                `ntn_`            `[RED`
+         8                `ntn_AAAA`        `[REDACTE`
+        13                `ntn_AAAAAAAAA`   `[REDACTED]`
+        20                `[REDACTED]`      `[REDACTED]`
+
+    So up to 13 characters of a live credential reached a Notion property,
+    and whether they did depended on where the token happened to sit. The
+    reachability is this docstring's own sentence above: `except Exception`
+    catches anything, and `validate_event()` echoes the value it rejected —
+    an Event field this project does not bound.
+
+    Bounding last can only truncate the `[REDACTED]` marker, which is
+    cosmetic. `ops_status._authored()` already had this order.
     """
-    return redact(one_line(bounded(f"{type(exc).__name__}: {exc}")))
+    return bounded(redact(one_line(f"{type(exc).__name__}: {exc}")))
 
 
 class ProjectionOutcome(enum.Enum):

@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from controltower.attention import severity as attention_severity  # noqa: E402
 from controltower.notion_page import (  # noqa: E402
     MAX_CHILDREN_PER_APPEND,
     MAX_TABLE_ROWS,
@@ -1410,6 +1411,129 @@ class AFailedRewriteSaysThePageIsEmptyTests(unittest.TestCase):
         publish(transport=transport, parent_page_id=PARENT, payload=_payload())
         result = publish(transport=transport, parent_page_id=PARENT, payload=_payload())
         self.assertGreater(result.blocks_written, 0)
+
+
+class TheWorkspacePageRanksItsAlertsTooTests(unittest.TestCase):
+    """The Notion page's ATTENTION, ranked like the browser's (C129).
+
+    The browser page was fixed first — severity, source, ordering — and the
+    classifier lived in `dashboard_server.py`. This module sits **below**
+    that entrypoint and cannot import it, so the surface the whole workspace
+    reads would have kept the flat list while the local one improved.
+
+    The rule moved to `controltower/attention.py`, which both can reach.
+    That is the point of this class: not that the ranking exists, but that
+    **the two surfaces cannot rank the same list differently.**
+
+    Two things follow from ranking that a flat list did not have to answer:
+
+        the callout   names the P1 count and turns red, instead of "주의 N건"
+                      in orange whatever the N was made of
+        truncation    follows the rank. `MAX_TABLE_ROWS` cuts the list, and
+                      cutting by arrival order can drop a P1 to keep a P2.
+    """
+
+    def _payload(self, attention):
+        return {"attention": list(attention), "panels": [], "coverage": {},
+                "generated_at": "2026-08-27T10:00:00+09:00", "events_read": 0}
+
+    def _texts(self, blocks):
+        out = []
+        for block in blocks:
+            body = block.get(block.get("type")) or {}
+            out.append(
+                "".join(
+                    (item.get("plain_text")
+                     or (item.get("text") or {}).get("content") or "")
+                    for item in (body.get("rich_text") or ())
+                )
+            )
+        return out
+
+    def test_a_stopped_pipeline_is_listed_above_a_quiet_desktop(self):
+        blocks, _ = build_control_tower_blocks(
+            self._payload([
+                "3일 이상 아무것도 오지 않은 Desktop: DESKTOP_2",
+                "Runner가 9일째 실행되지 않았다",
+            ])
+        )
+        bullets = [t for t in self._texts(blocks) if t.startswith("[P")]
+
+        self.assertEqual(len(bullets), 2)
+        self.assertTrue(bullets[0].startswith("[P1]"), bullets)
+        self.assertTrue(bullets[1].startswith("[P2]"), bullets)
+
+    def test_the_two_surfaces_agree_on_the_ranking(self):
+        """The whole reason the rule moved. Driven over both renderers with
+        one list — a divergence here means the workspace and the operator
+        are reading different priorities off the same facts."""
+        import importlib
+
+        dashboard_server = importlib.import_module("dashboard_server")
+        lines = [
+            "Runner가 9일째 실행되지 않았다",
+            "3일 이상 아무것도 오지 않은 Desktop: X",
+            "완전히 새로운 문장",
+        ]
+        for line in lines:
+            with self.subTest(line=line[:20]):
+                self.assertEqual(
+                    dashboard_server.attention_severity(line)[0],
+                    attention_severity(line)[0],
+                )
+
+    def test_an_unclassified_line_is_marked_and_sorts_to_the_top(self):
+        blocks, _ = build_control_tower_blocks(
+            self._payload([
+                "3일 이상 아무것도 오지 않은 Desktop: X",
+                "무엇인지 알 수 없는 새 경보",
+            ])
+        )
+        bullets = [t for t in self._texts(blocks) if t.startswith("[")]
+
+        self.assertTrue(bullets[0].startswith("[?]"), bullets)
+        self.assertIn("분류 불가", bullets[0])
+
+    def test_the_callout_names_the_p1_count(self):
+        blocks, _ = build_control_tower_blocks(
+            self._payload(["Runner가 9일째 실행되지 않았다"])
+        )
+        callout = blocks[0]
+
+        self.assertEqual(callout["type"], "callout")
+        self.assertEqual(callout["callout"]["color"], "red_background")
+        self.assertIn("P1 1건", self._texts([callout])[0])
+
+    def test_only_p2s_keep_the_amber_callout(self):
+        """The control. A callout that was always red would say nothing."""
+        blocks, _ = build_control_tower_blocks(
+            self._payload(["3일 이상 아무것도 오지 않은 Desktop: X"])
+        )
+
+        self.assertEqual(blocks[0]["callout"]["color"], "orange_background")
+
+    def test_truncation_keeps_the_severe_ones(self):
+        """`MAX_TABLE_ROWS` cuts the list. Cutting in arrival order can drop
+        a P1 to keep a P2, which is the one thing the cap must not do."""
+        noise = [f"3일 이상 아무것도 오지 않은 Desktop: D{i}" for i in range(MAX_TABLE_ROWS + 5)]
+        blocks, _ = build_control_tower_blocks(
+            self._payload(noise + ["Runner가 9일째 실행되지 않았다"])
+        )
+        bullets = [t for t in self._texts(blocks) if t.startswith("[")]
+
+        self.assertEqual(len(bullets), MAX_TABLE_ROWS)
+        self.assertTrue(bullets[0].startswith("[P1]"), bullets[0])
+
+    def test_the_severity_prefix_never_carries_the_message_itself(self):
+        """`_safe()` still runs on the line. The prefix is this module's own
+        text and must not become a way around the redaction boundary."""
+        token = "ntn_" + "A" * 44
+        blocks, _ = build_control_tower_blocks(
+            self._payload([f"Runner가 9일째 실행되지 않았다 {token}"])
+        )
+
+        self.assertNotIn(token, "".join(self._texts(blocks)))
+
 
 
 if __name__ == "__main__":

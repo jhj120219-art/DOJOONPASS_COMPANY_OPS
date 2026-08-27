@@ -325,5 +325,112 @@ class FormatReportTests(unittest.TestCase):
         self.assertIn("CREATED", lines[1])
 
 
+class TheSetupCommandSaysWhetherTheBootstrapTookTests(unittest.TestCase):
+    """`init_notion.py`'s exit code (C117).
+
+    The defect. `main()` printed its summary line —
+
+        EXISTS=10 CREATED=0 RENAMED=0 SKIPPED=0 FAILED=1
+
+    — and returned **0** for any `FAILED`. The one Property that can reach
+    `FAILED` without raising is the Title:
+    `BootstrapTitleRenameFailureTests` above pins the state where the rename
+    `"Name" -> "Project"` is refused and the Database is left with no
+    `Project` property at all.
+
+    That is not cosmetic. `notion/properties.py` writes every PROJECTS row as
+    `{"Project": _title(...)}`, so the Database this leaves behind fails
+    **every** later Notion Sync. And this module's own docstring records why
+    the rename is automated in the first place: the manual step "was
+    attempted twice by a human operator and did not take effect either time".
+    Exiting 0 told the operator the automated attempt had worked, and sent
+    them to the next line of docs/13 on top of the same broken state.
+
+    Driven through `main()` because that is where the code lived. Nothing
+    reaches Notion — `RealNotionTransport` is replaced by the in-memory one
+    every other test in this file uses.
+    """
+
+    def _run(self, transport):
+        import contextlib
+        import importlib
+        import io
+        import os
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        init_notion = importlib.import_module("init_notion")
+        original_factory = init_notion.RealNotionTransport
+        original_environ = dict(os.environ)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            init_notion.RealNotionTransport = lambda **kwargs: transport
+            os.environ["NOTION_API_TOKEN"] = "ntn_" + "testtokenvalue0000"
+            os.environ["NOTION_PROJECTS_DATABASE_ID"] = "DB-1"
+            os.environ.pop("NOTION_OPS_RUNS_DATABASE_ID", None)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = init_notion.main(("init_notion.py",))
+        finally:
+            init_notion.RealNotionTransport = original_factory
+            os.environ.clear()
+            os.environ.update(original_environ)
+        return code, out.getvalue(), err.getvalue(), init_notion
+
+    def test_a_refused_title_rename_does_not_report_success(self):
+        transport = InMemoryNotionTransport(
+            initial_properties={"Name": {"type": "title", "title": {}}}
+        )
+        transport.fail_next_method = "update_database"
+
+        code, out, err, init_notion = self._run(transport)
+
+        self.assertIn("FAILED=1", out)
+        self.assertEqual(
+            code,
+            init_notion.DEGRADED_EXIT,
+            "the Title rename was refused and the command reported success",
+        )
+        self.assertIn("DEGRADED", err)
+        self.assertIn("Project", err)
+
+    def test_a_clean_bootstrap_still_reports_success(self):
+        """The antecedent. Without it a `main()` that returned 3 whatever
+        happened would satisfy the assertion above."""
+        transport = InMemoryNotionTransport(
+            initial_properties={"Name": {"type": "title", "title": {}}}
+        )
+
+        code, out, err, _ = self._run(transport)
+
+        self.assertIn("FAILED=0", out)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("DEGRADED", err)
+
+    def test_a_title_already_named_project_is_not_a_failure(self):
+        """`SKIPPED` means there was nothing to rename — the good outcome,
+        and the one a second run of this idempotent command produces."""
+        transport = InMemoryNotionTransport(
+            initial_properties={"Project": {"type": "title", "title": {}}}
+        )
+
+        code, out, err, _ = self._run(transport)
+
+        self.assertIn("SKIPPED=1", out)
+        self.assertIn("FAILED=0", out)
+        self.assertEqual(code, 0, err)
+
+    def test_the_exit_code_is_the_one_the_other_entrypoints_spend(self):
+        """docs/14 §4: "`3`은 `ops_status.py`의 기존 '사람이 확인해야 함'과
+        같은 뜻이다 — 두 진입점이 같은 숫자로 같은 말을 한다." A fourth
+        meaning for the same number would undo that."""
+        import importlib
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        init_notion = importlib.import_module("init_notion")
+
+        self.assertEqual(init_notion.DEGRADED_EXIT, 3)
+        self.assertEqual(init_notion.CONFIG_ERROR_EXIT, 1)
+        self.assertNotEqual(init_notion.DEGRADED_EXIT, init_notion.CONFIG_ERROR_EXIT)
+
+
 if __name__ == "__main__":
     unittest.main()

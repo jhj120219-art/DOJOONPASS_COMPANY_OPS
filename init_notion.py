@@ -105,6 +105,31 @@ def _safe_block(text: str) -> str:
     return "\n".join(_safe(line) for line in text.splitlines())
 
 
+#: A bootstrap that reached the Database and could not bring every Property
+#: to spec.
+#:
+#: **Why this exists (C117).** `main()` printed `FAILED=N` in its summary
+#: line and returned **0** for any N. The only Property that can reach
+#: `FAILED` without raising is the Title -- `_bootstrap_title_property()`
+#: returns it when the rename `"Name" -> "Project"` is refused -- and that is
+#: precisely the step this module was written to automate, because
+#: `bootstrap.py`'s own docstring records that "this exact manual step was
+#: attempted twice by a human operator and did not take effect either time".
+#:
+#: The consequence is not cosmetic. `notion/properties.py` writes every
+#: PROJECTS row as `{"Project": _title(...)}`, so a Database whose Title is
+#: still called something else fails **every** later Notion Sync. Exiting 0
+#: told the operator the automated step had worked and sent them on to the
+#: next line of docs/13 -- repeating, with a green light on top, exactly the
+#: history the automation exists to end.
+#:
+#: 3 rather than a new number, for the reason docs/14 §4 gives: "`3`은
+#: `ops_status.py`의 기존 '사람이 확인해야 함'과 같은 뜻이다 -- 두 진입점이
+#: 같은 숫자로 같은 말을 한다." The Database exists and is reachable; some of
+#: it is not at spec, which is a person's problem and not a crash.
+DEGRADED_EXIT = 3
+
+
 def main(argv: Sequence[str] = ()) -> int:
     refusal = unexpected_arguments(
         argv,
@@ -213,6 +238,24 @@ def main(argv: Sequence[str] = ()) -> int:
     if not diagnosis.search_available:
         print("  (이 integration은 Workspace 검색 권한이 없어 Page 목록을 확인하지 못했다)")
     print(f"  다음 할 일     : {_safe(diagnosis.required_action)}")
+
+    # The exit code, from the bootstrap this command exists to perform. See
+    # `DEGRADED_EXIT`.
+    #
+    # `result.failed` only -- not the readiness printed just above, which
+    # the comment at step 9 already excludes on purpose, and not `skipped`,
+    # which means the Title was already named `Project` and is the good
+    # outcome rather than a missed one.
+    if result.failed:
+        print(
+            f"[DEGRADED] Property {len(result.failed)}개가 Spec에 맞춰지지 "
+            f"못했다: {', '.join(_safe(name) for name in result.failed)}. "
+            "위 Report의 해당 줄에 이유가 있다. "
+            "Title이 여기 있으면 이후 Notion Sync는 전부 실패한다 "
+            "(모든 Row 쓰기가 'Project' Property를 쓴다).",
+            file=sys.stderr,
+        )
+        return DEGRADED_EXIT
 
     return 0
 

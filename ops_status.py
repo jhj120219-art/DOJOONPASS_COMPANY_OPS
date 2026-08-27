@@ -147,7 +147,12 @@ from controltower import (  # noqa: E402
     unsourced_layer_coverage,
 )
 from notion.properties import ROLE_DISPLAY_NAMES  # noqa: E402
-from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
+from cli import (  # noqa: E402
+    CONFIG_ERROR_EXIT,
+    output_is_gone,
+    run_entrypoint,
+    unexpected_arguments,
+)  # noqa: E402
 from scheduler.lock import (  # noqa: E402
     is_locked,
     lock_held_since,
@@ -174,8 +179,9 @@ def _agent_dir() -> Path:
 
     Measured, and not hypothetically: a probe written during C31 set
     `RUNTIME_DIR` to a temp tree holding a future-dated `agent_state.json`,
-    read back "agent has not run for 3 day(s)" from this repository's own
-    runtime, and nearly recorded a working check as missing.
+    read back "agent has not run for 3 day(s)" (그때의 문구; C120에서 한국어로 바뀌었다) from this
+    repository's own runtime, and nearly recorded a working check as
+    missing.
 
     This is C13's 결함 2 in a second place, and its wording applies verbatim:
     *"Reaching for the default inside here made this function depend on a
@@ -838,6 +844,106 @@ def _one_per_event(items, key):
 # the schema is either scanned here or fails the suite. `evidence` is handled
 # separately below because it is a list, not a string.
 _EVENT_TEXT_FIELDS = ("event_id", "project_id", "milestone", "summary", "blocker")
+
+
+#: The four Decision Context fields a person fills in through
+#: `src/review_cli.py`. Named here rather than imported so this stays a
+#: read-only view — `HistoryCandidate` owns them, and
+#: `test_the_field_roster_is_the_one_review_cli_offers` checks the two agree.
+_DECISION_CONTEXT_FIELDS = (
+    "decision_context",
+    "expected_outcome",
+    "actual_outcome",
+    "lessons_learned",
+)
+
+
+def _secret_shaped_decision_context(
+    keep_dir: Path,
+    review_dir: Path,
+) -> tuple[tuple[tuple[str, str], ...], int]:
+    """`(history_id, fields)` for Candidates whose typed prose is secret-shaped.
+
+    **The third door, and the only one with neither a refusal nor a report
+    (C125).** `_secret_shaped_event_content()` below names two ways text
+    reaches Company History and what happens at each:
+
+        Signal typed on this machine    `find_secret_material()` REFUSES it
+        Event from another Desktop      nothing reads the content; that
+                                        detector reports it
+
+    Decision Context is a third, and it is the one a person writes **as
+    prose, deliberately**, through `review_cli.py`. "토큰을 교체했다. 새 값은
+    …" is an ordinary sentence to write in a lessons-learned field.
+
+    Measured end to end in a temp tree, with a token typed into
+    `decision_context`:
+
+        submit_review()                 accepted, nothing scanned
+        candidate on disk               holds the token
+        _secret_shaped_event_content()  blind — it reads `processed/`
+                                        Events, and this is a Candidate
+        Daily History markdown          **token present**, SECRET_RE matches
+
+    So the material is recognisable and nothing was looking. Company History
+    is synced to the Working Copy, committed, pushed to the backup remote
+    (`scan_for_secrets()` compares filenames, never content) and rendered
+    into the Notion page.
+
+    **This reports; it refuses nothing** — the same posture, and for the same
+    reason, as the Event detector: refusing here would be `review_cli.py`
+    discarding a paragraph the person just typed, and that is a decision
+    recorded in BACKLOG rather than taken in a status view. What
+    `review_cli.py` does now is *warn at the moment of typing*, which costs
+    nothing and refuses nothing.
+
+    Reads both `keep/` and `review/`: a REVIEW candidate is equally on disk
+    and equally headed for Company History once someone decides on it.
+
+    The matched text is never returned, for the reason
+    `find_secret_material()` states: a report of a leaked credential must not
+    become the second copy of it.
+
+    Returns `(rows, unchecked)`. The second number is Candidates this could
+    not read, and it is **counted rather than skipped** — a file nobody
+    opened is not a file with no secret in it, which is the silent-loss
+    direction this project keeps removing. `ASilentlyDroppedEntryIsAROSTER…`
+    is the gate that said so when the first draft dropped them: the
+    `count += 1` spelling is what its classifier reads as "recorded" (C88).
+    """
+    found: list[tuple[str, str]] = []
+    unchecked = 0
+    for directory in (keep_dir, review_dir):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            # `FileHistoryRepository.save()` stages into these directories,
+            # so a killed run leaves a `.tmp-…json`. It is residue rather
+            # than a Candidate, and `_incomplete_writes()` already reports
+            # it — the same skip `_split_reviewed()` makes twenty lines up.
+            if is_incomplete_write(path.name):
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                # `RecursionError` too, and it is not defensive padding:
+                # `json.loads` raises it rather than `ValueError` on deeply
+                # nested input, and a Candidate file is untrusted the moment
+                # a person or another tool can write one. Same triple as
+                # `_split_reviewed()` twenty lines up.
+                unchecked += 1
+                continue
+            if not isinstance(data, dict):
+                unchecked += 1
+                continue
+            fields = [
+                name
+                for name in _DECISION_CONTEXT_FIELDS
+                if isinstance(data.get(name), str) and SECRET_RE.search(data[name])
+            ]
+            if fields:
+                found.append((str(data.get("history_id") or path.name), "/".join(fields)))
+    return tuple(sorted(found)), unchecked
 
 
 def _secret_shaped_event_content(
@@ -3055,6 +3161,44 @@ def _print_history(now: datetime) -> list[str]:
     # Everything printed is redacted, including the ids -- `event_id` and
     # `project_id` are among the fields scanned, so quoting one raw is exactly
     # how this report would become the second copy of a leaked credential.
+    # The Candidate side of the same question (C125). Placed beside the Event
+    # detector because an operator reading either line takes the same action
+    # — rotate the credential — and because the two doors are only
+    # distinguishable if both are reported.
+    secret_context, unchecked_context = _secret_shaped_decision_context(
+        RUNTIME_DIR / "history_candidates" / "keep",
+        RUNTIME_DIR / "history_candidates" / "review",
+    )
+    if unchecked_context:
+        # A fact, not an ATTENTION line, following C26's rule: an unreadable
+        # Candidate is already an ATTENTION item from
+        # `_candidate_consistency()`, and a second alarm for one action is
+        # how a section stops being read. What this adds is the *scope* of
+        # the answer above it — "no secret found" is only about the files
+        # that could be opened.
+        print(
+            f"  Decision Context 미확인: {unchecked_context}건 "
+            f"(읽지 못한 Candidate — 위 Secret 점검은 이 파일들을 보지 못했다)"
+        )
+    if secret_context:
+        named_context = ", ".join(
+            f"{_authored(history_id)}({fields})"
+            for history_id, fields in secret_context[:5]
+        )
+        attention.append(
+            f"History Candidate의 Decision Context에 Secret 형태의 문자열 "
+            f"{len(secret_context)}건: {named_context}"
+            f"{' 외' if len(secret_context) > 5 else ''} — 이 필드는 사람이 "
+            f"`review_cli.py`로 직접 타이핑한 산문이고, **들어올 때 아무것도 "
+            f"검사하지 않는다**. Signal은 그 자리에서 거부되고(`find_secret_material()`), "
+            f"다른 Desktop의 Event는 최소한 아래 줄이 보고하지만, 이 경로는 "
+            f"둘 다 없었다(C125). 실측: Daily History에 그대로 렌더링되고 "
+            f"Company Repository -> Working Copy -> backup 원격까지 간다 "
+            f"(`scan_for_secrets()`는 이름만 본다). 해당 자격증명을 **교체**해야 "
+            f"한다 — Candidate를 고쳐도 이미 렌더링된 Daily와 원격 history에는 "
+            f"남는다"
+        )
+
     secret_events = _secret_shaped_event_content(RUNTIME_DIR / "events" / "processed")
     if secret_events:
         # One line per leaked credential, not per file holding it (C77). The
@@ -4150,8 +4294,8 @@ def _print_agent(now: datetime) -> list[str]:
     # Measured: a lock file recording a dead pid, made read-only —
     # `stale_lock_cannot_be_cleared()` returns True, and the AGENT section
     # printed nothing about it. The only trace was `needs_attention()`'s
-    # "agent has not run for N day(s)", which needs N days to appear and
-    # names a symptom rather than the cause.
+    # "이 머신의 Agent가 N일째 실행되지 않았다", which needs N days to appear
+    # and names a symptom rather than the cause.
     #
     # Read-only, decides nothing, takes nothing — `is_locked()` /
     # `lock_held_since()` / `stale_lock_cannot_be_cleared()` are the
@@ -4929,7 +5073,7 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
 
     # How long ago that was — the question this line never answered.
     #
-    # The AGENT section has had "agent has not run for N day(s)" since it was
+    # The AGENT section has had an "N일째 실행되지 않았다" line since it was
     # written. The Runner, which is the machine that actually assembles
     # Company History and pushes the Backup, had no equivalent: `started_at`
     # was printed and never compared to anything. So a Runner that simply
@@ -4938,8 +5082,8 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     # last SUCCESS, in green, forever.
     #
     # Measured on this machine: the last run was two days old and ATTENTION
-    # carried "agent has not run for 2 day(s)" and nothing at all about the
-    # Runner.
+    # carried "agent has not run for 2 day(s)" (그때의 문구; C120에서 한국어로 바뀌었다) and nothing
+    # at all about the Runner.
     #
     # `SILENT_AFTER_DAYS` is reused rather than a new threshold invented. Its
     # comment already states the reasoning this needs — a machine switched
@@ -5157,6 +5301,27 @@ def _block(label: str, render, now: datetime) -> list[str]:
     try:
         return list(render(now))
     except OSError as exc:
+        # An `OSError` from **writing** is not damaged evidence, and this arm
+        # is the one place in this file that can mistake it for some (C118).
+        #
+        # Measured: `python ops_status.py | head -3` raised
+        # `OSError(22, 'Invalid argument')` inside `_print_history()`'s own
+        # `print()`. This handler caught it, reported
+        # `HISTORY — 읽지 못했다`, and raised an ATTENTION line saying
+        # "디스크나 권한 문제이며 사람이 확인해야 한다" — about a block whose
+        # evidence was perfectly readable. Then its own `print()` failed the
+        # same way, so the handler raised too: two tracebacks and exit 120.
+        #
+        # The docstring above already draws this line for the other case —
+        # "a `TypeError` from a rollup is a bug in this program and must not
+        # be dressed up as a disk problem". A closed pipe is the same
+        # mis-attribution wearing `OSError`'s type.
+        #
+        # Re-raised rather than handled here: there is nothing to say and
+        # nowhere to say it, and `run_entrypoint()` at the bottom of this
+        # file owns what that means for the exit code.
+        if output_is_gone():
+            raise
         # `_authored()`: the path in the message can be an Event filename,
         # and `safe_event_filename()` builds those from `event_id` — a string
         # another Desktop chose and `validate_event()` only type-checks.
@@ -5271,4 +5436,8 @@ def main(argv: Sequence[str] = ()) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    # `run_entrypoint()` rather than `main()` directly: this is the tool an
+    # operator pipes (`| head`, `| more`, a pager they quit out of), and the
+    # exit code that state used to produce was `120` with two tracebacks.
+    # See `cli.OUTPUT_LOST_EXIT` for why the answer is 2 and not 0.
+    raise SystemExit(run_entrypoint(main, sys.argv))

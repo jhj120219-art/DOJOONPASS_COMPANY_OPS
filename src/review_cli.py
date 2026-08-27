@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import enum
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 # Same defensive fix as run_company_ops.py/init_notion.py (this Sprint's
@@ -40,6 +41,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments
+from oplog import SECRET_RE
 from history import (
     FileHistoryRepository,
     HistoryCandidate,
@@ -90,6 +92,25 @@ def _prompt_field(
     return raw
 
 
+def _echo_typed(updates: dict, print_fn: PrintFn) -> None:
+    """Print back what the person typed for a candidate that was not saved.
+
+    Two callers reach here — a save that raised, and input that ended mid
+    candidate — and both mean the same thing: this text exists nowhere but
+    the terminal. Decision Context is what README RULE 11/12 call the
+    company's most valuable asset; losing a paragraph of it is not an
+    acceptable failure mode, and one copy of the sentence is how the two
+    paths stay saying it the same way.
+    """
+    if not updates:
+        return
+    print_fn("  입력한 내용은 아래와 같습니다. 다시 시도하거나 따로 보관하세요.")
+    for field_name, label in _REVIEW_FIELDS:
+        if field_name in updates:
+            value = updates[field_name]
+            print_fn(f"    {label}: {'(지움)' if value is None else value}")
+
+
 def _review_one(
     reviewer: HistoryReviewer,
     candidate: HistoryCandidate,
@@ -103,20 +124,87 @@ def _review_one(
     print_fn(f"Event ID: {candidate.event_id}")
     print_fn(f"Summary: {candidate.summary}")
 
-    proceed = input_fn("이 항목을 검토하시겠습니까? (Enter=예, n=건너뛰기): ").strip().lower()
-    if proceed == "n":
-        print_fn("건너뜁니다.")
-        return ReviewOutcome.SKIPPED
-
     updates: dict[str, Any] = {}
-    for field_name, label in _REVIEW_FIELDS:
-        value = _prompt_field(input_fn, print_fn, label, getattr(candidate, field_name))
-        if value is not _SKIP:
-            updates[field_name] = value
+    try:
+        proceed = input_fn(
+            "이 항목을 검토하시겠습니까? (Enter=예, n=건너뛰기): "
+        ).strip().lower()
+        if proceed == "n":
+            print_fn("건너뜁니다.")
+            return ReviewOutcome.SKIPPED
+
+        for field_name, label in _REVIEW_FIELDS:
+            value = _prompt_field(
+                input_fn, print_fn, label, getattr(candidate, field_name)
+            )
+            if value is not _SKIP:
+                updates[field_name] = value
+    except (EOFError, KeyboardInterrupt):
+        # The input ran out — or a person pressed Ctrl+C — part way through
+        # this candidate. C117 found this by running the real command:
+        #
+        #     printf 'n\nn\nn\n' | python src/review_cli.py
+        #
+        # ended on the fourth candidate with a raw `EOFError` traceback and
+        # exit 1, which this project reserves for a configuration error. Any
+        # non-terminal invocation reaches it — a pipe, a redirect, a task
+        # with no console.
+        #
+        # What is echoed here is the same thing the save-failure path below
+        # echoes, for the same reason and it is the reason this branch
+        # exists at all: whatever the person had already typed for *this*
+        # candidate was never passed to `submit_review()`, so the terminal is
+        # the only place it still is. Printing it before re-raising is the
+        # difference between "the session ended" and "the paragraph is gone".
+        if updates:
+            print_fn("")
+            print_fn(f"[중단] {candidate.history_id} 은(는) 저장되지 않았습니다.")
+            _echo_typed(updates, print_fn)
+        raise
 
     if not updates:
         print_fn("변경 사항이 없습니다.")
         return ReviewOutcome.SKIPPED
+
+    # Secret-shaped prose, named before it is stored (C125).
+    #
+    # **This is the door nothing was watching.** `_secret_shaped_event_content()`
+    # in `ops_status.py` writes down two ways text reaches Company History —
+    # a Signal typed here, which `find_secret_material()` refuses outright,
+    # and an Event from another Desktop, which nothing reads but that
+    # detector reports. Decision Context is a third, and it had neither.
+    # Measured end to end in a temp tree: a token typed into
+    # `decision_context` is accepted unscanned, stored, invisible to the
+    # Event detector (it reads `processed/`, this is a Candidate), and
+    # **rendered into the Daily History markdown** that is committed and
+    # pushed to the backup remote.
+    #
+    # A warning, not a refusal, and the line is deliberate. `oplog`'s own
+    # note says the patterns over-match on purpose — "a work note reading
+    # 'auth token: rotated' is refused even though it carries no secret" —
+    # and that trade was accepted for a Signal, which is a short structured
+    # record. This field is **prose**: refusing a lessons-learned paragraph
+    # because it contains the words "auth token:" would be a different
+    # bargain, and choosing it is a policy decision (BACKLOG), not something
+    # a warning needs. What the person gets instead is the fact, at the one
+    # moment they can still retype it.
+    #
+    # The matched text is never echoed, for `find_secret_material()`'s
+    # stated reason: a report of a leaked credential must not become the
+    # second copy of it. The field name is what the person needs.
+    flagged = [
+        label
+        for field_name, label in _REVIEW_FIELDS
+        if isinstance(updates.get(field_name), str)
+        and SECRET_RE.search(updates[field_name])
+    ]
+    if flagged:
+        print_fn(
+            f"  [주의] {', '.join(flagged)}에 Secret 형태의 문자열이 있습니다. "
+            "저장하면 Daily History에 렌더링되어 Company Repository와 backup "
+            "원격까지 갑니다 — 거기서는 지워도 남습니다. 값이 진짜 자격증명이면 "
+            "지금 다시 쓰고, 이미 저장했다면 그 자격증명을 교체하세요."
+        )
 
     try:
         reviewer.submit_review(candidate.history_id, **updates)
@@ -134,15 +222,60 @@ def _review_one(
         # losing a paragraph of it to a transient disk error is not an
         # acceptable failure mode.
         print_fn(f"[실패] {candidate.history_id} 저장하지 못했습니다: {exc}")
-        print_fn("  입력한 내용은 아래와 같습니다. 다시 시도하거나 따로 보관하세요.")
-        for field_name, label in _REVIEW_FIELDS:
-            if field_name in updates:
-                value = updates[field_name]
-                print_fn(f"    {label}: {'(지움)' if value is None else value}")
+        _echo_typed(updates, print_fn)
         return ReviewOutcome.FAILED
 
     print_fn(f"저장되었습니다: {candidate.history_id}")
     return ReviewOutcome.SAVED
+
+
+#: The exit code for a session in which the operator typed Decision Context
+#: and this tool could not store it.
+#:
+#: **Why this exists (C117).** `main()` called `run_interactive_review()`,
+#: **threw the return value away**, and returned `0`. A session where every
+#: single save failed — where the person typed paragraphs into three
+#: candidates and none of them reached disk — ended the same way as a clean
+#: one. `test_every_candidate_failing_still_completes_the_session` pinned
+#: that state and asserted only the printed line.
+#:
+#: This file already argues the point against itself. `main()`'s own
+#: docstring ends: *"without `SystemExit` the refusal would print and then
+#: exit 0, which is the shape of the defect rather than the fix."* The
+#: summary line `저장 실패: N건` exists for the same reason — because "a
+#: failure printed thirty candidates ago has scrolled off". The exit code is
+#: the one signal that cannot scroll off.
+#:
+#: 3, matching `ops_status.py`, docs/14 §4's Overall Status table, and the
+#: other two entrypoints that write outside this machine. The session did
+#: run — nothing crashed — and something needs a person.
+#:
+#: It also covers the second state C117 found, and that one came from
+#: running the real command rather than from reading it: input that ends
+#: before the candidates do. The rest of the list was never offered, so a
+#: `0` there would be saying "reviewed" about candidates nobody ever saw.
+DEGRADED_EXIT = 3
+
+
+@dataclass(frozen=True)
+class ReviewSession:
+    """What one pass over the candidates did.
+
+    Was a bare `int` (the updated count) until C117. The count alone cannot
+    answer the question `main()` has to ask — `0` is both "nothing needed
+    reviewing" and "every save failed" — and the failures were already
+    tracked here; they simply had nowhere to go but the screen.
+    """
+
+    updated: int = 0
+    #: `history_id`s whose save raised. The operator's typed text for these
+    #: is in the terminal scrollback and nowhere else (`_review_one()`
+    #: echoes it back on purpose).
+    failed: tuple[str, ...] = ()
+    #: `history_id`s the session never reached, because the input ended or a
+    #: person interrupted it. Distinct from a skip, which the operator chose
+    #: — these were never put in front of anybody.
+    unreached: tuple[str, ...] = ()
 
 
 def run_interactive_review(
@@ -150,24 +283,39 @@ def run_interactive_review(
     *,
     input_fn: InputFn = input,
     print_fn: PrintFn = print,
-) -> int:
+) -> ReviewSession:
     """Review every KEEP/REVIEW candidate one at a time.
 
-    Returns the count actually updated. Only ever calls
+    Returns what the session did. Only ever calls
     reviewer.list_reviewable() and reviewer.submit_review() — no Daily
     Generator, Scheduler, or Backup call happens here.
     """
     candidates = reviewer.list_reviewable()
     if not candidates:
         print_fn("리뷰할 History Candidate가 없습니다.")
-        return 0
+        return ReviewSession()
 
     updated_count = 0
     failed: list[str] = []
-    for candidate in candidates:
-        outcome = _review_one(
-            reviewer, candidate, input_fn=input_fn, print_fn=print_fn
-        )
+    unreached: list[str] = []
+    for index, candidate in enumerate(candidates):
+        try:
+            outcome = _review_one(
+                reviewer, candidate, input_fn=input_fn, print_fn=print_fn
+            )
+        except (EOFError, KeyboardInterrupt):
+            # The session ends here, and every candidate after this one was
+            # never offered. Caught rather than allowed out, because the
+            # alternative is what C117 measured on the real command: a raw
+            # `EOFError` traceback, exit 1 (this project's configuration-error
+            # code), and no summary of what the session had already saved.
+            #
+            # `_review_one()` has already echoed anything typed for this
+            # candidate. Both exceptions land here on purpose: Ctrl+C and a
+            # closed pipe leave the operator in the same place — a list that
+            # was not finished — and the lines below say how much of it.
+            unreached = [c.history_id for c in candidates[index:]]
+            break
         if outcome is ReviewOutcome.SAVED:
             updated_count += 1
         elif outcome is ReviewOutcome.FAILED:
@@ -178,7 +326,17 @@ def run_interactive_review(
         # Named again at the end: a failure printed thirty candidates ago has
         # scrolled off, and "저장됨 2건" alone reads like success.
         print_fn(f"저장 실패: {len(failed)}건 — {', '.join(failed)}")
-    return updated_count
+    if unreached:
+        # A count rather than a list, because this one can be the whole
+        # backlog. The ids are still on disk and `ops_status.py` reports
+        # them; what a reader needs here is that the session stopped early.
+        print_fn(
+            f"검토하지 못한 Candidate: {len(unreached)}건 "
+            "(입력이 끝났거나 중단됐습니다 — 다시 실행하면 그대로 남아 있습니다)."
+        )
+    return ReviewSession(
+        updated=updated_count, failed=tuple(failed), unreached=tuple(unreached)
+    )
 
 
 def main(argv: Sequence[str] = ()) -> int:
@@ -221,7 +379,28 @@ def main(argv: Sequence[str] = ()) -> int:
 
     repository = FileHistoryRepository()
     reviewer = RepositoryHistoryReviewer(repository)
-    run_interactive_review(reviewer)
+    session = run_interactive_review(reviewer)
+
+    # See `DEGRADED_EXIT`. A skip is not a failure — the operator chose it —
+    # and an empty candidate list is not one either; both leave these two
+    # tuples empty and this returns 0, which is what they mean.
+    if session.failed:
+        print(
+            f"[DEGRADED] {len(session.failed)}건의 Decision Context가 저장되지 "
+            "못했습니다. 입력한 내용은 위 출력에만 남아 있습니다 — 스크롤을 "
+            "올려 확인한 뒤 다시 시도하거나 따로 보관하세요.",
+            file=sys.stderr,
+        )
+        return DEGRADED_EXIT
+    if session.unreached:
+        print(
+            f"[DEGRADED] {len(session.unreached)}건을 검토하지 못한 채 "
+            "끝났습니다 — 입력이 끝났거나 중단됐습니다. 이 명령은 터미널에서 "
+            "직접 실행해야 합니다(파이프로 답을 넣으면 목록 끝까지 가지 "
+            "못합니다).",
+            file=sys.stderr,
+        )
+        return DEGRADED_EXIT
     return 0
 
 

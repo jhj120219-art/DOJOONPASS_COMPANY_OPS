@@ -1432,6 +1432,380 @@ class StrayShellArtifactsInTheRepositoryRootTests(unittest.TestCase):
                 self.assertFalse((REPO_ROOT / f"{name}.py").exists())
 
 
+
+class NoTestTakesADefaultThatPointsAtTheLiveTreeTests(unittest.TestCase):
+    """Every parameter whose default is under `runtime/`, checked at every
+    call site in `tests/` (C126).
+
+    C123 found this one instance at a time: two tests built an
+    `OneDriveTransport` without `outgoing_dir`, so `send()` staged a
+    fabricated Event into the operator's own `runtime/events/outgoing/` on
+    every full run. The fix there was a gate for that one class — which is
+    the roster shape, and there are **eleven** such callables.
+
+    Discovered by introspection rather than listed, so a twelfth is covered
+    the day it is written:
+
+        agent.agent.run_once            lock_path log_path outbox_dir
+                                        rejected_signals_dir sent_dir
+                                        signals_dir state_path
+        agent.status.read_status        (five)
+        collector.runtime.run_once      incoming_dir log_path processed_dir
+                                        rejected_dir
+        collector.state.PersistentSeenEventStore   state_path
+        controltower.rollup.build_company_rollup   processed_dir
+        history.file_repository.FileHistoryRepository  keep_dir review_dir
+        monthly.generator.mark_month_dirty         monthly_dir
+        monthly.generator.run_once                 state_path
+        scheduler.scheduler.run_once               lock_path state_path
+        transport.intake.run_intake     incoming_dir processed_dir
+                                        rejected_dir transport_dir
+        transport.onedrive.OneDriveTransport       outgoing_dir
+
+    **The reads are the reason this is not only about pollution.** C123's
+    instances wrote; the ones this found *read*, which is worse in one
+    specific way — the test's answer then depends on what the operator did
+    yesterday. Measured, on the two `read_status()` helpers this caught:
+
+        signals_dir omitted, watermark past the dates on disk
+            undelivered_closed_signal_count -> **5**
+            (the operator's real Signal files, in runtime/agent/signals/)
+        signals_dir given
+            undelivered_closed_signal_count -> 0
+
+    Both call sites passed every other directory explicitly and missed the
+    one with a default. They were green only because their fixtures' dates
+    happen to sit before the live ones.
+
+    Two shapes are deliberately **not** offenders, and both were false
+    positives in the first draft:
+
+        build_company_rollup(events=..., now=...)   `events` replaces the
+                                                   directory read entirely
+        Store(root / "state.json")                 positional arguments
+                                                   cover the leading
+                                                   parameters
+    """
+
+    #: `processed_dir` is not read when the caller supplies the events.
+    SUBSTITUTES = {"processed_dir": "events"}
+
+    #: The one call that takes a default **on purpose**, with the reason.
+    #:
+    #: `test_the_documented_one_liner_builds_a_model` runs the command
+    #: docs/13 §3-⑨ gives an operator, exactly as that operator would type
+    #: it — on the default directory. Passing `processed_dir` would test a
+    #: different command than the one the document publishes.
+    #:
+    #: Safe because it is read-only and its assertions do not depend on what
+    #: it reads: it checks that every panel has a `source` or a `note`, which
+    #: holds for an empty tree and a full one alike. That is also the
+    #: property the test exists for — the docstring says "it must work on a
+    #: machine with no evidence at all".
+    #:
+    #: Keyed by `(file, callable)` rather than by line, because a line number
+    #: goes stale on the next edit above it — the drift C92 recorded when
+    #: two of them moved twice in one Sprint.
+    ALLOWED = {
+        ("test_controltower_dashboard.py", "controltower.rollup.build_company_rollup"),
+    }
+
+    def _runtime_defaulting(self):
+        """`{qualified name: [parameter, ...]}`, from the real signatures.
+
+        **Qualified, and that is not tidiness.** Five modules export a
+        `run_once` — agent, collector, scheduler, monthly and app.runner —
+        with different parameters, and the first draft of this class keyed on
+        the bare name. It reported nineteen offenders, of which fifteen were
+        `test_collector_runtime.py` calling the *collector's* `run_once`
+        against the *scheduler's* parameter list. A check that names healthy
+        code is a check that gets switched off.
+        """
+        import importlib
+        import inspect
+        import pkgutil
+
+        runtime = REPO_ROOT / "runtime"
+
+        def under_runtime(value):
+            return isinstance(value, Path) and (
+                value == runtime or runtime in value.parents
+            )
+
+        found = {}
+        for module_info in pkgutil.walk_packages([str(REPO_ROOT / "src")]):
+            try:
+                module = importlib.import_module(module_info.name)
+            except Exception:  # noqa: BLE001 — a module that will not import
+                continue       # is another test's problem, not this one's
+            constants = {
+                name
+                for name, value in vars(module).items()
+                if name.startswith("DEFAULT_") and under_runtime(value)
+            }
+            for name, obj in vars(module).items():
+                if not (inspect.isclass(obj) or inspect.isfunction(obj)):
+                    continue
+                if getattr(obj, "__module__", None) != module_info.name:
+                    continue
+                try:
+                    signature = inspect.signature(obj)
+                except (TypeError, ValueError):
+                    continue
+                risky = [
+                    parameter.name
+                    for parameter in signature.parameters.values()
+                    if under_runtime(parameter.default)
+                    # The other spelling: `x_dir=None` with
+                    # `x_dir if x_dir is not None else DEFAULT_X_DIR` inside.
+                    or (
+                        parameter.default is None
+                        and f"DEFAULT_{parameter.name.upper()}" in constants
+                    )
+                ]
+                if risky:
+                    found[f"{module_info.name}.{name}"] = sorted(risky)
+        return found
+
+    @staticmethod
+    def _direct_imports(scope):
+        """`ImportFrom` statements belonging to this scope.
+
+        **Does not descend into a nested `def` (C126).** `ast.walk()` yields
+        every descendant, so a module-level sweep written with it collects
+        imports from inside every test method in the file — which is how the
+        first draft decided that `test_observability.py` binds `run_once` to
+        `agent.agent`, on the strength of one `from agent.agent import
+        run_once` twelve hundred lines below the call it then misjudged.
+
+        This and `_bindings()`'s unbind rule are **two independent fixes for
+        that, either of which is sufficient** — measured: restoring the
+        descent leaves the sweep correct, because the unbind then answers.
+        Recorded rather than one of them deleted: they fail differently. The
+        unbind needs an import to be *present and untracked*; not descending
+        needs nothing at all, and is what keeps `_bindings()` describing a
+        scope rather than a file.
+        `test_the_resolver_reads_the_import_that_is_in_scope` drives both,
+        and the redundancy is measured rather than asserted: breaking either
+        one alone leaves every test here green, and breaking **both together**
+        turns the sample's `app.runner.run_once` call back into a false
+        offender. That is what "either is sufficient" means, stated as the
+        mutation that shows it.
+        """
+        found = []
+        stack = list(getattr(scope, "body", []))
+        while stack:
+            statement = stack.pop()
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(statement, ast.ImportFrom):
+                found.append(statement)
+            for field in ("body", "orelse", "finalbody"):
+                stack.extend(getattr(statement, field, None) or [])
+            for handler in getattr(statement, "handlers", None) or []:
+                stack.extend(handler.body)
+        return found
+
+    def _bindings(self, scope, qualified):
+        """`{name as spelled here: qualified name}` for one scope."""
+        by_leaf = {}
+        for full in qualified:
+            by_leaf.setdefault(full.rsplit(".", 1)[1], []).append(full)
+
+        names = {}
+        for statement in self._direct_imports(scope):
+            if not statement.module:
+                continue
+            for alias in statement.names:
+                local = alias.asname or alias.name
+                candidate = f"{statement.module}.{alias.name}"
+                if candidate in qualified:
+                    names[local] = candidate
+                elif alias.name in by_leaf and len(by_leaf[alias.name]) == 1:
+                    # A package re-export (`from scheduler import run_once`),
+                    # unambiguous only when one module defines that leaf.
+                    names[local] = by_leaf[alias.name][0]
+                else:
+                    # Imported from somewhere this sweep does not track, or
+                    # ambiguous. **Unbind**, so an outer scope's binding for
+                    # the same name cannot answer for this call:
+                    # `app.runner.run_once` takes no runtime default at all,
+                    # and the honest verdict for its calls is "not mine".
+                    names[local] = None
+        return names
+
+    def _resolved_calls(self, tree, qualified):
+        """`(call node, qualified name)` for every call this sweep can name.
+
+        Scope-aware, innermost wins. A file that imports one `run_once` in
+        one test method and a different one in another resolves each call
+        against the import that is actually in scope for it.
+        """
+        parent = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parent[child] = node
+
+        def chain(node):
+            """This node's enclosing scopes, outermost first."""
+            scopes, current = [], node
+            while current is not None:
+                if isinstance(current, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    scopes.append(current)
+                current = parent.get(current)
+            return list(reversed(scopes))
+
+        cache = {}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            names = {}
+            for scope in chain(node):
+                if id(scope) not in cache:
+                    cache[id(scope)] = self._bindings(scope, qualified)
+                names.update(cache[id(scope)])
+            resolved = names.get(node.func.id)
+            if resolved is not None:
+                yield node, resolved
+
+    def test_the_introspection_finds_the_callables_we_know_about(self):
+        """Guards the guard. An import failure or a rename would leave the
+        sweep below scanning for nothing, which is the vacuous shape C76 §4
+        swept a whole repository for."""
+        found = self._runtime_defaulting()
+
+        self.assertGreaterEqual(len(found), 8, f"only found {sorted(found)}")
+        self.assertIn("outgoing_dir", found["transport.onedrive.OneDriveTransport"])
+        self.assertIn("signals_dir", found["agent.status.read_status"])
+        # The name that made qualification necessary: more than one module
+        # defines it, with different parameters.
+        run_onces = [name for name in found if name.endswith(".run_once")]
+        self.assertGreater(len(run_onces), 1, run_onces)
+
+    def test_no_test_leaves_such_a_parameter_to_its_default(self):
+        risky = self._runtime_defaulting()
+        offenders = []
+        allowed_seen = set()
+        for path in sorted((REPO_ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            # A call inside a method is resolved with that method's own
+            # imports; the deepest scope wins, so the last verdict for a
+            # given line is the right one.
+            for node, qualified in self._resolved_calls(tree, risky):
+                given = {keyword.arg for keyword in node.keywords}
+                positional = len(node.args)
+                missing = [
+                    parameter
+                    for index, parameter in enumerate(risky[qualified])
+                    if parameter not in given
+                    and self.SUBSTITUTES.get(parameter) not in given
+                    and index >= positional
+                ]
+                if missing and (path.name, qualified) not in self.ALLOWED:
+                    offenders.append(
+                        f"{path.name}:{node.lineno} {qualified}() left "
+                        f"{missing} to a default under runtime/"
+                    )
+                if missing and (path.name, qualified) in self.ALLOWED:
+                    allowed_seen.add((path.name, qualified))
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a test let a parameter fall back to this repository's live "
+            "runtime/ tree. If it writes, it leaves residue in the "
+            "operator's directories; if it reads, the test's answer depends "
+            "on what the operator did yesterday:\n  " + "\n  ".join(offenders),
+        )
+
+        # An allowance that stops matching anything is a permission nobody
+        # needs, still granted. C88's shape: the roster outlived its subject
+        # and kept advertising a to-do that was already done.
+        self.assertEqual(
+            allowed_seen,
+            self.ALLOWED,
+            "an entry in ALLOWED no longer matches any call — delete it "
+            f"(unmatched: {sorted(self.ALLOWED - allowed_seen)})",
+        )
+
+    #: Two methods, two different `run_once` imports, and a third with none
+    #: — the shape `test_observability.py` actually has. Written out here so
+    #: the resolver is checked against a case whose right answer is obvious,
+    #: rather than against whatever the real tree happens to contain.
+    RESOLVER_SAMPLE = """
+from agent.status import read_status
+
+class T:
+    def test_a(self):
+        from collector.runtime import run_once
+        run_once(incoming_dir=x)
+
+    def test_b(self):
+        from app.runner import run_once
+        run_once(local_master_dir=x)
+
+    def test_c(self):
+        read_status(state_path=p)
+
+    def test_d(self):
+        from agent.agent import run_once
+        run_once()
+"""
+
+    def test_the_resolver_reads_the_import_that_is_in_scope(self):
+        """The contract both mechanisms in `_direct_imports()` exist for.
+
+        `test_b` calls `app.runner.run_once`, which takes no runtime default
+        at all — naming it would be reporting a healthy test, and the first
+        draft did exactly that for three of them.
+        """
+        risky = self._runtime_defaulting()
+        tree = ast.parse(self.RESOLVER_SAMPLE)
+
+        resolved = {
+            node.lineno: qualified
+            for node, qualified in self._resolved_calls(tree, risky)
+        }
+
+        self.assertEqual(
+            sorted(resolved.values()),
+            [
+                "agent.agent.run_once",
+                "agent.status.read_status",
+                "collector.runtime.run_once",
+            ],
+            f"resolved: {resolved}",
+        )
+        # and specifically: the untracked import is not answered for by the
+        # tracked one three methods above it
+        self.assertNotIn("app.runner.run_once", resolved.values())
+
+    def test_the_sweep_would_notice_one(self):
+        """Guards the guard, by feeding it the defect — the real tree is
+        clean, so a sweep that had stopped working looks identical to one
+        that works."""
+        risky = {"transport.onedrive.OneDriveTransport": ["outgoing_dir"]}
+        local = {"OneDriveTransport": "transport.onedrive.OneDriveTransport"}
+        self.assertTrue(local)
+        samples = {
+            "OneDriveTransport(sync_folder=t)": 1,
+            "OneDriveTransport(sync_folder=t, outgoing_dir=o)": 0,
+            "OneDriveTransport(t, o)": 0,
+        }
+        for source, expected in samples.items():
+            with self.subTest(call=source):
+                node = ast.parse(source).body[0].value
+                given = {keyword.arg for keyword in node.keywords}
+                missing = [
+                    parameter
+                    for index, parameter in enumerate(risky[local[node.func.id]])
+                    if parameter not in given
+                    and self.SUBSTITUTES.get(parameter) not in given
+                    and index >= len(node.args)
+                ]
+                self.assertEqual(len(missing), expected)
+
+
 class DeadCapabilityInventoryTests(unittest.TestCase):
     """The complete list of public functions nothing in production calls.
 
@@ -1531,6 +1905,18 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         # are waiting on a decision.
         "do_GET",
         "log_message",
+        # `rank()` joined for the same structural reason, not the same
+        # framework one (C129). `controltower/notion_page.py` passes it as
+        # `sorted(attention, key=_attention_rank)` — a bare name on the right
+        # of a keyword argument, which is neither a Call nor an Attribute, so
+        # this scanner cannot see it for exactly the reason the `do_POST`
+        # note below records. It is called on every ATTENTION line the Notion
+        # page renders.
+        #
+        # Wrapping the call site in a lambda purely to make it visible was
+        # the alternative and was rejected: contorting production code to
+        # suit a detector is how the detector stops describing the code.
+        "rank",
         # `do_POST` left this list in C115, and the direction is worth
         # recording: it is not that the detector got weaker, it is that the
         # code got more visible. The refusal used to be a hand-written roster
@@ -3098,6 +3484,148 @@ class EveryTrackedModuleParsesOnThisInterpreterTests(unittest.TestCase):
         self.assertFalse(_offends(fixed))
         self.assertFalse(_offends("def f(a: int) -> str:\n    return ''\n"))
         self.assertFalse(_offends("x = 1 | 2\n"))
+
+
+
+class NothingHereNeedsAGrammarOlderDesktopsDoNotHaveTests(unittest.TestCase):
+    """CHARACTERIZATION (C119): every tracked module still parses under the
+    **3.9** grammar, which is what DESKTOP_1 runs.
+
+    The class above states this gap in its own docstring and then says
+    nothing would notice it:
+
+        test_every_tracked_python_file_compiles
+            `compile()` on **this** interpreter. On 3.9 it also enforced
+            3.9. On 3.13 it enforces 3.13 and says nothing about 3.9, so a
+            `match` statement or an `except*` would pass here and abort
+            collection on a Desktop that has not moved.
+
+        Measured in C76 ... across all 139 tracked `.py` files, **zero**
+        post-3.9 AST constructs. Nothing has drifted; **nothing would notice
+        if it did.**
+
+    This is the thing that would notice. It is not the "declared minimum
+    interpreter" that docstring says is needed and that BACKLOG A holds as a
+    decision — it declares nothing. It pins the **measurement** C76 already
+    took, the way `StrayShellArtifactsInTheRepositoryRootTests` pins a set of
+    files nobody has decided about yet: the day this goes red, somebody
+    chooses, and until then the tree cannot drift past 3.9 in silence.
+
+    **Why 3.9 and not some other number.** Not chosen here either. BACKLOG D
+    records it: DESKTOP_1 is `Python 3.9.7 / Windows 10 Pro 10.0.19042`, it
+    runs an Agent (AGENT.md §1), and the whole tree is copied there. The 32
+    failures that machine already shows are enumerated in that section and
+    understood — 31 of them are `enterContext` (3.11+) in one test file, an
+    `AttributeError` at run time. A **syntax** error is worse than any of
+    them: it aborts collection of its whole file, so the 32 would become "32
+    failures and some number of tests that no longer exist".
+
+    `ast.parse(..., feature_version=(3, 9))` rather than a hand-written list
+    of node types. CPython maintains it, and the messages name themselves:
+
+        match      -> Pattern matching is only supported in Python 3.10 and greater
+        except*    -> Exception groups are only supported in Python 3.11 and greater
+        type X = Y -> Type statement is only supported in Python 3.12 and greater
+        def f[T]() -> Type parameter lists are only supported in Python 3.12 and greater
+
+    **What it does not see, stated rather than implied.** `feature_version`
+    reaches the parser, not the tokenizer, so PEP 701 f-strings (`f"{d["k"]}"`,
+    3.12+) pass here and fail on 3.9. Measured, not assumed — that string is
+    in `test_the_check_can_actually_disagree` below. Runtime API drift
+    (`enterContext` again) is outside this entirely: it is not syntax.
+    """
+
+    #: BACKLOG D's DESKTOP_1, as a tuple. Not a policy — see the docstring.
+    OLDEST_DESKTOP = (3, 9)
+
+    def _python_files(self):
+        return [
+            path
+            for path in _tracked_files()
+            if path.suffix == ".py" and path.is_file()
+        ]
+
+    def test_the_scan_sees_the_files_it_is_supposed_to(self):
+        """Guards the guard. A derivation that came back empty would pass
+        this class forever, which is the vacuous shape C76 §4 swept for."""
+        names = {path.name for path in self._python_files()}
+
+        self.assertIn("ops_status.py", names)
+        self.assertIn("run_agent.py", names)
+        self.assertGreater(len(names), 50)
+
+    def _refusal(self, source, name="<probe>"):
+        """The `SyntaxError` the older grammar gives for `source`, or `None`.
+
+        One copy, and the guard below drives **this** rather than `ast.parse`
+        directly. Measured why: a mutant that dropped `feature_version` from
+        the sweep left a guard written against `ast.parse` completely green,
+        because that guard was proving something about the standard library
+        instead of about the check it guards.
+        """
+        try:
+            ast.parse(source, name, feature_version=self.OLDEST_DESKTOP)
+        except SyntaxError as exc:
+            return exc
+        return None
+
+    def test_every_tracked_module_parses_under_the_older_grammar(self):
+        offenders = []
+        for path in self._python_files():
+            source = path.read_text(encoding="utf-8")
+            refusal = self._refusal(source, str(path))
+            if refusal is not None:
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT)}:{refusal.lineno}: {refusal.msg}"
+                )
+
+        self.assertEqual(
+            offenders,
+            [],
+            "a tracked module uses syntax newer than Python "
+            f"{self.OLDEST_DESKTOP[0]}.{self.OLDEST_DESKTOP[1]}, which is what "
+            "BACKLOG D records DESKTOP_1 as running. On that machine this is "
+            "not a failing test — it aborts collection of the whole file. "
+            "Either rewrite it, or decide in BACKLOG A that the older "
+            "Desktops are no longer supported and change OLDEST_DESKTOP with "
+            "that decision written down:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_the_check_can_actually_disagree(self):
+        """A `feature_version` that was being ignored would make the test
+        above pass over anything. Each of these is a real construct from the
+        release that introduced it — and the last one is the limit this
+        check has, asserted rather than left as a footnote."""
+        newer = {
+            "3.10 match": "match x:\n    case 1:\n        pass\n",
+            "3.11 except*": "try:\n    pass\nexcept* ValueError:\n    pass\n",
+            "3.12 type alias": "type Alias = int\n",
+            "3.12 type params": "def f[T](x: T) -> T:\n    return x\n",
+        }
+        for label, source in newer.items():
+            with self.subTest(construct=label):
+                refusal = self._refusal(source)
+                self.assertIsNotNone(
+                    refusal,
+                    f"{label} was accepted — the sweep above is passing over "
+                    "anything a newer interpreter can parse",
+                )
+                ast.parse(source)  # and it is fine on this interpreter
+
+        # The blind spot, pinned so it cannot be discovered twice.
+        self.assertIsNone(self._refusal('d = {}\nprint(f"{d["k"]}")\n'))
+
+    def test_the_grammar_this_repository_actually_uses_still_passes(self):
+        """The antecedent. A check that rejected everything would also make
+        the sweep above green-by-accident impossible to tell from real."""
+        ordinary = (
+            "from __future__ import annotations\n"
+            "def f(x: int | None = None) -> str | None:\n"
+            "    if (n := 1):\n"
+            "        return f'{n}'\n"
+            "    return None\n"
+        )
+        self.assertIsNone(self._refusal(ordinary))
 
 
 class NoPatchPlaceholderSurvivesIntoTheSourceTests(unittest.TestCase):

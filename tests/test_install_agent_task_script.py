@@ -345,10 +345,19 @@ class ATypoInTheSyncFolderIsSaidOutLoudTests(unittest.TestCase):
         from events import create_event
         from transport.onedrive import OneDriveTransport
 
-        target = Path(tempfile.mkdtemp()) / "OneDrve" / "CompanyOpsEvents"
+        scratch = Path(tempfile.mkdtemp())
+        target = scratch / "OneDrve" / "CompanyOpsEvents"
         self.assertFalse(target.exists())
 
-        OneDriveTransport(sync_folder=target).send(
+        # `outgoing_dir` is not optional decoration here (C123). Left out, it
+        # defaults to `DEFAULT_OUTGOING_DIR` — `runtime/events/outgoing/` in
+        # **this repository** — and this test wrote its fixture Event into the
+        # live tree on every run. Measured: `E1.json` (`project_id "P"`,
+        # `summary "s"`) was sitting there, beside a second one from
+        # `test_observability.py`, when the session went looking.
+        OneDriveTransport(
+            sync_folder=target, outgoing_dir=scratch / "outgoing"
+        ).send(
             create_event(
                 source="DESKTOP_1",
                 role="CTO_BACKEND",

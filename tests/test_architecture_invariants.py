@@ -4247,7 +4247,14 @@ class LayeringInvariantTests(unittest.TestCase):
         # `cli` joined in C79, when this became the fifth entrypoint to
         # refuse a command-line argument. A leaf, like `oplog` and
         # `runsummary`, so it closes no cycle.
-        "review_cli": {"history", "cli"},
+        #
+        # `oplog` joined in C125, for `SECRET_RE`. Decision Context is the
+        # third door text takes into Company History and the only one that
+        # had neither a refusal nor a report — measured: a token typed here
+        # reaches the Daily History markdown and the backup remote. The same
+        # edge `collector` and `agent` already declare, to the same leaf, and
+        # it closes no cycle either.
+        "review_cli": {"history", "cli", "oplog"},
         # Read-only rollups over Execution Evidence. Three edges, each for
         # exactly one thing it must not restate (C28):
         #   events    parse the Event files
@@ -6845,6 +6852,30 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
             "the backup scope walk; a dropped file surfaces as Company "
             "History that is not backed up, which ops_status.py reports",
         ),
+        "src/cli.py": (
+            2,
+            "**The one place on this roster where recording is impossible "
+            "by construction, rather than traded away** (C118). Both "
+            "handlers are inside `run_entrypoint()`, and it only reaches "
+            "them after `output_is_gone()` has confirmed that stdout no "
+            "longer accepts a flush -- i.e. after the program reading this "
+            "process's output has exited. "
+            "The first guards the one line that tells the operator so, on "
+            "stderr, which is usually still a terminal (`tool | head`) and "
+            "sometimes is not (`tool > log 2>&1` loses both at once). The "
+            "second guards the `dup2` to `os.devnull` that stops the "
+            "interpreter's shutdown flush from overriding the exit code "
+            "with `120`; it can also raise `io.UnsupportedOperation` -- an "
+            "`OSError` subclass -- for a `StringIO` stdout, which is every "
+            "in-process test. "
+            "Nothing is dropped: there is no entry here, only two "
+            "best-effort writes to streams already known to be gone, and a "
+            "handler that re-raised either one would replace a clean "
+            "`OUTPUT_LOST_EXIT` with the traceback it exists to remove. "
+            "Two rather than one on purpose -- a stderr that has also gone "
+            "must not skip the `dup2`, which is the half that decides the "
+            "exit code.",
+        ),
         "ops_status.py": (
             3,
             "read one at a time in C68 and split three ways. All three "
@@ -7425,6 +7456,7 @@ class TheSweepReadsBothSpellingsOfSilentTests(unittest.TestCase):
 
         self.assertGreater(by_spelling["pass"], 0, "the widening changed nothing")
         self.assertGreater(by_spelling["continue"], 0, "the original half is gone")
+
 
 
 class OneLogWriterInvariantTests(unittest.TestCase):

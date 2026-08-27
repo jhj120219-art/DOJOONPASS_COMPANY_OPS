@@ -42,7 +42,9 @@ project and every entrypoint sits above it.
 
 from __future__ import annotations
 
-from typing import Sequence
+import os
+import sys
+from typing import Callable, Sequence
 
 # The exit code every entrypoint already documents for this class of problem
 # (`AGENT.md` §6: `1` 설정 오류). A new code would have to be documented, and
@@ -80,3 +82,101 @@ def unexpected_arguments(
         f"설정은 전부 환경변수로 합니다: {names}\n"
         f"사용법은 AGENT.md를 보세요."
     )
+
+
+# ------------------------------------------------ the output-side boundary
+
+#: What a tool exits with when the program reading its output ended first.
+#:
+#: **Why this is not 0 (C118).** Measured, on this machine:
+#:
+#:     python ops_status.py | head -3
+#:
+#:     OSError: [Errno 22] Invalid argument      <- inside the report
+#:     OSError: [Errno 22] Invalid argument      <- inside the handler for it
+#:     Exception ignored on flushing sys.stdout
+#:     exit 120
+#:
+#: `120` is the interpreter's "an exception escaped at shutdown"; it is not
+#: one of this project's codes and says nothing to a person or a wrapper.
+#:
+#: `0` would be worse. For `ops_status.py` a `0` is a **claim** — "사람이 지금
+#: 할 일은 없다" — and the report never finished being computed, let alone
+#: read. Reporting the all-clear because nobody was listening is the shape
+#: this project keeps removing.
+#:
+#: `2` rather than a fifth number: docs/14 §4 already spends 2 on "the run
+#: did not deliver what it exists for", and a report that reached no reader
+#: is exactly that. `1` stays configuration, `3` stays "something needs a
+#: person" — a judgement this state has not reached.
+OUTPUT_LOST_EXIT = 2
+
+
+def output_is_gone(stream=None) -> bool:
+    """True when the program on the other end of `stream` has closed it.
+
+    **Measured rather than guessed at, and that is the whole point.** On
+    Windows a write to a pipe whose reader has exited raises
+
+        OSError(22, 'Invalid argument')
+
+    — **not** `BrokenPipeError`, whose `errno` (`EPIPE`, 32) is what the
+    portable recipes match on. And `EINVAL` is a real disk error too, so an
+    errno test here would either miss this on Windows or start calling
+    genuine I/O failures "the reader left".
+
+    So this asks the stream instead. Measured on the same run:
+
+        write("")     OK      <- buffered, proves nothing
+        write("x")    OK      <- buffered, proves nothing
+        flush()       raises  <- reaches the OS every time
+        stdout.closed False   <- proves nothing either
+
+    `flush()` is the one probe that touches the file descriptor, and on a
+    healthy stream it is free.
+    """
+    target = sys.stdout if stream is None else stream
+    try:
+        target.flush()
+    except OSError:
+        return True
+    return False
+
+
+def run_entrypoint(main_fn: Callable[[Sequence[str]], int], argv: Sequence[str]) -> int:
+    """Call a tool's `main()` and turn a lost output stream into an answer.
+
+    Only that. An `OSError` this cannot attribute to the output side is
+    re-raised untouched — a disk or permission failure must keep its
+    traceback, and a handler that swallowed both would be the "did the unsafe
+    thing and reported success" shape this module was written about.
+
+    The `dup2` is CPython's own recipe for this state. Without it the
+    interpreter flushes `sys.stdout` once more on the way out, that flush
+    raises again, and the process exits `120` no matter what is returned
+    here — so the return value below would be a number nobody ever sees.
+    """
+    try:
+        return main_fn(argv)
+    except OSError:
+        if not output_is_gone():
+            raise
+
+    # stderr is usually still a terminal in `tool | head` — that is where the
+    # operator is. Guarded anyway: `tool > file 2>&1` loses both at once, and
+    # a report about a lost stream must not be the thing that crashes.
+    try:
+        print(
+            "[중단] 출력을 받던 프로그램이 먼저 끝났습니다 (파이프가 닫혔습니다). "
+            "보고를 끝내지 못했으므로 이 실행은 아무 판정도 하지 않았습니다.",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except OSError:
+        pass
+    return OUTPUT_LOST_EXIT

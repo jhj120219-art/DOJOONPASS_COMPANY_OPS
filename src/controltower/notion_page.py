@@ -62,6 +62,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from oplog import one_line, redact
 
+from .attention import rank as _attention_rank
+from .attention import severity as _attention_severity
+from .attention import tally as _attention_tally
+
 # ------------------------------------------------------------------ limits
 
 #: The idle threshold `ops_status.py` uses for a silent Desktop.
@@ -388,11 +392,19 @@ def build_control_tower_blocks(
         )
         warnings.append("model_error present")
     elif attention:
+        counts = _attention_tally(attention)
+        severe = counts.get("P1", 0) + counts.get("?", 0)
         blocks.append(
             _callout(
-                f"주의 {len(attention)}건 — 사람이 확인해야 할 항목이 있다.",
+                (
+                    f"주의 {len(attention)}건 — 그중 P1 {counts.get('P1', 0)}건"
+                    + (f" · 미분류 {counts['?']}건" if counts.get("?") else "")
+                    + ". 아래 ATTENTION을 위에서부터 읽는다."
+                )
+                if severe
+                else f"주의 {len(attention)}건 — 사람이 확인해야 할 항목이 있다.",
                 "⚠️",
-                "orange_background",
+                "red_background" if severe else "orange_background",
             )
         )
     else:
@@ -469,15 +481,42 @@ def build_control_tower_blocks(
         blocks.append(_paragraph("현재 집계된 Project ID: " + ", ".join(ids)))
 
     # ---- 4. attention ----------------------------------------------------
+    #
+    # **Ranked, and the ranking is labelled (C129).** This was a flat bullet
+    # list in the order `ops_status.py` happened to build it, so on the page
+    # the whole workspace reads, "Runner가 열흘째 실행되지 않았다" sat below
+    # "3일 이상 조용한 Desktop" and looked the same as it.
+    #
+    # `controltower/attention.py` holds the rule, shared with the browser
+    # page so the two surfaces cannot rank the same list differently. The
+    # prefix says which reading it is; a line the rule does not recognise is
+    # `?` and sorts to the top rather than being filed as minor.
+    #
+    # Truncation follows the rank, not the arrival order — if only twenty of
+    # forty fit, the twenty that fit must be the twenty that matter.
     blocks.append(_heading("ATTENTION", 2))
     if attention:
-        for item in attention[:MAX_TABLE_ROWS]:
-            blocks.append(_bullet(_safe(item)))
+        counts = _attention_tally(attention)
+        summary = " · ".join(
+            f"{level} {counts[level]}건"
+            for level in ("P1", "?", "P2")
+            if counts.get(level)
+        )
+        blocks.append(
+            _paragraph(
+                f"{summary} — 심각도는 이 페이지의 분류이며 각 줄에 근거를 "
+                "붙였다. Event Schema에도 Run Manifest에도 심각도 필드는 없다."
+            )
+        )
+        for item in sorted(attention, key=_attention_rank)[:MAX_TABLE_ROWS]:
+            level, why = _attention_severity(item)
+            prefix = f"[{level}] " + (f"({why}) " if why else "(분류 불가) ")
+            blocks.append(_bullet(prefix + _safe(item)))
         if len(attention) > MAX_TABLE_ROWS:
             blocks.append(
                 _paragraph(
-                    f"ATTENTION {len(attention)}건 중 {MAX_TABLE_ROWS}건만 표시했다. "
-                    "전체는 Dashboard(브라우저)에서 확인한다."
+                    f"ATTENTION {len(attention)}건 중 심각한 {MAX_TABLE_ROWS}건만 "
+                    "표시했다. 전체는 Dashboard(브라우저)에서 확인한다."
                 )
             )
     else:

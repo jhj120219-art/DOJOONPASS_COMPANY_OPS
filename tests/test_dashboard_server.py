@@ -42,7 +42,10 @@ The classes
                                             column the page cannot name
 """
 
+import contextlib
+import io
 import json
+import os
 import re
 import sys
 import tempfile
@@ -861,7 +864,26 @@ class TheFleetTableReadsAsAVerdictTests(PageTestCase):
         return self.page()
 
     def _flagged(self, page):
-        return re.findall(r"<td class='state warn'>(.*?)</td>", page)
+        """Cell values carrying the `warn` verdict.
+
+        Matches the class **list**, not one exact spelling (C129). It used to
+        be `<td class='state warn'>`, which is the value a cell had when the
+        only thing a cell could carry was a verdict. Numeric cells now also
+        get `num` for tabular alignment, and `days_silent` — the column this
+        class exists to check — is numeric, so the literal stopped matching
+        the very cells it was written for while the marking was still there.
+
+        A test that pins a class string rather than the property it stands
+        for fails on presentation and passes on regression; this asks the
+        question it means.
+        """
+        return [
+            value
+            for classes, value in re.findall(
+                r"<td class='([^']*)'>(.*?)</td>", page
+            )
+            if "warn" in classes.split()
+        ]
 
     def test_a_desktop_past_the_threshold_is_marked(self):
         flagged = self._flagged(self._fleet())
@@ -1220,11 +1242,31 @@ class ThePageIsReadOnlyTests(PageTestCase):
 
         self.assertIn(b"405", head.splitlines()[0])
         self.assertEqual(body, b"")
-        # The headers a GET would carry are still described.
         self.assertIn(b"Cache-Control: no-store", head)
-        # Content-Length still describes what a GET would return, which is
-        # the whole point of the method.
+
+        # `Content-Length` describes the **405 representation**, not a GET
+        # (C121). The comment here used to say the opposite, one line above
+        # this very assertion — `Content-Length: 9` is `len(b"read-only")`,
+        # while a GET of the same path returns tens of kilobytes. Both facts
+        # are asserted now, so the two can never be confused again by
+        # reading only one of them.
         self.assertIn(b"Content-Length: 9", head)
+        self.assertEqual(len(b"read-only"), 9)
+
+        get_head, get_body = self._raw_request("GET")
+        self.assertIn(b"200", get_head.splitlines()[0])
+        self.assertGreater(
+            len(get_body),
+            1000,
+            "the GET this compares against returned almost nothing, so the "
+            "contrast below proves nothing",
+        )
+        self.assertNotIn(
+            f"Content-Length: {len(get_body)}".encode("ascii"),
+            head,
+            "the HEAD refusal advertised the GET's size — that is the claim "
+            "the old comment made and the server does not make",
+        )
 
     def test_a_refusal_that_is_not_head_still_carries_its_body(self):
         """The control for the test above: the suppression must be keyed on
@@ -1848,6 +1890,632 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
         parity = [key for key, _title, flag in dashboard_server._BLOCKS if flag]
 
         self.assertEqual(parity, ["CONTROL TOWER"])
+
+
+
+def _bare_payload(**over):
+    """The smallest payload `render_html()` accepts, for UI-shape tests."""
+    payload = {
+        "generated_at": "2026-08-27T10:00:00+09:00",
+        "window": {"since": None, "until": None},
+        "build_ms": 5,
+        "attention": [],
+        "blocks": [],
+        "ops": {},
+        "model": {
+            "schema_version": "1.2",
+            "generated_at": "2026-08-27T10:00:00+09:00",
+            "since": None,
+            "until": None,
+            "events_read": 3,
+            "coverage": {
+                "evidence_from": "2026-08-05", "evidence_to": "2026-08-10",
+                "unreadable": 0, "duplicates": 0,
+                "history_uncovered_from": None, "history_checked": True,
+                "complete": True,
+            },
+            "unreadable": [],
+            "panels": [],
+        },
+        "model_error": None,
+    }
+    payload.update(over)
+    return payload
+
+
+def _panel(key, columns, rows, **over):
+    panel = {
+        "key": key, "title": key, "status": "SOURCED",
+        "columns": list(columns),
+        "rows": [
+            {"key": str(i), "values": values, "evidence": [], "evidence_count": 0}
+            for i, values in enumerate(rows)
+        ],
+        "note": None, "source": None, "unsourced_layers": [],
+    }
+    panel.update(over)
+    return panel
+
+
+class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
+    """ATTENTION, as the thing a person reads first (C129).
+
+    What it was: a flat `<ol>` of nine escaped strings, in the order
+    `ops_status.py` happened to build them, with a 396-character paragraph
+    sitting between two one-line alerts and `**` / backticks showing as
+    literal characters. A reader could not tell which line meant "Company
+    History is not being written" and which meant "a Desktop is quiet".
+
+    Three things changed, and each is checked below:
+
+        severity   P1 / P2 / **?**, with the phrase it matched shown beside
+                   it — the classification is this screen's reading, not a
+                   field the pipeline computes, and it says so
+        source     which ops_status block raised the line, reconstructed
+                   exactly from `blocks[i]["attention"]`
+        length     over 150 characters folds into a disclosure, so one long
+                   line cannot push the rest below the fold
+    """
+
+    def test_a_stopped_pipeline_outranks_a_quiet_desktop(self):
+        page = dashboard_server.render_html(
+            _bare_payload(attention=[
+                "3일 이상 아무것도 오지 않은 Desktop: DESKTOP_2",
+                "Runner가 9일째 실행되지 않았다",
+            ])
+        )
+
+        self.assertEqual(re.findall(r"<li class='att (\w+)'>", page), ["p1", "p2"])
+
+    def test_a_line_nothing_classifies_is_labelled_not_buried(self):
+        """The honest default. Filing an unrecognised alert as minor is how
+        a new critical condition arrives silently."""
+        page = dashboard_server.render_html(
+            _bare_payload(attention=["완전히 새로운 종류의 경보"])
+        )
+
+        self.assertIn("<span class='sev unknown'>?</span>", page)
+        self.assertIn("분류하지 못한", page)
+        self.assertEqual(re.findall(r"<li class='att (\w+)'>", page), ["unknown"])
+
+    def test_the_badge_says_what_it_matched_on(self):
+        """A severity with no stated reason is an opinion. This screen has
+        no severity field to quote, so it quotes its own rule instead."""
+        page = dashboard_server.render_html(
+            _bare_payload(attention=["Runner가 9일째 실행되지 않았다"])
+        )
+
+        self.assertIn("파이프라인이 돌지 않음", page)
+        self.assertIn("이 화면의 분류", page)
+
+    def test_each_line_carries_the_block_that_raised_it(self):
+        """Exact, not guessed: `gather()` extends the flat list block by
+        block and records each count in the same pass."""
+        page = dashboard_server.render_html(
+            _bare_payload(
+                attention=["Runner가 9일째 실행되지 않았다", "무언가"],
+                blocks=[
+                    {"key": "LAST RUN", "title": "LAST RUN", "parity": False,
+                     "text": "", "attention": 1},
+                    {"key": "AGENT", "title": "AGENT", "parity": False,
+                     "text": "", "attention": 1},
+                ],
+            )
+        )
+
+        self.assertIn("<span class='sev-src'>LAST RUN</span>", page)
+        self.assertIn("<span class='sev-src'>AGENT</span>", page)
+
+    def test_a_mismatched_partition_attributes_nothing(self):
+        """If the counts do not add up, the list was built some other way.
+        Attributing a line to the wrong block is worse than not attributing
+        it — the operator would open the wrong file."""
+        sources = dashboard_server.attention_sources(
+            ["a", "b", "c"], [{"key": "COMPANY", "attention": 1}]
+        )
+
+        self.assertEqual(sources, [None, None, None])
+
+    def test_a_long_p2_folds_instead_of_pushing_the_rest_down(self):
+        """Folding exists so one long paragraph cannot push the other items
+        below the fold. It applies to the ones that can afford to wait."""
+        long_line = "3일 이상 아무것도 오지 않은 Desktop: " + "가" * 300
+        page = dashboard_server.render_html(_bare_payload(attention=[long_line]))
+
+        self.assertIn("전체 보기", page)
+        self.assertIn(f"({len(long_line):,}자)", page)
+
+    def test_a_p1_is_never_folded_however_long_it_is(self):
+        """**The screen exists to show these** (C130). Measured on the
+        rendered page: two items sat behind a disclosure and one was a P1 —
+        `KEEP Candidate … Daily History에 없다`, whose tail carries the only
+        sentence saying what recovers it. An operator scanning for what is
+        wrong read 150 characters of the most serious item and had to click
+        for the rest."""
+        tail = "여기에만 적힌 복구 방법"
+        long_p1 = ("수집됐지만 History에 들어가지 못한 Event 1건: "
+                   + "가" * 400 + " " + tail)
+        page = dashboard_server.render_html(_bare_payload(attention=[long_p1]))
+
+        self.assertNotIn("전체 보기", page)
+        self.assertIn(tail, page)
+
+    def test_an_unclassified_line_is_never_folded_either(self):
+        """It sorts to the top because nobody knows what it is; folding it
+        would put the unknown behind a click."""
+        long_unknown = "아무 규칙에도 걸리지 않는 새 경보 " + "나" * 400
+        page = dashboard_server.render_html(_bare_payload(attention=[long_unknown]))
+
+        self.assertNotIn("전체 보기", page)
+
+    def test_a_marker_cut_in_half_by_the_fold_is_not_left_showing(self):
+        """The fold cuts at 150 characters and lands mid-`**` about as often
+        as not. `_inline_markup()` only matches pairs, so the head rendered
+        as `대상은 **그 실행이 수집한…` — literal asterisks, which is the
+        defect the markup rendering was added to remove."""
+        line = ("3일 이상 아무것도 오지 않은 Desktop: " + "가" * 180
+                + " **강조된 부분이 잘린다** 그리고 더 있다" + "나" * 200)
+        page = dashboard_server.render_html(_bare_payload(attention=[line]))
+
+        head = page[page.index("att-body"):page.index("전체 보기")]
+        self.assertNotIn("**", head)
+        # and the full text in the disclosure still renders the pair
+        self.assertIn("<strong>강조된 부분이 잘린다</strong>", page)
+
+    def test_pairs_the_author_balanced_are_untouched(self):
+        """The control: `_drop_unpaired()` must only take a marker the cut
+        orphaned, never one the author closed."""
+        self.assertEqual(dashboard_server._drop_unpaired("가 **나** 다"), "가 **나** 다")
+        self.assertEqual(dashboard_server._drop_unpaired("평범한 문장"), "평범한 문장")
+
+    def test_the_authors_emphasis_renders_and_their_markup_does_not(self):
+        """`ops_status.py` writes `**` and backticks for both surfaces. Raw,
+        they showed as asterisks; unescaped, an Event id could inject."""
+        page = dashboard_server.render_html(
+            _bare_payload(attention=["<script>x</script> **굵게** `코드`"])
+        )
+
+        self.assertIn("<strong>굵게</strong>", page)
+        self.assertIn("<code>코드</code>", page)
+        self.assertNotIn("<script>x", page)
+
+    def test_severity_is_derived_not_stored(self):
+        """Guards the guard: the rule table must actually discriminate."""
+        self.assertEqual(
+            dashboard_server.attention_severity("Runner가 3일째 실행되지 않았다")[0],
+            "P1",
+        )
+        self.assertEqual(
+            dashboard_server.attention_severity(
+                "3일 이상 아무것도 오지 않은 Desktop: X"
+            )[0],
+            "P2",
+        )
+        self.assertEqual(dashboard_server.attention_severity("xyz")[0], "?")
+
+
+class TheCompanyLineSeparatesQuietFromEmptyTests(unittest.TestCase):
+    """COMPANY — the required first section, which did not exist (C129).
+
+    What stood in for it was the `COMPANY` prose block at the bottom of the
+    page, inside a `<pre>`.
+
+    The case this class exists for is the last one: **zero Events with zero
+    ATTENTION**. The first draft printed a green "지금 사람이 할 일은 없다"
+    over six zeroes — every word true about a field, and false about the
+    company. That is C77's defect arriving in the section written to
+    summarise it, so the evidence count decides before the severity does.
+    """
+
+    def _verdict(self, page):
+        return re.search(r"company-state (\w+)'>([^<]*)", page).groups()
+
+    def test_no_events_is_not_reported_as_nothing_to_do(self):
+        model = _bare_payload()["model"] | {"events_read": 0}
+        page = dashboard_server.render_html(_bare_payload(model=model))
+
+        tone, text = self._verdict(page)
+        self.assertEqual(tone, "warn")
+        self.assertIn("셀 Event가 없다", text)
+
+    def test_events_and_no_attention_is_reported_as_clear(self):
+        """The control — without it the check above passes on a screen that
+        never says anything is fine."""
+        page = dashboard_server.render_html(_bare_payload())
+
+        tone, text = self._verdict(page)
+        self.assertEqual(tone, "ok")
+        self.assertIn("할 일은 없다", text)
+
+    def test_a_p1_makes_the_line_red(self):
+        page = dashboard_server.render_html(
+            _bare_payload(attention=["Runner가 9일째 실행되지 않았다"])
+        )
+
+        tone, text = self._verdict(page)
+        self.assertEqual(tone, "bad")
+        self.assertIn("P1 1건", text)
+
+    def test_only_p2s_make_it_amber(self):
+        page = dashboard_server.render_html(
+            _bare_payload(attention=["3일 이상 아무것도 오지 않은 Desktop: X"])
+        )
+
+        self.assertEqual(self._verdict(page)[0], "warn")
+
+    def test_a_missing_record_is_not_a_zero(self):
+        """`operational_facts()` answers `None` for a source it could not
+        read, and the difference has to survive to the screen."""
+        page = dashboard_server.render_html(_bare_payload(ops={}))
+
+        self.assertIn("기록 없음", page)
+        self.assertIn("Run Manifest가 아직 없다", page)
+
+
+class TheTwoNotionSyncsAreNeverOneStatusTests(unittest.TestCase):
+    """NOTION SYNC — the required ninth section, which did not exist (C129).
+
+    AGENT.md §6c spends a paragraph on why these must not be merged: the
+    Runner's sync writes PROJECTS **rows** on the Runner's schedule, the
+    publish rewrites a **page** when a person runs a command, and "앞의 것이
+    며칠 멈춰 있어도 뒤의 것은 계속 성공한다". One status for both is false
+    about whichever one the reader meant.
+    """
+
+    def _page(self, **ops):
+        return dashboard_server.render_html(_bare_payload(ops=ops))
+
+    def test_both_syncs_appear_as_separate_cards(self):
+        page = self._page(run={"notion_sync": "SUCCESS", "started_at": "2026-08-27T09:00:00+09:00", "days_ago": 0.1})
+
+        self.assertIn("Runner의 Notion Sync", page)
+        self.assertIn("Dashboard publish", page)
+        self.assertEqual(page.count("<div class='sync'>"), 2)
+
+    def test_skipped_is_shown_as_not_a_failure(self):
+        """docs/14 §4: `SKIPPED`가 실패가 아닌 것이 핵심이다. Rendering it red
+        would report every pre-Notion deployment as broken."""
+        page = self._page(run={"notion_sync": "SKIPPED", "started_at": None})
+
+        self.assertIn("실패가 아니다", page)
+        self.assertNotIn("<span class='state bad'>SKIPPED</span>", page)
+
+    def test_the_publish_side_admits_it_has_no_local_record(self):
+        """`publish_control_tower.py` writes its timestamp onto the Notion
+        page and nothing here. Borrowing the Runner's would be the merge
+        this section exists to prevent."""
+        page = self._page(run={"notion_sync": "SUCCESS",
+                               "started_at": "2026-08-27T09:00:00+09:00"})
+
+        publish = page[page.index("Dashboard publish"):]
+        self.assertIn("이 머신에 기록이 없다", publish)
+        self.assertNotIn("2026-08-27T09:00:00+09:00", publish[:600])
+
+    def test_an_unreadable_queue_is_not_reported_as_empty(self):
+        page = self._page(run={}, notion_queue=None, notion_pending=None)
+
+        self.assertIn("읽지 못했다", page)
+
+
+class OneValueRepeatedIsNotAColumnTests(unittest.TestCase):
+    """Table width, measured rather than eyeballed (C129).
+
+    On the live screen PROJECTS had **16 columns**, six of them `—` in all
+    four rows, and ACTIVITY had twelve, two of which (`of_total`,
+    `truncated`) held literally the same value on all sixteen rows. The cost
+    was not the pixels: the table needed sideways scrolling, so `Project`
+    and `Blocker` could not be read at the same time as the row they
+    belonged to.
+    """
+
+    def _page(self, columns, rows):
+        model = _bare_payload()["model"] | {
+            "panels": [_panel("ACTIVITY", columns, rows)]
+        }
+        return dashboard_server.render_html(_bare_payload(model=model))
+
+    def test_a_constant_column_is_shown_once(self):
+        page = self._page(
+            ["event_id", "status", "of_total"],
+            [{"event_id": "E1", "status": "IN_PROGRESS", "of_total": 2},
+             {"event_id": "E2", "status": "IN_PROGRESS", "of_total": 2}],
+        )
+
+        self.assertIn("한 줄로 접었다", page)
+        self.assertEqual(re.search(r"<thead><tr>(.*?)</tr>", page).group(1).count("<th"), 2)
+        # the value is not lost — it is stated once
+        self.assertIn("IN_PROGRESS", page)
+
+    def test_a_varying_column_stays_a_column(self):
+        page = self._page(
+            ["event_id", "status"],
+            [{"event_id": "E1", "status": "IN_PROGRESS"},
+             {"event_id": "E2", "status": "BLOCKED"}],
+        )
+
+        self.assertNotIn("한 줄로 접었다", page)
+
+    def test_the_first_column_is_never_folded(self):
+        """It identifies the row. Folding it would leave a table of values
+        with nothing to attach them to."""
+        kept, folded = dashboard_server._fold_constant_columns(
+            ["project_id", "status"],
+            [{"values": {"project_id": "P", "status": "X"}},
+             {"values": {"project_id": "P", "status": "X"}}],
+        )
+
+        self.assertEqual(kept, ["project_id"])
+        self.assertEqual(folded, [("status", "X")])
+
+    def test_a_single_row_folds_nothing(self):
+        """With one row every column is trivially constant and the table
+        would disappear."""
+        kept, folded = dashboard_server._fold_constant_columns(
+            ["a", "b", "c"], [{"values": {"a": 1, "b": 2, "c": 3}}]
+        )
+
+        self.assertEqual(kept, ["a", "b", "c"])
+        self.assertEqual(folded, [])
+
+
+class TimeAndWidthAreReadableTests(unittest.TestCase):
+    """The remaining width offenders, and the narrow screen (C129)."""
+
+    def test_a_timestamp_is_shown_compactly_with_the_full_value_kept(self):
+        cell = dashboard_server._timestamp_cell("2026-08-05T18:00:00+09:00")
+
+        self.assertIn("08-05 18:00", cell)
+        self.assertIn("title='2026-08-05T18:00:00+09:00'", cell)
+
+    def test_something_that_is_not_a_timestamp_is_left_alone(self):
+        self.assertIsNone(dashboard_server._timestamp_cell("해당 없음"))
+        self.assertIsNone(dashboard_server._timestamp_cell(""))
+
+    def test_a_numeric_verdict_keeps_its_colour(self):
+        """The regression this class was written after: right-aligning
+        numbers first dropped the verdict class from `days_silent`, which is
+        the whole point of the DESKTOPS table."""
+        cell = dashboard_server._cell("days_silent", 18)
+
+        self.assertIn("num", cell)
+        self.assertIn("warn", cell)
+
+    def test_no_marker_of_the_projects_own_convention_is_left_showing(self):
+        """One convention, one renderer for it.
+
+        `ops_status.py` and the Dashboard Model both write `**bold**` and
+        `` `code` ``. ATTENTION was taught to render them; panel notes were
+        not, and measured on the live page two `**` pairs survived — in the
+        SPRINTS and JUDGEMENTS notes, which are the two panels a reader most
+        needs to understand because they explain why a section is empty.
+        """
+        model = _bare_payload()["model"] | {
+            "panels": [
+                _panel("X", ["a"], [{"a": 1}],
+                       note="`코드`와 **강조**가 있는 설명",
+                       source="`출처`도 마찬가지"),
+            ]
+        }
+        page = dashboard_server.render_html(_bare_payload(model=model))
+
+        self.assertIn("<strong>강조</strong>", page)
+        self.assertIn("<code>코드</code>", page)
+        self.assertIn("<code>출처</code>", page)
+        self.assertNotIn("**강조**", page)
+
+    def test_a_note_still_cannot_become_markup(self):
+        """`_inline_markup()` escapes before it substitutes, so widening the
+        rendering must not have widened what an author can inject."""
+        model = _bare_payload()["model"] | {
+            "panels": [_panel("X", ["a"], [{"a": 1}],
+                              note="<script>alert(1)</script>")]
+        }
+        page = dashboard_server.render_html(_bare_payload(model=model))
+
+        self.assertNotIn("<script>alert", page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_the_page_brings_its_own_icon(self):
+        """A browser asks for `/favicon.ico` on every load and this server
+        answered **404** — measured in its own log, on the line after the
+        page request. A 404 in the network tab beside a status screen is one
+        more thing an operator has to rule out.
+
+        A `data:` URI rather than a route, so nothing new is served and the
+        page still fetches nothing from anywhere (C130)."""
+        page = dashboard_server.render_html(_bare_payload())
+
+        self.assertIn("rel='icon'", page)
+        self.assertIn("data:image/svg+xml,", page)
+
+    def test_the_icon_is_inline_and_not_a_second_request(self):
+        """The point of the fix. A `<link rel=icon href=/something>` would
+        trade one 404 for one more round trip, and this page's own footer
+        promises it contacts nothing."""
+        page = dashboard_server.render_html(_bare_payload())
+
+        icon = page[page.index("rel='icon'"):]
+        icon = icon[:icon.index(">")]
+        self.assertIn("data:", icon)
+        self.assertNotIn("http://", icon.replace("http://www.w3.org", ""))
+
+    def test_a_block_does_not_print_its_own_title_twice(self):
+        """`ops_status.py` opens each section with its title and a rule,
+        because a terminal has nothing else to separate them. The card's
+        `<h3>` says the same thing two lines above, so every block opened
+        with its title twice — twelve lines of the operational area saying
+        nothing across six blocks (C130)."""
+        payload = _bare_payload(blocks=[{
+            "key": "COMPANY", "title": "COMPANY — Desktop 4가 수집한 Event",
+            "parity": False, "attention": 0,
+            "text": "COMPANY — Desktop 4가 수집한 Event 기준\n" + "-" * 60
+                    + "\n  DESKTOP_1  events=9",
+        }])
+        page = dashboard_server.render_html(payload)
+
+        pre = page[page.index("<pre>"):page.index("</pre>")]
+        self.assertNotIn("-" * 60, pre)
+        self.assertNotIn("기준", pre)
+        self.assertIn("DESKTOP_1", pre)
+        # the title is still on the card, once
+        self.assertEqual(page.count("COMPANY — Desktop 4가 수집한 Event"), 1)
+
+    def test_a_block_of_another_shape_keeps_every_line(self):
+        """Losing a line of content to a guess is worse than a duplicated
+        heading. Both conditions must hold before anything is dropped."""
+        for text in (
+            "COMPANY 제목만 있고 밑줄이 없다\n  내용",
+            "다른 것으로 시작한다\n" + "-" * 60 + "\n  내용",
+            "한 줄뿐",
+        ):
+            with self.subTest(text=text[:18]):
+                self.assertEqual(
+                    dashboard_server._strip_block_heading(text, "COMPANY"), text
+                )
+
+    def test_no_cell_is_cut_with_an_ellipsis(self):
+        """`.kpi-src` was the one rule on the page that clipped text
+        outright; hover revealed it, and hover does not exist on a phone."""
+        page = dashboard_server.render_html(_bare_payload())
+
+        self.assertNotIn("text-overflow:ellipsis", page)
+
+    def test_the_page_has_a_narrow_screen_rule(self):
+        """There was no `@media` block at all."""
+        page = dashboard_server.render_html(_bare_payload())
+
+        self.assertIn("@media (max-width:760px)", page)
+        self.assertIn("@media (max-width:420px)", page)
+
+    def test_a_long_unbroken_token_can_wrap(self):
+        """A 400-character run with no spaces is what an `event_id` or a
+        base64 blob looks like; without a break rule it sets the table's
+        width and pushes every later column off-screen."""
+        page = dashboard_server.render_html(_bare_payload())
+
+        self.assertIn("td{overflow-wrap:anywhere}", page)
+        self.assertIn(".att-body{color:#ffd7d5;overflow-wrap:anywhere}", page)
+
+
+class TheServerRefusesAPortItCannotHonourTests(unittest.TestCase):
+    """`main()`'s own configuration path (C116).
+
+    Measured: nothing in this suite called `dashboard_server.main()`. Every
+    test above drives `_Handler` through a server it builds itself, so the
+    entrypoint's port handling — the block whose comment says refusing is the
+    point, "quietly serving on the taken port instead is the 'did the unsafe
+    thing and reported success' shape `src/cli.py` was written about" —
+    had never executed.
+
+    Found by mutation rather than by reading: replacing `resolve_port()` with
+    `resolve_port() or DEFAULT_PORT`, which turns every refusal into a silent
+    bind on 8765, left the whole suite green.
+
+    Nothing here opens a socket. Every case returns before `_Server` is
+    constructed, and `_Server` is replaced by a recorder that proves it.
+    """
+
+    def setUp(self):
+        self._server_calls = []
+        self._real_server = dashboard_server._Server
+        self._real_environ = dict(os.environ)
+
+        def _recording_server(address, handler):
+            self._server_calls.append(address)
+            raise _StopBeforeServing()
+
+        dashboard_server._Server = _recording_server
+        self.addCleanup(setattr, dashboard_server, "_Server", self._real_server)
+        self.addCleanup(self._restore_environ)
+
+    def _restore_environ(self):
+        os.environ.clear()
+        os.environ.update(self._real_environ)
+
+    def _main(self, raw=None):
+        os.environ.pop(dashboard_server.PORT_ENV_VAR, None)
+        if raw is not None:
+            os.environ[dashboard_server.PORT_ENV_VAR] = raw
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = dashboard_server.main(("dashboard_server.py",))
+            except _StopBeforeServing:
+                code = None
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_port_outside_the_range_is_refused_before_any_socket(self):
+        """`99999` is the value that made this worth writing: `isdigit()`
+        accepts it, `bind()` cannot, and `publish_control_tower.py` used to
+        advertise it to the whole Notion workspace."""
+        for raw in ("99999", "0", "65536", "-1", "abc", "80.5", ""):
+            with self.subTest(port=raw):
+                self._server_calls.clear()
+                code, _, err = self._main(raw)
+
+                if raw == "":
+                    # Empty is "unset", not "wrong" — it must reach the bind.
+                    self.assertIsNone(code)
+                    self.assertEqual(
+                        self._server_calls,
+                        [("127.0.0.1", dashboard_server.DEFAULT_PORT)],
+                    )
+                    continue
+
+                self.assertEqual(code, dashboard_server.CONFIG_ERROR_EXIT)
+                self.assertEqual(self._server_calls, [], "opened a socket anyway")
+                self.assertIn(dashboard_server.PORT_ENV_VAR, err)
+                self.assertIn(repr(raw), err)
+
+    def test_a_real_port_is_the_one_bound(self):
+        """The antecedent. Without it a `main()` that refused everything
+        would satisfy every assertion above."""
+        code, _, err = self._main("9001")
+
+        self.assertIsNone(code, err)
+        self.assertEqual(self._server_calls, [("127.0.0.1", 9001)])
+
+    def test_an_unset_variable_binds_the_default(self):
+        code, _, err = self._main(None)
+
+        self.assertIsNone(code, err)
+        self.assertEqual(
+            self._server_calls, [("127.0.0.1", dashboard_server.DEFAULT_PORT)]
+        )
+
+    def test_a_port_already_in_use_says_which_variable_moves_it(self):
+        """The one refusal an operator hits without having mistyped anything.
+        "Address already in use" alone leaves them nowhere to go."""
+        def _busy(address, handler):
+            raise OSError(98, "Address already in use")
+
+        dashboard_server._Server = _busy
+
+        code, _, err = self._main("9002")
+
+        self.assertEqual(code, dashboard_server.CONFIG_ERROR_EXIT)
+        self.assertIn("9002", err)
+        self.assertIn(dashboard_server.PORT_ENV_VAR, err)
+
+    def test_an_argument_is_refused_before_the_port_is_even_read(self):
+        os.environ[dashboard_server.PORT_ENV_VAR] = "99999"
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = dashboard_server.main(("dashboard_server.py", "--port", "9000"))
+
+        message = err.getvalue()
+
+        self.assertEqual(code, dashboard_server.CONFIG_ERROR_EXIT)
+        self.assertEqual(self._server_calls, [])
+        # The argument, not the (also wrong) port: an operator who passed a
+        # flag needs to be told the flag does not exist first.
+        self.assertIn("--port", message)
+        self.assertNotIn("포트 번호가 아닙니다", message)
+
+
+class _StopBeforeServing(Exception):
+    """Raised by the fake `_Server` so `main()` never reaches
+    `serve_forever()`. A test that blocked there would hang the suite."""
 
 
 if __name__ == "__main__":

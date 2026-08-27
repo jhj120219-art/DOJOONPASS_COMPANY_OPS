@@ -3162,9 +3162,37 @@ C95가 탐지를 붙였다. 남은 것은 “그래서 어떻게 할 것인가�
 이번 Sprint에서 "테스트가 한 번도 실행하지 않은 코드"를 훑어 결함 6건을
 찾았다. 같은 눈으로 아직 보지 않은 곳:
 
-**`src/` 전 모듈 감사 완료.** 남은 미검증은 코드가 아니라 환경이다 —
-`bootstrap_dashboard_databases()`의 성공 경로만 실제 Notion Workspace를
-요구하며, 실패 경로(부분 실패, id 누락, 부모 Page 없음, 재시도 복구)는
+~~**`src/` 전 모듈 감사 완료.** 남은 미검증은 코드가 아니라 환경이다.~~
+
+**C116~C121이 이 문장을 다시 반증했다.** 승인 없이, 새 환경 없이, 여섯 Cycle에서
+결함 8건을 찾아 고쳤다. 그리고 **왜** 이 문장이 틀렸는지가 중요하다 — 이 문장은
+`src/`에 대해 참이었을 수 있지만 **`src/`는 이 저장소의 코드 전부가 아니다.**
+
+    C115의 coverage sweep     --source=src, 98% (6042 stmt)
+    그 측정 밖                 저장소 루트의 entrypoint 6개
+                              (ops_status 276KB, run_company_ops, run_agent,
+                               dashboard_server, publish_control_tower, init_notion)
+
+**가리킨 곳의 98%는 가리키지 않은 곳에 대해 아무 말도 하지 않는다.** C116~C118의
+결함 다섯이 전부 그 밖에 있었고, `publish_control_tower.py`는 **어떤 테스트도
+import한 적이 없었다.**
+
+이번에 실제로 통한 방법 넷, 전부 승인도 새 환경도 필요 없다:
+
+1. **측정의 경계를 의심한다.** "어느 테스트가 이 파일을 import하는가"는 coverage보다
+   훨씬 싸고, `publish_control_tower`(2개 파일이 언급, **0개가 import**)를 즉시
+   집어냈다. 다만 극단만 찾는다 — 26개 파일이 언급하는 `ops_status.py` 안의 안 도는
+   줄은 못 본다.
+2. **한 Sprint의 결함을 다음 Sprint의 스캔으로 쓴다.** C116의 "실패를 찍고 exit 0"을
+   나머지 entrypoint에 물어 C117이 둘을 더 찾았다.
+3. **주입된 스텁이 절대 하지 않는 일을 묻는다.** `make_input_fn`은 EOF를 흉내내지
+   않았다(C117 §4). `io.StringIO`는 쓰기에 실패하지 않는다(C118). 두 결함 다 그
+   한 질문에서 나왔다.
+4. **방금 한 수정을 실제로 돌려 본다.** C117 §4와 C121이 둘 다 "고친 것을 확인하려던
+   실행"에서 나왔다. C82의 규칙이 두 번 더 값을 냈다.
+
+남은 미검증 중 코드가 아닌 것은 여전히 `bootstrap_dashboard_databases()`의 성공
+경로 하나뿐이다 — 실패 경로(부분 실패, id 누락, 부모 Page 없음, 재시도 복구)는
 C9에서 전부 검증했다.
 
 (감사 완료 이력: `notion/bootstrap.py`·`history/review.py`·`review_cli.py`·
@@ -3590,6 +3618,1709 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 
 ---
 
+## C130. "Chrome에서 안 열린다"의 원인은 Chrome이 아니었고, 접힌 43개 중 고쳐야 할 것은 하나였다
+
+### 1. 로딩 실패 — 서버에서 브라우저까지 순서대로 좁혔다
+
+"Chrome 문제"라고 부르지 않고 층마다 쟀다. **끊긴 지점은 세 번째와 네 번째 사이다:**
+
+    1 서버      살아 있음. `GET /` 200, 64,485 bytes, 0.06s
+    2 HTTP      전선 위가 정상. `HTTP/1.0 200`, Content-Length 일치,
+                Cache-Control: no-store — 잘린 응답도 깨진 헤더도 아니다
+    3 HTML      `<!doctype html>` … `</html>` 완결. 파서 오류 0
+    4 브라우저  탭이 **이미 죽은 8801 포트**를 보고 있었다(그 서버는 앞선
+                작업에서 종료됨). 살아 있는 8765로 옮긴 뒤에도
+                `Frame with ID 0 is showing error page`가 났고 —
+                **서버 로그에 요청 자체가 남지 않았다.**
+
+**요청이 도착하지 않았다**는 것이 판정이다. 서버가 거절한 것도, 응답이 깨진 것도
+아니다. 확인 사살로 `https://example.com`을 열었더니 이동은 했으나 스크린샷 주입이
+timeout — 즉 이 환경의 확장이 **loopback에 닿지 못하고, 주입도 하지 못한다**. 원인은
+Dashboard 밖에 있다. **외부 병목으로 기록하고 SKIP.** (C129 §9가 "브라우저 확인
+불가"라고만 적었던 것을 여기서 어느 층인지까지 좁혔다.)
+
+**대신 실제 렌더링을 했다.** 디스크에 `msedge.exe`가 있다:
+
+    msedge.exe --headless=new --screenshot --window-size=1440,1500 http://127.0.0.1:8765/
+    msedge.exe --headless=new --dump-dom  (측정 스크립트 주입)
+
+**서버 로그에 요청이 남았다** — 앞의 확장과 달리 이건 진짜로 연결된다. 이 PNG를 눈으로
+봤고, 아래 §3·§4의 숫자는 전부 이 DOM에서 나온 것이다. **"HTML이 정상이다"가 아니라
+"렌더된 상자를 쟀다".**
+
+### 2. `<pre>` 6개가 넘친다 — 재보니 넘치지 않았다
+
+가설을 그대로 받지 않고 쟀다:
+
+    <pre> 블록          6개
+    가장 긴 줄          153자
+    가장 긴 무공백 토큰 60자 (`-`×60 구분선)
+    뷰포트를 넘는 <pre> **0개**
+    뷰포트를 넘는 컨테이너 **0개**
+
+기존 `pre{white-space:pre-wrap;word-break:break-word}`가 이미 감싸고 있고 열 정렬도
+살아 있다. **강제 줄바꿈을 추가하지 않았다** — 지금 규칙이 로그 가독성을 지키면서
+넘침을 막고 있으므로, 여기서 `break-all`을 넣는 것은 없는 문제를 고치려고 정렬을
+부수는 일이다.
+
+**대신 진짜 결함이 그 PNG에서 보였다.** 블록마다 자기 제목과 `-`×60 구분선을 다시
+찍고 있었다 — 카드의 `<h3>`가 두 줄 위에서 같은 말을 하는데. **여섯 블록 × 2줄 =
+운영 영역 열두 줄이 아무 말도 하지 않았다.** `ops_status.py`는 터미널에서 절을 나눌
+것이 그것뿐이라 옳고, 이 페이지에서만 군더더기다.
+
+`_strip_block_heading()`이 **두 조건이 모두 맞을 때만** 지운다: 첫 줄이 그 블록의
+key로 시작하고, 둘째 줄이 실제로 10자 이상의 `-` 구분선일 것. 모양이 달라진 블록은
+추측으로 한 줄을 잃는 대신 원문 그대로 남는다.
+
+### 3. `<details>` 43개 — 세어 보고 하나만 고쳤다
+
+일괄 삭제하지 않고 종류별로 갈랐다. 기준은 요구사항 그대로 **"사용자가 찾지 않아도
+중요한 정보가 보이는가"**:
+
+    42  행별 증거 목록 (event id / 파일명 / 시각)
+        summary가 **`N건`으로 개수를 이미 보여준다**. 숨는 것은 어느 id인가뿐 —
+        정의상 "상세 기술 정보". **접힌 채로 둔다.**
+     1  CONTROL TOWER 터미널 출력 (패널 대조용)
+        summary에 용도가 적혀 있고 배지가 `이상 없음`. 위 패널들의 **중복**이므로
+        기본 열림이면 같은 사실을 두 번 읽힌다. **접힌 채로 둔다.**
+     1  ATTENTION 접기  ← **이것이 결함이었다**
+        210자 넘는 경보를 접었는데, 그중 하나가 **P1**이었다.
+        요구사항은 "ATTENTION/RISKS를 접힌 영역 안에 숨기지 않는다"이다.
+
+**P1과 미분류는 아무리 길어도 접지 않는다.** P2만, 그리고 한계를 150 → 210자로 올려
+접히는 줄 자체를 줄였다. 지금 페이지에서 접히는 것은 **P2 한 줄뿐**이다.
+
+    접기 대상 (before)  ['p1', 'p2']
+    접기 대상 (after)   ['p2']
+
+미분류(`?`)도 접지 않는 이유는 C129 §3과 같다 — **규칙이 못 알아본 줄이 조용히 접히는
+것이 가장 나쁜 실패다.**
+
+### 4. `/favicon.ico`가 매번 404였다
+
+서버 로그에서 페이지 요청 **바로 다음 줄**로 보였다. 상태 화면 옆의 404는 운영자가
+"이게 문제인가"를 한 번 더 배제해야 하는 것이다. 인라인 `data:` URI 아이콘으로 바꿨다 —
+**새로 서빙하는 것도, 새로 가져오는 것도 없다.** 막대 세 개는 페이지가 이미 쓰는
+P1/P2/정상 색이다. 재렌더 후 로그에 404 없음.
+
+### 5. 내가 만든 결함 둘
+
+- **favicon 패치가 Python 따옴표를 깼다.** SVG의 `"` 를 그대로 둔 채 href를 `"`로
+  감쌌더니 URI 중간에서 문자열이 닫혀 `SyntaxError: invalid decimal literal`.
+  URI 안의 따옴표를 `%22`로 인코딩해 해결.
+- **내 테스트 둘이 P1 줄로 접기를 시험하고 있었다.** P1이 접히지 않게 되자 그 둘이
+  깨졌다 — **테스트가 고치려는 결함을 전제로 삼고 있었다.** P2 줄로 바꾸고,
+  `test_a_p1_is_never_folded_however_long_it_is`와 미분류 판을 새로 넣었다.
+
+그리고 **M5(favicon 제거)가 처음엔 살아남았다** — 아무 테스트도 덮지 않았다.
+`test_the_page_brings_its_own_icon` / `test_the_icon_is_inline_and_not_a_second_request`
+추가 후 DETECTS 2.
+
+### 6. 측정
+
+    mutation  M1 P1도 다시 접힘             DETECTS (2건)
+              M2 접기 자체 비활성           DETECTS (2건)
+              M3 제목 제거 삭제             DETECTS (1건)
+              M4 제목을 조건 없이 제거      DETECTS (1건)
+              M5 favicon 제거               DETECTS (2건)  ← 처음엔 SURVIVED
+    전체 회귀  C129 끝 **4189 passed / 8 skipped / 6091 subtests**
+               ->      **4195 passed / 8 skipped / 6094 subtests** (557s)
+               신규 실패 0. `runtime/` 쓰기 0 (타임스탬프 대조).
+
+**렌더링 검증 (headless Edge, 실 서버, 실 데이터):**
+
+    GET /            200  58,028 bytes   서버 로그에 요청 도착 확인
+    /favicon.ico     요청 없음 (인라인)
+    <details>        44 = 증거 42 + 대조 1 + P2 접기 1
+    접힌 P1          **0개**
+    <pre>            6개, 남은 `-` 구분선 **0개**, 뷰포트 초과 **0개**
+    첫 화면          COMPANY · ATTENTION(9건, P1 6건 전부 펼침) · NOTION SYNC
+                     두 카드까지 **스크롤 없이** 보인다 (1440×1500 PNG 육안 확인)
+
+**좁은 화면:** headless Edge가 CSS 뷰포트를 ~492px로 clamp해서 `--window-size=390`이
+media query를 발화시키지 못한다(360/390/420/477/500 모두 `innerWidth 492`로 측정됨).
+그래서 중단점을 옮긴 사본(760→900, 420→600)으로 **같은 규칙을** 그 폭에서 돌렸다:
+1열 레이아웃 정상, 잘림 없음, `scrollWidth == viewport` (477 == 477) —
+**페이지 수평 넘침 없음.** 이 우회를 쓴 이유와 함께 적어 둔다.
+
+### 7. 남긴 것
+
+- **브라우저 확장이 loopback에 닿지 못한다.** §1에서 층을 특정했다. 이 환경 밖의
+  문제이고 사용자 조치가 필요하다. **외부 병목. SKIP.** headless Edge 렌더링이
+  이번 검증을 대신했고 그 한계(뷰포트 clamp)까지 §6에 적었다.
+- **`publish_control_tower.py`의 로컬 영수증** — C129 §9 그대로. **A절.**
+
+## C129. Dashboard를 사람이 읽을 수 있게 — 아홉 섹션 중 둘이 아예 없었고, 표는 옆으로 스크롤해야 읽혔다
+
+### 1. 어떻게 쟀는가 — 200을 완료로 보지 않았다
+
+브라우저 자동화가 이 환경에서 `127.0.0.1`에도 `file://`에도 닿지 못했으므로(서버 로그에
+요청이 남지 않았다), 렌더링을 **HTML/CSS로 직접 쟀다**. 눈으로 보는 것보다 잘림에
+대해서는 더 정확하다:
+
+    HTMLParser로 "사람이 읽는 텍스트"를 뽑아 전부 출력
+    <style>을 파싱해 clip/wrap/media 규칙을 확인
+    <details> 43개 중 열려 있는 것 0개
+    <th> 개수로 표 너비를 셈
+
+### 2. 없던 섹션 둘 (요구사항 #1, #9)
+
+    COMPANY       구조화된 절이 **없었다**. 대신 페이지 맨 아래 `<pre>` 안의
+                  프로즈 블록. "회사가 지금 어떤 상태인가"에 답하려면 문단을
+                  읽고 나머지 넷을 머리에 들고 있어야 했다.
+    NOTION SYNC   같은 자리에 같은 방식으로만 있었다. AGENT.md §6c가 "두 sync를
+                  구분한다"고 한 문단을 쓰는데, Dashboard에는 그 구분이 없었다.
+
+둘 다 **필드에서** 만들었다. `operational_facts()`가 `ops_status.py`가 읽는 파일들을
+같은 loader로 읽어 Run Manifest / retry queue / dashboard pending / backup state /
+agent state를 **필드로** 돌려준다. **프로즈는 한 글자도 파싱하지 않는다.**
+
+**publish 쪽은 이 머신에 기록이 없다** — `publish_control_tower.py`는 시각을 Notion
+페이지에만 쓴다. Runner의 시각을 빌려 쓰는 것이 이 절이 막으려는 바로 그 합치기이므로,
+`기록 없음`이라고 말하고 어디를 봐야 하는지 적었다. 로컬 영수증을 만드는 것은 새
+`runtime/` 산출물이고 docs/14 §2의 결정이다(E-14와 같은 이유). **SKIP.**
+
+### 3. ATTENTION — 아홉 줄이 구별되지 않았다 (요구사항 #8)
+
+평평한 `<ol>`에, `ops_status.py`가 만든 순서 그대로, **396자짜리 문단이 한 줄짜리 경보
+둘 사이에** 있었고 `**`와 backtick이 **글자 그대로** 보였다. "Company History가 안
+쓰이고 있다"와 "Desktop이 조용하다"가 똑같이 생겼다.
+
+    심각도   P1 / P2 / **?** — 배지 옆에 **무엇을 보고 그렇게 분류했는지**
+    출처     어느 ops_status 블록이 올렸는지. `blocks[i]["attention"]`으로
+             **정확히** 복원한다(`gather()`가 블록 단위로 extend하며 같은 패스에서
+             개수를 기록하므로 그 개수가 목록을 순서대로 분할한다)
+    길이     150자 넘으면 `전체 보기` disclosure로 접는다
+
+**심각도는 이 화면의 분류이고 그렇게 적혀 있다.** Event Schema에도 Run Manifest에도
+심각도 필드가 없다. 규칙이 못 알아본 줄은 `?`로 **맨 위에** 남는다 — 새 경보가 조용히
+하위로 분류되는 것이 가장 나쁜 실패다.
+
+### 4. 표 — 16열을 옆으로 스크롤해서 읽고 있었다
+
+    PROJECTS     16열, 그중 6열이 네 행 모두 `—`
+    ACTIVITY     12열, 그중 둘(`of_total` `truncated`)이 16행 **전부 같은 값**
+    시각         `2026-08-05T18:00:00+09:00` = 25자, 표마다 네 개까지
+
+비용은 픽셀이 아니었다. 표가 옆으로 스크롤되니 **`Project`와 `Blocker`를 그 행과 함께
+볼 수 없었고**, `16`을 열여섯 번 `아니오`를 열여섯 번 적는 것이 그 값을 치르고 있었다.
+
+**모든 행이 같은 값인 열은 열이 아니라 캡션이다.** 표에서 빼고 아래에 값과 함께 한 줄로
+적는다. 규칙 하나이지 손으로 고른 열 목록이 아니다. 안전장치 둘: **첫 열은 절대 접지
+않고**(행을 식별한다), **행이 2개 미만이면 아무것도 접지 않는다**(1행이면 모든 열이
+자명하게 '같은 값'이라 표가 사라진다).
+
+실측: **PROJECTS 16 → 9열, TEAMS 10 → 7, DESKTOPS 11 → 9, ACTIVITY 12 → 10,
+COMPLETIONS 12 → 9.** 시각은 `08-05 18:00`(연도는 흐리게, 원본은 `title`), `<td>` 안의
+전체 ISO 표기 **20+ → 0개**.
+
+### 5. 나머지 UI 결함
+
+    text-overflow:ellipsis   1곳(`.kpi-src`) — 잘렸고 hover로만 보였다. 휴대폰에는
+                             hover가 없다. **제거**
+    @media                   **0개**. 좁은 화면 규칙이 아예 없었다 → 3개 추가
+    td의 줄바꿈               없었다. 끊기지 않는 긴 토큰 하나가 표 너비를 정하고
+                             뒤의 열을 화면 밖으로 밀어낸다 → `overflow-wrap:anywhere`
+    `**` 글자 그대로          ATTENTION 9줄 중 7줄 + 패널 note 2곳 → 전부 렌더링
+
+### 6. Notion 페이지도 같은 목록을 쓴다 — 그래서 같이 고쳤다
+
+분류기를 처음엔 `dashboard_server.py`에 뒀는데, `controltower/notion_page.py`는 그
+entrypoint **아래**라 import할 수 없다. 즉 **회사 전체가 보는 표면만 평평한 채로 남을
+뻔했다.** 규칙을 `src/controltower/attention.py`로 옮겨 둘 다 쓰게 했고, 회귀가
+**두 표면이 같은 목록을 다르게 정렬할 수 없다**를 단정한다.
+
+Notion 쪽에서 따라온 것 둘: 상단 callout이 **P1 개수를 말하고 빨개진다**(전에는 N이
+무엇으로 이뤄졌든 `주의 N건` 주황), 그리고 `MAX_TABLE_ROWS` **잘림이 심각도 순을
+따른다** — 도착 순으로 자르면 P2를 남기려고 P1을 버릴 수 있다.
+
+**Notion에는 아무것도 발행하지 않았다.** `build_control_tower_blocks()`를 로컬에서
+불러 블록을 눈으로 확인했다(네트워크 없음).
+
+### 7. 내가 만든 결함 넷 — 전부 게이트/mutation이 잡았다
+
+- **빈 트리에 초록 "할 일 없음".** Event 0건 + ATTENTION 0건에서 COMPANY가
+  `지금 사람이 할 일은 없다`를 초록으로 찍었다. **C77이 Coverage 배너에서 없앤 그
+  변환이, 그것을 요약하려고 추가한 절에서 다시 났다.** 이제 증거 수가 먼저 판단한다.
+- **숫자 정렬이 판정 색을 덮었다.** `_cell()`에서 숫자 분기를 verdict보다 **앞에** 둬서
+  `days_silent`(DESKTOPS 표의 존재 이유)의 경고 색이 사라졌다. 기존 회귀 2건이 잡았다.
+- **`cov-item` 클래스 재사용.** COMPANY 타일에 Coverage 타일의 클래스를 썼더니
+  "Coverage 타일은 주황이 아니다"를 단정하던 기존 테스트가 내 타일에서 실패했다.
+  뜻이 다른 두 절이 같은 selector에 답하면 한쪽에 대한 모든 단정이 양쪽에 대한 단정이
+  된다 → `fold-item` 별도 클래스.
+- **`ops.get("backup")`.** `BackupLogIsNeverPersistedTests`는 `"backup"`을 위치 인자로
+  받는 **모든** 호출을 보고하고, 그 넓이는 "80개 파일에서 hit 0"이라 받아들여진 것이다.
+  내 dict 키가 첫 hit이 될 뻔했다 → `last_backup`으로 개명(더 정확한 이름이기도 하다).
+  **의도적으로 넓은 보안 게이트가 내 키 때문에 비용을 치르게 하지 않는다.**
+
+그리고 **`_e()`의 `getattr` 기본값**이 조용히 물어 갔던 것 하나: `last_successful_backup_at`
+이라고 추측했더니 `getattr`이 기본값을 답해 화면이 `백업 기록 없음`이라고 말했다 —
+`backup_state.json`에 2026-08-24 성공이 들어 있는데. 속성을 직접 읽도록 고쳤다.
+
+### 8. 측정
+
+    mutation  Dashboard   M1 빈 트리 초록 복귀              DETECTS (1건)
+                          M2 미분류를 P2로                  DETECTS (2건)
+                          M3 열 접기 비활성                 DETECTS (2건)
+                          M4 첫 열까지 접음                 DETECTS (1건)
+                          M5 publish가 Runner 시각을 빌림   DETECTS (1건)
+                          M6 숫자 셀이 판정보다 먼저        DETECTS (2건)
+              Notion      M1 도착 순으로 복귀               DETECTS (3건)
+                          M2 심각도 접두사 제거             DETECTS (3건)
+                          M3 callout 항상 주황              DETECTS (1건)
+                          M4 두 표면이 다른 규칙            DETECTS (2건)
+    신규 회귀  36건 (dashboard 29 + notion 7)
+    전체 회귀  C128 끝 **4151 passed / 8 skipped / 6084 subtests**
+               ->        **4189 passed / 8 skipped / 6091 subtests** (572s)
+               중간에 게이트 3건이 실제로 발화했다(§7). **신규 실패 0**, 운영 트리 쓰기 0.
+
+**실제 실행 검증 (실 서버, 실 데이터):**
+
+    GET /                    200  57,971 bytes  0.066s
+    GET /api/dashboard.json  200  55,750 bytes
+    GET /healthz             200
+    위조 Host                403
+    ?since=엉터리            400
+    ?since=&until= 창        200
+    아홉 섹션 전부 존재      OK (COMPANY·PROJECTS·TEAMS·DESKTOPS·KPI·
+                             ACTIVITY·COMPLETIONS·ATTENTION·NOTION SYNC)
+
+**경계 테스트:** 빈 트리(Event 0) / 400자 무공백 토큰 / 300자 id / 200행 / 미분류 경보 /
+P1·P2 정렬 / `<script>` 주입 — 전부 통과.
+
+**Evidence:** `tests/test_dashboard_server.py`의 신규 5개 클래스,
+`tests/test_controltower_notion_page.py::TheWorkspacePageRanksItsAlertsTooTests`,
+신규 모듈 `src/controltower/attention.py`.
+
+### 9. 남긴 것
+
+- **`publish_control_tower.py`의 로컬 영수증** — 있으면 "마지막 발행"을 말할 수 있다.
+  새 `runtime/` 산출물이라 docs/14 §2 결정. **A절.**
+- **`<details>` 43개가 전부 접혀 있다.** 행마다 붙는 증거 블록이다. 접힌 것이 맞다고
+  보지만("한눈에" 요구와 충돌하지 않는다), 행마다 `N건`이 한 줄씩 붙는 것은 남아 있다.
+  다음 후보.
+- **브라우저 렌더링 확인은 이 환경에서 불가능했다.** 자동화가 `127.0.0.1`에도
+  `file://`에도 닿지 못한다(서버 로그에 요청이 남지 않는다). HTML/CSS 측정으로 대신했고
+  그 방법과 한계를 §1에 적었다. **사용자가 브라우저로 직접 열어 보는 것이 남은 검증이다.**
+
+## C128. 감사 넷 — 결함 없음 (숫자만 남긴다)
+
+C96·C99·C112와 같은 자리다. 찾지 못한 것도 **얼마나 찾았는지**와 함께 적어 두지 않으면
+다음 사람이 같은 곳을 다시 판다.
+
+### 1. staging 접두사를 Event id로 위조할 수 있는가 — **불가**
+
+`is_incomplete_write(name)`는 `name.startswith(".tmp-")` 한 줄이고, **28곳이 그것으로
+파일을 건너뛴다.** 그러니 `event_id`가 `.tmp-`로 시작하는 파일명을 만들 수 있다면
+그 Event는 모든 리더에게 "미완성 쓰기 잔여물"로 보여 **조용히 사라진다.**
+`event_id`는 docs/02가 "있고 null이 아니다"까지만 제약하는, 다른 Desktop이 정하는 값이다.
+
+적대적 id 9종으로 실측 — `.tmp-EVT-1`, `..tmp-EVT-1`, `_.tmp-EVT-1`, `.tmp-`,
+` .tmp-x`, `.TMP-EVT-1`, `LRM + .tmp-EVT`, `./.tmp-EVT`, `.tmp-EVT`:
+
+    9종 전부 -> 파일명이 `.tmp-`로 시작하지 않는다 (skip 판정 False)
+
+`safe_event_filename()`의 `.strip("._")`가 앞의 점을 떼기 때문이고, 그것은 이 목적으로
+쓰인 줄이 아니라 Windows 파일명 규칙을 위해 있던 줄이다 — **의도하지 않은 이유로 옳다.**
+그래서 회귀가 아니라 이 기록을 남긴다: 그 `strip`을 지우는 사람이 무엇을 함께 지우는지
+알 수 있도록.
+
+### 2. 두 파일명 생성기가 여전히 같은 답을 하는가 — **그렇다**
+
+`reporter/local_output.safe_event_filename`과 `transport/onedrive.safe_event_filename`은
+"byte for byte identical"이라고 서로 선언한다(`DuplicatedRulesStayInStepTests`가 지킨다).
+위 9종에 대해 셋째 생성기 `history.file_repository.safe_candidate_filename`까지 포함해
+**세 벌 전부 동일**한 것을 다시 확인했다.
+
+### 3. TODO / FIXME / XXX / HACK — **0건**
+
+`src/`와 저장소 루트의 모든 `.py`. 유일한 매치는 `monthly/parser.py:71`이고, 그것은
+`TODO: `라는 **문자열을 파싱 대상으로 언급하는 주석**이지 미완료 표시가 아니다.
+
+### 4. 조용한 핸들러 / dead capability — **명부와 일치**
+
+`ASilentlyDroppedEntryIsARosterNotAParagraphTests` 10건(subtest 22)과
+`DeadCapabilityInventoryTests` 통과. 이 세션이 더한 핸들러 둘(`src/cli.py`, C118)은
+명부에 근거와 함께 올렸고, C125가 더할 뻔한 넷째는 **명부에 올리는 대신 세도록** 고쳤다.
+
+## C127. 자르고 나서 가리면 늦는다 — `bounded()`가 토큰을 패턴의 최소 길이 아래로 잘라내고 있었다
+
+### 1. 어떻게 찾았는가 — C124의 질문을 세 번째 primitive에 던졌다
+
+C124는 "`one_line()`과 `redact()`의 **순서**가 중요한가"를 묻고, 두 순서를 재서
+**중요하지 않다**는 답을 얻었다(그래서 순서를 강제하려던 게이트를 버렸다).
+
+같은 질문을 `bounded()`에 던졌다. **답이 반대였다.**
+
+### 2. 결함 P2 (**보안**) — 순서가 실제로 중요한 곳
+
+`SECRET_PATTERNS`의 모든 패턴에는 **최소 길이**가 있다 —
+`ntn_[A-Za-z0-9]{10,}`. `bounded()`는 600자에서 자른다. **먼저** 돌면 아무도 비밀을
+찾기 전에 토큰을 그 최소 길이 아래로 잘라 버린다.
+
+실측 — 48자 토큰이 600자 경계에 걸치도록 두고:
+
+    잘린 뒤 남은 토큰 글자   bounded 먼저        redact 먼저
+     4                      `ntn_`              `[RED`
+     8                      `ntn_AAAA`          `[REDACTE`
+    13                      `ntn_AAAAAAAAA`     `[REDACTED]`
+    20                      `[REDACTED]`        `[REDACTED]`
+
+나중에 자르면 **마커**가 잘릴 뿐이고 그것은 미용 문제다. 먼저 자르면 살아 있는
+자격증명의 앞 13자가 **Notion property까지** 간다.
+
+**열세 글자보다 나쁜 것은 따로 있다.** 토큰이 가려졌는지가 **그 토큰이 600번째 글자
+기준으로 어디에 놓였는지**에 달려 있었다. 오프셋에 따라 되기도 하고 안 되기도 하는
+가드는 아무도 추론할 수 없다.
+
+### 3. 어디에 있었는가 — 둘, 둘 다 Notion에 쓰는 계층
+
+    src/controltower/dashboard.py         `unreadable`의 reason
+    src/controltower/notion_projection.py `_reason()`
+
+**둘 다 자기 주석에 도달 가능성을 적어 두고 있었다.** dashboard 쪽:
+"`validate_event()`가 **거부한 값을 그대로 되풀이한다**". projection 쪽:
+"`except Exception`은 무엇이든 잡는다". Event 필드는 이 프로젝트가 길이를 제한하지
+않으므로, 거부된 값이 예외 메시지에 실리면 600자를 넘기는 것은 어렵지 않다.
+
+셋째 자리 `ops_status._authored()`는 처음부터 `bounded(redact(one_line(text)))`였다 —
+안전한 순서가 이미 저장소 안에 있었고, 두 곳이 그것과 반대로 쓰고 있었다.
+
+### 4. 고친 것
+
+두 곳을 `bounded(redact(one_line(...)))`로 뒤집었다. `[REDACTED]`(10자)가 최소 14자를
+대체하므로 redact는 문자열을 **줄이기만** 하고, 따라서 나중에 자르는 것이 무엇을 더
+잃게 만들지 않는다.
+
+그리고 이번 순서는 **게이트로 만들었다** — C124에서 버린 것과 달리 이것은 실측으로
+load-bearing이다. `redact()`의 인자 안에 `bounded()`가 있으면 실패한다.
+
+### 5. C124와 나란히 놓는다 — 무엇이 중요하고 무엇이 아닌가
+
+    one_line ↔ redact   **어느 순서든 안전** (C124 §4에서 실측; `_ESCAPED` 수정 뒤)
+    bounded  → redact   **위험** (C127에서 실측: 최대 13자 유출)
+    redact   → bounded  안전 (마커만 잘린다)
+
+두 질문이 같아 보이고 답이 다르다. 그래서 둘 다 **재서** 답했고, 게이트는 답이
+"중요하다"인 쪽에만 붙였다. C124에서 순서 게이트를 버린 판단과 여기서 순서 게이트를
+붙인 판단은 같은 규칙의 두 결과다 — **측정이 정하고, 철자가 정하지 않는다.**
+
+### 6. 측정
+
+    mutation  M1 notion_projection을 bounded-first로 복귀 (원 결함)  DETECTS (2건)
+              M2 dashboard를 bounded-first로 복귀                    DETECTS (1건)
+              M3 bounded()가 자르지 않게 (전제 제거)                 DETECTS (2건)
+    신규 회귀  5건 (subtest 5)
+    전체 회귀  C126 끝 **4146 passed / 8 skipped / 6079 subtests**
+               -> **4151 passed / 8 skipped / 6084 subtests** (525s)
+               **신규 실패 0**, 운영 트리 쓰기 0.
+
+**실제 실행 검증:** 수정 뒤 `_reason(ValueError(...))`에 경계를 걸친 토큰을 넣어
+4·8·13·20자 네 위치 전부 `ntn_` 유출 없음(`[RED` / `[REDACTE` / `[REDACTED]`)을 확인.
+`controltower` 3개 테스트 파일 475건 통과.
+
+**Evidence:** `tests/test_oplog.py::BoundingBeforeRedactingDefeatsItTests`.
+
+### 7. 곁가지 — C124의 비용을 실 데이터로 쟀다
+
+살아 있는 Control Tower payload(32,843바이트 / 문자열 779개)에 대해 C124의 패턴 변경이
+**판정을 바꾼 문자열 0개**, payload 내 `[REDACTED]` 0개 — 과매치 없음. 비용은 전량 1회
+스캔 **4.39 ms → 5.74 ms**(+1.35 ms)이고 같은 페이지의 모델 빌드가 9 ms다. C124 §3에
+적어 두었다.
+
+## C126. 테스트가 운영 트리를 **읽고** 있었다 — C123을 한 클래스가 아니라 부류 전체로 넓혔다
+
+### 1. 어떻게 시작했는가 — C125가 남긴 실마리
+
+C125 §7이 적었다: "`FileHistoryRepository`의 기본 디렉터리도 C123과 같은 모양이다."
+확인하니 그 클래스는 깨끗했지만, **같은 모양의 기본값이 25개** 더 있었다
+(`DEFAULT_*_DIR` / `DEFAULT_*_PATH`, 전부 `runtime/` 아래).
+
+C123은 `OneDriveTransport` **한 클래스**에 게이트를 붙였다. 그것이 명부다. 그래서
+introspection으로 부류 전체를 뽑았다 — `inspect.signature`로 기본값이 `runtime/`
+아래인 파라미터를 갖는 callable:
+
+    callable 11개 / 파라미터 30개
+
+### 2. 결함 P2 — 두 테스트가 운영자의 **실제 Signal 파일**을 읽고 있었다
+
+    tests/test_observability.py:112       read_status(... signals_dir 없음)
+    tests/test_state_consistency.py:811   read_status(... signals_dir 없음)
+
+둘 다 나머지 디렉터리는 전부 명시적으로 넘기고, **기본값이 있는 그 하나만** 빠뜨렸다.
+`DEFAULT_SIGNALS_DIR`는 이 저장소의 `runtime/agent/signals/`이고 지금 **실제 Signal
+파일 5개**가 들어 있다.
+
+**실측 — watermark를 그 날짜들 뒤로 두면:**
+
+    signals_dir 생략   undelivered_closed_signal_count -> **5**   (운영자의 실 파일)
+    signals_dir 명시   undelivered_closed_signal_count -> 0
+
+**쓰기가 아니라 읽기라는 점이 더 나쁘다.** C123의 두 건은 잔여물을 남겼다. 이 둘은
+테스트의 답이 **운영자가 어제 무엇을 했는지에 달려 있게** 만든다. 지금 초록인 이유는
+fixture의 날짜가 우연히 디스크의 날짜보다 앞이기 때문이다.
+
+### 3. 게이트 — 명부가 아니라 introspection으로
+
+`inspect.signature`로 위험한 (callable, 파라미터) 쌍을 **뽑아서** `tests/` 전체의
+호출을 AST로 검사한다. 열두 번째 callable이 내일 생겨도 자동으로 덮인다.
+
+**거짓 양성 셋을 실측으로 걷어냈다** — 건강한 코드를 지목하는 검사는 꺼진다:
+
+    build_company_rollup(events=..., now=...)   `events`가 디렉터리 읽기를 대체한다
+    Store(root / "state.json")                  위치 인자가 앞 파라미터를 덮는다
+    run_once                                    **모듈 다섯 개가 같은 이름을 export한다**
+
+셋째가 제일 컸다. 첫 판본은 이름만 보고 19건을 지목했고 그중 15건이
+`test_collector_runtime.py`가 **collector의** `run_once`를 부르는 것을 **scheduler의**
+파라미터 목록으로 잰 것이었다. 게다가 이 저장소의 테스트는 import를 **메서드 안에서**
+한다 — 한 메서드가 `from collector.runtime import run_once`, 1,200줄 아래 다른
+메서드가 `from app.runner import run_once`.
+
+그래서 resolver를 **스코프 인식**으로 만들었다. 그 과정에서 내 버그 하나를 더 만났다:
+`ast.walk()`는 모든 자손을 내놓으므로, 모듈 스코프를 그것으로 훑으면 **파일 안 모든
+메서드의 import를 긁어모은다.** 그래서 첫 수정판이 `test_observability.py`가
+`run_once`를 `agent.agent`에 묶는다고 판단했다 — 근거는 문제의 호출보다 4,500줄 아래에
+있는 import 한 줄이었다.
+
+### 4. 두 수정이 서로 겹친다는 것을 **재서** 알았다
+
+중첩 `def`에 안 들어가는 것과, 추적하지 않는 import에 대해 이름을 **unbind**하는 것 —
+둘 다 넣었다. mutation으로 하나씩 깨 보니 **각각 단독으로는 전부 초록**이었다. 둘을
+**함께** 깨야 실패한다.
+
+지우지 않고 **기록했다.** 둘은 다른 방식으로 실패한다: unbind는 import가 *존재하되
+추적 밖*이어야 작동하고, 비하강은 아무 조건도 필요 없으며 `_bindings()`가 파일이 아니라
+스코프를 서술하게 만드는 쪽이다. "어느 쪽이든 충분하다"를 **그것을 보이는 mutation과
+함께** 적었다.
+
+### 5. 의도적 예외 하나 — 근거와 함께
+
+`test_the_documented_one_liner_builds_a_model`은 docs/13 §3-⑨이 운영자에게 주는 명령을
+**운영자가 치는 그대로** 기본 디렉터리에 대고 돌린다. `processed_dir`을 넘기면 문서가
+발행한 것과 다른 명령을 시험하게 된다. 읽기 전용이고, 단정이 내용에 의존하지 않는다
+(패널마다 `source` 또는 `note`가 있는지 — 빈 트리에서도 가득한 트리에서도 참이고, 그
+테스트의 docstring이 "증거가 하나도 없는 머신에서도 되어야 한다"고 말하는 그 성질이다).
+
+**줄 번호가 아니라 (파일, callable)로 키를 잡았다** — 줄 번호는 위쪽 편집 한 번에 낡는다
+(C92가 한 Sprint에 두 번 겪은 드리프트). 그리고 **매칭되지 않는 예외는 실패로 만든다**:
+아무것도 안 걸리는 허가는 아무도 필요 없는데 계속 주어져 있는 허가다(C88의 모양).
+
+### 6. 측정
+
+    mutation  M1 signals_dir 생략 복귀 (원 결함)                DETECTS (1건)
+              M2 introspection이 아무것도 못 찾음               DETECTS (2건)
+              M3 ALLOWED 항목이 낡음                           DETECTS (1건)
+              M4 스코프 하강 복귀                              단독으로는 SURVIVES
+              M5 unbind 제거                                   단독으로는 SURVIVES
+              M4+M5 함께                                       DETECTS (2건)
+    신규 회귀  4건 (subtest 3)
+    전체 회귀  C125 끝 **4142 passed / 8 skipped / 6076 subtests**
+               -> **4146 passed / 8 skipped / 6079 subtests** (527s)
+               **신규 실패 0**, 운영 트리 쓰기 0.
+
+**Evidence:** `tests/test_repository_hygiene.py::NoTestTakesADefaultThatPointsAtTheLiveTreeTests`.
+
+### 7. 남긴 것
+
+**기본값 자체를 없앨 것인가는 여전히 A절이다.** C123이 `DEFAULT_OUTGOING_DIR`에 대해
+남긴 질문이 이제 11개 callable / 30개 파라미터로 넓어졌다. 게이트가 사고는 막지만
+함정은 그대로 있고, 없애는 것은 공개 시그니처 결정이다. **다만 이제 그 결정의 범위가
+숫자로 있다.**
+
+**도구 메모 — `__pycache__`.** C125 §5에서 낡은 바이트코드가 mutation을 살려 주는 것을
+겪었으므로, 이 Cycle의 mutation은 매번 `__pycache__`를 지우고 쟀다. "살아남았다"는
+판정은 캐시를 지우고 다시 재야 신뢰할 수 있다.
+
+## C125. 문이 셋인데 표에는 둘만 있었다 — 사람이 직접 타이핑하는 그 하나가 빠져 있었다
+
+### 1. 어떻게 찾았는가 — Backup Audit이 자기 문서에 적어 둔 문장에서
+
+`backup/working_copy.py::scan_for_secrets()`의 docstring이 실측을 적어 두었다:
+"Daily History 파일에 붙여 넣어진 Notion 토큰 / GitHub PAT / AWS 키 / RSA 개인키 —
+**6개 중 0개 탐지**. 내용은 절대 읽지 않는다." 그것은 §29의 설계이고 정책 결정이다.
+
+그래서 물었다: **그 문자열은 애초에 어떻게 Daily History에 들어가는가?**
+
+`ops_status._secret_shaped_event_content()`가 그 답을 표로 적어 두고 있었다 — **문 두 개**:
+
+    이 머신에서 쓴 Signal      find_secret_material()이 그 자리에서 **거부**
+    다른 Desktop의 Event /     내용을 읽는 것이 없다. 이 탐지기가 **보고**
+    손으로 쓴 파일
+
+**셋째 문이 있다.** Decision Context — `src/review_cli.py`로 사람이 직접 타이핑해서
+`HistoryCandidate`에 저장되고 Daily History로 렌더링되는 산문 네 필드다.
+**거부도 보고도 없었다.**
+
+### 2. 실측 — 임시 트리에서 끝까지 흘려 봤다
+
+`decision_context`에 토큰을 타이핑했을 때:
+
+    submit_review()                  통과 — 아무것도 검사하지 않는다
+    디스크의 Candidate JSON          토큰 그대로
+    _secret_shaped_event_content()   **못 본다** — 그것은 `processed/`의 Event를
+                                     읽고 이것은 Candidate다
+    Daily History markdown           **토큰 있음**, SECRET_RE도 매치한다
+
+즉 **재료는 알아볼 수 있는데 아무도 보지 않고 있었다.** 거기서부터는
+Company Repository → Working Copy → backup 원격이고, `scan_for_secrets()`는 이름만
+본다. Notion 페이지에도 렌더링된다.
+
+**그리고 이 문이 가장 위험하다.** 다른 둘은 구조화된 기록이지만 이 필드는 **산문**이다.
+"토큰을 교체했다. 새 값은 …" 은 회고 필드에 쓰는 지극히 평범한 문장이다.
+
+### 3. 고친 것 — 두 선례를 각각 따랐다
+
+    ops_status.py    `_secret_shaped_decision_context()` — Event 탐지기의 거울.
+                     keep/ 와 review/ 를 읽고 (history_id, 필드)만 보고한다.
+                     **보고하고 거부하지 않는다** — 그 탐지기가 자기에 대해
+                     적어 둔 그 자세 그대로다.
+    review_cli.py    타이핑하는 그 순간 필드 이름을 대며 **경고**한다.
+                     저장은 한다.
+
+**왜 거부하지 않는가.** `oplog`가 자기 패턴이 일부러 과매치한다고 적어 두었다 —
+"'auth token: rotated'라고 쓴 업무 메모도 거부된다". 그 거래는 **Signal**에 대해
+받아들여진 것이고, Signal은 짧은 구조화된 기록이다. 같은 근거로 회고 **문단**을
+거부하는 것은 다른 거래이고, 그것을 고르는 것은 정책 결정이다(A절). 사람이 지금 받는
+것은 **아직 다시 칠 수 있는 순간의 사실**이다.
+
+양쪽 다 **매치한 문자열 자체는 절대 출력하지 않는다** — `find_secret_material()`이
+적어 둔 이유 그대로: 유출 보고가 그 유출의 두 번째 사본이 되어서는 안 된다.
+
+### 4. 게이트 둘이 내 수정을 잡았다 (둘 다 옳았다)
+
+- **`LayeringInvariantTests`** — `review_cli`가 `oplog`를 import하면서 선언된 계층을
+  벗어났다. `collector`·`agent`가 같은 leaf에 이미 갖고 있는 간선이고 순환도 만들지
+  않으므로 선언에 추가하고 **이유를 적었다.**
+- **`ASilentlyDroppedEntryIsARoster…`** — 내 `except (OSError, ValueError): continue`가
+  `ops_status.py`의 **네 번째** 조용한 핸들러였다. 명부가 "셋이 남은 것은 넷째를 더해도
+  된다는 허가가 아니다 — 개수가 강제 장치다"라고 적어 둔 그 자리다.
+
+  고친 방향이 중요하다. 명부에 넷째를 등록한 것이 아니라 **세게 만들었다**:
+  `unchecked += 1`로 세고(`_split_reviewed()`가 쓰는, 분류기가 "기록했다"로 읽는
+  철자 — C88), `RecursionError`까지 잡고(깊게 중첩된 JSON은 `ValueError`가 아니다),
+  그 수를 HISTORY 블록에 **사실로** 출력한다(ATTENTION이 아니다 — 읽을 수 없는
+  Candidate는 이미 `_candidate_consistency()`가 경보로 올린다, C26). 읽지 못한 파일이
+  있는데 "Secret 없음"이라고 답하는 것은 숫자가 **작아지는** 방향, 즉 안심으로 읽히는
+  방향이다.
+
+### 5. 내 테스트가 또 대리 지표를 쟀다 — mutation이 잡았다
+
+`test_the_warning_comes_before_the_save_confirmation`은 **찍힌 두 줄의 순서**를
+비교했다. 경고를 저장과 확인 메시지 **사이**로 옮기는 mutation이 그것을 통과했다 —
+그때는 이미 토큰이 디스크에 있고, 경고가 앞서야 하는 것은 바로 그 순간이다.
+reviewer를 spy로 바꿔 **쓰기 사건 자체**와 비교하도록 다시 썼고, mutation이 죽었다.
+
+**그리고 도구 문제 하나를 기록한다.** 이 mutation은 처음에 "살아남았다"고 나왔는데
+원인은 `__pycache__`의 낡은 바이트코드였다. stale cache는 mutation을 *살려* 줄 뿐
+없는 실패를 만들지는 못하므로 이 세션의 "DETECTS" 판정들은 영향받지 않는다. 다만
+**"살아남았다"는 판정은 캐시를 지우고 다시 재야 한다** — 이후로는 그렇게 했다.
+
+### 6. 측정
+
+    mutation  M1 탐지기를 _print_history에서 제거 (원 상태)      DETECTS (10건)
+              M2 keep/ 만 읽고 review/ 를 안 봄                  DETECTS (1건)
+              M3 decision_context 한 필드만 감시                 DETECTS (1건)
+              M4 매치한 문자열을 보고에 실음                     DETECTS (8건)
+              M5 review_cli 경고 제거                            DETECTS (3건)
+              M6 경고가 타이핑한 값을 되풀이                     DETECTS (1건)
+              M7 경고를 저장 뒤로 이동                           DETECTS (1건, 재작성 후)
+    신규 회귀  18건
+    전체 회귀  C124 끝 **4124 passed / 8 skipped / 6071 subtests**
+               -> **4142 passed / 8 skipped / 6076 subtests** (522s)
+               중간에 아키텍처 게이트 2건이 실제로 발화했다(§4). **신규 실패 0**,
+               운영 트리 쓰기 0.
+
+**실제 실행 검증:** 임시 트리에서 (1) `review_cli`가 타이핑 시점에 경고하고 토큰은
+되풀이하지 않는다, (2) `ops_status` 탐지기가 디스크의 Candidate를 찾아
+`('HIST-DC-PROBE-2', 'decision_context')`를 돌려주며 토큰은 담지 않는다,
+(3) 평범한 회고는 걸리지 않는다. 실 저장소 `python ops_status.py` exit 3, 출력 변화 없음
+(이 머신의 Candidate 14건에는 Secret 형태가 없다).
+
+**Evidence:** `tests/test_observability.py::DecisionContextIsTheThirdDoorTests` (13건),
+`tests/test_review_cli.py::SecretShapedProseIsNamedBeforeItIsStoredTests` (5건).
+
+### 6b. 내가 더한 비용을 쟀다 (C82의 규칙, 내 수정에 적용)
+
+이 탐지기는 `ops_status` 실행마다 keep/ + review/ 의 Candidate를 **전부 읽고 파싱한다.**
+실측:
+
+    살아 있는 트리   Candidate 14건 -> 0.81 ms   (HISTORY 블록 전체가 56 ms이므로 1.4%)
+      100건          65.1 ms
+    1,000건         560.7 ms          <- 선형, Candidate당 약 0.62 ms
+    5,000건       3,102.1 ms
+
+**최적화 하나를 시도했다가 실측으로 버렸다.** 형제 함수
+`_secret_shaped_event_content()`가 "필드를 join해서 한 번 훑고, 걸릴 때만 필드별로
+다시 본다"를 쓰고 그 이유를 적어 두었기에 같은 모양으로 바꿔 보았다 —
+**0.88배, 즉 더 느렸다.** 그 함수가 기록한 193 ms -> 25 ms 개선은 다른 비교였다
+(`find_secret_material()`의 **컴파일되지 않은 패턴 일곱 개** 대 결합된 `SECRET_RE`
+하나). 이 코드는 이미 결합된 쪽을 쓰고 있다.
+
+**두 번째 최적화는 시도하지 않았다 — 위험이 이득보다 크다.** 리터럴 앵커
+(`ntn_`, `secret`, `bearer`, `key`, `token`, `password`, `-----begin`, `gh`)로 값싼
+사전 필터를 두면 대부분의 텍스트에서 비싼 스캔을 건너뛸 수 있다. 그러려면 **일곱 개
+정규식이 무엇을 요구하는지의 두 번째 사본**을 손으로 유지해야 하고, 그것이 상위집합이
+아니게 되는 날이 곧 redaction 우회다 — 이 세션이 C115·C122·C124에서 계속 지운 그
+모양이다. `gh`가 두 글자라 필터로서 약한 것도 이득 쪽을 더 깎는다.
+
+현재 규모에서 0.81 ms이고 증가는 **E-2(보존 정책)** 가 이미 들고 있는 결정에 묶여
+있다. 그 결정이 나기 전에 이 함수를 최적화하는 것은 순서가 틀렸다.
+
+### 7. 남긴 것 — A절 후보
+
+**Decision Context를 거부할 것인가.** §3의 이유로 지금은 경고만 한다. 결정에 필요한
+사실은 다 모여 있다: 패턴은 일부러 과매치하고, 이 필드는 산문이며, C117이 만든
+"타이핑한 내용 되짚기" 경로가 이미 있으므로 거부해도 사람의 문단이 사라지지는 않는다.
+
+**이미 저장된 것은 지우지 않는다.** 탐지기는 보고만 한다. Candidate를 고쳐도 이미
+렌더링된 Daily와 원격 history에는 남으므로, 실제 조치는 **자격증명 교체**다 — 경고문과
+ATTENTION 줄 둘 다 그렇게 말한다.
+
+**`FileHistoryRepository`의 기본 디렉터리도 C123과 같은 모양이다.** `keep_dir=None`이면
+저장소의 실 `runtime/history_candidates/keep/`을 가리킨다. 이번 probe를 쓰면서 걸려
+넘어질 뻔했고(명시적으로 넘겨서 피했다), C123이 `DEFAULT_OUTGOING_DIR`에 대해 남긴
+질문이 여기에도 그대로 적용된다. **A절 후보 하나로 합쳐 둔다.**
+
+## C124. Notion에 말을 거는 파일의 sink가 **하나도** 보호되지 않았다 — 그리고 그것을 고치다 redact() 자체의 우회를 찾았다
+
+### 1. 어떻게 시작했는가 — "고쳤다고 가정하지 말고 확인하라"
+
+C116의 수정이 실제로 완결됐는지부터 쟀다.
+
+    publish_control_tower.py  coverage 113 stmt / 1 miss = **99%**
+                              (그 1은 `if __name__` 아래 줄, import되면 도달 불가)
+
+수정 전에는 `main()`의 첫 문장 뒤로 **0%**였다. 그리고 실 API로 exit 경로를 더 밟았다:
+
+    잘못된 token      -> 실 Notion 401, exit 1
+    없는 database id  -> 실 Notion 404, exit 1
+    공백 token        -> 네트워크 전에 설정 거절, exit 1
+
+**그 404 응답을 읽다가 결함이 나왔다.**
+
+### 2. 결함 P1 (**보안**) — 이 파일의 sink 중 보호된 것이 하나도 없었다
+
+404 본문이 `"additional_data":{"integration_id":"..."}`를 그대로 화면에 찍고 있었다.
+확인해 보니 이 파일의 `print()` **전부**가 원격 문자열을 날것으로 인쇄한다 —
+`redact()`도 `one_line()`도 없다.
+
+`init_notion.py`는 **정확히 같은 값**을 `_safe()`로 감싸고, 그 docstring이 이렇게 적어
+두었다:
+
+> the blind spot C31 §7/§8 closed at `run_company_ops.py`'s two sinks and
+> **did not look for at this one**
+
+여기도 보지 않았다. 이 도구는 그 뒤(C105/C106)에 쓰였고 같은 sink 열 개를 그대로
+열어 두었다.
+
+**실측으로 재현했다.** 프록시가 Notion 대신 답하며 요청 헤더를 되돌려 주는 경우
+(docs/04 §56이 다루는 그 경우이고, `NotionAPIError`는 본문 400바이트를 그대로 나른다):
+
+    [FAILED] PROJECTS Database에 접근하지 못했다: ... | 502 Bad Gateway
+    Upstream request was:
+      Authorization: Bearer <토큰 48자 전부>
+      다음 할 일     : 없음 — 설정 완료
+
+`print()` **하나가 stderr 다섯 줄**이 됐다. 두 가지가 동시에 터졌다:
+
+    redact    이 프로세스가 방금 보낸 API 토큰이 화면에 그대로 나왔다.
+              `tool > log 2>&1`이면 디스크에 남는다
+    one_line  위조된 줄이 `init_notion.py`가 "남은 할 일"을 찍는 바로 그 형식이다
+
+`_safe()`를 넣고 열 곳에 적용했다. 재현을 다시 돌리면 **1줄, `[REDACTED]`**.
+
+**`ops_status.py`가 자기 sink를 일부러 redact하지 않는 것과 충돌하지 않는다.** 그 결정은
+"경로·id·개수로 만든 메시지"에 대한 것이고, 운영자가 열어야 할 경로를 가리면 손해다.
+여기에는 **로컬한 값이 하나도 없다** — 전부 네트워크에서 왔고, 응답 본문은 이 프로세스가
+보낸 것을 담을 수 있는 유일한 문자열이다.
+
+### 3. 결함 P1 (**보안**) — `\b`가 곧 우회였다. `redact()` 자체의 결함
+
+가드 가족(네 벌)이 서로 어긋나지 않는지 보려고 게이트를 쓰다가, 그 게이트가 **내 전제가
+틀렸다**고 알려줬다. `one_line()`은 제어문자를 `\n`·`\r`·`\t`·`\xNN`·`\uNNNN`으로
+쓰는데 **다섯 다 마지막 글자가 단어 문자**다. 그래서 줄 첫머리에 있던 토큰은
+`\b` 앞에서 이스케이프의 꼬리에 붙어 버린다:
+
+    "Authorization: Bearer\nntn_AAAA…"        (본문의 진짜 개행)
+      one_line -> "Authorization: Bearer\\nntn_AAAA…"
+      \bntn_   -> 매치 없음. `ntn_` 앞 글자가 letter `n`이다
+
+HEAD에서 48자 토큰으로 실측:
+
+    앞이 공백      LEAKED=False    <- 유일하게 덮여 있던 경우
+    앞이 개행      LEAKED=True
+    줄 첫머리      LEAKED=True
+    앞이 탭        LEAKED=True
+    앞이 CR        LEAKED=True
+
+**응답 본문은 줄 단위다 — 헤더는 한 줄에 하나다.** 그러니 "비밀이 줄 첫머리에 있다"는
+예외가 아니라 **평범한 모양**이고, 이 우회는 `redact()`를 쓰는 저장소의 **모든 sink**에
+있었다: agent/collector 로그, Dashboard payload, Notion Control Tower 페이지,
+`ops_status.py`의 ATTENTION.
+
+`\b`를 이스케이프까지 경계로 세는 `_ESCAPED`로 바꿨다(Python `re`는 lookbehind가
+고정폭이어야 하므로 폭별로 나눠 `|`로 묶었다). `Bearer\s+`도 같은 이유로 개행 넘어간
+헤더를 못 봤으므로 `_GAP`으로 넓혔다. 실측 후:
+
+    9개 배치 전부 LEAKED=False
+    과매치 없음: `intn_…`, `myghp_…`, `Bearer word`, `C:\Users\me\notes.txt` 전부 그대로
+
+**실 데이터에 대한 과매치·비용 실측 (C126 뒤 추가).** 살아 있는 Control Tower payload
+(32,843바이트, 문자열 779개)에 대해 **옛 패턴과 새 패턴의 판정이 달라진 문자열 0개**,
+payload 안의 `[REDACTED]` 0개 — 즉 이 저장소의 실제 운영 문자열 중 새로 가려진 것은
+없다. 비용은 payload 1회 전량 스캔에 **4.39 ms -> 5.74 ms**(+31%, +1.35 ms)이고,
+같은 페이지의 모델 빌드가 9 ms이므로 화면 한 장에 1.35 ms를 더한다. lookbehind 다섯
+갈래의 값이다.
+
+**ReDoS 재측정(BACKLOG D의 선형성 주장 유지 확인).** 적대적 4종, n=1k~50k:
+`A*n` 3.0→149.2 ms, `이스케이프 개행*n` 0.3→16.2 ms, `BEGIN 반복` 0.4→20.2 ms,
+`ntn_ 반복` 2.7→134.9 ms — **전부 선형**(50배 입력에 50배 시간). 실제 600바이트
+본문은 `redact(one_line(...))` 1회당 0.365 ms.
+
+### 4. 게이트 하나를 만들었다가 **측정 때문에 버렸다**
+
+"모든 `redact()`는 이미 flatten된 값을 받아야 한다"는 구조 게이트를 썼다. 돌려 보니
+`src/agent/agent.py`의 다섯 자리가 걸렸다 — 그것들은 실패 지점에서 redact하고
+sink(`run_agent.py`의 `one_line(error)`, `append_line()`)에서 flatten한다. 즉
+`one_line(redact(x))`다.
+
+**두 순서를 다 재고 나서 판단했다:**
+
+    material                redact(one_line)   one_line(redact)
+    개행 뒤 토큰            SAFE               SAFE
+    공백 뒤 토큰            SAFE               SAFE
+    완전한 PEM              SAFE               SAFE
+    잘린 PEM                SAFE               SAFE
+    줄 넘어간 Bearer JWT    SAFE               SAFE
+
+**순서는 불변식이 아니었고, `agent.py`는 틀린 적이 없었다.** 한 호출 자리의 철자에
+맞춰 규칙을 발명할 뻔했다. 게이트를 버리고, 진짜 성질 — **두 순서 다 구멍이 없다** —
+을 재는 `RedactionIsSafeInEitherOrderTests`로 바꿨다.
+
+그 성질은 공짜가 아니다: **§3 수정 전에는 두 순서의 답이 달랐고, 이 저장소가 주로 쓰는
+`redact(one_line(x))` 쪽이 약한 쪽이었다.** 버린 게이트의 전제와 정반대다.
+
+### 5. 내 테스트가 두 번 공허했고, 게이트 셋이 내 작업을 잡았다
+
+- **corpus가 `one_line()`을 안 거쳤다.** `redact(text)`를 날 문자열에 부르면 진짜 개행은
+  단어 문자가 아니라 `\b`가 매치한다 — 즉 **우회를 재려고 쓴 테스트가 우회를 통과시키고
+  있었다.** `redact(one_line(text))`로 고치니 mutation 둘이 죽었다.
+- **`_GAP` mutation이 살아남았다.** `ntn_`/`ghp_` 값은 자기 패턴이 잡으므로 `Bearer` 패턴이
+  유일한 커버인 경우 — **접두사 없는 bearer 값(JWT)** — 이 corpus에 없었다. 넣으니 죽었다.
+- **hygiene 게이트가 내 docstring을 잡았다.** 재현 결과를 그대로 붙여 넣어 토큰 형태
+  리터럴이 추적 파일에 들어갔다. 스캐너에게 fixture와 유출은 같아 보인다 — 그게 그
+  스캐너의 값이다. 문장으로 바꿨다.
+- **인용 게이트가 잡았다.** docstring에 TheGuardFamilyStaysInStep… 이라는, 만들지도 않은
+  클래스 이름을 인용했다. 실제 이름으로 고쳤다. (그 이름을 여기서 backtick 없이 적는
+  것도 같은 게이트 때문이다 — 스캐너는 인용과 언급을 구별하지 못하고, 이 세션에서
+  **네 번째**로 결함의 *기록*이 결함처럼 보였다. C118 §6, C119 §4, C122 §4가 앞의 셋이다.)
+
+### 6. 측정
+
+    mutation  M1 `\b`로 복귀 (원 우회, 3패턴)              DETECTS (8건)
+              M2 ghp_ 경계만 복귀                            DETECTS (2건)
+              M3 _ESCAPED에서 `\b` 제거 (평범한 경우 파괴)   DETECTS (16건)
+              M4 _ESCAPED를 빈 문자열로 (과매치)             DETECTS (3건)
+              M5 _GAP을 `\s+`로 복귀                        DETECTS (2건, JWT 추가 후)
+              M6 redact가 전부 [REDACTED] 반환               DETECTS (23건)
+              + publish_control_tower sink 6종 mutation      DETECTS (M1 3, M2 4, M3 1,
+                                                             M4 10, M5 3, M6 11)
+    신규 회귀  20건 (subtest +66)
+    전체 회귀  C123 끝 **4104 passed / 8 skipped / 6005 subtests**
+               -> **4124 passed / 8 skipped / 6071 subtests** (521s)
+               중간에 게이트 4건이 실제로 발화했다(§5) — 전부 내 작업에 대해서다.
+               **신규 실패 0**, 운영 트리 쓰기 0.
+
+**실제 실행 검증:** 실 Notion에 대고 401 / 404 / 설정거절 3종(쓰기 없음), 수정 후 404를
+다시 쳐서 **여전히 한 줄**임을 확인. 재현 스크립트로 토큰 유출 True→False,
+stderr 5줄→1줄.
+
+**Evidence:** `tests/test_publish_control_tower.py::NothingRemoteReachesTheOperatorUnguardedTests`
+(10건), `tests/test_oplog.py::RedactionIsSafeInEitherOrderTests` (4건) 및
+`SecretPatternHomeTests`의 재작성 3건, `tests/test_agent.py::SecretSafetyTests` 재작성 2건.
+
+### 7. 남긴 것
+
+- **`bounded()`를 `publish_control_tower._safe`에 넣지 않았다.** transport가 본문을 이미
+  400자로 자르므로 `MAX_LOG_ERROR`(600) 아래이고, 가장 가까운 선례 둘
+  (`init_notion._safe`, `notion_page._safe`)도 넣지 않는다. 넣을 이유가 생기면 셋을 같이
+  본다.
+- **`run_company_ops.py`·`ops_status.py`의 sink는 이번에 다시 보지 않았다.** C31/C32가
+  훑은 곳이지만, §3의 우회는 **그 감사들보다 아래 계층**에 있었으므로 그때의 "안전하다"는
+  판정은 이 우회를 몰랐다. 지금은 `redact()` 자체가 고쳐졌으니 두 파일은 자동으로
+  나아졌다 — 다만 *어느 sink가 어느 가드를 쓰는지*는 여전히 손으로 쓴 명부다. 다음 후보.
+
+## C123. 테스트 스위트가 운영 트리에 가짜 Event를 쓰고 있었다 — 종료 전 검증에서 나왔다
+
+### 1. 어떻게 찾았는가 — "runtime/이 안 건드려졌나"를 실제로 쟀다
+
+종료 전 필수 검증 목록에 "실제 실행 검증"이 있다. 이 세션이 도구를 여러 번 돌렸으니
+운영 트리가 그대로인지 확인하려고 `find runtime -newermt <세션 시작>`을 돌렸다.
+**두 파일이 나왔다.**
+
+    runtime/events/outgoing/E1.json                    12:21
+    runtime/events/outgoing/3862cac2-...-336cf89e.json 12:22
+
+내용:
+
+    {"event_id": "E1", "project_id": "P", "summary": "s", "source": "DESKTOP_1", ...}
+    {"project_id": "PRJ", "milestone": "M", "event_type": "MILESTONE_COMPLETED", ...}
+
+**12:21~12:22는 직전 전체 pytest 실행 시각이다.** 내 도구 실행이 아니라 **테스트
+스위트**가 쓴 것이고, `project_id: "P"` / `summary: "s"`는 fixture다.
+
+### 2. 결함 P2 — 인자 하나가 빠지면 기본값이 저장소를 가리킨다
+
+    self.outgoing_dir = Path(outgoing_dir) if outgoing_dir is not None \
+        else DEFAULT_OUTGOING_DIR
+
+    DEFAULT_OUTGOING_DIR = PROJECT_ROOT / "runtime" / "events" / "outgoing"
+
+`tests/` 안에서 `OneDriveTransport(...)`를 만드는 자리가 20곳인데 **둘이
+`outgoing_dir`을 빠뜨렸다.** 둘 다 나머지 경로는 전부 `tempfile.mkdtemp()` 아래에
+정성껏 만들어 놓고, 기본값이 있는 그 하나만 놓쳤다.
+
+    tests/test_install_agent_task_script.py:351   OneDriveTransport(sync_folder=target)
+    tests/test_observability.py:14660             OneDriveTransport(root / "sync")
+
+그리고 `send()`는 **staging 파일을 지우지 않는다**(재전송 시 덮어쓸 뿐). 그래서 전체
+회귀를 돌릴 때마다 가짜 Event 둘이 운영 트리에 남았다.
+
+### 3. Company History는 오염되지 않는다 — 단정하기 전에 쟀다
+
+Collector는 `incoming/`을 읽고 `run_intake()`는 `transport/`를 승격시킨다.
+**`outgoing/`을 승격시키는 코드 경로는 없다.** 그러니 이 파일들이 Company History에
+들어갈 길은 없다. 그것을 확인한 뒤에 심각도를 P2로 적었다.
+
+남는 비용은 그래도 실재한다: **운영 디렉터리에 조작된 Event가 있다**는 것, 그리고
+읽기만 해야 할 트리에 테스트가 쓰고 있다는 것. `TestIsolationGuardTests`가 있는데
+이 모양을 보지 못했다.
+
+### 4. 그런데 그 디렉터리 자체가 결함보다 이상하다 (실측)
+
+    production에서 누가 쓰는가   **아무도** — `run_agent.py`는
+                                 `outgoing_dir=runtime/agent/outgoing`을 넘긴다
+    누가 읽는가                  **아무것도 없다** (저장소 전체 확인)
+    docs/14 §2 Artifact Taxonomy `events/`는 `transport|incoming|processed|rejected/`
+                                 로 적혀 있다 — **`outgoing/`은 그 목록에 없다.**
+                                 그리고 그 절의 자기 선언은 "새 폴더를 만들지 않았다"이다
+
+즉 **이 기본값이 이 시스템 전체에서 하는 유일한 일은, 인자를 잊은 호출자의 출력을
+조용히 받아 주는 것**이다. 그리고 그 일을 두 번 했다.
+
+### 5. 고친 것
+
+두 테스트에 `outgoing_dir`을 넣었고, 남아 있던 가짜 Event 둘을 치웠다(전체 회귀를
+다시 돌려도 재생성되지 않는 것을 실측했다). 그리고 이 부류 전체를 막는 게이트를
+붙였다 — `tests/` 아래 모든 `OneDriveTransport(...)` 생성을 AST로 훑어
+`outgoing_dir`(키워드 또는 두 번째 위치 인자)이 없으면 실패한다.
+
+**기본값을 없애지는 않았다.** `DEFAULT_OUTGOING_DIR`은 `transport.__all__`에 있는
+공개 API이고, 그것을 필수 인자로 바꾸는 것은 시그니처 결정이다. **A절 후보로 남긴다** —
+다만 이제 그 결정을 미뤄도 사고는 나지 않는다.
+
+### 6. 측정
+
+    mutation  M1 테스트가 다시 outgoing_dir을 뺌 (원 결함)   DETECTS (1건, 파일:줄 지목)
+              M2 AST 스캔이 아무것도 못 찾게 만듦             DETECTS (1건, 선행 조건)
+    신규 회귀  6건
+    실행 검증  가짜 파일 삭제 -> 두 테스트 파일 재실행(753 passed) ->
+              `runtime/events/outgoing/`가 **비어 있음**을 재확인
+
+**Evidence:** `tests/test_transport_onedrive.py::NoTestStagesIntoTheLiveRepositoryTests`.
+
+### 7. 교훈 — 종료 전 검증이 결함을 하나 더 냈다
+
+이 결함은 감사 Cycle이 아니라 **"끝났으니 트리가 깨끗한지 확인하자"** 에서 나왔다.
+`git status`는 `runtime/`이 `.gitignore`에 있어서 아무 말도 하지 않는다 —
+**버전 관리가 보지 않는 디렉터리는 종료 점검이 따로 봐야 한다.** 다음 Sprint의
+종료 절차에 `find runtime -newermt <시작시각>` 한 줄을 넣을 값이 있다.
+
+## C122. Event를 무엇이 나르는지 정의하는 파일이 "아직 안 정했다"고 말하고 있었다
+
+### 1. 어떻게 찾았는가 — "어느 테스트가 이 모듈을 보는가"의 바닥
+
+C116이 쓴 싼 질문을 `src/` 전체에 돌렸다. 바닥 둘이
+`transport/in_memory.py`(23줄)와 `transport/interface.py`(35줄)였다. 작아서 지나칠
+파일이지만, `interface.py`는 **Event를 무엇이 나르는지 정의하는 이음매**다.
+
+### 2. 결함 P2 — 네 문장이 전부 거짓이었고, 셋은 존재하지 않는 것을 가리켰다
+
+    No concrete production Transport is chosen yet (GitHub / OneDrive / USB /
+    SharedFolder are all still open — see the Event Transport analysis) ...
+    so a real Transport can be dropped in later
+    ...
+    Concrete implementations (e.g. GitHubTransport, USBTransport,
+    SharedFolderTransport) are chosen and built in a later phase.
+
+대조:
+
+    선택                   **끝났다** — `OneDriveTransport`
+                          ("COO Architecture Decision, Phase 5.1 / 5.15 / 5.2")
+                          `run_agent.py:142`가 생성하고 AGENT.md §1이 경로를 그린다
+    GitHubTransport        저장소 어디에도 없다. 있던 적도 없다
+    USBTransport           같음
+    SharedFolderTransport  같음
+    "the Event Transport analysis"  `docs/`에 그런 문서가 없다 (실측: 15개 전부 확인)
+
+**Event가 Desktop 사이를 어떻게 건너가는지 알아보려고 이음매의 정의를 연 사람이,
+"그 질문은 아직 열려 있다"는 답과 존재하지 않는 넷의 이름을 받는다.**
+
+`in_memory.py`도 같은 문장을 들고 있었고("the real candidates: GitHub / OneDrive /
+USB / SharedFolder"), `test_transport.py`의 주석 하나도 같은 문서를 인용하고 있었다.
+
+**왜 아무것도 못 잡았는가.** `DocumentPointersResolveTests`는 `docs/NN §M` 꼴의
+인용을 푼다. 이것은 산문으로 부른 문서 이름이고, 무엇보다 **결정이 자기가 정한
+이음매의 설명에 아무 흔적도 남기지 않았다.** C76의 교훈이 또 한 모듈에서 반복됐다 —
+"보류로 기록된 결정은 그 결정보다 오래 산다."
+
+### 3. 고친 것 — 그리고 게이트 두 반쪽
+
+문장을 실측으로 바꿨고, 어느 한쪽만으로는 다시 낡으므로 두 방향으로 묶었다:
+
+    이음매가 이름 붙인 모든 `*Transport`는 이 패키지의 실제 클래스여야 한다
+    `run_agent.py`가 생성하는 클래스는 이음매가 이름 붙여야 한다
+
+둘째가 이 결함을 구조적으로 불가능하게 만든다 — Transport를 새로 골라 Agent에
+배선하면, 이음매가 그것을 말하기 전까지 빨갛다.
+
+### 4. **내 게이트 하나가 공허했다 — mutation이 잡았다**
+
+"이음매가 이름 붙인 클래스는 전부 존재한다"의 첫 판본에 예외를 넣었다:
+*"그 문장이 '없다'고 말하고 있으면 넘어간다"*. 그런데 그 판정을 **문서 전체**에 대해
+했다 — 정정문에 "never built"가 들어 있으니 **모든 이름에 대해 조건이 거짓**이 되어
+집합이 언제나 비었다. `A GitHubTransport also delivers Events.`를 넣는 mutation이
+그대로 통과했다.
+
+고친 방법은 문구 판정을 없애는 것이다. **구분을 이름이 놓인 자리가 나르게 했다** —
+docstring에서 들여쓴 블록은 인용이고, 여백에 붙은 문장이 이 모듈의 주장이다. 옛
+문장 전체와 옛 클래스 이름 셋을 인용 블록으로 옮기고, 검사는 여백만 읽는다.
+
+**이 세션에서 세 번째다.** C118 §6과 C119 §4에서도 내 guard가 자기가 지키는 결함의
+*기록*에 걸렸다. 세 번 다 답은 같았다 — 문구로 예외를 두지 말고, 자료 구조가
+구분을 나르게 한다.
+
+### 5. 측정
+
+    mutation  M1 옛 "아직 안 정했다" 문단 복귀 (원 결함)      DETECTS (2건)
+              M2 이음매가 run_agent가 만드는 이름을 안 씀      DETECTS (2건)
+              M3 존재하지 않는 `GitHubTransport`를 이름 붙임   DETECTS (1건, 재작성 후)
+    신규 회귀  6건 (subtest 4)
+    전체 회귀  C121 끝 **4092 passed / 8 skipped / 6000 subtests**
+               -> **4098 passed / 8 skipped / 6005 subtests** (515s)
+               **신규 실패 0.**
+
+**Evidence:** `tests/test_transport.py::TransportSeamNamesWhatActuallyDeliversTests`.
+
+### 6. 남긴 것
+
+`docs/`에는 Transport를 다루는 문서가 **없다**(파일명 실측). 인용이 가리키던 분석이
+어딘가에 있었다면 그것을 `docs/`로 들여오는 것이 맞겠지만, 새 Spec 문서를 만드는 것은
+문서 정책 결정이다. 지금은 **그 문서가 없다는 사실 자체를 회귀가 단정한다** — 언젠가
+쓰이면 그 테스트가 빨개지고, 그때 인용을 되살리면 된다.
+
+## C121. 주석이 자기 **바로 다음 줄**의 단정과 반대되는 말을 하고 있었다 — C115가 고친 결함을 C115의 수정이 재생산했다
+
+### 1. 어떻게 찾았는가 — C120의 수정을 세 번째 소비자에서 확인하려다
+
+C120이 ATTENTION 목록을 건드렸고, 그 목록의 소비자는 셋이다. 터미널과 Notion은 봤으니
+**Dashboard를 띄워서** 확인했다(포트 8792). 목록은 정상이었다 — payload와 HTML 둘 다
+새 한국어 줄을 싣고 옛 영어는 없다.
+
+그 김에 `curl -I`를 쳤다. C115가 이 method를 위해 일을 했다고 적어 두었기 때문이다.
+
+### 2. 결함 P3 — 셋이 같은 거짓 문장을 들고 있었다 (동작은 옳다)
+
+실측:
+
+    GET  /                     200   Content-Length: 53140   본문 53140 바이트
+    HEAD /                     405   Content-Length: 9       본문 0 바이트
+    GET  /api/dashboard.json   200   Content-Length: 54414
+    HEAD /api/dashboard.json   405   Content-Length: 9
+
+C115가 남긴 문장, 세 곳에 같은 말로:
+
+> `Content-Length` above still describes what a GET *would* return,
+> **which is the point of the method.**
+
+**거짓이다.** HEAD는 `do_GET()`에 닿지 않는다 — C115가 만든 `__getattr__`이 GET이 아닌
+모든 method를 `do_POST()`의 405로 보내므로, `Content-Length`는 그 405 표현
+(`b"read-only"`, 9바이트)의 크기다. GET은 53140을 돌려준다.
+
+**동작은 옳다.** 405의 `Content-Length`는 405 표현의 것이 맞고, HEAD에 본문을 안 보내는
+것도 맞다(RFC 9110 §9.3.2). **틀린 것은 문장뿐이다** — 그리고 그 문장은 이 응답이 갖지
+**않은** 유일한 성질을 이름으로 집어 말하고 있었다.
+
+셋 중 하나가 특히 나쁘다. 회귀 테스트의 주석이었고, **바로 다음 줄**이 이렇다:
+
+    # Content-Length still describes what a GET would return, which is
+    # the whole point of the method.
+    self.assertIn(b"Content-Length: 9", head)
+
+주석과 단정이 한 줄 사이로 서로를 반박하고 있었고, 옳은 쪽은 단정이었다.
+
+### 3. 이것이 C115 자신의 결함 모양이다
+
+C115의 제목이 **"GET만 답한다는 문장이 세 method에 대해 거짓이었다"** 이다. 산문의 보편
+주장이 그 아래 코드가 하지 않는 말을 하는 것 — 그 결함을 고치면서 같은 모양을 세 벌 새로
+만들었다. C82("방금 한 수정에 같은 질문을 던진다")가 정확히 이래서 있는 규칙이다.
+
+### 4. 고친 것
+
+문장 셋을 실측으로 바꿨고, 회귀에는 **두 사실을 나란히** 넣었다 — HEAD의
+`Content-Length`가 `len(b"read-only")`이고, 그것이 같은 경로 GET의 크기와 **다르다**는
+것. 한쪽만 읽고 다시 헷갈릴 수 없다. GET 본문이 1000바이트를 넘는지도 단정한다 — 비교
+대상이 비어 있으면 대조가 아무것도 증명하지 않는다.
+
+### 5. 측정
+
+    mutation  M1 HEAD가 GET의 크기를 광고하게 만듦 (옛 주석이 주장하던 동작)  DETECTS (1건)
+              M2 본문 억제 제거                                              DETECTS (1건)
+    변경 회귀  1건 강화 (단정 4개 추가), 신규 0
+    실행 검증  실 서버 2회 기동 — method 2종 × 경로 2종, raw socket으로 와이어 바이트 확인
+              Dashboard가 C120의 새 한국어 줄을 싣는 것도 같이 확인
+              (`이 머신의 Agent가` 있음 / `agent has not run for` 없음)
+
+**Evidence:** `tests/test_dashboard_server.py::ThePageIsReadOnlyTests::test_a_head_request_answers_without_a_body`
+(강화), `dashboard_server.py::_Handler._send` 주석, C115 §2 본문(위에 정정 인용을 달았다).
+
+## C120. 회사가 읽는 Notion 페이지에 영어 한 줄이 섞여 있었다 — 그리고 그 함수는 여덟 줄 전부가 영어였다
+
+### 1. 어떻게 찾았는가 — 터미널이 아니라 **발행된 페이지**를 읽었다
+
+여기까지의 Cycle은 전부 로컬에서 도구를 돌려 찾았다. 이번에는 실 Notion Workspace에서
+Control Tower 페이지를 **읽기 전용으로** 내려받아 블록 66개를 그대로 찍어 봤다
+(`find_child_page` → `list_block_children`, 쓰기 없음).
+
+페이지 자체는 아주 좋았다 — `이 화면의 범위`, `이 데이터는 실제 업무인가`,
+`원천이 없는 계층`, 그리고 두 sync 시각을 다른 것으로 이름 붙인 `동기화 상태`까지
+AGENT.md §6c가 약속한 그대로다. ATTENTION 블록:
+
+    [11] 3일 이상 아무것도 오지 않은 Desktop: DESKTOP_1, DESKTOP_2, ...
+    [12] Collector가 거부한 Event 4건 (출처불명=4) — 사람이 확인해야 한다
+    [13] 읽을 수 없는 파일 transport 1건 — ...
+    [14] KEEP Candidate 1건이 저장돼 있는데 ...
+    [15] 수집됐지만 History에 들어가지 못한 Event 1건: FI-CRASH-1 ...
+    [16] Runner가 9.4일째 실행되지 않았다 ...
+    [17] 마지막 실행에서 시작조차 되지 못한 단계: dashboard ...
+    [18] Notion 자격증명이 전달돼 있지만 ...
+    [19] **agent has not run for 15 day(s)**
+
+### 2. 결함 P2 — 한 목록, 두 언어. 그리고 하필 그 줄이다
+
+`ops_status.main()`의 ATTENTION은 **하나의 리스트**이고 세 표면에 그대로 렌더된다:
+
+    ops_status.py           터미널 블록
+    dashboard_server.py     ATTENTION 패널 (같은 목록)
+    publish_control_tower   Notion 페이지의 bullet — **워크스페이스 전체가 읽는다**
+
+그 리스트에 기여하는 것은 넷이다 — `needs_attention()`, `signal_attention`,
+`delivery_attention`, `lock_attention`. **뒤의 셋과 `ops_status.py`의 모든 블록은 이미
+한국어였다.** 첫째만 영어였고, 하나가 아니라 **여덟 개 전부**였다:
+
+    agent state unreadable: {...}
+    agent state says it has collected through {...}, which is in the future ...
+    {n} event(s) created but not delivered
+    {n} signal(s) rejected and awaiting a human
+    agent has never completed a run
+    agent state's last_run is not a timestamp — ...
+    agent has not run for {n} day(s)
+    {n} date(s) not yet collected
+
+**하필 그 줄이라는 것이 중요하다.** Agent가 멈춘 것은 이 상태 화면이 존재하는 이유
+그 자체다. 회사 사람이 페이지를 열었을 때 다른 여덟 줄과 다르게 생긴 한 줄이 바로
+그것이다.
+
+여덟 개를 옆줄과 나란히 읽히도록 옮겼다. Runner의 줄이
+`Runner가 9.4일째 실행되지 않았다`이므로 Agent의 줄은
+`이 머신의 Agent가 15일째 실행되지 않았다`이다. `이 머신의`는 장식이 아니다 —
+`ops_status.py`가 이 절의 제목을 `AGENT — 이 머신의 Agent`로 달고, 바로 위 COMPANY
+절은 **다른** Desktop들의 Agent를 이야기한다.
+
+### 3. 왜 번역만으로 끝내지 않았는가 — 게이트를 붙였다
+
+문자열은 쉬운 절반이다. 섞인 **이유**는 `needs_attention()`이 `src/agent/`에 살고,
+reason code를 돌려주는 API처럼 읽히며, 자기가 어느 화면에 인쇄되는지와 아무 연결이
+없다는 것이다. 다음에 추가되는 reason도 같은 이유로 영어일 것이다.
+
+게이트는 **소스에서 문자열 리터럴을 스캔하지 않는다.** Korean이 하나도 없는 값을
+보간하는 f-string은 소스 스캔을 통과하고 사람 앞에서 실패한다. 대신 실제 함수를
+여덟 분기 전부에 대해 **돌려서** 나온 문자열에 한글이 있는지 본다. 그리고
+"각 분기가 정말 reason을 하나 만드는가"를 선행 조건으로 따로 단정한다 — 빈 튜플 위를
+지나가는 검사는 C76 §4가 훑은 그 공허한 모양이다.
+
+`AgentStatusSnapshot.needs_attention()`의 docstring에 세 표면과 그 이유를 적었다.
+다음 사람이 `src/agent/` 안에서 그 함수를 열었을 때 자기 문장이 어디로 가는지 알 수
+있어야 한다.
+
+### 4. 과거 측정 인용은 다시 쓰지 않았다
+
+`ops_status.py`와 `test_observability.py`가 옛 영어 문구를 인용하는 자리가 여섯 군데다.
+**현재 동작을 서술하는 셋**은 새 문구로 바꿨고, **그때 잰 값을 인용하는 셋**은 원문을
+그대로 두고 `(그때의 문구; C120에서 한국어로 바뀌었다)`를 붙였다. D절의 규칙 그대로다 —
+잰 적 없는 문장을 잰 것처럼 만들지 않는다.
+
+### 5. 측정
+
+    mutation  M1 한 reason을 영어로 되돌림 (원 결함)         DETECTS (1건)
+              M2 rejected-signal 분기가 reason을 안 만듦     DETECTS (1 subtest — 선행 조건)
+    신규 회귀  4건 (subtest 8)
+    변경 단정  기존 회귀 15건이 새 문구로 갱신됨 (test_agent 2, test_observability 13)
+    전체 회귀  C119 끝 **4088 passed / 8 skipped / 5992 subtests**
+               -> **4092 passed / 8 skipped / 6000 subtests** (512s)
+               **신규 실패 0.**
+
+**실제 실행 검증:** `python ops_status.py` — ATTENTION 9줄 전부 한국어, 마지막 줄이
+`! 이 머신의 Agent가 16일째 실행되지 않았다`로 `! Runner가 10.0일째 실행되지 않았다`
+바로 아래에 나란히 선다. exit 3 (변하지 않음).
+
+**Notion 페이지는 다시 발행하지 않았다.** `publish_control_tower.py`는 워크스페이스에
+쓰는 명령이고, 이 세션이 외부 시스템에 하는 쓰기는 사용자의 몫이다. 페이지는 다음
+발행 때 한국어 줄을 싣는다 — 그때까지 [19]는 옛 문구 그대로다.
+
+**Evidence:** `tests/test_observability.py::EveryAttentionLineSpeaksTheSameLanguageTests`.
+
+### 6. 남긴 것 — 같은 질문의 나머지
+
+`needs_attention()`이 유일한 영어였는지는 **이 리스트에 대해서만** 확인했다. 같은 질문을
+아직 던지지 않은 표면이 둘 있다:
+
+- **`run_agent.py` / Agent 로그.** `AgentStatus`·`DateOutcome` enum 값(`COMPLETED`,
+  `FAILED`, `SKIPPED_ALREADY_RUNNING`)은 기계용 식별자이고 로그 형식의 일부라
+  번역 대상이 아니다. 그 옆의 산문은 이미 한국어다. **확인함, 결함 없음.**
+- **Run Manifest / Dashboard payload의 `reason` 문자열.** 사람이 읽는 화면에 그대로
+  실리는데 출처가 여럿이다(Notion API 응답 본문 포함 — 그것은 원격이 쓴 것이라
+  번역 대상이 아니다). 어디까지가 "우리 문장"인지 가르는 것이 먼저이고, 그것은
+  출력 계약 결정이다. 다음 Sprint 후보.
+
+## C119. "nothing would notice if it did" — 자기 docstring이 적어 둔 구멍을 닫았다
+
+### 1. 어떻게 찾았는가 — 테스트 자신이 자기 사각지대를 적어 두고 있었다
+
+`EveryTrackedModuleParsesOnThisInterpreterTests`의 docstring:
+
+> `test_every_tracked_python_file_compiles` — `compile()` on **this** interpreter.
+> On 3.9 it also enforced 3.9. **On 3.13 it enforces 3.13 and says nothing about 3.9**,
+> so a `match` statement or an `except*` would pass here and abort collection on a
+> Desktop that has not moved.
+>
+> Measured in C76 ... across all 139 tracked `.py` files, **zero** post-3.9 AST
+> constructs. Nothing has drifted; **nothing would notice if it did.**
+
+C76이 재고, C76이 이름 붙이고, C76이 열어 둔 채로 남긴 구멍이다. 그리고 그 사이에
+배포 머신이 3.9.7 → 3.13.14로 옮겨갔으므로(BACKLOG D) **구멍은 그때 열렸다** — 그 전에는
+`compile()`이 우연히 같은 일을 하고 있었다.
+
+**살아 있는 구멍인 이유.** DESKTOP_1은 `Python 3.9.7 / Windows 10 Pro 10.0.19042`이고
+Agent를 돌린다(AGENT.md §1). 트리는 통째로 복사된다. 그 머신이 이미 보이는 32건은 D절에
+전부 열거돼 있고 이해돼 있다 — 31건은 한 테스트 파일의 `enterContext`(3.11+)이고 실행 중
+`AttributeError`다. **Syntax error는 그것들보다 나쁘다:** 파일 하나의 collection을 통째로
+중단시키므로, 32건이 "32건 실패 + 사라진 테스트 몇 개"가 된다.
+
+### 2. 무엇을 했는가 — 최소 인터프리터를 **정하지 않고** 드리프트를 보이게 했다
+
+그 docstring은 구멍을 닫으려면 "**declared minimum interpreter**"가 필요하고 그것은 A절의
+결정이라고 적었다. 맞다. 그래서 **선언하지 않았다.**
+
+대신 C76이 이미 **잰 값**을 고정했다 —
+`StrayShellArtifactsInTheRepositoryRootTests`가 아무도 결정하지 않은 파일 다섯을 고정하는
+것과 같은 idiom이다. 빨개지는 날 사람이 결정하고, 그때까지 트리는 조용히 3.9를 넘어갈 수
+없다. `RUNTIME-DECLARATION`은 3.13 그대로다 — **이 게이트는 그 줄과 무관하고 D절의 SKIP을
+뒤집지 않는다.** 하나는 "이 숫자를 잰 인터프리터", 다른 하나는 "가장 오래된 Desktop이
+읽을 수 있는 문법"이다.
+
+### 3. 손으로 쓴 노드 명부 대신 CPython의 것을 쓴다
+
+    ast.parse(source, name, feature_version=(3, 9))
+
+CPython이 유지하고, 메시지가 자기 이름을 댄다. 실측:
+
+    match x: case 1:      Pattern matching is only supported in Python 3.10 and greater
+    except* ValueError:   Exception groups are only supported in Python 3.11 and greater
+    type Alias = int      Type statement is only supported in Python 3.12 and greater
+    def f[T](x: T)        Type parameter lists are only supported in Python 3.12 and greater
+
+손으로 `ast.Match`/`ast.TryStar`/PEP 695 노드 목록을 적었다면 C115가 고친 바로 그 모양
+— **명부** — 이 하나 더 생겼을 것이다.
+
+**보지 못하는 것도 적어 두었다(추측이 아니라 실측).** `feature_version`은 parser에는 닿고
+tokenizer에는 닿지 않으므로 PEP 701 f-string(`f"{d["k"]}"`, 3.12+)은 여기를 통과하고 3.9에서
+깨진다. 그 문자열이 회귀에 **들어 있다** — 각주로 남기지 않고 단정으로 고정했다. 런타임
+API 드리프트(`enterContext`)는 아예 이 게이트 밖이다. Syntax가 아니다.
+
+### 4. 내 guard가 자기 대상이 아니라 표준 라이브러리를 증명하고 있었다
+
+"이 체크가 실제로 반대할 수 있는가"를 `ast.parse(source, feature_version=...)`로 직접
+썼다. **sweep에서 `feature_version`을 떼는 mutation이 그것을 통과했다** — 그 guard는
+sweep에 대해서가 아니라 `ast` 모듈에 대해서 참인 문장을 단정하고 있었다.
+
+파싱을 `_refusal()` 한 곳으로 모으고 guard가 **그것을** 몰게 했다. 이제 어디서 kwarg가
+빠져도 죽는다. C115 §4·C118 §6과 같은 모양이 세 번째다: **guard는 자기가 지키는 것을
+호출해야 한다.**
+
+### 5. 측정
+
+    mutation  M1 src/oplog.py에 match 문 추가        DETECTS (1건, 파일:줄:이유를 지목)
+              M2 공유 parser에서 feature_version 제거  DETECTS (4건, 재작성 후)
+              M3 OLDEST_DESKTOP을 (3,13)으로 올림      DETECTS (4건)
+    신규 회귀  4건 (subtest 4)
+    실측      추적 중인 `.py` 전부가 3.9 문법으로 파싱된다 — C76의 값이 그대로 유효하다
+
+**Evidence:** `tests/test_repository_hygiene.py::NothingHereNeedsAGrammarOlderDesktopsDoNotHaveTests`.
+
+### 6. 남은 결정 (A절, 변하지 않음)
+
+"DESKTOP_1을 계속 지원하는가"는 여전히 사람의 결정이다. 바뀐 것은 **그 결정을 미루는 비용이
+보인다**는 것뿐이다: 지원을 끊기로 하면 `OLDEST_DESKTOP` 한 줄을 올리고 그 근거를 적으면
+되고, 계속 지원하면 이 게이트가 매 실행 지킨다. 어느 쪽도 지금 고르지 않았다.
+
+## C118. `ops_status.py | head` — 파이프가 닫히자 도구가 자기 디스크를 탓하고 120으로 죽었다
+
+### 1. 어떻게 찾았는가 — C117이 남긴 스캔을 그대로 돌렸다
+
+C117 §7이 다음 스캔을 이렇게 적었다: **"이 스텁이 절대 하지 않는 일 중, 진짜는 하는 것은
+무엇인가."** `input_fn`에서 답은 EOF였다. 같은 질문을 **출력 쪽**에 던졌다 — 테스트는
+`io.StringIO`에 쓴다. `StringIO`가 절대 하지 않는 일은? **쓰기 실패다.**
+
+    python ops_status.py | head -3
+
+    OSError: [Errno 22] Invalid argument      <- _print_history()의 print() 안에서
+    OSError: [Errno 22] Invalid argument      <- 그 오류를 처리하는 핸들러 안에서
+    Exception ignored on flushing sys.stdout
+    exit 120
+
+AGENT.md가 **가장 먼저 실행하라**고 적어 둔 도구이고, 105줄짜리 보고이며, 파이프로 읽는
+것이 가장 흔한 방식이다.
+
+### 2. 결함 P1 — 쓰기 실패가 "손상된 증거"로 보고됐다
+
+`_block()`은 `OSError`를 잡아 그 섹션을 `HISTORY — 읽지 못했다`로 보고하고 ATTENTION에
+**"디스크나 권한 문제이며 사람이 확인해야 한다"** 를 올린다. 그 계약은 **증거가 손상된
+경우**를 위한 것이고, 자기 docstring이 그렇게 적어 두었다:
+
+> `OSError` only. A `TypeError` from a rollup is a bug in this program and must not be
+> dressed up as a disk problem; docs/10 §46's contract is about damaged *evidence*.
+
+파이프가 닫힌 것은 **같은 오분류가 `OSError` 타입을 입고 온 것**이다. 증거는 완벽하게
+읽혔고, 읽던 쪽이 먼저 끝났을 뿐이다. 그런데 화면에는 그 블록이 읽히지 않았다고 뜨고,
+운영자는 디스크를 보러 간다.
+
+**그리고 핸들러가 다시 터졌다.** 그 핸들러가 하는 첫 일이 `print()`다. 두 번째 traceback과
+`120`(인터프리터의 "종료 중 예외가 있었다")이 거기서 나온다.
+
+### 3. 결함 P1 — 종료 코드 120, 그리고 `0`이 더 나빴을 이유
+
+`120`은 이 프로젝트의 코드가 아니고 사람에게도 `$?`를 읽는 스크립트에게도 아무 말을 하지
+않는다.
+
+**그렇다고 `0`이 답은 아니다.** 이 도구의 `0`은 **주장**이다 —
+"ATTENTION — 없음. 사람이 지금 할 일은 없다." 그 판정은 계산조차 끝나지 않았다.
+아무도 안 듣고 있다고 해서 전원 이상 없음을 선언하는 것은, 이 저장소가 계속 지워 온 바로
+그 모양이다.
+
+`2`를 쓴다. docs/14 §4가 이미 `2`에 "이 실행이 존재 이유를 이루지 못했다"를 주고 있고,
+독자에게 닿지 못한 보고가 정확히 그것이다. `1`은 설정, `3`은 "사람이 봐야 함" — 이 상태가
+도달하지 못한 판정 — 으로 남는다. **다섯 번째 숫자를 만들지 않았다.**
+
+### 4. errno로 판별하지 않는다 — 실측이 그렇게 시킨다
+
+포터블한 레시피는 `BrokenPipeError`(`EPIPE`, 32)를 잡으라고 한다. **Windows는 그것을 던지지
+않는다.** 그리고 `EINVAL`(22)은 진짜 디스크 오류이기도 하므로, errno 비교는 이 플랫폼에서
+결함을 놓치거나 멀쩡한 I/O 실패를 "읽던 쪽이 갔다"로 부르게 된다.
+
+그래서 **스트림에 직접 물었다.** 파이프를 실제로 끊고 잰 값:
+
+    write("")      OK        <- 버퍼링. 아무것도 증명하지 못한다
+    write("x")     OK        <- 버퍼링. 아무것도 증명하지 못한다
+    flush()        raises    <- 매번 파일 디스크립터에 닿는다
+    stdout.closed  False     <- 이것도 아무것도 증명하지 못한다
+
+`flush()` 하나만이 답한다. `cli.output_is_gone()`이 그것을 쓴다. 정상 스트림에서는 공짜다.
+
+### 5. 고친 모양
+
+    src/cli.py       OUTPUT_LOST_EXIT = 2
+                     output_is_gone(stream)   flush()로 묻는다
+                     run_entrypoint(main, argv)
+                       - 출력이 살아 있는 OSError는 traceback째로 그대로 올려보낸다
+                       - 죽었으면 stderr에 한 줄, dup2로 devnull, 2를 반환
+    ops_status.py    _block()  output_is_gone()이면 re-raise (오진을 아예 시도하지 않는다)
+                     __main__  run_entrypoint(main, sys.argv)
+
+`dup2`는 CPython 자신의 레시피다. 없으면 인터프리터가 종료 중에 `sys.stdout`을 한 번 더
+flush하고, 그것이 다시 터져서 **무엇을 반환하든 프로세스는 120으로 끝난다** — 위에서 고른
+숫자를 아무도 못 보게 된다.
+
+`src/cli.py`의 조용한 `except OSError: pass` 둘은 `ASilentlyDroppedEntryIsARosterNotAParagraphTests`
+로스터에 올렸다. 게이트가 제대로 발화했고, 이 둘은 **로스터에서 유일하게 "기록이 거래된
+것이 아니라 구조적으로 불가능한" 항목**이다 — 두 스트림이 이미 없는 것이 확인된 뒤에만
+닿는 자리이고, 버려지는 항목 자체가 없다.
+
+### 6. 내 테스트가 틀린 이유로 통과했다 — mutation이 잡았다
+
+첫 회귀는 `assertRaises(OSError)`만 단정했다. **원 결함을 되돌리는 M1이 그것을 통과했다** —
+가드가 없어도 핸들러가 `print()`에서 다시 터지므로 `OSError`는 여전히 나온다. 한 `print()`
+늦게 나올 뿐이다. *무언가* 잘못됐다는 것과 *무엇이* 잘못됐는지는 다른 단정이다.
+
+원인은 fixture였다. 내 `_DeadPipe`가 모든 write에 실패하도록 돼 있었는데, **실측한 진짜
+파이프는 write를 계속 성공시킨다**(버퍼링). 그래서 진짜 결함에서는 핸들러의 `print()` 세
+개가 전부 **성공**하고, `HISTORY — 읽지 못했다`가 버퍼에 들어가고 디스크를 탓하는 ATTENTION
+줄이 반환된다. fixture를 실측대로 다시 만드니 M1이 죽었고, 실패 메시지가 오진 문장을 그대로
+찍어 보여 준다.
+
+**C117 §4와 정확히 같은 실수를, 그 Sprint의 교훈을 적용하는 중에 다시 했다.**
+
+### 7. 측정
+
+    mutation  M1 _block이 다시 파이프 손실을 손상된 증거로 취급 (원 결함)  DETECTS (1건, fixture 재작성 후)
+              M2 _block이 모든 OSError를 re-raise                          DETECTS (5건)
+              M3 __main__이 다시 main()을 직접 호출                        DETECTS (1건)
+              M4 output_is_gone이 항상 False                               DETECTS (2건)
+              M5 run_entrypoint가 모든 OSError를 삼킴                      DETECTS (1건)
+    신규 회귀  7건
+    전체 회귀  C117 끝 **4077 passed / 8 skipped**
+               -> **4084 passed / 8 skipped / 5988 subtests** (536s)
+               중간에 `ASilentlyDroppedEntryIsARosterNotAParagraphTests` 2건이 실제로
+               발화했다 — 게이트가 작동한 것이고, 로스터를 채워서 닫았다.
+               **신규 실패 0.**
+
+**실제 실행 검증 (실 저장소):**
+
+    python ops_status.py | head -3     exit 2, traceback 없음, stderr 한 줄
+    python ops_status.py | head -20    exit 2, 같음
+    python ops_status.py | head -60    exit 3   <- 보고를 다 쓴 뒤라 파이프가 안 끊긴다
+    python ops_status.py               exit 3   (변하지 않음)
+    python ops_status.py > file 2>&1   exit 3, 105줄
+    python ops_status.py --dry-run     exit 1   (변하지 않음)
+
+`head -60`이 3인 것은 결함이 아니라 버퍼링의 사실이다: 프로세스는 **버퍼가 찬 뒤에 쓰려고
+할 때만** 독자가 떠난 것을 알 수 있다. `2`의 뜻은 "독자가 잘랐다"가 아니라
+**"내가 다 쓰지 못했다"** 이고, 그 문장은 세 경우 모두에서 참이다.
+
+**Evidence:** `tests/test_observability.py::AClosedPipeIsNotDamagedEvidenceTests` (7건).
+
+### 8. 남긴 것
+
+**다른 entrypoint는 실측상 여기 닿지 못한다.** 파이프가 끊기려면 64KB 버퍼가 차야 하고,
+`init_notion.py`·`publish_control_tower.py`·`dashboard_server.py`는 20줄 남짓을 찍는다.
+`run_agent.py`는 긴 Catch-up에서만 커진다. `run_company_ops.py`는 **돌리지 않았다** — 실
+파이프라인 실행이고 History와 Backup에 쓴다. 그래서 `run_entrypoint()`를 이 넷에 붙이는 것은
+**하지 않았다**: 측정 없이 다섯 곳의 종료 코드 계약을 건드리는 일이고,
+`run_company_ops.py`에서는 `2`가 이미 FAILED를 뜻하므로 같은 숫자를 두 가지로 만들게 된다.
+다음 Sprint의 항목으로 남긴다.
+
+## C117. 같은 결함을 나머지 entrypoint에 대고 쏴 봤다 — 둘이 더 나왔고, 셋째는 실행이 찾았다
+
+### 1. 방법 — C116의 결함을 질문으로 바꿨다
+
+C116이 찾은 것은 "**stderr에 실패를 찍고 exit 0**"이었다. 그 모양을 나머지 entrypoint
+넷(`run_agent.py`, `init_notion.py`, `src/review_cli.py`, `ops_status.py`)에 그대로
+물었다. 한 Sprint의 결함을 다음 Sprint의 스캔으로 쓰는 것은 C20이 이미 한 방법이고,
+이번에는 **두 건**이 나왔다.
+
+**`run_agent.py`는 결함이 없었다 — 확인하고 넘어갔다.** `DateOutcome.FAILED`가 나오면
+`agent.run_once()`가 즉시 `AgentStatus.FAILED`로 반환하고(`src/agent/agent.py:349`)
+entrypoint가 exit 2를 낸다. `rejected_signals`는 exit 0으로 남지만 그것이 설계다 —
+Agent의 종료 코드는 **전달 무결성**을 말하고, "사람이 봐야 함"은 `ops_status.py`
+ATTENTION이 말한다(AGENT.md §6 종료 코드 표).
+
+### 2. 결함 P1 — `init_notion.py`: `FAILED=1`을 찍고 exit 0 (그리고 그 뒤 모든 Sync가 실패한다)
+
+마지막 요약 줄:
+
+    EXISTS=10 CREATED=0 RENAMED=0 SKIPPED=0 FAILED=1
+
+그리고 `return 0`. **raise 없이 `FAILED`에 닿을 수 있는 Property는 Title 하나**다 —
+`_bootstrap_title_property()`가 `"Name" → "Project"` Rename이 거부됐을 때 돌려준다.
+그 상태의 PROJECTS에는 `Project` Property가 **아예 없고**,
+`src/notion/properties.py:229`가 모든 Row를 `{"Project": _title(...)}`로 쓰므로
+**이후 Notion Sync가 전부 실패한다.**
+
+그리고 이 Rename을 자동화한 이유가 `src/notion/bootstrap.py` 머리말에 적혀 있다 —
+"이 정확한 수동 단계를 사람이 두 번 시도했고 두 번 다 적용되지 않았다". exit 0은
+**그 자동화가 성공했다고 말하며** 운영자를 docs/13의 다음 줄로 보냈다. 자동화가
+없앤다던 역사를, 초록불을 얹어서 반복한 셈이다.
+
+`DEGRADED_EXIT = 3`. `SKIPPED`(Title이 이미 `Project`)는 포함하지 않았다 — 그것이 좋은
+결과이고 이 멱등한 명령의 두 번째 실행이 내는 값이다. 9단계의 Dashboard readiness도
+포함하지 않았다 — 그 줄의 주석이 이미 "이 진단의 결과는 종료 코드를 바꾸지 않는다"고
+정해 두었고, 그것은 이 명령의 일이 아니다.
+
+### 3. 결함 P1 — `src/review_cli.py`: 사람이 타이핑한 것을 못 지키고도 exit 0
+
+    run_interactive_review(reviewer)
+    return 0
+
+**반환값을 버렸다.** 그 함수는 `failed` 목록을 이미 들고 있었고 화면에
+`저장 실패: N건 — <ids>`까지 찍고 있었다. 세 항목에 문단을 타이핑했는데 셋 다 디스크에
+닿지 못한 세션이 깨끗한 세션과 **같은 코드로** 끝났다. 기존 회귀
+`test_every_candidate_failing_still_completes_the_session`이 바로 그 상태를 고정하면서
+**출력만** 단정하고 있었다.
+
+이 파일이 자기 자신에 대해 이미 반론을 적어 두었다. `main()`의 docstring 마지막 줄:
+
+> without `SystemExit` the refusal would print and then exit 0, **which is the shape of
+> the defect rather than the fix.**
+
+그리고 `저장 실패` 요약 줄이 존재하는 이유도 같다 — "서른 개 전에 찍힌 실패는 이미
+스크롤 밖으로 나갔다". **종료 코드는 스크롤 밖으로 나가지 않는 유일한 신호다.**
+
+`ReviewSession` dataclass로 바꿨다. `int` 하나로는 `main()`이 물어야 하는 질문에 답할 수
+없다 — `0`이 "검토할 것이 없었다"와 "전부 저장에 실패했다" 둘 다이기 때문이다.
+
+### 4. 결함 P1 — 그리고 **실제로 돌려 보니** 세 번째가 나왔다 (fixture ≠ 터미널)
+
+§3을 고치고 실 저장소에 대고 한 번 돌렸다. 아무것도 쓰지 않도록 전부 건너뛰려고:
+
+    printf 'n\nn\nn\n' | python src/review_cli.py
+
+네 번째 Candidate에서 **raw `EOFError` traceback**과 **exit 1**로 죽었다.
+
+    EOFError: EOF when reading a line
+
+`1`은 이 프로젝트가 **설정 오류에만** 쓰는 코드다(`src/cli.py`의 `CONFIG_ERROR_EXIT`).
+설정에는 아무 문제가 없는 실행이었다. 그리고 터미널이 아닌 모든 실행이 여기 닿는다 —
+파이프, 리디렉션, 콘솔 없는 Task.
+
+**더 나쁜 것.** 입력이 필드 프롬프트 **중간**에 끊기면 그때까지 타이핑한 문단이
+traceback과 함께 사라졌다. 이 파일의 저장 실패 경로는 **정확히 그 텍스트를 되짚어
+출력하려고** 존재하는데("Decision Context는 README RULE 11/12이 회사의 가장 값진
+자산이라고 부르는 것이다"), 입력이 끊기는 쪽에는 그 장치가 없었다.
+
+**어떤 테스트도 이것을 잡을 수 없었다.** 이 파일의 모든 fixture가
+`input_fn=make_input_fn([...])`을 주입하는데, 그것은 목록이 떨어지면 `""`를 **영원히**
+돌려준다 — 실제 `input()`이 절대 하지 않는 유일한 동작이다. fixture와 운영자의 터미널이
+가장 흔한 경계에서 어긋나 있었고, suite가 믿고 있던 쪽은 fixture였다.
+
+고친 모양:
+
+    _review_one()   EOFError/KeyboardInterrupt를 잡아 그 항목에 타이핑한 것을
+                    되짚어 출력하고 다시 raise
+    루프            잡아서 세션을 끝내고, 화면에 뜬 적도 없는 나머지를 unreached로 센다
+    main()          unreached가 있으면 3
+
+`KeyboardInterrupt`도 같은 자리에서 잡는다. Ctrl+C와 닫힌 파이프는 운영자를 **같은
+곳** — 끝내지 못한 목록 — 에 남기고, 전에는 같은 traceback을 남겼다.
+
+### 5. 실제 실행 검증 (실 저장소, 쓰기 없음)
+
+    A  printf 'n\nn\nn\n' | python src/review_cli.py
+       -> "리뷰 완료: 0건 저장됨 (총 14건 중)."
+          "검토하지 못한 Candidate: 11건 (입력이 끝났거나 중단됐습니다 ...)"
+          "[DEGRADED] 11건을 검토하지 못한 채 끝났습니다 ..."   **exit 3**, traceback 없음
+    B  14개 전부에 'n' -> **exit 0** (선행 조건: 끝까지 돈 세션은 여전히 0)
+    C  '' 뒤에 Decision Context 한 줄만 주고 EOF
+       -> "[중단] HIST-f75edf1b-... 은(는) 저장되지 않았습니다."
+          "    Decision Context: some decision context typed by a person"   **exit 3**
+          -- **타이핑한 문단이 되돌아왔다.** 이전에는 traceback과 함께 사라졌다.
+
+`runtime/history_candidates/`는 세 번 다 바이트 단위로 그대로다(전부 skip / 미저장).
+
+`init_notion.py`는 실 Workspace에 **쓰기 때문에** 실행하지 않았다. 대신 in-memory
+transport로 `main()` 전체를 돌려 세 상태(Rename 거부 / 정상 / 이미 `Project`)를
+확인했다. 실 API에 대고 Rename 거부를 재현하려면 Integration 권한을 낮춰야 하고,
+그것은 외부 조치다 — **SKIP으로 기록한다.**
+
+### 6. 측정
+
+    mutation  M1 init_notion 종료 코드를 무조건 0으로 복귀 (원 결함)   DETECTS (1건)
+              M2 init_notion이 SKIPPED도 DEGRADED로                    DETECTS (1건)
+              M3 review_cli 종료 코드를 무조건 0으로 복귀 (원 결함)    DETECTS (1건)
+              M4 review_cli가 "저장 0건"을 DEGRADED로                  DETECTS (3건)
+              M5 run_interactive_review가 failed 목록을 버림           DETECTS (2건)
+              M6 EOFError를 다시 루프 밖으로 흘려보냄 (원 결함)        DETECTS (4건)
+              M7 unreached에서 멈춘 그 항목을 제외                     DETECTS (4건)
+              M8 중단 시 타이핑한 텍스트 되짚기를 제거                DETECTS (1건)
+              M9 main()이 unreached를 무시                             DETECTS (1건)
+              M10 루프가 매 항목마다 unreached를 채움                  DETECTS (1건)
+    신규 회귀  13건 (init_notion 4 + review_cli 9)
+    전체 회귀  C116 끝 **4064 passed / 8 skipped**
+               -> C117 §2·§3 뒤 **4070 passed / 8 skipped / 5984 subtests** (529s)
+               -> C117 §4 뒤   **4077 passed / 8 skipped / 5984 subtests** (525s)
+               **신규 실패 0.**
+
+**Evidence:** `tests/test_notion_bootstrap.py::TheSetupCommandSaysWhetherTheBootstrapTookTests`
+(4건), `tests/test_review_cli.py::InputThatEndsBeforeTheCandidatesDoTests` (7건) 및
+`MainWiresTheRealRepositoryToTheRealReviewerTests`의 신규 2건.
+
+### 7. 이번에 배운 것 — 그리고 그것이 만든 다음 스캔
+
+**§4는 정적으로 찾을 수 없었다.** 코드를 읽어도 `input()`이 EOF에 raise한다는 것은
+알지만, 그 경로가 이 도구에서 무엇을 잃는지는 **돌려 봐야** 보였다. C76이 남긴
+"실제로 돌리고 결과를 읽는다"가 또 한 번 맞았고, 이번에는 그 실행이 §3의 수정을
+검증하려던 부수 행동이었다.
+
+그래서 다음 스캔은 이것이다: **주입된 fixture가 실제 I/O가 하는 일을 하지 않는 자리.**
+`make_input_fn`은 EOF를 흉내내지 않았다. 같은 질문을 `input_fn`/`print_fn`/transport
+스텁/`Path` 스텁 전부에 던질 수 있다 — "이 스텁이 절대 하지 않는 일 중, 진짜는 하는
+것은 무엇인가."
+
+## C116. Notion에 쓰는 두 번째 도구가, 세 표면이 다 실패해도 exit 0이었다 — 그리고 그것을 볼 테스트가 하나도 없었다
+
+### 1. 어떻게 찾았는가 — 커버리지 측정의 경계를 의심했다
+
+C115 §8이 전체 suite를 coverage로 돌려 **98% (6042 stmt, 106 miss)** 를 얻었다. 그 명령은
+`--source=src`였다. 저장소 루트의 **entrypoint 6개** — `ops_status.py`(276KB),
+`run_company_ops.py`, `run_agent.py`, `dashboard_server.py`, `publish_control_tower.py`,
+`init_notion.py` — 는 그 측정 안에 아예 없다. **가리킨 곳의 98%는 가리키지 않은 곳에 대해
+아무 말도 하지 않는다.**
+
+그래서 각 entrypoint를 어느 테스트가 실제로 import하는지 셌다:
+
+    ops_status              26개 파일이 언급, import 다수
+    run_company_ops         20개 파일이 언급
+    run_agent                7개
+    dashboard_server         4개
+    init_notion              4개
+    publish_control_tower    2개 — **둘 다 import하지 않는다**
+
+`publish_control_tower.py`를 실행하는 유일한 것은
+`AnEntrypointRefusesArgumentsItCannotHonourTests`이고, 그것은 subprocess로 `--dry-run`을
+줘서 exit 1을 확인한다 — **`main()`의 첫 문장**에서 끝나는 거절이다. 그 뒤의 health check,
+부모 Row 탐색, Notion write 표면 4개, 부분 실패 보고, 종료 코드는 **한 번도 돈 적이 없었다.**
+
+### 2. 결함 P1 — 셋이 실패해도 exit 0 (Task Scheduler가 읽는 유일한 신호)
+
+`publish()` 뒤의 write 3개는 **일부러** non-fatal이다. `Notes` 열을 잃는 것이 Control Tower
+페이지 자체를 잃는 값이어서는 안 된다. 셋 다 stderr에 `실패 — <이유>`를 찍는다. 그리고
+`main()`은 **0**을 돌려줬다.
+
+AGENT.md §6c는 바로 그 위 문단에서 **"예약 실행이 필요하면 Task Scheduler에
+`run_company_ops.py`와 나란히 등록한다"** 고 말한다. Task Scheduler가 자동으로 읽는 신호는
+stdout이 아니라 `Last Run Result` 하나다.
+
+**이것은 이 저장소가 이미 한 번 고친 결함이다.** `run_company_ops._report_run_summary()`의
+docstring이 그대로 적어 두었다:
+
+> Before this, `main()` returned 0 whatever it printed. ... So a run whose Backup failed the
+> Secret Scan reported 0x0 / success, and **the failures that were handled *gracefully* were
+> exactly the ones that became invisible.**
+
+같은 결함이, Notion에 쓰는 **다른 한 도구**에 그대로 남아 있었다. 고치지 않았던 이유는
+명백하다 — 그 도구의 `main()`을 도는 테스트가 없었다.
+
+`DEGRADED_EXIT = 3`을 붙였다. 새 숫자가 아니라 이 프로젝트가 이미 쓰는 숫자다:
+`ops_status.py` exit 3과 Runner의 DEGRADED가 둘 다 "사람이 봐야 하는 것이 있고, 물건 자체는
+멀쩡하다"이며 이 상태가 정확히 그것이다.
+
+**`skipped_hand_written` / `skipped_unsourced`는 넣지 않았다.** 사람이 쓴 Row를 건너뛰는 것은
+이 도구가 약속을 지키는 것이고(AGENT.md §6c "사람이 쓴 내용은 이깁니다"), 원천 없는 Row는
+이 시스템이 만들지 않은 데이터다. 둘 다 실패가 아니며, 그것까지 3으로 올리면 진짜 3을
+아무도 안 보게 된다. `PublishResult.warnings`도 같은 이유로 뺐다 — 자기 필드 docstring이
+"Never a reason to fail"이라고 적어 두었다.
+
+### 3. 결함 P1 — 주석이 자기 바로 아랫줄에 의해 거짓이 됐다 (**Notion 표면**)
+
+Dashboard 주소를 만드는 블록의 주석:
+
+> The address the operator would actually type, **read from the server module rather than
+> restated here.** `dashboard_server.py` owns the port and its one environment variable;
+> **a second copy of either is how the page starts advertising an address nothing listens on.**
+
+그리고 그 아랫줄:
+
+    raw_port = os.environ.get(dashboard_server.PORT_ENV_VAR, "").strip()
+    port = raw_port if raw_port.isdigit() else str(dashboard_server.DEFAULT_PORT)
+
+상수 둘은 정말로 server 모듈에서 읽었다. **파싱을 베꼈다.** 두 답이 실제 값에서 갈린다:
+
+    COMPANY_OPS_DASHBOARD_PORT   dashboard_server.py   페이지에 실린 주소
+    "99999"                      거절, exit 1          http://127.0.0.1:99999/
+    "0"                          거절, exit 1          http://127.0.0.1:0/
+    "-1"                         거절, exit 1          http://127.0.0.1:8765/
+
+앞의 둘은 주석 자신의 실패 문장 그대로다 — **아무것도 listen할 수 없는 주소**를, 이 머신의
+터미널이 아니라 **워크스페이스 전체가 읽는 면**에 실었다(하위 페이지 + PROJECTS Database
+설명 + 각 Project Row 본문, 세 군데 전부). 셋째는 더 조용하고 더 나을 것 없다: 운영자가
+기본 포트를 못 쓴다고 말했는데 페이지가 기본 포트를 광고했다.
+
+`dashboard_server.resolve_port()` 한 벌로 합쳤다. 두 소비자가 서로 다른 답을 필요로 하므로
+예외가 아니라 `None`을 돌려준다 — 서버는 뜨지 못하니 거절하고(기존 메시지 그대로),
+publish는 **주소를 빼고** 페이지를 낸다. `notion_page.py`의 모든 `dashboard_url` 사용이
+이미 `if dashboard_url:`로 감싸여 있어 생략은 지원되는 상태지 구멍이 아니다. 없는 주소는
+독자에게 아무 값도 안 들지만 틀린 주소는 한 번의 헛걸음을 들게 한다.
+
+**허용 범위 자체는 건드리지 않았다.** 무엇을 포트로 칠지 넓히거나 좁히는 것은 "두 도구가
+같은 답을 하게 만든다"와 별개의 결정이고, 한 번에 둘 다 하면 어느 쪽도 측정되지 않는다.
+
+### 4. 결함 P2 — `dashboard_server.main()`의 포트 거절도 테스트가 없었다 (**mutation이 찾았다**)
+
+읽어서 찾은 것이 아니다. §2·§3을 고치고 회귀 5종을 돌린 뒤 `resolve_port()`를
+`resolve_port() or DEFAULT_PORT`로 바꿔 봤다 — 모든 거절이 8765에 조용히 bind하는 것으로
+바뀐다. **suite 전체가 초록이었다.**
+
+`dashboard_server.main()`을 부르는 테스트가 하나도 없었다. 위쪽 테스트 전부가 서버를 자기가
+세워서 `_Handler`만 두드린다. 그래서 "거절하는 것이 요점이다 — 조용히 점유된 포트에 대신
+서비스하는 것은 `src/cli.py`가 쓰인 그 '위험한 일을 하고 성공을 보고하는' 모양이다"라고
+자기 주석이 말하는 블록이 한 번도 돈 적이 없었다.
+
+소켓을 하나도 열지 않는 회귀 5건을 붙였다 — `_Server`를 기록기로 바꿔 **거절이 bind보다
+먼저**임을 단정한다.
+
+### 5. False Positive 하나 — 그리고 내 테스트가 다른 파일을 깨뜨렸다
+
+**내 guard가 내 주석에 걸렸다.** "publisher는 자기 파서를 갖지 않는다"를 raw text로
+`.isdigit()` 부재로 단정했더니, **결함을 기록해 둔 주석이 그 문자열을 담고 있어서** 실패했다.
+`tokenize`로 COMMENT/STRING을 걷어낸 뒤 검사하도록 고쳤고, "토크나이저가 빈 것을 돌려주면
+모든 단정이 공허해진다"를 막는 guard도 같이 붙였다.
+
+**그리고 진짜 결함 하나 — 내 것.** `_patch()`가 원본을 dict에 **대입**으로 저장했다. 같은
+이름을 두 번 patch하는 테스트에서 두 번째 저장이 원본 자리에 **stub을 덮었고**, `tearDown`이
+stub을 되돌려 놓았다. `dashboard_server.resolve_port`가 프로세스 나머지 동안 교체된 채로
+남아 `test_dashboard_server.py` **17건이 같은 실행에서 실패하고 혼자 돌면 통과**했다.
+`setdefault`로 바꾸고, 한 테스트 안에서 여러 시나리오를 도는 자리는 `setUp()`을 손으로 다시
+부르는 대신(그것이 `_restore`를 새 dict로 갈아치워 바깥 patch의 기록을 잃게 만든다)
+중첩되는 `scenario()` context manager로 바꿨다. `TestIsolationGuardTests`가 존재하는 바로
+그 누수를 내가 만들었다.
+
+### 6. 부수 — 출력 한 칸
+
+`Notes 열` 실패 줄만 공백이 하나 많아 콜론이 다른 다섯 줄과 어긋나 있었다. 고쳤다.
+
+### 7. 측정
+
+    mutation  M1 종료 코드를 무조건 0으로 복귀 (원 결함)      DETECTS (8건)
+              M2 포트 파싱을 isdigit()로 복귀 (원 결함)       DETECTS (7건)
+              M3 resolve_port가 거절 대신 기본값 반환         DETECTS (7건)
+              M4 사람이 쓴 Row 건너뜀을 DEGRADED에 포함       DETECTS (1건)
+              M5 main()이 None을 무시하고 8765에 bind         DETECTS (6건)  <- §4를 찾은 그것
+              M6 빈 값을 오류로 취급                          DETECTS (5건)
+              M7 거절 대신 기본값으로 bind까지 진행           DETECTS (6건)
+    신규 회귀  28건 (publish_control_tower 23 + dashboard_server 5), subtest +37
+    전체 회귀  시작 **4036 passed / 8 skipped / 5944 subtests** (528s)
+               끝   **4064 passed / 8 skipped / 5981 subtests** (556s)
+               **신규 실패 0.** 4036 + 23 + 5 = 4064
+
+**실제 실행 검증 (실 Notion, 쓰기 없음).** `.env`를 export하고 `main()`을 in-process로
+돌리되 write 표면 4개를 전부 raise/기록기로 바꿨다 — 즉 **Notion에 한 글자도 쓰지 않았다**:
+
+    NotionConfig.from_env()   실 자격증명으로 성공
+    client.health_check()     실 PROJECTS Database에 도달, ok
+    find_project("COMPANY_OPS")  실 Row 발견 (아니면 FAILED_EXIT로 끝났을 것)
+    셋 다 실패                exit **3** (이전 코드였다면 0)
+                              마지막 줄: "실행 상태: DEGRADED — ... DB 설명, Notes 열, Project Row"
+    포트 99999                publish에 넘어간 dashboard_url = **None** (이전에는
+                              "http://127.0.0.1:99999/")
+
+그리고 실 entrypoint 4회 실행:
+
+    COMPANY_OPS_DASHBOARD_PORT=99999 python dashboard_server.py   exit 1, 메시지 불변
+    COMPANY_OPS_DASHBOARD_PORT=abc   python dashboard_server.py   exit 1, 메시지 불변
+    python publish_control_tower.py                               exit 1 (미설정)
+    python publish_control_tower.py --dry-run                     exit 1 (인자 거절)
+
+**Evidence:** `tests/test_publish_control_tower.py` (신규 파일 23건),
+`tests/test_dashboard_server.py::TheServerRefusesAPortItCannotHonourTests` (5건).
+
+### 8. 남긴 것 — coverage 측정의 경계 자체
+
+`--source=src`는 이번에 결함 셋을 숨겼다. entrypoint 6개를 포함한 측정을 한 번 돌리는 것이
+다음 Sprint에서 가장 값싼 다음 걸음이다. 이번에는 "어느 테스트가 import하는가"라는 훨씬 싼
+질문으로 같은 답에 닿았지만, 그 질문은 `publish_control_tower`처럼 **아무도 import하지 않는**
+극단만 찾아낸다 — 26개 파일이 언급하는 `ops_status.py` 안의 안 도는 줄은 못 본다.
+
+
 ## C115. GET만 답한다는 문장이 세 method에 대해 거짓이었다 — 그리고 그것을 지키는 테스트가 같은 명부를 베끼고 있었다
 
 ### 1. 어떻게 찾았는가 — 실제로 띄우고 실제 HTTP로 두드렸다
@@ -3627,8 +5358,16 @@ method도, 아직 존재하지 않는 method도(실측: 지어낸 `FROBNICATE`�
 의도적이다: 무제한 `__getattr__`은 이 클래스의 진짜 `AttributeError`를 삼켜 오타를 조용한
 405로 만든다(M3에서 실제로 21건이 깨졌다).
 
-HEAD 응답은 헤더만 보내고 본문을 보내지 않게 했다(RFC 9110 §9.3.2). `Content-Length`는
-GET이 돌려줄 크기를 그대로 말한다 — 그것이 이 method의 요점이다.
+HEAD 응답은 헤더만 보내고 본문을 보내지 않게 했다(RFC 9110 §9.3.2).
+
+> **C121 정정.** 여기 이어져 있던 문장 — "`Content-Length`는 GET이 돌려줄 크기를 그대로
+> 말한다 — 그것이 이 method의 요점이다" — 는 **거짓이다.** HEAD는 `do_GET()`에 닿지
+> 않고 405 거절을 받으므로 `Content-Length`는 그 405 표현(`b"read-only"`)의 크기다.
+> 실측: `GET / → 200, Content-Length 53140` / `HEAD / → 405, Content-Length 9, 본문 0바이트`.
+> 동작은 옳고(405의 Content-Length는 405 표현의 것이 맞다) **문장만 틀렸다.**
+> 같은 문장이 `_send()`의 주석과 그것을 재는 회귀의 주석에도 있었다 — 후자는 바로 다음
+> 줄에서 `Content-Length: 9`를 단정하고 있었다. C115가 고친 결함(주석의 보편 주장이
+> 거짓)을 C115의 수정이 그대로 재생산했다.
 
 ### 3. 결함 P2 — 그 결함을 지키던 테스트가 같은 명부를 베끼고 있었다
 
@@ -22289,7 +24028,7 @@ Company History는 계속 기록된다). 그런데 삼킨 실패가 **어디에�
   장식이 아니라 **시스템이 한 일에 대한 거짓 진술**이다.
 
   쓰기 지점 한 곳(`_one_line()`)에서 escape한다. 개행만이 아니라
-  `str.splitlines()`가 끊는 문자 전부다 — `\v \f \x1c-\x1e \x85  
+  `str.splitlines()`가 끊는 문자 전부다 — `\v \f \x1c-\x1e \x85
    ` 7종을 빼면 같은 위조를 하는 다른 방법이 그대로 남는다. 역슬래시는
   일부러 이중화하지 않았다(Windows 경로가 오류 문자열에 상시 등장한다).
   Event를 아예 거부하는 쪽이 더 깊은 수정이지만 그것은 Event Schema 계약
@@ -23116,6 +24855,42 @@ Testability → Release Readiness 순으로 두었다. 기능 추가는 마지�
 
 각각 되돌리기 어렵거나 자격증명이 필요해 이번 Sprint에서 하지 않았다.
 1~4는 순서를 지켜야 한다 — 뒤엣것이 앞엣것을 전제한다.
+
+### E-1b. Entrypoint를 포함한 coverage 1회 (Testability) — 승인 불필요
+
+C115의 sweep은 `--source=src`였고, 저장소 루트의 entrypoint 6개는 그 안에 없다.
+C116~C118의 결함 다섯이 전부 그 밖에 있었다. 한 번은 포함해서 재야 한다.
+
+**비용을 미리 적어 둔다(실측).** 이 세션에서 두 번 시도했고 둘 다 중단했다:
+
+    coverage run --source=.  (tests 포함)          약 4분에 3%  -> 추정 2시간+
+    coverage run --include=<루트 6개>              약 4분에 3%  -> 같은 수준
+    COVERAGE_CORE=sysmon 으로 재시도               같은 수준
+
+`--include`는 **리포트**를 좁힐 뿐 트레이싱을 좁히지 않는다. 전체 suite가 무계측
+528초인 것과 비교하면 오버헤드가 20배 이상이고, 원인은 `ops_status.py`(276KB)가
+거의 모든 테스트에서 반복 실행되는 것으로 보인다. 그러니 "그냥 한 번 돌린다"가
+아니라 **파일별로 나눠 돌리거나** 관련 테스트 파일만 대상으로 재는 편이 현실적이다.
+그 전까지는 §B의 1번(누가 import하는가)이 훨씬 싼 대용품이다.
+
+### E-1c. `run_entrypoint()`를 나머지 entrypoint에 붙일 것인가 (Reliability) — 측정 필요
+
+C118이 `ops_status.py`에만 붙였다. 나머지는 **실측상 파이프가 끊길 만큼 출력하지
+않는다**(64KB 버퍼가 차야 한다; `init_notion` / `publish_control_tower` /
+`dashboard_server`는 20줄 남짓). `run_agent.py`는 긴 Catch-up에서만 커지고,
+`run_company_ops.py`는 실 파이프라인이라 이 세션에서 **돌리지 않았다.**
+
+붙이기 전에 정해야 하는 것: `run_company_ops.py`에서 `2`는 이미 **FAILED**를 뜻한다
+(docs/14 §4). 같은 숫자를 "출력이 끊겼다"에도 쓰면 한 숫자가 두 가지를 말하게 된다.
+측정 없이 다섯 곳의 종료 코드 계약을 건드릴 일이 아니다.
+
+### E-1d. "우리 문장"과 "원격이 쓴 문장"의 경계 (Observability) — 결정 필요
+
+C120이 ATTENTION 목록을 한국어로 통일하고 게이트를 붙였다. 같은 질문이 아직 답을
+못 받은 곳: Run Manifest와 Dashboard payload의 `reason` 문자열이다. 사람이 읽는
+화면에 그대로 실리는데 출처가 여럿이고, 그중에는 **Notion API 응답 본문**이 있다 —
+그것은 원격이 쓴 것이므로 번역 대상이 아니다. 어디까지가 우리 문장인지 가르는 것이
+먼저이고, 그것은 출력 계약 결정이다.
 
 ### E-2. 보존 정책 결정 (Reliability) — 승인 필요
 

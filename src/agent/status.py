@@ -101,10 +101,34 @@ class AgentStatusSnapshot:
         machine that is simply off for a weekend is normal in this
         deployment (docs/07 §58) and a status view that cries wolf every
         Monday gets ignored.
+
+        **Korean, and that is a contract rather than a preference (C120).**
+        These strings are not a log line and not an API value. They are
+        appended verbatim to `ops_status.main()`'s ATTENTION list, and that
+        list is rendered on three surfaces:
+
+            ops_status.py          the terminal block, every other line Korean
+            dashboard_server.py    the ATTENTION panel, same list
+            publish_control_tower  a bulleted list on the Notion page the
+                                   whole workspace reads
+
+        Measured on the live page before this changed: eight Korean bullets
+        and, among them, `agent has not run for 15 day(s)`. Every sibling
+        contributor to that list — `signal_attention`, `delivery_attention`,
+        `lock_attention`, and every block in `ops_status.py` — was already
+        Korean; this one function was the only English in the company's
+        status page.
+
+        The phrasing deliberately mirrors the lines it now sits beside:
+        `Runner가 9.4일째 실행되지 않았다` is the Runner's, so the Agent's is
+        `이 머신의 Agent가 15일째 실행되지 않았다`. "이 머신의" is not
+        decoration — `ops_status.py` heads this whole section
+        `AGENT — 이 머신의 Agent`, and the COMPANY section above it talks
+        about *other* Desktops' agents.
         """
         reasons: list[str] = []
         if self.state_error is not None:
-            reasons.append(f"agent state unreadable: {self.state_error}")
+            reasons.append(f"이 머신의 Agent state를 읽을 수 없다: {self.state_error}")
 
         # A collection date in the future is a silent, permanent stop, and
         # every other signal here reports it as perfect health.
@@ -124,18 +148,18 @@ class AgentStatusSnapshot:
         collected_through = self.last_successful_collection_date
         if collected_through is not None and collected_through > now.date():
             reasons.append(
-                f"agent state says it has collected through {collected_through.isoformat()}, "
-                f"which is in the future (today is {now.date().isoformat()}) — nothing will "
-                f"be collected until that date arrives"
+                f"이 머신의 Agent state가 {collected_through.isoformat()}까지 수집했다고 "
+                f"말하는데 그 날짜는 미래다 (오늘은 {now.date().isoformat()}) — 그 날짜가 "
+                f"올 때까지 아무것도 수집되지 않는다"
             )
 
         if self.outbox_count:
             reasons.append(
-                f"{self.outbox_count} event(s) created but not delivered"
+                f"만들어졌지만 전달되지 않은 Event {self.outbox_count}건"
             )
         if self.rejected_signal_count:
             reasons.append(
-                f"{self.rejected_signal_count} signal(s) rejected and awaiting a human"
+                f"거부된 Signal {self.rejected_signal_count}건이 사람을 기다리고 있다"
             )
         # Two facts, and they were reported as one. `days_since_last_run()`
         # answers None both for "no `last_run` at all" and for "`last_run` is
@@ -161,7 +185,8 @@ class AgentStatusSnapshot:
         # prints three lines above it, and that sends an operator to install
         # an Agent that is already installed. Worse, it is the branch that
         # *silences* staleness: an Agent that really has been down for weeks
-        # reports the newcomer's line instead of `has not run for N day(s)`.
+        # reports the newcomer's line instead of the `N일째 실행되지 않았다`
+        # one.
         #
         # Not fixed by validating the field on load. `last_run` is
         # informational — `last_successful_collection_date` is what decides
@@ -176,17 +201,17 @@ class AgentStatusSnapshot:
         # value already is.
         elapsed = self.days_since_last_run(now)
         if self.last_run is None:
-            reasons.append("agent has never completed a run")
+            reasons.append("이 머신의 Agent가 한 번도 실행을 완료한 적이 없다")
         elif elapsed is None:
             reasons.append(
-                "agent state's last_run is not a timestamp — when this Agent last ran "
-                "cannot be told, so staleness is not checked (the value is on the "
-                "last_run line)"
+                "이 머신의 Agent state의 last_run이 timestamp가 아니다 — 마지막 실행 "
+                "시각을 알 수 없어 지연 여부를 검사하지 못한다 (그 값은 위 last_run "
+                "줄에 있다)"
             )
         elif elapsed >= stale_after_days:
-            reasons.append(f"agent has not run for {elapsed} day(s)")
+            reasons.append(f"이 머신의 Agent가 {elapsed}일째 실행되지 않았다")
         if self.pending_dates:
-            reasons.append(f"{len(self.pending_dates)} date(s) not yet collected")
+            reasons.append(f"아직 수집되지 않은 날짜 {len(self.pending_dates)}건")
         return tuple(reasons)
 
 

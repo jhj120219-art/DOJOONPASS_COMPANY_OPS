@@ -10,6 +10,7 @@ These tests cover the shared module's own contract, so the guarantees are
 asserted once rather than three times.
 """
 
+import ast
 import re
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import oplog  # noqa: E402
@@ -531,17 +533,129 @@ class SecretPatternHomeTests(unittest.TestCase):
         self.assertIs(signals._SECRET_PATTERNS, oplog.SECRET_PATTERNS)
         self.assertIs(signals._SECRET_RE, oplog.SECRET_RE)
 
+
+    #: What `tests/test_repository_hygiene.py::test_no_secret_material_in_any
+    #: _tracked_file` refuses. Built by concatenation for the reason that
+    #: test exists — a literal here and a leaked credential look the same to
+    #: a scanner.
+    HYGIENE_PATTERNS = (
+        r"\bntn_[A-Za-z0-9]{10,}",
+        r"\bsecret_[A-Za-z0-9]{10,}",
+        r"Bearer\s+[A-Za-z0-9._-]{20,}",
+    )
+
+    #: One string per hygiene pattern, plus the placements `one_line()`
+    #: produces. The last three are the C124 bypass: before the fix the
+    #: detector missed every one of them.
+    CORPUS = (
+        "ntn_" + "A" * 44,
+        "secret_" + "B" * 30,
+        "Bearer " + "C" * 40,
+        "log line\nntn_" + "D" * 44,
+        "log line\tntn_" + "E" * 44,
+        "log line\rghp_" + "F" * 36,
+        # A bearer value with **no known prefix** — a JWT is the ordinary
+        # one — wrapped across lines. This is the only case the `Bearer`
+        # pattern is the sole cover for: `ntn_`/`ghp_`/`secret_` values are
+        # caught by their own pattern whatever precedes them, so without
+        # this row a mutation reverting `_GAP` to `\s+` passed every test
+        # here. Measured: it did.
+        "Authorization: Bearer\neyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + "Q" * 40,
+        "Authorization: Bearer\teyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." + "Q" * 40,
+    )
+
     def test_the_repository_hygiene_patterns_are_still_covered(self):
-        """Unchanged obligation, restated at the new home: a Signal travels
+        r"""Unchanged obligation, restated at the new home: a Signal travels
         off this machine into Company History, so it is held to at least the
-        bar tracked files are."""
-        for pattern in (
-            r"\bntn_[A-Za-z0-9]{10,}",
-            r"\bsecret_[A-Za-z0-9]{10,}",
-            r"Bearer\s+[A-Za-z0-9._-]{20,}",
+        bar tracked files are.
+
+        **Behaviour, not the pattern text (C124).** This used to assert that
+        three literal regex sources were `in` the tuple:
+
+            r"\bntn_[A-Za-z0-9]{10,}"
+            r"\bsecret_[A-Za-z0-9]{10,}"
+            r"Bearer\s+[A-Za-z0-9._-]{20,}"
+
+        which is the hand-written-roster shape C115 removed elsewhere: it
+        pins the *spelling* and says nothing about what the spelling catches.
+        It went red for a change that made the detector **stronger** — the
+        `\b` in the first two was a bypass, because `one_line()` renders a
+        newline as `\n` and the letter `n` is a word character, so a token
+        that began a line was not redacted at all.
+
+        The obligation is unchanged and is now checked as an obligation: for
+        every string `tests/test_repository_hygiene.py` would refuse in a
+        tracked file, this detector must also fire. A future rewrite of
+        either side is free, and a *weakening* of this one fails.
+        """
+        for text in self.CORPUS:
+            with self.subTest(text=text[:24]):
+                # `redact(one_line(...))`, which is how **every** sink in
+                # this repository composes the pair, and the composition the
+                # bypass lived in. Calling `redact()` on the raw string
+                # instead makes this pass either way: a real newline is not
+                # a word character, so plain `\b` matches after it, and the
+                # first draft of this test did exactly that and was vacuous
+                # for the case it was written for.
+                secret = oplog.redact(oplog.one_line(text))
+                self.assertNotIn(
+                    text.splitlines()[-1],
+                    secret,
+                    "a string the hygiene guard refuses in a tracked file "
+                    f"survived redact(one_line(...)):\n  {secret[:120]}",
+                )
+
+    def test_the_corpus_is_one_the_hygiene_guard_would_actually_refuse(self):
+        """Guards the guard, in the direction that matters: a corpus of
+        harmless strings would make the check above pass over nothing.
+
+        Compared against the hygiene patterns on the **raw** string, because
+        that is the form a tracked file holds — `one_line()` is what the log
+        path adds, and the question here is only "would the repository
+        refuse this material at all".
+        """
+        import re
+
+        for text in self.CORPUS:
+            with self.subTest(text=text[:24]):
+                self.assertTrue(
+                    any(re.search(p, text) for p in self.HYGIENE_PATTERNS)
+                    or "ghp_" in text,
+                    f"{text[:24]!r} is not something the hygiene guard refuses",
+                )
+
+    def test_the_bypass_is_pinned_at_the_composition_that_had_it(self):
+        """The C124 measurement itself, as one assertion.
+
+        Stated separately from the loop above because it is a different
+        claim: not "this material is caught" but "it is caught **in the
+        arrangement every sink actually uses**". Before the fix all five of
+        these leaked and the only covered case was a token preceded by a
+        space.
+        """
+        token = "ntn_" + "Z" * 44
+        for label, raw in (
+            ("space", "Authorization: Bearer " + token),
+            ("newline", "Authorization: Bearer\n" + token),
+            ("line start", "header\n" + token),
+            ("tab", "header\t" + token),
+            ("carriage return", "header\r" + token),
         ):
-            with self.subTest(pattern=pattern):
-                self.assertIn(pattern, oplog.SECRET_PATTERNS)
+            with self.subTest(placement=label):
+                self.assertNotIn(token, oplog.redact(oplog.one_line(raw)))
+
+    def test_ordinary_text_is_still_left_alone(self):
+        """The other direction. A detector that redacted everything would
+        pass every assertion above and be useless."""
+        for benign in (
+            "intn_abcdefghijklmnop",
+            "my" + "ghp_" + "x" * 36,
+            "Bearer word",
+            "the auth token was rotated yesterday",
+            "C:" + chr(92) + "Users" + chr(92) + "me" + chr(92) + "notes.txt",
+        ):
+            with self.subTest(text=benign[:24]):
+                self.assertEqual(oplog.redact(benign), benign)
 
 
 def _project_modules() -> list[str]:
@@ -655,6 +769,284 @@ class SharedWriterTests(unittest.TestCase):
                 )
         self.assertNotIn("oplog", packages)
         self.assertNotIn("__pycache__", packages)
+
+
+class RedactionIsSafeInEitherOrderTests(unittest.TestCase):
+    r"""`redact()` and `one_line()` compose safely both ways round (C124).
+
+    **This class replaced a structural gate whose premise was wrong.** The
+    first attempt asserted that every `redact()` in production code takes an
+    already-`one_line()`d argument, on the reasoning that `_PEM_BLOCK`'s
+    second branch is written for the flattened form. Running it found five
+    call sites in `src/agent/agent.py` that redact at the point of failure
+    and flatten later — `run_agent.py` prints `one_line(error)`, and
+    `oplog.append_line()` applies both at the write point — so the
+    composition there is `one_line(redact(x))`.
+
+    Measured rather than argued, on both orders, before deciding which was
+    the defect:
+
+        material                redact(one_line)   one_line(redact)
+        token after a newline   SAFE               SAFE
+        token after a space     SAFE               SAFE
+        complete PEM block      SAFE               SAFE
+        truncated PEM block     SAFE               SAFE
+        wrapped Bearer JWT      SAFE               SAFE
+
+    So the ordering is **not** the invariant, `agent/agent.py` was never
+    wrong, and a gate enforcing an order would have been a rule invented to
+    match one call site's spelling. What matters is that both halves are
+    applied somewhere on the path, and that neither order has a hole.
+
+    That second clause is what this class pins, and it is not free: before
+    C124's `_ESCAPED` fix the two orders **disagreed**. `redact(one_line(x))`
+    — the composition most sinks use — missed a token that began a line,
+    because `one_line()` writes a newline as `\n` and `\b` will not match
+    between the letter `n` and `ntn_`. The order this repository mostly uses
+    was the weaker one, which is the opposite of what the discarded gate
+    assumed.
+    """
+
+    TOKEN = "ntn_" + "A" * 44
+    GITHUB = "ghp_" + "B" * 36
+    PEM_BODY = "MIIEowIBAAKCAQEAxyz+abc/DEF="
+    JWT = "eyJhbGciOiJIUzI1NiJ9." + "Q" * 40
+
+    def _materials(self):
+        pem = "-----BEGIN RSA PRIVATE KEY-----"
+        return {
+            "token after a newline": ("h\n" + self.TOKEN, self.TOKEN),
+            "token after a space": ("h " + self.TOKEN, self.TOKEN),
+            "token after a tab": ("h\t" + self.TOKEN, self.TOKEN),
+            "github token at line start": ("h\n" + self.GITHUB, self.GITHUB),
+            "complete PEM": (
+                f"{pem}\n{self.PEM_BODY}\n-----END RSA PRIVATE KEY-----",
+                self.PEM_BODY,
+            ),
+            "truncated PEM": (f"{pem}\n{self.PEM_BODY}", self.PEM_BODY),
+            "wrapped Bearer JWT": ("Authorization: Bearer\n" + self.JWT, self.JWT),
+        }
+
+    def test_neither_order_leaks(self):
+        for label, (raw, secret) in self._materials().items():
+            for name, rendered in (
+                ("redact(one_line(x))", oplog.redact(oplog.one_line(raw))),
+                ("one_line(redact(x))", oplog.one_line(oplog.redact(raw))),
+            ):
+                with self.subTest(material=label, order=name):
+                    self.assertNotIn(secret, rendered, rendered[:140])
+
+    def test_the_materials_really_do_contain_something_to_find(self):
+        """Guards the guard. A corpus whose `secret` never appears in `raw`
+        would satisfy every assertion above trivially."""
+        for label, (raw, secret) in self._materials().items():
+            with self.subTest(material=label):
+                self.assertIn(secret, raw)
+                self.assertGreaterEqual(len(secret), 20)
+
+    def test_both_orders_still_leave_ordinary_text_alone(self):
+        """The control. "Redact everything" passes the first test and
+        destroys the logs this module exists to keep readable."""
+        for benign in (
+            "REJECTED_SIGNAL 2026-08-24-standup.json",
+            "C:" + chr(92) + "Users" + chr(92) + "me" + chr(92) + "notes.txt",
+            "intn_abcdefghijklmnop",
+            "Bearer word",
+        ):
+            with self.subTest(text=benign[:28]):
+                self.assertEqual(oplog.redact(oplog.one_line(benign)),
+                                 oplog.one_line(benign))
+                self.assertEqual(oplog.one_line(oplog.redact(benign)),
+                                 oplog.one_line(benign))
+
+    def test_the_agent_composition_is_the_one_this_protects(self):
+        """Named so the connection is findable from the other side. If
+        `agent.py` ever stops redacting at the point of failure this class
+        is still correct, but the sentence above about *why* it exists needs
+        re-reading rather than deleting."""
+        import ast
+
+        source = (
+            Path(__file__).resolve().parents[1] / "src" / "agent" / "agent.py"
+        ).read_text(encoding="utf-8")
+        redacts = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "redact"
+        ]
+        unflattened = [
+            node
+            for node in redacts
+            if not any(
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "one_line"
+                for inner in ast.walk(node)
+            )
+        ]
+
+        self.assertTrue(redacts, "agent.py stopped redacting entirely")
+        self.assertEqual(
+            len(unflattened),
+            len(redacts),
+            "agent.py now flattens inline as well — harmless, but the "
+            "docstring above describes a composition that no longer exists",
+        )
+
+
+class BoundingBeforeRedactingDefeatsItTests(unittest.TestCase):
+    r"""`bounded()` must run **after** `redact()`, everywhere (C127).
+
+    C124 asked whether the order of `one_line()` and `redact()` was
+    load-bearing, measured both, and found it was not — either composition
+    is safe, and a gate enforcing one would have been a rule invented to
+    match a spelling. The same question about `bounded()` has the opposite
+    answer, and this class is that measurement.
+
+    Every pattern in `SECRET_PATTERNS` has a **minimum length**
+    (`ntn_[A-Za-z0-9]{10,}`). `bounded()` truncates at 600 characters. Run
+    first, it can cut a token below that minimum, and what reaches the sink
+    is the part of the credential that survived:
+
+        surviving chars   bounded first     redact first
+         4                `ntn_`            `[RED`
+         8                `ntn_AAAA`        `[REDACTE`
+        13                `ntn_AAAAAAAAA`   `[REDACTED]`
+        20                `[REDACTED]`      `[REDACTED]`
+
+    Bounding last can only truncate the marker, which costs nothing.
+
+    **Two live sites had the unsafe order**, both in `controltower/` — the
+    layer whose output is written to Notion:
+
+        controltower/dashboard.py         the `unreadable` reason, whose own
+                                          comment records that
+                                          `validate_event()` "echoes the
+                                          value it rejected"
+        controltower/notion_projection.py `_reason()`, whose own docstring
+                                          says `except Exception` catches
+                                          anything
+
+    Both name their own reachability: an Event field this project does not
+    bound, echoed into an exception message, is how a string gets past 600
+    characters with a credential near the end.
+
+    The worst part is not the thirteen characters. It is that whether a
+    token was redacted at all depended on **where it happened to sit**
+    relative to character 600 — a guard that works or does not according to
+    an offset is one nobody can reason about.
+    """
+
+    TOKEN = "ntn_" + "A" * 44
+
+    def _straddling(self, surviving):
+        """Text whose token has exactly `surviving` characters past the cut."""
+        pad = "x" * (oplog.MAX_LOG_ERROR - surviving - 1)
+        return pad + " " + self.TOKEN
+
+    def test_bounding_first_lets_a_partial_token_through(self):
+        """The defect, kept as the reason this class exists. Asserted rather
+        than described, so the day `bounded()` or the patterns change, the
+        premise is re-measured instead of believed."""
+        leaked = [
+            surviving
+            for surviving in (4, 8, 13)
+            if "ntn_" in oplog.redact(
+                oplog.one_line(oplog.bounded(self._straddling(surviving)))
+            )
+        ]
+
+        self.assertEqual(
+            leaked,
+            [4, 8, 13],
+            "bounding before redacting no longer leaks — if the patterns "
+            "lost their minimum length, this class's premise needs rereading",
+        )
+
+    def test_bounding_last_never_does(self):
+        for surviving in (4, 8, 13, 20, 48):
+            with self.subTest(surviving=surviving):
+                rendered = oplog.bounded(
+                    oplog.redact(oplog.one_line(self._straddling(surviving)))
+                )
+
+                self.assertNotIn("ntn_", rendered)
+                self.assertLessEqual(len(rendered), oplog.MAX_LOG_ERROR + 3)
+
+    def test_no_production_module_bounds_before_it_redacts(self):
+        """Structural, over the tree. Two sites had it and neither was
+        reachable from a test that would have noticed."""
+        offenders = []
+        files = [
+            path
+            for path in list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py"))
+            if "__pycache__" not in str(path)
+        ]
+        for path in sorted(files):
+            source = path.read_text(encoding="utf-8")
+            if "redact(" not in source:
+                continue
+            for node in ast.walk(ast.parse(source, str(path))):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "redact"
+                    and node.args
+                ):
+                    continue
+                if any(
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "bounded"
+                    for inner in ast.walk(node.args[0])
+                ):
+                    offenders.append(
+                        f"{path.relative_to(REPO_ROOT).as_posix()}:{node.lineno}"
+                    )
+
+        self.assertEqual(
+            offenders,
+            [],
+            "`bounded()` inside `redact()`'s argument: the cut happens "
+            "before anything looks for a secret, and every pattern has a "
+            "minimum length. Wrap the other way round — "
+            "`bounded(redact(one_line(x)))`:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_the_structural_check_can_see_a_redact_at_all(self):
+        """Guards the guard. A sweep that found no `redact()` calls would
+        pass forever — the vacuous shape C76 §4 swept for."""
+        seen = 0
+        files = list(SRC.rglob("*.py")) + list(REPO_ROOT.glob("*.py"))
+        for path in files:
+            if "__pycache__" in str(path):
+                continue
+            source = path.read_text(encoding="utf-8")
+            if "redact(" not in source:
+                continue
+            seen += sum(
+                1
+                for node in ast.walk(ast.parse(source, str(path)))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "redact"
+            )
+
+        self.assertGreater(seen, 5, f"only {seen} redact() calls found")
+
+    def test_the_safe_order_is_the_one_the_two_fixed_sites_now_use(self):
+        """Named, so the fix is findable from here and a revert reads as a
+        revert rather than as a refactor."""
+        import inspect
+
+        from controltower.notion_projection import _reason
+
+        source = inspect.getsource(_reason)
+
+        self.assertIn("bounded(redact(one_line(", source)
+
 
 
 if __name__ == "__main__":

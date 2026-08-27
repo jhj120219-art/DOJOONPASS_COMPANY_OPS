@@ -112,12 +112,60 @@ _PEM_BLOCK = (
     r")"
 ) % (_PEM_BODY, _PEM_BODY)
 
+# A word boundary that also counts `one_line()`'s output as a boundary.
+#
+# **`\b` alone was a redaction bypass, and the two functions are always used
+# together (C124).** Most sinks compose them as `redact(one_line(x))`, which
+# is the order `_PEM_BLOCK`'s second branch is written for; `agent/agent.py`
+# redacts at the point of failure and flattens later at its sink, so the
+# reverse composition is live too and `RedactionIsSafeInEitherOrderTests`
+# holds both. But `one_line()` renders a control character as `\n`, `\r`,
+# `\t`, `\xNN` or `\uNNNN`, and **every one of those ends in a word
+# character**. So a secret that began a line arrives at `redact()` glued to
+# the tail of an escape:
+#
+#     "Authorization: Bearer\nntn_AAAA…"   (a real newline in the body)
+#       one_line ->  "Authorization: Bearer\\nntn_AAAA…"
+#       `\bntn_`  ->  no match: the character before `ntn_` is the letter `n`
+#
+# Measured on HEAD, through the real pair, with a 48-character token:
+#
+#     after a space     LEAKED=False      <- the only case that was covered
+#     after a newline   LEAKED=True
+#     at line start     LEAKED=True
+#     after a tab       LEAKED=True
+#     after a CR        LEAKED=True
+#
+# A response body is line-oriented — headers are one per line — so "the
+# secret starts a line" is the *ordinary* shape of the thing this module
+# exists to catch, not an exotic one. It reached every sink: agent and
+# collector logs, the Dashboard payload, the Notion Control Tower page, and
+# `ops_status.py`'s ATTENTION block.
+#
+# Written as alternated lookbehinds because Python's `re` requires each
+# lookbehind to be fixed-width; `(?<=\\n)` is two, `(?<=\\x..)` four,
+# `(?<=\\u....)` six. `\b` stays as the last alternative so ordinary text is
+# unaffected — this only *adds* places a token may start.
+_ESCAPED = (
+    r"(?:"
+    r"(?<=\\n)|(?<=\\r)|(?<=\\t)"
+    r"|(?<=\\x[0-9A-Fa-f]{2})"
+    r"|(?<=\\u[0-9A-Fa-f]{4})"
+    r"|\b"
+    r")"
+)
+
+#: What separates `Bearer` from its value once `one_line()` has run. `\s`
+#: cannot match a literal backslash-n, so a header wrapped across lines was
+#: invisible to the `Bearer` pattern for the same reason.
+_GAP = r"(?:\s|\\[nrt])+"
+
 SECRET_PATTERNS = (
-    r"\bntn_[A-Za-z0-9]{10,}",
-    r"\bsecret_[A-Za-z0-9]{10,}",
-    r"Bearer\s+[A-Za-z0-9._-]{20,}",
+    _ESCAPED + r"ntn_[A-Za-z0-9]{10,}",
+    _ESCAPED + r"secret_[A-Za-z0-9]{10,}",
+    r"Bearer" + _GAP + r"[A-Za-z0-9._-]{20,}",
     _PEM_BLOCK,
-    r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+    _ESCAPED + r"gh[pousr]_[A-Za-z0-9]{20,}",
     _NAMESPACE + r"(?:API|ACCESS|AUTH|SECRET)[_-]?(?:KEY|TOKEN)\s*[=:]\s*\S+",
     _NAMESPACE + r"(?:PASSWORD|PASSWD|CLIENT[_-]?SECRET)\s*[=:]\s*\S+",
 )

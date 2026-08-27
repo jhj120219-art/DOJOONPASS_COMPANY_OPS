@@ -1,3 +1,5 @@
+import contextlib
+import io
 import re
 import sys
 import tempfile
@@ -103,7 +105,7 @@ class EmptyRepositoryTests(ReviewCliTestCase):
         result = review_cli.run_interactive_review(
             self.reviewer, input_fn=make_input_fn([]), print_fn=print_fn
         )
-        self.assertEqual(result, 0)
+        self.assertEqual(result, review_cli.ReviewSession(updated=0, failed=()))
         self.assertTrue(any("없습니다" in line for line in print_fn.lines))
 
 
@@ -121,7 +123,8 @@ class FullReviewTests(ReviewCliTestCase):
             self.reviewer, input_fn=make_input_fn(responses), print_fn=make_print_fn()
         )
 
-        self.assertEqual(result, 1)
+        self.assertEqual(result.updated, 1)
+        self.assertEqual(result.failed, ())
         updated = self.repo.get(history_id)
         self.assertEqual(updated.decision_context, "왜 시작했는가에 대한 맥락")
         self.assertEqual(updated.expected_outcome, "기대 결과")
@@ -136,7 +139,7 @@ class FullReviewTests(ReviewCliTestCase):
             self.reviewer, input_fn=make_input_fn(responses), print_fn=make_print_fn()
         )
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result.updated, 0)
         candidate = self.repo.get(history_id)
         self.assertIsNone(candidate.decision_context)
 
@@ -159,7 +162,8 @@ class FullReviewTests(ReviewCliTestCase):
             self.reviewer, input_fn=make_input_fn(responses), print_fn=make_print_fn()
         )
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result.updated, 0)
+        self.assertEqual(result.failed, (), "a skip is not a save failure")
         candidate = self.repo.get(history_id)
         self.assertIsNone(candidate.decision_context)
 
@@ -195,7 +199,7 @@ class MultipleCandidatesTests(ReviewCliTestCase):
             self.reviewer, input_fn=make_input_fn(responses), print_fn=make_print_fn()
         )
 
-        self.assertEqual(result, 1)
+        self.assertEqual(result.updated, 1)
         self.assertEqual(self.repo.get(first_id).decision_context, "context one")
         self.assertIsNone(self.repo.get(second_id).decision_context)
 
@@ -248,8 +252,48 @@ class MainWiresTheRealRepositoryToTheRealReviewerTests(unittest.TestCase):
     def setUp(self):
         self.captured = []
         real = review_cli.run_interactive_review
-        review_cli.run_interactive_review = self.captured.append
+
+        def _record(reviewer, **kwargs):
+            # Returns a real `ReviewSession`, not `None`: `main()` reads
+            # `.failed` off this value to choose its exit code, and a stub
+            # that answered `None` would make the wiring tests fail for a
+            # reason that has nothing to do with wiring.
+            self.captured.append(reviewer)
+            return self.session
+
+        self.session = review_cli.ReviewSession()
+        review_cli.run_interactive_review = _record
         self.addCleanup(setattr, review_cli, "run_interactive_review", real)
+
+    def test_a_session_with_unsaved_context_does_not_report_success(self):
+        """The defect (C117): `main()` threw this value away and returned 0.
+        A session in which the operator typed Decision Context into three
+        candidates and none of them reached disk ended like a clean one."""
+        self.session = review_cli.ReviewSession(updated=0, failed=("HIST-1",))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = review_cli.main()
+
+        self.assertEqual(code, review_cli.DEGRADED_EXIT)
+        self.assertIn("저장되지", err.getvalue())
+
+    def test_a_clean_session_still_reports_success(self):
+        """The antecedent, and the two cases that must not be degraded: an
+        empty candidate list and a session the operator skipped through both
+        leave `failed` empty."""
+        for session in (
+            review_cli.ReviewSession(),
+            review_cli.ReviewSession(updated=0, failed=()),
+            review_cli.ReviewSession(updated=3, failed=()),
+        ):
+            with self.subTest(session=session):
+                self.session = session
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    code = review_cli.main()
+
+                self.assertEqual(code, 0)
+                self.assertEqual(err.getvalue(), "")
 
     def test_main_starts_a_review(self):
         review_cli.main()
@@ -392,7 +436,8 @@ class SaveFailureIsolationTests(unittest.TestCase):
         updated, saved, _ = self._run({"HIST-1"})
 
         self.assertEqual(saved, ["HIST-2", "HIST-3"])
-        self.assertEqual(updated, 2)
+        self.assertEqual(updated.updated, 2)
+        self.assertEqual(updated.failed, ("HIST-1",))
 
     def test_the_failure_is_reported_not_silently_counted_as_a_skip(self):
         _, _, output = self._run({"HIST-1"})
@@ -419,7 +464,8 @@ class SaveFailureIsolationTests(unittest.TestCase):
     def test_every_candidate_failing_still_completes_the_session(self):
         updated, saved, output = self._run({"HIST-1", "HIST-2", "HIST-3"})
 
-        self.assertEqual(updated, 0)
+        self.assertEqual(updated.updated, 0)
+        self.assertEqual(set(updated.failed), {"HIST-1", "HIST-2", "HIST-3"})
         self.assertEqual(saved, [])
         self.assertIn("저장 실패: 3건", output)
 
@@ -436,6 +482,265 @@ class SaveFailureIsolationTests(unittest.TestCase):
         self.assertEqual(
             {o.value for o in ReviewOutcome}, {"SAVED", "SKIPPED", "FAILED"}
         )
+
+
+class InputThatEndsBeforeTheCandidatesDoTests(ReviewCliTestCase):
+    """Found by running the real command (C117), not by reading it.
+
+        printf 'n\\nn\\nn\\n' | python src/review_cli.py
+
+    ended on the fourth candidate with a raw `EOFError` traceback and exit
+    **1** — the code this project reserves for a configuration error. Every
+    non-terminal invocation reaches it: a pipe, a redirect, a task with no
+    console. And if the input ran out *between* the field prompts, the
+    paragraph the person had already typed went with it, even though this
+    file's save-failure path goes out of its way to echo exactly that text
+    back ("Decision Context is what README RULE 11/12 call the company's
+    most valuable asset").
+
+    **No test could have caught it.** Every fixture here supplies
+    `input_fn=make_input_fn(...)`, which answers `""` forever once its list
+    is exhausted — the one thing the real `input()` never does. The fixture
+    and the operator's terminal disagreed about the most ordinary edge there
+    is, and the fixture is the one the suite believed.
+    """
+
+    def _raising_input(self, answers, exc=EOFError):
+        it = iter(answers)
+
+        def _input(_prompt):
+            try:
+                return next(it)
+            except StopIteration:
+                raise exc()
+
+        return _input
+
+    def test_the_session_ends_without_a_traceback(self):
+        for _ in range(3):
+            self._seed_keep_candidate(event_id=f"TEST-{_}-001")
+
+        session = review_cli.run_interactive_review(
+            self.reviewer,
+            input_fn=self._raising_input(["n"]),
+            print_fn=make_print_fn(),
+        )
+
+        self.assertEqual(session.updated, 0)
+        self.assertEqual(session.failed, ())
+        self.assertEqual(len(session.unreached), 2)
+
+    def test_the_candidate_it_stopped_on_counts_as_unreached(self):
+        """It was displayed, so it is tempting to call it offered. It was
+        not: nobody answered for it, and it is still on disk unchanged."""
+        first = self._seed_keep_candidate(event_id="TEST-FIRST-001")
+        second = self._seed_keep_candidate(
+            event_id="TEST-SECOND-001", event_type="ISSUE_RESOLVED", milestone=None
+        )
+
+        session = review_cli.run_interactive_review(
+            self.reviewer,
+            input_fn=self._raising_input(["n"]),
+            print_fn=make_print_fn(),
+        )
+
+        self.assertIn(second, session.unreached)
+        self.assertNotIn(first, session.unreached)
+
+    def test_text_typed_before_the_input_ran_out_is_echoed_back(self):
+        """The whole reason this branch exists. Those words reached no
+        `submit_review()` call, so the terminal is the only place they are."""
+        self._seed_keep_candidate()
+        print_fn = make_print_fn()
+
+        review_cli.run_interactive_review(
+            self.reviewer,
+            # proceed, then one field, then the input ends.
+            input_fn=self._raising_input(["", "타이핑한 결정 맥락"]),
+            print_fn=print_fn,
+        )
+
+        output = chr(10).join(print_fn.lines)
+        self.assertIn("타이핑한 결정 맥락", output)
+        self.assertIn("[중단]", output)
+
+    def test_an_interrupt_is_handled_the_same_way(self):
+        """Ctrl+C leaves the operator in the same place a closed pipe does —
+        a list that was not finished — and used to leave the same traceback."""
+        self._seed_keep_candidate()
+
+        session = review_cli.run_interactive_review(
+            self.reviewer,
+            input_fn=self._raising_input([], exc=KeyboardInterrupt),
+            print_fn=make_print_fn(),
+        )
+
+        self.assertEqual(len(session.unreached), 1)
+
+    def test_a_session_that_ran_to_the_end_reaches_everything(self):
+        """The antecedent. Without it, a `run_interactive_review()` that
+        reported every candidate unreached would pass every test above."""
+        self._seed_keep_candidate(event_id="TEST-ONE-001")
+        self._seed_keep_candidate(
+            event_id="TEST-TWO-001", event_type="ISSUE_RESOLVED", milestone=None
+        )
+
+        session = review_cli.run_interactive_review(
+            self.reviewer,
+            input_fn=self._raising_input(["n", "n"]),
+            print_fn=make_print_fn(),
+        )
+
+        self.assertEqual(session.unreached, ())
+        self.assertEqual(session.failed, ())
+
+    def test_the_summary_says_the_session_stopped_early(self):
+        """A count on screen as well as in the exit code: the operator who
+        piped answers in is looking at the terminal, not at `$?`."""
+        for index in range(4):
+            self._seed_keep_candidate(event_id=f"TEST-{index}-001")
+        print_fn = make_print_fn()
+
+        review_cli.run_interactive_review(
+            self.reviewer,
+            input_fn=self._raising_input(["n"]),
+            print_fn=print_fn,
+        )
+
+        output = chr(10).join(print_fn.lines)
+        self.assertIn("검토하지 못한 Candidate: 3건", output)
+
+    def test_main_does_not_report_success_for_a_session_it_could_not_finish(self):
+        """The exit code, which is where the original defect landed: `1`,
+        from an uncaught `EOFError`, for a run that had nothing wrong with
+        its configuration."""
+        real = review_cli.run_interactive_review
+        review_cli.run_interactive_review = lambda reviewer, **kw: (
+            review_cli.ReviewSession(updated=1, failed=(), unreached=("HIST-9",))
+        )
+        self.addCleanup(setattr, review_cli, "run_interactive_review", real)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = review_cli.main()
+
+        self.assertEqual(code, review_cli.DEGRADED_EXIT)
+        self.assertIn("검토하지 못한", err.getvalue())
+
+
+class SecretShapedProseIsNamedBeforeItIsStoredTests(ReviewCliTestCase):
+    """The warning at the one moment it can still be retyped (C125).
+
+    Decision Context is the third door text takes into Company History, and
+    the only one that had neither a refusal nor a report. A Signal typed on
+    this machine is refused outright by `find_secret_material()`; an Event
+    from another Desktop is at least reported by
+    `ops_status._secret_shaped_event_content()`. This field — the one a
+    person writes as prose — was accepted unscanned and rendered straight
+    into the Daily History that is pushed to the backup remote.
+
+    **A warning rather than a refusal, deliberately.** `oplog` records that
+    its patterns over-match on purpose — "a work note reading 'auth token:
+    rotated' is refused even though it carries no secret" — and that bargain
+    was struck for a Signal, which is a short structured record. Refusing a
+    lessons-learned paragraph on the same grounds is a different bargain and
+    a policy decision (BACKLOG). What the person gets is the fact, while
+    they are still at the keyboard.
+    """
+
+    TOKEN = "ntn_" + "P" * 44
+
+    def _review(self, typed):
+        printed = make_print_fn()
+        answers = iter(["", typed, "", "", ""])
+        review_cli._review_one(
+            self.reviewer,
+            self.repo.get(self._seed_keep_candidate()),
+            input_fn=lambda prompt: next(answers, ""),
+            print_fn=printed,
+        )
+        return chr(10).join(printed.lines)
+
+    def test_a_secret_shaped_field_is_named(self):
+        output = self._review(f"새 토큰은 {self.TOKEN} 이다.")
+
+        self.assertIn("[주의]", output)
+        self.assertIn("Decision Context", output)
+
+    def test_the_warning_does_not_repeat_the_secret(self):
+        """The rule `find_secret_material()` states: a report of a leaked
+        credential must not become the second copy of it. Here it would be a
+        copy on the operator's screen and in their scrollback."""
+        output = self._review(f"새 토큰은 {self.TOKEN} 이다.")
+
+        warning = [line for line in output.splitlines() if "[주의]" in line]
+        self.assertTrue(warning)
+        self.assertNotIn(self.TOKEN, chr(10).join(warning))
+
+    def test_it_warns_and_still_saves(self):
+        """A warning that also refused would silently discard a paragraph
+        somebody typed — which is the decision this deliberately does not
+        take."""
+        history_id = self._seed_keep_candidate(event_id="TEST-SAVE-001")
+        answers = iter(["", f"값은 {self.TOKEN}", "", "", ""])
+        review_cli._review_one(
+            self.reviewer,
+            self.repo.get(history_id),
+            input_fn=lambda prompt: next(answers, ""),
+            print_fn=make_print_fn(),
+        )
+
+        self.assertIn(self.TOKEN, self.repo.get(history_id).decision_context)
+
+    def test_ordinary_prose_gets_no_warning(self):
+        """The control, and the one that matters most for a warning: an
+        alert on every review note is an alert nobody reads."""
+        output = self._review("Notion Integration 토큰을 교체하기로 했다.")
+
+        self.assertNotIn("[주의]", output)
+
+    def test_the_warning_comes_before_the_write_not_before_the_message(self):
+        """Order is the whole value — and the order that matters is against
+        `submit_review()`, not against the confirmation line.
+
+        Measured: a mutation moving the warning to sit between the save and
+        the `저장되었습니다` message passed the first version of this test,
+        which compared the two *printed lines*. By then the token is on
+        disk, which is the moment the warning exists to precede. So this
+        records the real event instead — the reviewer is a spy and the
+        timeline holds both the prints and the write.
+        """
+        events = []
+
+        class _Spy:
+            def __init__(inner, real):
+                inner._real = real
+
+            def list_reviewable(inner, decision=None):
+                return inner._real.list_reviewable(decision)
+
+            def submit_review(inner, history_id, **updates):
+                events.append("WRITE")
+                return inner._real.submit_review(history_id, **updates)
+
+        answers = iter(["", f"값은 {self.TOKEN}", "", "", ""])
+        review_cli._review_one(
+            _Spy(self.reviewer),
+            self.repo.get(self._seed_keep_candidate()),
+            input_fn=lambda prompt: next(answers, ""),
+            print_fn=lambda *a: events.append(
+                "WARN" if any("[주의]" in str(x) for x in a) else "print"
+            ),
+        )
+
+        self.assertIn("WARN", events)
+        self.assertIn("WRITE", events)
+        self.assertLess(
+            events.index("WARN"),
+            events.index("WRITE"),
+            f"the warning came after the write: {events}",
+        )
+
 
 
 if __name__ == "__main__":

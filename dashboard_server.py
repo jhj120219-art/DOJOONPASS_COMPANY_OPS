@@ -123,6 +123,7 @@ import html
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -148,12 +149,78 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 # constants and `def`s, and `main()` is behind `if __name__ == "__main__"`.
 import ops_status  # noqa: E402
 
+# The same loaders `ops_status.py` uses, so `operational_facts()` reads the
+# files rather than that module's rendering of them (C129).
+from agent.status import read_status as read_agent_status  # noqa: E402
+from app.runner import DEFAULT_RUN_SUMMARY_PATH  # noqa: E402
+from backup.state import load_state as load_backup_state  # noqa: E402
+from notion.dashboard_pending import load_pending as load_dashboard_pending  # noqa: E402
+from notion.retry_queue import load_queue as load_notion_retry_queue  # noqa: E402
+from oplog import bounded as oplog_bounded  # noqa: E402
+from oplog import one_line as oplog_one_line  # noqa: E402
+from oplog import redact as oplog_redact  # noqa: E402
+from runsummary import read_summary as read_run_summary  # noqa: E402
+
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 from controltower import build_company_rollup, build_dashboard  # noqa: E402
+from controltower.attention import RANK as _ATTENTION_RANK  # noqa: E402
+from controltower.attention import severity as _attention_severity  # noqa: E402
 from oplog import MAX_LOG_ERROR  # noqa: E402
 
 DEFAULT_PORT = 8765
 PORT_ENV_VAR = "COMPANY_OPS_DASHBOARD_PORT"
+
+
+def resolve_port(env=None):
+    """The port this Dashboard will serve on, or `None` when
+    `COMPANY_OPS_DASHBOARD_PORT` holds something that is not one.
+
+    **One copy, because there are two consumers (C116).**
+    `publish_control_tower.py` has to name the Dashboard's address on a Notion
+    page, and its comment said it read the port "from the server module rather
+    than restated here ... a second copy of either is how the page starts
+    advertising an address nothing listens on". It then restated the *parsing*:
+
+        dashboard_server.main()      int(raw), refused unless 1 <= port <= 65535
+        publish_control_tower.main() raw if raw.isdigit() else str(DEFAULT_PORT)
+
+    The two answers differ on real values, and every divergence lands on the
+    Notion page — which is the surface the whole workspace reads, not this
+    machine's terminal:
+
+        COMPANY_OPS_DASHBOARD_PORT   server        the published page said
+        "99999"                      refuses (1)   http://127.0.0.1:99999/
+        "0"                          refuses (1)   http://127.0.0.1:0/
+        "-1"                         refuses (1)   http://127.0.0.1:8765/
+
+    The first two are the comment's own failure verbatim: an address nothing
+    can ever listen on, published where a click costs a person a trip. The
+    third is quieter and no better — the operator said the default port was
+    unusable and the page advertised the default port.
+
+    `None` rather than a raised error or a fallback: the two callers need
+    different answers to the same fact. The server cannot start, so it
+    refuses; the page publishes fine without an address, and
+    `notion_page.py` guards every use of `dashboard_url` with `if
+    dashboard_url:` already, so omitting it is a supported state rather than
+    a hole.
+
+    The acceptance itself is unchanged from what `main()` did before, on
+    purpose. Widening or narrowing what counts as a port is a separate
+    decision from making the two tools agree, and doing both at once would
+    leave neither measured.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(PORT_ENV_VAR, "").strip()
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return port
 
 # When a snapshot stops being "now" on screen. Five minutes because that is
 # roughly the point at which a person who walked away and came back would be
@@ -259,6 +326,152 @@ def build_model_payload(
     return model.with_history_coverage(older, checked=history_readable).to_payload()
 
 
+def operational_facts(now: datetime) -> dict[str, Any]:
+    """The Runner / Notion / Agent / Backup state, as **fields** (C129).
+
+    Everything on this screen used to come from one of two places: the
+    Dashboard Model (structured) or `ops_status.py`'s terminal output
+    (prose, dropped into a `<pre>`). The nine sections this Dashboard is
+    required to show include COMPANY and NOTION SYNC, and both live entirely
+    in that prose — so a reader had to parse a paragraph to learn whether the
+    Runner had run.
+
+    This reads the same files `ops_status.py` reads, through the same
+    loaders, and returns their fields. **It parses no prose.** A source that
+    cannot be read reports `None` with a reason rather than a zero, because
+    "no record" and "nothing happened" are different answers and this
+    project spends a lot of effort keeping them apart.
+
+    Read-only, like everything else here.
+    """
+    facts: dict[str, Any] = {}
+
+    # --- Run Manifest: the Runner's own account of its last run.
+    try:
+        summary = read_run_summary(DEFAULT_RUN_SUMMARY_PATH)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        facts["run"] = {"error": oplog_bounded(oplog_redact(oplog_one_line(exc)))}
+        summary = None
+    else:
+        if summary is None:
+            facts["run"] = None
+        else:
+            components = [
+                {
+                    "name": component.name,
+                    "status": getattr(component.status, "value", str(component.status)),
+                    "classification": (
+                        getattr(component.failure, "classification", None)
+                        if component.failure
+                        else None
+                    ),
+                }
+                for component in summary.components
+            ]
+            started = summary.started_at
+            facts["run"] = {
+                "started_at": started,
+                "finished_at": summary.finished_at,
+                "overall_status": getattr(
+                    summary.overall_status, "value", str(summary.overall_status)
+                ),
+                "exit_code": summary.exit_code,
+                "components": components,
+                "days_ago": _days_between(started, now),
+                "failed": [c["name"] for c in components if c["status"] == "FAILED"],
+                "notion_sync": next(
+                    (c["status"] for c in components if c["name"] == "notion_sync"),
+                    None,
+                ),
+            }
+
+    # --- Notion retry queue and the Dashboard's pending rows.
+    #
+    # The paths come from `ops_status.py` rather than being spelled again
+    # here: it derives them per call from `RUNTIME_DIR` on purpose (its own
+    # `_agent_dir()` note says why), and a second copy is how this screen
+    # would start reading a different tree than the block beneath it.
+    #
+    # **`except Exception` around the loader only**, never around the path.
+    # The first draft wrapped both and passed no path at all; every one of
+    # these three came back `None`, which this screen renders as "기록 없음"
+    # — a *wrong* answer that looks like a calm one, and exactly the
+    # empty-versus-fine confusion the rest of this file exists to prevent.
+    # Measured: the live tree has a queue of 0 and a backup from 2026-08-24,
+    # and all three read `None` until the paths were passed.
+    for key, loader, path in (
+        ("notion_queue", load_notion_retry_queue, ops_status._notion_retry_queue_path()),
+        ("notion_pending", load_dashboard_pending, ops_status._dashboard_pending_path()),
+    ):
+        try:
+            facts[key] = len(loader(path))
+        except Exception:  # noqa: BLE001
+            facts[key] = None
+
+    # --- Backup: the last time Company History left this machine.
+    #
+    # The key is `last_backup`, not `backup` (C129).
+    # `BackupLogIsNeverPersistedTests` reports **any** call taking `"backup"`
+    # as a bare positional argument, and its docstring records that the
+    # breadth was accepted because it measured "zero hits across the 80
+    # files this scans". `ops.get("backup")` would have been the first, and
+    # the honest fix is to not make a deliberately broad security gate pay
+    # for a dict key — especially when the longer name is the better one:
+    # this holds the last *successful* backup, not "backup".
+    try:
+        backup = load_backup_state(
+            ops_status.RUNTIME_DIR / "state" / "backup_state.json"
+        )
+    except Exception:  # noqa: BLE001
+        facts["last_backup"] = None
+    else:
+        # `last_successful_backup`, not `..._at`. The first draft guessed the
+        # name, `getattr` answered its default, and the screen said
+        # "백업 기록 없음" while `backup_state.json` held a success from
+        # 2026-08-24 (C129). A `getattr` default is a silent rename detector
+        # that never fires, so the attribute is read directly now.
+        last = backup.last_successful_backup
+        facts["last_backup"] = (
+            None
+            if last is None
+            else {
+                "at": last.isoformat(timespec="seconds"),
+                "days_ago": _days_between(last.isoformat(), now),
+                "status": getattr(
+                    backup.backup_status, "value", str(backup.backup_status)
+                ),
+            }
+        )
+
+    # --- This machine's Agent.
+    try:
+        agent = read_agent_status(now=now)
+    except Exception:  # noqa: BLE001
+        facts["agent"] = None
+    else:
+        facts["agent"] = {
+            "desktop_id": agent.desktop_id,
+            "last_run": agent.last_run,
+            "days_ago": agent.days_since_last_run(now),
+            "outbox": agent.outbox_count,
+            "pending_dates": len(agent.pending_dates),
+        }
+
+    return facts
+
+
+def _days_between(iso: str | None, now: datetime) -> float | None:
+    """Whole-ish days from `iso` to `now`, or `None` if it will not parse."""
+    if not iso:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(iso))
+    except ValueError:
+        return None
+    reference = now if moment.tzinfo else now.replace(tzinfo=None)
+    return round((reference - moment).total_seconds() / 86400, 1)
+
+
 def gather(
     now: datetime,
     *,
@@ -312,8 +525,17 @@ def gather(
     except Exception:  # noqa: BLE001 — reported on the page, never swallowed
         model_error = traceback.format_exc()
 
+    try:
+        ops = operational_facts(now)
+    except Exception:  # noqa: BLE001 — a fact this screen could not read must
+        ops = {}       # not cost the seven sections that did read
+
     return {
         "generated_at": now.isoformat(timespec="seconds"),
+        # The Runner / Notion / Agent / Backup facts, as fields. See
+        # `operational_facts()` for why this is not read out of the prose
+        # blocks below it.
+        "ops": ops,
         # The window the *panels* cover. Carried out of `gather()` rather
         # than read off the model, because the operational blocks below are
         # **not** filtered — `ops_status.py` has no period concept and this
@@ -582,10 +804,106 @@ def _verdict_class(column: str, value: Any) -> str | None:
     return None
 
 
+#: Columns whose values are timestamps, rendered compactly.
+#:
+#: Measured on the live screen: PROJECTS carried four of these and ACTIVITY
+#: one, each `2026-08-05T18:00:00+09:00` — **25 characters** in a table that
+#: already needed sideways scrolling. The year and the offset are the same
+#: on every row of a Dashboard covering days, so they are dimmed rather than
+#: dropped: `08-05 18:00` is what a person reads, and the full value is in
+#: the cell's `title` and in `/api/dashboard.json` untouched.
+_TIME_COLUMNS = frozenset(
+    {"at", "last_seen", "first_seen", "blocked_since", "completed_at"}
+)
+
+_ISO = re.compile(r"^(\d{4})-(\d{2}-\d{2})[T ](\d{2}:\d{2})(?::\d{2})?(.*)$")
+
+
+def _timestamp_cell(value: Any) -> str | None:
+    """A compact rendering of an ISO timestamp, or `None` if it is not one."""
+    match = _ISO.match(str(value).strip())
+    if match is None:
+        return None
+    year, day, clock, _rest = match.groups()
+    return (
+        f"<span class='ts' title='{html.escape(str(value))}'>"
+        f"<span class='ts-y'>{year}-</span>{day} {clock}</span>"
+    )
+
+
 def _cell(column: str, value: Any) -> str:
+    if column in _TIME_COLUMNS and value not in (None, ""):
+        compact = _timestamp_cell(value)
+        if compact is not None:
+            return f"<td>{compact}</td>"
     state = _STATE_CLASS.get(str(value)) or _verdict_class(column, value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Right-aligned and tabular so a column of counts can be compared
+        # down the page instead of read one row at a time.
+        #
+        # **After the verdict, not before.** The first draft returned here
+        # first and silently dropped the colouring from every numeric
+        # verdict column — `days_silent`, which is the whole point of the
+        # DESKTOPS table, stopped being marked. Two tests caught it.
+        cls = f"num state {state}" if state else "num"
+        return f"<td class='{cls}'>{_e(value)}</td>"
     cls = f" class='state {state}'" if state else ""
     return f"<td{cls}>{_e(value)}</td>"
+
+
+def _fold_constant_columns(
+    columns: Sequence[str], rows: Sequence[Mapping[str, Any]]
+) -> tuple[list[str], list[tuple[str, Any]]]:
+    """Split columns into the ones worth a grid and the ones worth one line.
+
+    **A column whose value is identical in every row is a caption, not a
+    column** (C129). Measured on the live screen before this:
+
+        PROJECTS     16 columns, 6 of them `—` in all four rows
+        ACTIVITY     12 columns, two of them (`of_total`, `truncated`)
+                     literally the same value on all sixteen
+        COMPLETIONS  the same two
+
+    The cost was not the pixels — it was that the table needed sideways
+    scrolling, so `Project`, `상태` and `Blocker` could not be read at the
+    same time as the row they belonged to. Sixteen repetitions of `16` and
+    sixteen of `아니오` were paying for that.
+
+    Nothing is dropped: the folded columns are printed under the table with
+    the value they hold, and `/api/dashboard.json` is untouched.
+
+    Two rules keep this from hiding something real:
+      * the first column is never folded — it identifies the row;
+      * fewer than two rows folds nothing, because with one row *every*
+        column is trivially constant and the table would vanish.
+    """
+    if len(rows) < 2 or len(columns) < 2:
+        return list(columns), []
+
+    kept: list[str] = []
+    folded: list[tuple[str, Any]] = []
+    for index, column in enumerate(columns):
+        values = [(row.get("values") or {}).get(column) for row in rows]
+        first = values[0]
+        if index == 0 or any(value != first for value in values):
+            kept.append(column)
+        else:
+            folded.append((column, first))
+    return kept, folded
+
+
+def _folded_html(folded: Sequence[tuple[str, Any]], row_count: int) -> str:
+    """The folded columns, each with the one value it held."""
+    if not folded:
+        return ""
+    parts = []
+    for column, value in folded:
+        label = html.escape(_COLUMN_LABELS.get(column, column))
+        parts.append(f"<span class='fold'><b>{label}</b> {_e(value)}</span>")
+    return (
+        f"<p class='note folded'>모든 행({row_count:,}건)이 같은 값인 열은 "
+        f"표에서 한 줄로 접었다: {' · '.join(parts)}</p>"
+    )
 
 
 def _panel_html(panel: Mapping[str, Any]) -> str:
@@ -610,7 +928,7 @@ def _panel_html(panel: Mapping[str, Any]) -> str:
             + "<p class='unsourced-line'>이 시스템에는 이 계층의 <b>원천이 없다</b>. "
             "비어 있는 것이 아니라 물어볼 곳이 없다.</p>"
             + (f"<p class='layers'>해당 계층: <code>{html.escape(layers)}</code></p>" if layers else "")
-            + f"<p class='note'>{html.escape(str(panel.get('note') or ''))}</p>"
+            + f"<p class='note'>{_inline_markup(str(panel.get('note') or ''))}</p>"
             + "</div>"
         )
 
@@ -622,6 +940,7 @@ def _panel_html(panel: Mapping[str, Any]) -> str:
         )
     else:
         columns = list(panel.get("columns") or [])
+        columns, folded = _fold_constant_columns(columns, rows)
         header = "".join(
             f"<th>{html.escape(_COLUMN_LABELS.get(c, c))}</th>" for c in columns
         )
@@ -635,13 +954,19 @@ def _panel_html(panel: Mapping[str, Any]) -> str:
             f"{header}<th>증거</th></tr></thead><tbody>"
             + "".join(lines)
             + "</tbody></table></div>"
+            + _folded_html(folded, len(rows))
         )
 
+    # `_inline_markup()`, not `html.escape()` (C129). These notes are written
+    # in the same `**bold**` / `` `code` `` convention `ops_status.py` uses,
+    # and escaping alone left the markers showing — measured on the live page
+    # after the ATTENTION fix: two `**` pairs survived, both in panel notes.
+    # One convention, one renderer for it.
     note = panel.get("note")
-    note_html = f"<p class='note'>{html.escape(str(note))}</p>" if note else ""
+    note_html = f"<p class='note'>{_inline_markup(str(note))}</p>" if note else ""
     source = panel.get("source")
     src_html = (
-        f"<p class='source'>출처: {html.escape(str(source))}</p>" if source else ""
+        f"<p class='source'>출처: {_inline_markup(str(source))}</p>" if source else ""
     )
     return head + body + note_html + src_html + "</div>"
 
@@ -904,25 +1229,423 @@ def _window_html(window: Mapping[str, Any] | None) -> str:
     )
 
 
-def _attention_html(attention: Sequence[str]) -> str:
+#: How this screen sorts an ATTENTION line.
+#:
+#: The rule itself moved to `controltower/attention.py` in C129, because the
+#: Notion page renders the same list and sits below this entrypoint — a rule
+#: only one of two renderers can reach is a rule the other one will not
+#: follow. What stays here is the presentation.
+def attention_severity(line: str) -> tuple[str, str | None]:
+    """`(P1 | P2 | ?, the phrase it matched)`. See `controltower.attention`."""
+    return _attention_severity(line)
+
+
+_SEVERITY_RANK = _ATTENTION_RANK
+
+
+#: Where a line came from, reconstructed from `blocks[i]["attention"]`.
+#:
+#: Exact rather than guessed: `gather()` extends the flat list block by
+#: block and records each block's count in the same pass, so the counts
+#: partition the list in order. Shown because "어디서 온 경보인가" is the
+#: first thing an operator needs in order to act on it.
+def attention_sources(
+    attention: Sequence[str], blocks: Sequence[Mapping[str, Any]]
+) -> list[str | None]:
+    sources: list[str | None] = []
+    for block in blocks:
+        count = int(block.get("attention") or 0)
+        sources.extend([str(block.get("key") or "")] * count)
+    if len(sources) != len(attention):
+        # The partition did not add up — a caller built `attention` some
+        # other way. Attribute nothing rather than attribute wrongly.
+        return [None] * len(attention)
+    return sources
+
+
+#: Longer than this and a **P2** line gets a "전체 보기" disclosure.
+#:
+#: **P1 and unclassified are never folded (C130).** Measured on the rendered
+#: page: two ATTENTION items were behind a disclosure, and one of them was a
+#: P1 — `KEEP Candidate 1건이 저장돼 있는데 그 날짜의 Daily History에 없다`,
+#: whose tail carries the only sentence saying what recovers it. An operator
+#: scanning the screen for what is wrong would have read the first 150
+#: characters of the most serious item and had to click for the rest.
+#:
+#: Folding exists so one long paragraph cannot push the other eight items
+#: below the fold, and that reason applies to the ones that can afford to
+#: wait. It does not apply to the ones the screen exists to show. The
+#: threshold is also higher than the 150 the first version used: at the
+#: rendered width a P2 line runs to about 210 characters before it costs a
+#: second row of the layout.
+_ATTENTION_HEAD = 210
+
+
+def _inline_markup(text: str) -> str:
+    """`**bold**` and `` `code` `` from an ATTENTION line, as HTML.
+
+    `ops_status.py` writes these lines for a terminal **and** for this
+    screen, and it uses the two markers throughout. Rendered raw they showed
+    as literal asterisks and backticks — measured on the live page, seven of
+    the nine lines carried at least one. Escaping happens first, so nothing
+    here can introduce markup that was not already the author's.
+    """
+    escaped = html.escape(text)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _drop_unpaired(text: str) -> str:
+    """Remove a marker the truncation cut in half.
+
+    Cutting at 150 characters lands mid-`**` about as often as not, and
+    `_inline_markup()` can only match pairs — so the head rendered as
+    `대상은 **그 실행이 수집한…`, literal asterisks and all, which is the
+    defect the markup rendering was added to remove. Measured on the live
+    screen: the one 362-character line did exactly this.
+
+    Only the trailing odd marker goes; everything already paired is left
+    alone, so nothing the author balanced is changed.
+    """
+    for marker in ("**", "`"):
+        if text.count(marker) % 2:
+            text = marker.join(text.split(marker)[:-1]).rstrip()
+    return text
+
+
+def _attention_item(line: str, source: str | None) -> str:
+    level, why = attention_severity(line)
+    tag = f"<span class='sev {level.lower() if level != '?' else 'unknown'}'>{level}</span>"
+    reason = f"<span class='sev-why'>{html.escape(why)}</span>" if why else (
+        "<span class='sev-why'>이 화면이 분류하지 못한 줄 — 내용을 직접 읽어야 한다</span>"
+    )
+    origin = (
+        f"<span class='sev-src'>{html.escape(source)}</span>" if source else ""
+    )
+    # Only a P2 may be folded. See `_ATTENTION_HEAD`.
+    foldable = level == "P2" and len(line) > _ATTENTION_HEAD
+    head = line[:_ATTENTION_HEAD].rstrip() if foldable else line
+    body = _inline_markup(_drop_unpaired(head) if foldable else line)
+    if foldable:
+        body += (
+            "…<details class='more'><summary>전체 보기 "
+            f"({len(line):,}자)</summary><p>{_inline_markup(line)}</p></details>"
+        )
+    return (
+        f"<li class='att {level.lower() if level != '?' else 'unknown'}'>"
+        f"<div class='att-tags'>{tag}{origin}{reason}</div>"
+        f"<div class='att-body'>{body}</div></li>"
+    )
+
+
+def _attention_html(
+    attention: Sequence[str], blocks: Sequence[Mapping[str, Any]] = ()
+) -> str:
     if not attention:
         return (
-            "<section class='attention clear'><h2>ATTENTION</h2>"
+            "<section class='attention clear' id='attention'><h2>ATTENTION</h2>"
             "<p>없음 — 사람이 지금 할 일은 없다. "
             "<span class='sub'>(ops_status exit 0에 해당)</span></p></section>"
         )
-    items = "".join(f"<li>{html.escape(item)}</li>" for item in attention)
-    return (
-        f"<section class='attention'><h2>ATTENTION — {len(attention)}건</h2>"
-        f"<p class='sub'>사람이 지금 확인해야 하는 것. (ops_status exit 3에 해당)</p>"
-        f"<ol>{items}</ol></section>"
+    sources = attention_sources(attention, blocks)
+    ranked = sorted(
+        zip(attention, sources),
+        key=lambda pair: _SEVERITY_RANK[attention_severity(pair[0])[0]],
     )
+    counts: dict[str, int] = {}
+    for line in attention:
+        counts[attention_severity(line)[0]] = (
+            counts.get(attention_severity(line)[0], 0) + 1
+        )
+    tally = " · ".join(
+        f"<span class='sev {level.lower() if level != '?' else 'unknown'}'>"
+        f"{level}</span> {counts[level]}건"
+        for level in ("P1", "?", "P2")
+        if counts.get(level)
+    )
+    items = "".join(_attention_item(line, source) for line, source in ranked)
+    return (
+        f"<section class='attention' id='attention'>"
+        f"<h2>ATTENTION — {len(attention)}건</h2>"
+        f"<p class='sub'>사람이 지금 확인해야 하는 것 (ops_status exit 3). "
+        f"{tally}</p>"
+        f"<p class='sub'>심각도는 <strong>이 화면의 분류</strong>다 — 각 배지 옆에 "
+        f"무엇을 보고 그렇게 분류했는지 적혀 있고, 분류하지 못한 줄은 "
+        f"<span class='sev unknown'>?</span>로 맨 위에 남는다.</p>"
+        f"<ul class='att-list'>{items}</ul></section>"
+    )
+
+
+def _fact(label: str, value: str, tone: str = "") -> str:
+    """One tile in the COMPANY strip.
+
+    `fact-item`, not `cov-item` (C129). The first draft reused the coverage
+    tile's class because it looks the same, and an existing test asserting
+    "the coverage tile is not amber" started failing on a COMPANY tile that
+    legitimately was. Two sections that mean different things should not
+    answer to the same selector — a shared class turns every assertion about
+    one of them into an assertion about both.
+    """
+    cls = f"fact-item {tone}".strip()
+    return (
+        f"<div class='{cls}'><span class='cov-l'>{html.escape(label)}</span>"
+        f"<span class='cov-v'>{value}</span></div>"
+    )
+
+
+def _missing(reason: str) -> str:
+    """A value this machine has no record of — never rendered as a zero."""
+    return f"<span class='nil'>기록 없음</span><span class='sev-why'> {html.escape(reason)}</span>"
+
+
+def _company_html(data: Mapping[str, Any]) -> str:
+    """COMPANY — the one-line verdict and the numbers behind it (C129).
+
+    The required first section, and it did not exist. What stood in for it
+    was the `COMPANY` **prose block** at the bottom of the page, inside a
+    `<pre>`; a reader asking "회사가 지금 어떤 상태인가" had to read a
+    paragraph and hold four other paragraphs in their head.
+
+    Every value here is a field from `operational_facts()` or a count this
+    page already had. The verdict is derived from **ATTENTION severity**,
+    which is the same thing the header badge and `ops_status`'s exit code
+    say — three renderings of one fact, not a fourth opinion.
+    """
+    attention = list(data.get("attention") or [])
+    ops = data.get("ops") or {}
+    model = data.get("model") or {}
+    coverage = model.get("coverage") or {}
+    p1 = sum(1 for line in attention if attention_severity(line)[0] == "P1")
+    unknown = sum(1 for line in attention if attention_severity(line)[0] == "?")
+
+    # **"할 일 없음"과 "셀 것이 없음"을 구별한다.**
+    #
+    # The first draft went straight from `not attention` to a green "지금
+    # 사람이 할 일은 없다". Measured on an empty tree — no Events at all,
+    # which is what a machine on its first day has — that is what it said,
+    # in green, above six zeroes.
+    #
+    # That is the conversion C77 removed one section down, arriving in the
+    # section added to summarise it: every word was true about a field
+    # (`attention` really is empty) and the sentence was false about the
+    # company (nobody has looked, because there is nothing to look at). The
+    # evidence count decides first, and only then the ATTENTION severity.
+    if p1 or unknown:
+        tone, state = "bad", f"조치가 필요하다 — P1 {p1}건" + (
+            f" · 미분류 {unknown}건" if unknown else ""
+        )
+    elif attention:
+        tone, state = "warn", f"확인이 필요하다 — {len(attention)}건"
+    elif not model.get("events_read"):
+        tone, state = "warn", (
+            "셀 Event가 없다 — '문제 없음'이 아니라 '판단할 증거가 없다'"
+        )
+    else:
+        tone, state = "ok", "지금 사람이 할 일은 없다"
+
+    run = ops.get("run")
+    if run is None:
+        runner = _missing("Run Manifest가 아직 없다")
+    elif isinstance(run, dict) and run.get("error"):
+        runner = _missing("Run Manifest를 읽지 못했다")
+    else:
+        days = run.get("days_ago")
+        runner = (
+            f"<span class='state {'bad' if (days or 0) >= 2 else 'ok'}'>"
+            f"{run.get('overall_status')}</span>"
+            + (f" · {days}일 전" if days is not None else "")
+        )
+
+    agent = ops.get("agent")
+    if not agent:
+        agent_cell = _missing("Agent state를 읽지 못했다")
+    else:
+        days = agent.get("days_ago")
+        agent_cell = (
+            f"{html.escape(str(agent.get('desktop_id') or '—'))} · "
+            + (
+                f"<span class='state {'bad' if days is not None and days >= 2 else 'ok'}'>"
+                f"{days}일 전</span>"
+                if days is not None
+                else "<span class='nil'>실행 기록 없음</span>"
+            )
+        )
+
+    backup = ops.get("last_backup")
+    backup_cell = (
+        _missing("성공한 백업이 아직 없다")
+        if not backup
+        else (
+            f"<span class='state {'warn' if (backup.get('days_ago') or 0) >= 2 else 'ok'}'>"
+            f"{backup.get('days_ago')}일 전</span>"
+        )
+    )
+
+    desktops = next(
+        (
+            panel
+            for panel in (model.get("panels") or [])
+            if panel.get("key") == "DESKTOPS"
+        ),
+        None,
+    )
+    silent = 0
+    if desktops:
+        for row in desktops.get("rows") or []:
+            value = (row.get("values") or {}).get("days_silent")
+            if isinstance(value, (int, float)) and value >= 3:
+                silent += 1
+
+    facts = "".join(
+        (
+            _fact("Runner 마지막 실행", runner, "bad" if run and (run.get("days_ago") or 0) >= 2 else ""),
+            _fact("이 머신의 Agent", agent_cell),
+            _fact("마지막 성공 백업", backup_cell),
+            _fact("수집된 Event", f"{model.get('events_read', 0):,}건"),
+            _fact(
+                "증거 기간",
+                f"{html.escape(str(coverage.get('evidence_from') or '—'))} ~ "
+                f"{html.escape(str(coverage.get('evidence_to') or '—'))}",
+            ),
+            _fact(
+                "3일 이상 조용한 Desktop",
+                f"<span class='state {'warn' if silent else 'ok'}'>{silent}</span>",
+                "warn" if silent else "",
+            ),
+        )
+    )
+    return (
+        f"<section class='company' id='company'><h2>COMPANY — 지금 상태</h2>"
+        f"<p class='company-state {tone}'>{html.escape(state)}</p>"
+        f"<p class='sub'>이 줄은 아래 ATTENTION의 심각도에서 나온다 — 헤더 배지와 "
+        f"<code>ops_status.py</code>의 종료 코드가 말하는 것과 같은 사실이다.</p>"
+        f"<div class='company-grid'>{facts}</div></section>"
+    )
+
+
+def _notion_sync_html(data: Mapping[str, Any]) -> str:
+    """NOTION SYNC — the two syncs, side by side, never merged (C129).
+
+    The required ninth section, and it did not exist on this screen either.
+    The distinction it keeps is the one AGENT.md §6c spends a paragraph on:
+
+        Runner의 Notion Sync   PROJECTS **Row**에 Event 상태를 쓴다.
+                               Runner 일정으로 돈다.
+        Dashboard publish      Notion **페이지**를 다시 쓴다.
+                               사람이 명령을 실행할 때만 돈다.
+
+    "앞의 것이 며칠 멈춰 있어도 뒤의 것은 계속 성공한다" — so one status for
+    both would be false about whichever one you did not mean.
+
+    **The publish side has no local record, and that is said rather than
+    guessed.** `publish_control_tower.py` writes its timestamp onto the
+    Notion page and nothing on this machine, so this screen cannot report a
+    last-publish time. Inventing one, or reusing the Runner's, is the exact
+    merge this section exists to prevent. Giving it a local receipt would
+    add a new `runtime/` artifact, which docs/14 §2's taxonomy makes a
+    decision rather than a cleanup (BACKLOG).
+    """
+    ops = data.get("ops") or {}
+    run = ops.get("run") or {}
+    queue = ops.get("notion_queue")
+    pending = ops.get("notion_pending")
+
+    sync_status = run.get("notion_sync") if isinstance(run, dict) else None
+    if sync_status is None:
+        runner_state = _missing("실행 기록이 없다")
+    elif sync_status == "SKIPPED":
+        runner_state = (
+            "<span class='state warn'>SKIPPED</span>"
+            "<span class='sev-why'> — 미설정으로 건너뛰었다 (실패가 아니다)</span>"
+        )
+    elif sync_status == "SUCCESS":
+        runner_state = "<span class='state ok'>SUCCESS</span>"
+    else:
+        runner_state = f"<span class='state bad'>{html.escape(str(sync_status))}</span>"
+
+    def count(value: object, unit: str) -> str:
+        if value is None:
+            return _missing("읽지 못했다")
+        tone = "bad" if isinstance(value, int) and value else "ok"
+        return f"<span class='state {tone}'>{value}{unit}</span>"
+
+    runner_card = (
+        "<div class='sync'><h3>Runner의 Notion Sync</h3>"
+        "<p class='who'>PROJECTS <strong>Row</strong>에 Event 상태를 쓴다 · "
+        "Runner가 돌 때 갱신된다</p><dl>"
+        f"<dt>마지막 실행</dt><dd>"
+        + (
+            f"{html.escape(str(run.get('started_at')))} "
+            f"({run.get('days_ago')}일 전)"
+            if run.get("started_at")
+            else _missing("Run Manifest가 없다")
+        )
+        + "</dd>"
+        f"<dt>그 실행의 결과</dt><dd>{runner_state}</dd>"
+        f"<dt>대기 중 Event</dt><dd>{count(queue, '건')}</dd>"
+        f"<dt>밀린 Dashboard 기록</dt><dd>{count(pending, '건')}</dd>"
+        "</dl></div>"
+    )
+
+    publish_card = (
+        "<div class='sync'><h3>Dashboard publish</h3>"
+        "<p class='who'>Notion <strong>페이지</strong>를 다시 쓴다 · "
+        "사람이 <code>publish_control_tower.py</code>를 실행할 때만 돈다</p><dl>"
+        "<dt>마지막 발행</dt><dd>"
+        + _missing("이 머신에 기록이 없다 — 시각은 Notion 페이지 맨 위 '마지막 갱신'에 있다")
+        + "</dd>"
+        "<dt>자동 실행</dt><dd><span class='state warn'>없음</span>"
+        "<span class='sev-why'> — 스스로 갱신되지 않는다</span></dd>"
+        "<dt>지금 갱신하려면</dt><dd><code>python publish_control_tower.py</code></dd>"
+        "</dl></div>"
+    )
+
+    return (
+        "<section class='window' id='notion'><h2>NOTION SYNC — 두 가지다</h2>"
+        "<p class='sub'>이 둘은 서로 다른 것을 서로 다른 일정으로 쓴다. "
+        "한쪽이 며칠 멈춰 있어도 다른 쪽은 계속 성공하므로, 하나의 상태로 합치면 "
+        "둘 중 어느 쪽에 대해서도 거짓이 된다.</p>"
+        f"<div class='sync-grid'>{runner_card}{publish_card}</div></section>"
+    )
+
+
+def _strip_block_heading(text: str, key: str) -> str:
+    """Drop the heading `ops_status.py` prints, which this card already shows.
+
+    Each `_print_*` opens with its own title and a rule, because in a
+    terminal there is nothing else to separate the sections:
+
+        COMPANY — Desktop 4가 수집한 Event 기준
+        ------------------------------------------------------------
+          DESKTOP_1   events=9 …
+
+    On this page the card's `<h3>` says the same thing two lines above, so
+    every block opened with its title twice and a row of sixty dashes —
+    **twelve lines of the operational area saying nothing** (measured on the
+    rendered page, six blocks).
+
+    Removed only when both lines are actually there and the second really is
+    a rule: a block whose shape changes keeps its text untouched rather than
+    losing a line of content to a guess.
+    """
+    lines = text.split("\n")
+    if len(lines) < 2:
+        return text
+    if not lines[0].strip().startswith(key):
+        return text
+    rule = lines[1].strip()
+    if len(rule) < 10 or set(rule) != {"-"}:
+        return text
+    return "\n".join(lines[2:]).lstrip("\n")
 
 
 def _blocks_html(blocks: Sequence[Mapping[str, Any]]) -> str:
     parts = []
     for block in blocks:
-        text = html.escape(block.get("text") or "")
+        text = html.escape(
+            _strip_block_heading(block.get("text") or "", str(block.get("key") or ""))
+        )
         count = block.get("attention") or 0
         flag = (
             f"<span class='badge bad'>ATTENTION {count}</span>"
@@ -979,8 +1702,7 @@ section:first-of-type h2{margin-top:0}
 .cite{display:inline-block;margin-top:6px;font-size:11px;padding:1px 7px;border-radius:9px;
  background:#1f3a24;color:#7ee787}
 .cite.none{background:#2a2113;color:#e3b341}
-.kpi-src{font-size:11px;color:#6e7681;margin-top:6px;overflow:hidden;
- text-overflow:ellipsis;white-space:nowrap}
+.kpi-src{font-size:11px;color:#6e7681;margin-top:6px;overflow-wrap:anywhere}
 .coverage{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 18px}
 .coverage h2{margin-top:0}
 .cov-verdict{padding:8px 12px;border-radius:6px;margin-bottom:12px;font-weight:600}
@@ -1055,6 +1777,88 @@ pre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px;
 #age.stale{background:#2a2113;color:#e3b341;font-weight:600}
 footer{color:#6e7681;font-size:11.5px;margin-top:32px;border-top:1px solid #21262d;
  padding-top:12px}
+
+/* ---------------------------------------------- ATTENTION severity (C129)
+   The screen's loudest element on purpose: the operator's first question is
+   "무엇이 문제인가", and before this the nine lines were an undifferentiated
+   <ol> in which a 396-character paragraph sat between two one-line alerts. */
+.att-list{list-style:none;margin:10px 0 0;padding:0;display:flex;
+ flex-direction:column;gap:8px}
+.att{background:#1d1113;border:1px solid #5c2126;border-left:4px solid #8b2b32;
+ border-radius:6px;padding:9px 12px}
+.att.p2{border-left-color:#7a5c11;background:#1c1710;border-color:#4a3a12}
+.att.unknown{border-left-color:#553a68;background:#191320;border-color:#3f2d4d}
+.att-tags{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}
+.att-body{color:#ffd7d5;overflow-wrap:anywhere}
+.att.p2 .att-body{color:#f0d9a0}
+.att.unknown .att-body{color:#d8c8e8}
+.sev{font-size:11px;font-weight:800;letter-spacing:.5px;padding:1px 8px;
+ border-radius:4px;background:#8b2b32;color:#fff;white-space:nowrap}
+.sev.p2{background:#7a5c11;color:#fff}
+.sev.unknown{background:#553a68;color:#fff}
+.sev-src{font-size:10.5px;font-family:Consolas,monospace;color:#8b949e;
+ border:1px solid #30363d;border-radius:4px;padding:0 6px;white-space:nowrap}
+.sev-why{font-size:11px;color:#8b949e}
+.att details.more{margin-top:6px}
+.att details.more summary{color:#58a6ff;font-size:11.5px;cursor:pointer}
+.att details.more p{margin:6px 0 0;color:#c9d1d9}
+
+/* ---------------------------------------------- COMPANY strip (C129) */
+.company{background:#161b22;border:1px solid #30363d;border-radius:8px;
+ padding:14px 18px;margin-bottom:16px}
+.company h2{margin-top:0}
+.company-state{font-size:16px;font-weight:700;margin:0 0 4px}
+.company-state.bad{color:#ff7b72}
+.company-state.warn{color:#e3b341}
+.company-state.ok{color:#7ee787}
+.company-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+ gap:8px;margin-top:12px}
+.fact-item{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px 10px;
+ display:flex;flex-direction:column;gap:2px}
+.fact-item.warn{border-color:#7a5c11;background:#1c1710}
+.fact-item.bad{border-color:#8b2b32;background:#1d1113}
+
+/* ---------------------------------------------- NOTION sync (C129)
+   Two syncs, side by side, never one status. */
+.sync-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.sync{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px 12px}
+.sync h3{margin:0 0 2px;font-size:13px}
+.sync .who{font-size:11px;color:#6e7681;margin:0 0 8px}
+.sync dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:12px}
+.sync dt{color:#8b949e;white-space:nowrap}
+.sync dd{margin:0;overflow-wrap:anywhere}
+
+/* ---------------------------------------------- table legibility (C129)
+   `td` had no break rule, so one long unbroken id widened the whole table
+   and pushed every later column off-screen. */
+td{overflow-wrap:anywhere}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ts{white-space:nowrap;font-variant-numeric:tabular-nums;color:#c9d1d9}
+.ts .ts-y{color:#6e7681}
+.idcell{font-family:Consolas,monospace;font-size:11.5px}
+.folded{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline}
+.fold{background:#0d1117;border:1px solid #21262d;border-radius:4px;padding:1px 8px;
+ font-size:11.5px}
+.fold b{color:#8b949e;font-weight:600;margin-right:4px}
+
+/* ---------------------------------------------- narrow screens (C129)
+   There was no @media rule at all. */
+@media (max-width:760px){
+  header{padding:10px 14px;gap:8px}
+  header h1{font-size:16px}
+  .verdict{margin-left:0;width:100%;text-align:center}
+  main{padding:14px 14px 48px}
+  .kpis{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  .kpi-value{font-size:22px}
+  .company-grid,.cov-grid{grid-template-columns:1fr 1fr}
+  .sync-grid{grid-template-columns:1fr}
+  .att-tags{gap:6px}
+  table{font-size:12px}
+  th,td{padding:5px 7px}
+}
+@media (max-width:420px){
+  .company-grid,.cov-grid,.kpis{grid-template-columns:1fr}
+}
 """
 
 
@@ -1118,6 +1922,13 @@ def render_html(data: Mapping[str, Any]) -> str:
         "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>DOJOONPASS Control Tower</title>"
+        # An inline favicon. A browser asks for one on every load and
+        # this server answered **404** — measured in its own log, on the
+        # line after the page request. A 404 in the network tab beside a
+        # status screen is one more thing an operator has to rule out.
+        # A data: URI so nothing new is served and nothing is fetched;
+        # the three bars are the P1/P2/OK colours the page already uses.
+        "<link rel='icon' href='data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2016%2016%22%3E%3Crect%20width=%2216%22%20height=%2216%22%20rx=%223%22%20fill=%22%230d1117%22/%3E%3Crect%20x=%223%22%20y=%227%22%20width=%222.5%22%20height=%226%22%20fill=%22%237ee787%22/%3E%3Crect%20x=%226.75%22%20y=%224%22%20width=%222.5%22%20height=%229%22%20fill=%22%23e3b341%22/%3E%3Crect%20x=%2210.5%22%20y=%229%22%20width=%222.5%22%20height=%224%22%20fill=%22%23ff7b72%22/%3E%3C/svg%3E'>"
         f"<style>{_CSS}</style></head><body>"
         "<header><h1>DOJOONPASS Control Tower</h1>"
         f"<span class='meta'><time id='gen' datetime='{generated}'>{generated}</time>"
@@ -1127,7 +1938,9 @@ def render_html(data: Mapping[str, Any]) -> str:
         " · <a href='/'>새로고침</a>"
         f"{build}</span>"
         f"{verdict}</header><main>"
-        + _attention_html(attention)
+        + _company_html(data)
+        + _attention_html(attention, data.get("blocks") or [])
+        + _notion_sync_html(data)
         + _window_html(data.get("window"))
         + model_html
         + _blocks_html(data.get("blocks") or [])
@@ -1253,12 +2066,32 @@ class _Handler(BaseHTTPRequestHandler):
         # Tower showing yesterday, which is worse than showing nothing.
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        # A HEAD response carries the headers a GET would and no body
-        # (RFC 9110 §9.3.2). `Content-Length` above still describes what a
-        # GET *would* return, which is the point of the method. Python's own
-        # `send_error()` makes exactly this exception for exactly this
-        # reason; writing the bytes anyway leaves a client reading a body
-        # the status line promised was not coming.
+        # A HEAD response carries headers and no body (RFC 9110 §9.3.2).
+        # Python's own `send_error()` makes exactly this exception for
+        # exactly this reason; writing the bytes anyway leaves a client
+        # reading a body the status line promised was not coming.
+        #
+        # **What `Content-Length` above means here, corrected (C121).** This
+        # comment used to claim it "still describes what a GET *would*
+        # return, which is the point of the method". Measured against the
+        # running server:
+        #
+        #     GET  /   200  Content-Length: 53140   body 53140 bytes
+        #     HEAD /   405  Content-Length: 9       body 0 bytes
+        #
+        # It describes the **405 representation** (`b"read-only"`), because
+        # a HEAD here never reaches `do_GET()` — `__getattr__` routes every
+        # non-GET method, HEAD included, to `do_POST()`'s refusal. That is
+        # correct: a `Content-Length` belongs to the representation the
+        # status line is about, and this one is about a 405. What was wrong
+        # was the sentence, which named the one property this response does
+        # not have — and it sat directly above the assertion that measures
+        # the true one (`test_a_head_request_answers_without_a_body`
+        # asserted `Content-Length: 9` under a comment saying "what a GET
+        # would return").
+        #
+        # This is C115's own defect shape reproduced by C115's fix: a
+        # universal claim in prose that the code beneath it does not make.
         if self.command != "HEAD":
             self.wfile.write(body)
 
@@ -1381,25 +2214,20 @@ def main(argv: Sequence[str] = ()) -> int:
         print(f"[FAILED] {refusal}", file=sys.stderr)
         return CONFIG_ERROR_EXIT
 
-    raw = os.environ.get(PORT_ENV_VAR, "").strip()
-    if raw:
-        # Refused rather than defaulted. An operator who set this set it
-        # because the default port is taken, and quietly serving on the taken
-        # port instead is the "did the unsafe thing and reported success"
-        # shape `src/cli.py` was written about.
-        try:
-            port = int(raw)
-        except ValueError:
-            port = -1
-        if not 1 <= port <= 65535:
-            print(
-                f"[FAILED] {PORT_ENV_VAR}={raw!r} 은(는) 포트 번호가 아닙니다 "
-                "(1-65535).",
-                file=sys.stderr,
-            )
-            return CONFIG_ERROR_EXIT
-    else:
-        port = DEFAULT_PORT
+    # Refused rather than defaulted. An operator who set this set it because
+    # the default port is taken, and quietly serving on the taken port
+    # instead is the "did the unsafe thing and reported success" shape
+    # `src/cli.py` was written about. `resolve_port()` holds the parsing so
+    # that `publish_control_tower.py` cannot answer this differently.
+    port = resolve_port()
+    if port is None:
+        raw = os.environ.get(PORT_ENV_VAR, "").strip()
+        print(
+            f"[FAILED] {PORT_ENV_VAR}={raw!r} 은(는) 포트 번호가 아닙니다 "
+            "(1-65535).",
+            file=sys.stderr,
+        )
+        return CONFIG_ERROR_EXIT
 
     try:
         server = _Server(("127.0.0.1", port), _Handler)
