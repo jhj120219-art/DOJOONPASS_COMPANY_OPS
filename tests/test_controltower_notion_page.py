@@ -24,9 +24,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from controltower.attention import severity as attention_severity  # noqa: E402
+from controltower import notion_page  # noqa: E402
 from controltower.notion_page import (  # noqa: E402
     MAX_CHILDREN_PER_APPEND,
     MAX_TABLE_ROWS,
+    RICH_TEXT_LIMIT,
     NOTE_MARKER,
     ROW_PAGE_MARKER,
     SILENT_AFTER_DAYS,
@@ -116,17 +118,429 @@ def _payload(**overrides):
 
 
 def _all_text(blocks):
-    """Every rich_text string in a block list, flattened."""
+    """Every rich_text string in a block tree, flattened in document order.
+
+    **Recursive since C134.** The page grew toggle headings, so a section a
+    reader reaches by clicking once is now a `children` list rather than a
+    top-level block — and a helper that stopped at the top level reported
+    those sections as *absent*. Seventeen tests failed on content that was
+    on the page the whole time.
+
+    Depth-first and in order, so assertions about what comes before what
+    still mean what they said.
+    """
     out = []
     for block in blocks:
         body = block.get(block.get("type")) or {}
         for item in body.get("rich_text") or ():
             out.append((item.get("text") or {}).get("content", ""))
-        for row in (body.get("children") or ()):
-            for cell in (row.get("table_row") or {}).get("cells") or ():
-                for item in cell:
-                    out.append((item.get("text") or {}).get("content", ""))
+        for child in body.get("children") or ():
+            cells = (child.get("table_row") or {}).get("cells")
+            if cells is not None:
+                for cell in cells:
+                    for item in cell:
+                        out.append((item.get("text") or {}).get("content", ""))
+            else:
+                out.extend(_all_text([child]))
     return out
+
+
+class ThePageIsReadTopToBottomTests(unittest.TestCase):
+    """C134. The order is the answer to a question, not the Model's order.
+
+    Before this the page ran: callout, 이 화면의 범위, 이 데이터는 실제 업무인가,
+    ATTENTION, then seven equal `###` panels in `PANEL_LAYOUT` order — which
+    put **KPI fifth of seven** and the coverage metadata second. A reader
+    with ten seconds met two paragraphs of provenance before the first
+    problem.
+    """
+
+    def _payload(self, **over):
+        base = {
+            "generated_at": "2026-08-27T09:00:00+09:00",
+            "attention": [],
+            "blocks": [],
+            "window": {"since": None, "until": None},
+            "model": {
+                "schema_version": "1.2",
+                "generated_at": "2026-08-27T09:00:00+09:00",
+                "events_read": 3,
+                "coverage": {"complete": True, "history_checked": True,
+                             "evidence_from": "2026-08-01",
+                             "evidence_to": "2026-08-07",
+                             "unreadable": 0, "duplicates": 0},
+                "unreadable": [],
+                "panels": _panels(),
+            },
+        }
+        base.update(over)
+        return base
+
+    def _top_headings(self, blocks):
+        return [
+            "".join((i.get("text") or {}).get("content", "")
+                    for i in (b.get("heading_2") or {}).get("rich_text") or ())
+            for b in blocks
+            if b.get("type") == "heading_2"
+        ]
+
+    def test_the_six_sections_are_in_the_required_order(self):
+        blocks, _ = build_control_tower_blocks(self._payload())
+
+        headings = self._top_headings(blocks)
+        numbers = [h[0] for h in headings if h and h[0] in "①②③④⑤⑥"]
+
+        self.assertEqual(numbers, ["①", "②", "③", "④", "⑤", "⑥"])
+
+    def test_the_first_block_is_the_one_line_verdict(self):
+        """Ten seconds buys the callout and nothing else, so the callout has
+        to be the whole answer."""
+        blocks, _ = build_control_tower_blocks(self._payload())
+
+        self.assertEqual(blocks[0]["type"], "callout")
+        text = "".join(
+            (i.get("text") or {}).get("content", "")
+            for i in blocks[0]["callout"]["rich_text"]
+        )
+        self.assertTrue(
+            text.startswith(("정상", "주의", "조치 필요")), text[:40]
+        )
+
+    def test_details_are_folded_and_the_first_five_sections_are_not(self):
+        blocks, _ = build_control_tower_blocks(self._payload())
+
+        folded = [
+            b for b in blocks
+            if b.get(b.get("type"), {}).get("is_toggleable")
+        ]
+        self.assertTrue(folded, "⑥ has no folded sections at all")
+        for block in blocks:
+            body = block.get(block.get("type")) or {}
+            if block.get("type") == "heading_2" and body.get("rich_text"):
+                head = (body["rich_text"][0].get("text") or {}).get("content", "")
+                if head[:1] in "①②③④⑤":
+                    with self.subTest(section=head):
+                        self.assertFalse(body.get("is_toggleable"), head)
+
+    def test_recent_completions_is_not_a_second_top_level_table(self):
+        """`COMPLETIONS` is a **filtered view** of `ACTIVITY` — the same
+        Events, selected by `event_type`. Two tables with identical columns
+        at the top level showed a reader the same rows twice."""
+        blocks, _ = build_control_tower_blocks(self._payload())
+
+        top = [
+            "".join((i.get("text") or {}).get("content", "")
+                    for i in (b.get(b.get("type")) or {}).get("rich_text") or ())
+            for b in blocks
+        ]
+        self.assertNotIn("최근 완료", top)
+        self.assertIn("최근 완료만 따로 보기", "\n".join(_all_text(blocks)))
+
+    def test_every_panel_the_model_builds_still_reaches_the_page(self):
+        """Guards the reordering. Nothing may be lost by moving it.
+
+        Checked on **content**, not on the panel title: `METRICS` renders as
+        ③'s callouts and ⑥'s table under this page's own section names, and
+        its own title ("KPI") is deliberately not shown because "③ 핵심 숫자"
+        already says it. A title check would have demanded that redundancy
+        back.
+        """
+        blocks, _ = build_control_tower_blocks(self._payload())
+        text = "\n".join(_all_text(blocks))
+
+        for panel in _panels():
+            rows = panel.get("rows") or []
+            if not rows:
+                # An unsourced panel has no rows; its title and note are the
+                # content, and both are what ⑥ renders for it.
+                with self.subTest(panel=panel["key"]):
+                    self.assertIn(str(panel["title"]), text)
+                continue
+            values = rows[0].get("values") or {}
+            checkable = [
+                v for v in values.values()
+                if isinstance(v, str) and v not in ("", "—")
+            ]
+            self.assertTrue(checkable, f"no checkable value in {panel['key']}")
+            # **Any**, not every. Some row values are internal identifiers
+            # that the page deliberately does not print — `METRICS` rows
+            # carry `key: "events"`, and the sibling class asserts that very
+            # string stays off the page. Demanding all of them would make
+            # these two tests contradict each other.
+            with self.subTest(panel=panel["key"]):
+                self.assertTrue(
+                    any(value in text for value in checkable),
+                    f"{panel['key']} rendered none of {checkable}",
+                )
+
+
+class TheAuthorsEmphasisRendersAndTheirMarkersDoNotTests(unittest.TestCase):
+    """C134. `**bold**` and `` `code` `` reached Notion as literal characters.
+
+    `ops_status.py` writes this project's markup convention throughout its
+    ATTENTION lines, and the Model's panel notes use it too. Measured on the
+    **published page** in a browser:
+
+        ... Notion이 정상이라는 뜻이 **아니다**. 두 숫자는 ...
+        ... 다음 행동: `python run_company_ops.py` 를 한 번 돌려 ...
+
+    `dashboard_server.py` has had `_inline_markup()` for this since C129.
+    The Notion renderer had none, so one convention was honoured on one of
+    the two surfaces that share it.
+    """
+
+    def test_bold_becomes_an_annotation_not_asterisks(self):
+        runs = notion_page._rich("뜻이 **아니다**. 그리고")
+
+        self.assertEqual(
+            [(r["text"]["content"], r["annotations"]["bold"]) for r in runs],
+            [("뜻이 ", False), ("아니다", True), (". 그리고", False)],
+        )
+
+    def test_backticks_become_code_not_backticks(self):
+        runs = notion_page._rich("`python run_agent.py` 로 확인한다")
+
+        self.assertTrue(runs[0]["annotations"]["code"])
+        self.assertEqual(runs[0]["text"]["content"], "python run_agent.py")
+        self.assertNotIn("`", "".join(r["text"]["content"] for r in runs))
+
+    def test_an_unbalanced_marker_is_left_as_text(self):
+        """Non-greedy and anchored on the markers: a truncated line may carry
+        one half of a pair, and a greedy match there renders the rest of the
+        alert in bold."""
+        runs = notion_page._rich("unbalanced ** marker")
+
+        self.assertEqual(len(runs), 1)
+        self.assertFalse(runs[0]["annotations"]["bold"])
+        self.assertEqual(runs[0]["text"]["content"], "unbalanced ** marker")
+
+    def test_plain_text_is_untouched(self):
+        """The control — without it this class passes on a renderer that
+        mangles every string."""
+        runs = notion_page._rich("아무 표시도 없는 문장")
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["text"]["content"], "아무 표시도 없는 문장")
+
+    def test_no_marker_survives_onto_an_attention_bullet(self):
+        payload = {
+            "generated_at": "2026-08-27T09:00:00+09:00",
+            "attention": ["Notion이 정상이라는 뜻이 **아니다** — `run_company_ops.py`"],
+            "blocks": [], "window": {"since": None, "until": None},
+            "model": {
+                "schema_version": "1.2",
+                "generated_at": "2026-08-27T09:00:00+09:00",
+                "events_read": 1,
+                "coverage": {"complete": True, "history_checked": True,
+                             "evidence_from": "2026-08-01",
+                             "evidence_to": "2026-08-07",
+                             "unreadable": 0, "duplicates": 0},
+                "unreadable": [], "panels": _panels(),
+            },
+        }
+        blocks, _ = build_control_tower_blocks(payload)
+        bullets = [
+            b for b in blocks
+            if b.get("type") == "bulleted_list_item"
+            and any(
+                "아니다" in (r.get("text") or {}).get("content", "")
+                for r in b["bulleted_list_item"]["rich_text"]
+            )
+        ]
+
+        self.assertEqual(len(bullets), 1, "the ATTENTION line did not render")
+        runs = bullets[0]["bulleted_list_item"]["rich_text"]
+        joined = "".join(r["text"]["content"] for r in runs)
+        self.assertNotIn("**", joined)
+        self.assertNotIn("`", joined)
+        self.assertTrue(any(r["annotations"]["bold"] for r in runs))
+        self.assertTrue(any(r["annotations"]["code"] for r in runs))
+
+
+class ThePageSpeaksToAReaderNotAFieldNameTests(unittest.TestCase):
+    """C134. The Notion tables carried the Model's field names as headers.
+
+    Measured on the published page: `display_name`, `blocked_project_count`,
+    `days_silent`, `evidence_count` were column headings, every panel ended
+    with `이 표에 싣지 않은 열: key, derived_from`, and every heading carried
+    the internal panel key (`Project  ·  PROJECTS`). The map that translates
+    them existed — in `dashboard_server.py`, an entrypoint this module
+    cannot import.
+    """
+
+    def _blocks(self):
+        payload = {
+            "generated_at": "2026-08-27T09:00:00+09:00",
+            "attention": [], "blocks": [],
+            "window": {"since": None, "until": None},
+            "model": {
+                "schema_version": "1.2",
+                "generated_at": "2026-08-27T09:00:00+09:00",
+                "events_read": 3,
+                "coverage": {"complete": True, "history_checked": True,
+                             "evidence_from": "2026-08-01",
+                             "evidence_to": "2026-08-07",
+                             "unreadable": 0, "duplicates": 0},
+                "unreadable": [], "panels": _panels(),
+            },
+        }
+        return build_control_tower_blocks(payload)[0]
+
+    def test_no_field_name_is_used_as_a_column_heading(self):
+        text = "\n".join(_all_text(self._blocks()))
+
+        for field in ("display_name", "blocked_project_count", "days_silent",
+                      "evidence_count", "derived_from", "project_id"):
+            with self.subTest(field=field):
+                self.assertNotIn(field, text)
+
+    def test_no_panel_key_is_shown_beside_its_title(self):
+        text = "\n".join(_all_text(self._blocks()))
+
+        for key in ("PROJECTS", "COMPLETIONS", "METRICS", "DESKTOPS"):
+            with self.subTest(key=key):
+                self.assertNotIn(f"·  {key}", text)
+
+    def test_the_labels_are_the_ones_the_browser_page_uses(self):
+        """One map, two renderers. A label that drifted would give the same
+        column two names depending on which screen a reader opened."""
+        import importlib
+
+        from controltower import columns
+
+        dashboard_server = importlib.import_module("dashboard_server")
+
+        self.assertIs(dashboard_server._COLUMN_LABELS, columns.LABELS)
+
+
+class AZeroIsNeverAVerdictOverNoEvidenceTests(unittest.TestCase):
+    """C134. `열려 있는 Blocker  0  정상` on a machine with no Events.
+
+    Both fields are true and the sentence is false about the company: there
+    are no Blockers because there are no Events, not because anyone cleared
+    them. C77 removed this conversion from the coverage banner; C133 folded
+    that banner into ⑦ on the browser page, which made the KPI tiles the
+    first place a reader meets the zeros. The guard belongs with the
+    verdict.
+    """
+
+    def test_an_empty_corpus_withholds_every_verdict(self):
+        from controltower import verdict
+
+        for key in ("open_blockers", "teams_silent", "events"):
+            with self.subTest(metric=key):
+                word, tone = verdict.metric_verdict(key, 0, measured=False)
+
+                self.assertEqual(word, "판정 보류")
+                self.assertEqual(tone, "info")
+
+    def test_the_same_metric_is_judged_once_there_is_evidence(self):
+        """The control. Without it the check above passes on a module that
+        never judges anything."""
+        from controltower import verdict
+
+        self.assertEqual(
+            verdict.metric_verdict("open_blockers", 0, measured=True),
+            ("정상", "ok"),
+        )
+        self.assertEqual(
+            verdict.metric_verdict("open_blockers", 2, measured=True)[1], "warn"
+        )
+
+    def test_the_notion_page_says_the_zeros_are_not_an_answer(self):
+        payload = {
+            "generated_at": "2026-08-27T09:00:00+09:00",
+            "attention": [], "blocks": [],
+            "window": {"since": None, "until": None},
+            "model": {
+                "schema_version": "1.2",
+                "generated_at": "2026-08-27T09:00:00+09:00",
+                "events_read": 0,
+                "coverage": {"complete": True, "history_checked": True,
+                             "evidence_from": None, "evidence_to": None,
+                             "unreadable": 0, "duplicates": 0},
+                "unreadable": [], "panels": _panels(rows=False),
+            },
+        }
+        blocks, _ = build_control_tower_blocks(payload)
+        text = "\n".join(_all_text(blocks))
+
+        self.assertIn("셀 Event가 없다", text)
+        self.assertIn("판정 보류", text)
+        self.assertNotIn("0   정상", text)
+
+    def test_the_browser_page_withholds_them_too(self):
+        """Two surfaces, one rule — the whole reason it moved into
+        `controltower/verdict.py`."""
+        import importlib
+
+        dashboard_server = importlib.import_module("dashboard_server")
+
+        self.assertEqual(
+            dashboard_server._kpi_verdict("open_blockers", 0, measured=False),
+            ("판정 보류", "info"),
+        )
+
+
+def _panels(rows: bool = True):
+    """The Model's panels, in the shape `to_payload()` produces."""
+    def rowset(values):
+        return [{"values": v, "evidence": [], "evidence_count": 1} for v in values] if rows else []
+
+    return [
+        {"key": "METRICS", "title": "KPI", "status": "SOURCED",
+         "columns": ["key", "label", "value", "derived_from", "evidence_count"],
+         "rows": [
+             {"values": {"key": k, "label": lab, "value": 0,
+                         "derived_from": "…"}, "evidence": [], "evidence_count": 1}
+             for k, lab in (
+                 ("events", "기록된 Event"),
+                 ("projects_active", "움직인 Project"),
+                 ("milestones_completed", "완료된 Milestone"),
+                 ("open_blockers", "열려 있는 Blocker"),
+                 ("teams_silent", "조용한 Team"),
+             )
+         ]},
+        {"key": "RISKS", "title": "Risk / Blocker", "status": "SOURCED",
+         "columns": ["kind", "project_id", "team", "blocker", "days_open"],
+         "rows": rowset([{"kind": "OPEN_BLOCKER", "project_id": "P",
+                          "team": "CTO_BACKEND", "blocker": "b", "days_open": 2}])},
+        {"key": "PROJECTS", "title": "Project", "status": "SOURCED",
+         "columns": ["project_id", "state", "blocker", "days_blocked",
+                     "days_idle", "last_seen"],
+         "rows": rowset([{"project_id": "P", "state": "ACTIVE", "blocker": None,
+                          "days_blocked": None, "days_idle": 1,
+                          "last_seen": "2026-08-07T09:00:00+09:00"}])},
+        {"key": "TEAMS", "title": "팀별 진행현황", "status": "SOURCED",
+         "columns": ["display_name", "events", "projects",
+                     "blocked_project_count", "last_seen"],
+         "rows": rowset([{"display_name": "CTO Backend", "events": 3,
+                          "projects": 1, "blocked_project_count": 0,
+                          "last_seen": "2026-08-07T09:00:00+09:00"}])},
+        {"key": "DESKTOPS", "title": "Desktop", "status": "SOURCED",
+         "columns": ["source", "display_name", "events", "last_seen",
+                     "days_silent"],
+         "rows": rowset([{"source": "DESKTOP_1", "display_name": "CTO Backend",
+                          "events": 3, "last_seen": "2026-08-07T09:00:00+09:00",
+                          "days_silent": 1}])},
+        {"key": "ACTIVITY", "title": "최근 활동", "status": "SOURCED",
+         "columns": ["at", "source", "team", "project_id", "event_type",
+                     "summary"],
+         "rows": rowset([{"at": "2026-08-07T09:00:00+09:00",
+                          "source": "DESKTOP_1", "team": "CTO_BACKEND",
+                          "project_id": "P", "event_type": "STARTED",
+                          "summary": "s"}])},
+        {"key": "COMPLETIONS", "title": "최근 완료", "status": "SOURCED",
+         "columns": ["at", "source", "team", "project_id", "event_type",
+                     "summary"],
+         "rows": rowset([{"at": "2026-08-07T09:00:00+09:00",
+                          "source": "DESKTOP_1", "team": "CTO_BACKEND",
+                          "project_id": "P", "event_type": "COMPLETED",
+                          "summary": "s"}])},
+        {"key": "SPRINTS", "title": "Sprint / Task", "status": "UNSOURCED",
+         "columns": [], "rows": [], "unsourced_layers": ["SPRINT", "TASK"],
+         "note": "이 시스템에는 원천이 없다."},
+    ]
 
 
 class AZeroIsNeverAVerdictTests(unittest.TestCase):
@@ -425,6 +839,49 @@ class ADatabaseCanCarryItsOwnSummaryTests(unittest.TestCase):
             i["text"]["content"]
             for i in build_database_summary(payload or _payload())
         )
+
+    def test_only_real_blockers_are_counted_as_blockers(self):
+        """C134. `RISKS` is a union of three row shapes and this summary
+        counted all of them.
+
+        Measured: one `OPEN_BLOCKER` beside two `ROLE_MISMATCH` rows
+        rendered `열린 Blocker 3` — on the paragraph Notion shows under the
+        database title, which is the first thing a person sees when they
+        open the workspace. Overstating a blocker count is the direction
+        that costs someone an afternoon: they go looking for two projects
+        that are not stuck.
+        """
+        payload = _payload()
+        panels = payload["model"]["panels"]
+        risks = next(p for p in panels if p["key"] == "RISKS")
+        risks["rows"] = [
+            {"values": {"kind": "OPEN_BLOCKER", "project_id": "P1",
+                        "team": "CTO_BACKEND", "blocker": "b", "days_open": 3},
+             "evidence": [], "evidence_count": 1},
+            {"values": {"kind": "ROLE_MISMATCH", "event_id": "E1",
+                        "source": "DESKTOP_1", "claimed_role": "CMO",
+                        "expected_role": "CTO_BACKEND"},
+             "evidence": [], "evidence_count": 1},
+            {"values": {"kind": "EVENT_ID_CONFLICT", "event_id": "E2",
+                        "kept": "a.json", "ignored": "b.json"},
+             "evidence": [], "evidence_count": 1},
+        ]
+
+        text = self._text(payload)
+
+        self.assertIn("열린 Blocker 1", text)
+        self.assertNotIn("열린 Blocker 3", text)
+
+    def test_a_risk_free_period_reports_no_blockers(self):
+        """The control. Without it the check above passes on a summary that
+        hardcodes 1."""
+        payload = _payload()
+        risks = next(
+            p for p in payload["model"]["panels"] if p["key"] == "RISKS"
+        )
+        risks["rows"] = []
+
+        self.assertIn("열린 Blocker 0", self._text(payload))
 
     def test_the_summary_names_the_attention_count(self):
         text = self._text(_payload(attention=["a", "b", "c"]))
@@ -1438,6 +1895,12 @@ class TheWorkspacePageRanksItsAlertsTooTests(unittest.TestCase):
                 "generated_at": "2026-08-27T10:00:00+09:00", "events_read": 0}
 
     def _texts(self, blocks):
+        """One string per block, depth-first, in document order.
+
+        Recursive for the reason `_all_text()` is (C134): a toggle heading's
+        section is a `children` list, and a helper that could not see into
+        one would report the page as missing sections it renders.
+        """
         out = []
         for block in blocks:
             body = block.get(block.get("type")) or {}
@@ -1448,6 +1911,11 @@ class TheWorkspacePageRanksItsAlertsTooTests(unittest.TestCase):
                     for item in (body.get("rich_text") or ())
                 )
             )
+            children = [
+                c for c in (body.get("children") or ())
+                if (c.get("table_row") or {}).get("cells") is None
+            ]
+            out.extend(self._texts(children))
         return out
 
     def test_a_stopped_pipeline_is_listed_above_a_quiet_desktop(self):
@@ -1493,6 +1961,66 @@ class TheWorkspacePageRanksItsAlertsTooTests(unittest.TestCase):
 
         self.assertTrue(bullets[0].startswith("[?]"), bullets)
         self.assertIn("분류 불가", bullets[0])
+
+    def test_every_bullet_says_what_to_do_about_it(self):
+        """C133. The list described conditions and prescribed nothing.
+
+        The browser page grew a 다음 행동 line for every item; a remedy that
+        reached only the local screen would leave the surface the *company*
+        reads with the descriptions and none of the actions.
+        """
+        blocks, _ = build_control_tower_blocks(
+            self._payload([
+                "Runner가 9일째 실행되지 않았다",
+                "3일 이상 아무것도 오지 않은 Desktop: X",
+                "무엇인지 알 수 없는 새 경보",
+            ])
+        )
+        bullets = [t for t in self._texts(blocks) if t.startswith("[")]
+
+        self.assertEqual(len(bullets), 3)
+        for bullet in bullets:
+            with self.subTest(bullet=bullet[:24]):
+                self.assertIn("다음 행동:", bullet)
+
+    def test_an_unclassified_line_admits_it_has_no_remedy(self):
+        """The pair. Inventing a remedy for a line nothing classified is the
+        failure `?` exists to prevent one field over."""
+        blocks, _ = build_control_tower_blocks(
+            self._payload(["무엇인지 알 수 없는 새 경보"])
+        )
+        bullet = [t for t in self._texts(blocks) if t.startswith("[")][0]
+
+        self.assertIn("정해 두지 않았다", bullet)
+
+    def test_the_remedy_survives_the_rich_text_limit(self):
+        """`_text()` trims from the right and the remedy is on the right.
+
+        Nothing upstream bounds `blocker` or `summary` (docs/02 gives them no
+        maximum) and those strings are quoted into ATTENTION lines, so a line
+        past 2,000 characters is reachable. Before the body was trimmed to
+        fit, this bullet ended `…` with the whole 다음 행동 sentence gone.
+        """
+        long_line = "Runner가 9일째 실행되지 않았다 " + "가" * 3000
+        blocks, _ = build_control_tower_blocks(self._payload([long_line]))
+        bullet = [t for t in self._texts(blocks) if t.startswith("[")][0]
+
+        self.assertLessEqual(len(bullet), RICH_TEXT_LIMIT)
+        self.assertIn("다음 행동:", bullet)
+        self.assertTrue(bullet.rstrip().endswith("."), bullet[-60:])
+        # And the cut is announced rather than silent.
+        self.assertIn("…", bullet)
+
+    def test_a_short_line_is_not_trimmed(self):
+        """The control. Without it the class above would pass on a renderer
+        that truncated every bullet."""
+        blocks, _ = build_control_tower_blocks(
+            self._payload(["Runner가 9일째 실행되지 않았다"])
+        )
+        bullet = [t for t in self._texts(blocks) if t.startswith("[")][0]
+
+        self.assertIn("Runner가 9일째 실행되지 않았다 →", bullet)
+        self.assertNotIn("…", bullet)
 
     def test_the_callout_names_the_p1_count(self):
         blocks, _ = build_control_tower_blocks(

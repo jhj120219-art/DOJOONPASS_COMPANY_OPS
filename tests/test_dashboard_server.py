@@ -450,15 +450,101 @@ class TheScreenShowsTheModelsOwnNumbersTests(PageTestCase):
         )
 
         self.assertTrue(metrics["rows"])
-        for row in metrics["rows"]:
+        # The tile strip first, then split on the tile boundary. Matching a
+        # closing-tag pair was what broke: C133 moved `derived_from` off the
+        # tile, which changed which `</div></div>` came last and silently
+        # re-pointed the pattern at a different span. Bounding the strip also
+        # stops the final tile's segment running to the end of the document,
+        # where an assertion about it could be satisfied by another section.
+        strip = re.search(r"<section class='kpis'>(.*?)</section>", page, re.S)
+        self.assertIsNotNone(strip)
+        tiles = re.split(r"<div class='kpi ", strip.group(1))[1:]
+        self.assertEqual(len(tiles), len(metrics["rows"]), tiles)
+        for row, tile in zip(metrics["rows"], tiles):
             with self.subTest(metric=row["values"]["key"]):
                 value = row["values"]["value"]
                 label = row["values"]["label"]
-                self.assertIn(
-                    f"<div class='kpi-value'>{value}</div>"
-                    f"<div class='kpi-label'>{label}</div>",
-                    page,
-                )
+
+                self.assertIn(f"<span class='kpi-value'>{value}</span>", tile)
+                self.assertIn(f"<div class='kpi-label'>{label}</div>", tile)
+
+    def test_a_kpi_with_a_direction_says_which_way_is_good(self):
+        """C133. Nine bare counts made the reader supply nine judgements.
+
+        Three of the nine have a direction and get 정상 / 주의. The other six
+        are volume -- a quiet week really is a quiet week -- and they say
+        참고 in a word rather than being left ambiguous between "healthy"
+        and "nobody measured". Painting those amber would have taught an
+        operator to ignore amber.
+        """
+        self.put("E1")
+
+        page = self.page()
+        # Scoped to the KPI strip. The NOW tiles carry the same class -- the
+        # whole point of that class is that one vocabulary covers the page --
+        # so a page-wide count measures both strips and belongs to neither.
+        strip = re.search(r"<section class='kpis'>(.*?)</section>", page, re.S)
+        self.assertIsNotNone(strip)
+        words = re.findall(
+            r"<span class='verdict-word (\w+)'>([^<]*)</span>", strip.group(1)
+        )
+        metrics = next(
+            p for p in self.payload()["panels"] if p["key"] == "METRICS"
+        )
+
+        self.assertEqual(len(words), len(metrics["rows"]))
+        for row, (tone, word) in zip(metrics["rows"], words):
+            key = row["values"]["key"]
+            with self.subTest(metric=key):
+                if key in dashboard_server._KPI_LOWER_IS_BETTER:
+                    self.assertIn(word, ("정상", "주의", "판정 불가"))
+                    self.assertNotEqual(tone, "info")
+                else:
+                    self.assertEqual(word, "참고")
+                    self.assertEqual(tone, "info")
+
+    def test_both_surfaces_say_the_same_word_for_the_same_state(self):
+        """C134. The words existed twice — here and in the Notion renderer —
+        and the project's own dead-capability inventory is what caught it:
+        `verdict.shape()` was defined and never called, which is what "the
+        rule moved and the caller did not" looks like from the outside.
+
+        A reader moving between the browser page and the Notion page must
+        not have to learn two vocabularies for one company.
+        """
+        from controltower import verdict
+
+        self.assertEqual(
+            dashboard_server._VERDICTS,
+            {tone: (verdict.shape(tone), verdict.word(tone))
+             for tone in verdict.STATES},
+        )
+        # ...and the three states are the three this project uses, so a
+        # fourth added upstream has to be decided about rather than
+        # appearing silently.
+        self.assertEqual(
+            sorted(verdict.STATES), ["bad", "info", "ok", "warn"]
+        )
+
+    def test_every_state_carries_a_word_a_shape_and_an_emoji(self):
+        """Colour is the third carrier, never the only one — and the Notion
+        surface has no shapes, so it needs its own mark."""
+        from controltower import verdict
+
+        for tone in verdict.STATES:
+            with self.subTest(tone=tone):
+                self.assertTrue(verdict.word(tone).strip())
+                self.assertTrue(verdict.shape(tone).strip())
+                self.assertTrue(verdict.emoji(tone).strip())
+                self.assertTrue(verdict.colour(tone).endswith("_background"))
+
+    def test_the_directional_metrics_are_the_ones_that_can_be_bad(self):
+        """Guards the guard. The set above is written by hand, and a metric
+        added upstream would otherwise be silently filed as 참고 forever."""
+        self.assertEqual(
+            dashboard_server._KPI_LOWER_IS_BETTER,
+            frozenset({"open_blockers", "teams_silent", "desktop_role_mismatches"}),
+        )
 
     def test_a_kpi_carries_the_number_of_files_it_was_counted_from(self):
         """`Metric` declares that an untraceable number is a rumour. A tile
@@ -500,8 +586,37 @@ class TheScreenShowsTheModelsOwnNumbersTests(PageTestCase):
 
         page = self.page()
 
-        self.assertIn("class='state bad'>BLOCKED", page)
-        self.assertIn("class='state bad'>OPEN_BLOCKER", page)
+        # `assertRegex`, not a literal: C133 added a second class to these
+        # cells (`tok`, which stops `overflow-wrap:anywhere` splitting a
+        # state word down the middle), and a test that pins the exact
+        # attribute string is asserting the class list rather than the
+        # property — the mistake `days_silent` already recorded one class up.
+        self.assertRegex(page, r"class='state bad[^']*'>BLOCKED")
+        self.assertRegex(page, r"class='state bad[^']*'>OPEN_BLOCKER")
+
+    def test_a_short_state_word_is_never_split_down_the_middle(self):
+        """C133. `overflow-wrap:anywhere` lets a browser compute a cell's
+        min-content as one character, so a fifteen-column table compresses
+        until short words break too. Measured at 1440px on a probe tree:
+        `IN_PROGRESS` rendered `IN_PROG` / `RESS`, `COMPLETE` as `COMPL` /
+        `ETE` — the words a reader scans the table for."""
+        self.put("B1", project="P0", day=14, event_type="BLOCKED",
+                 status="BLOCKED", blocker="waiting on approval")
+
+        page = self.page()
+
+        self.assertIn("td.state,td.tok{white-space:nowrap}", page)
+        # The fixture's own state word carries the class on the real page.
+        self.assertRegex(page, r"class='[^']*\btok\b[^']*'>BLOCKED")
+
+    def test_a_long_identifier_still_wraps(self):
+        """The pair, and the reason `_TOKEN` is bounded at 24 characters.
+        Without the bound this would undo C129: one long id sets the table's
+        width and pushes every later column off-screen."""
+        long_id = "P" + "X" * 60
+
+        self.assertNotIn("tok", dashboard_server._cell("project_id", long_id))
+        self.assertIn("tok", dashboard_server._cell("status", "IN_PROGRESS"))
 
     def test_a_missing_value_is_a_dash_and_never_a_blank(self):
         """Blank reads as "nothing to say". This project spends a great deal
@@ -1367,11 +1482,62 @@ class ThePageSurvivesWhatItCannotBuildTests(PageTestCase):
         self.assertIsNotNone(data["model"])
         self.assertEqual(len(data["blocks"]), len(dashboard_server._BLOCKS))
 
+    def test_a_failed_model_is_not_reported_as_a_company_with_no_events(self):
+        """C133. `render_html` keeps the operational half alive when
+        `build_dashboard()` raises — deliberately, because the day the model
+        raises is a day an operator still needs LAST RUN. The NOW section
+        then rendered every model-derived tile as if the model had answered
+        **zero**.
+
+        Measured on the failure path before this: the headline read
+        `셀 Event가 없다 — '문제 없음'이 아니라 '판단할 증거가 없다'`, the Blocker
+        tile read `0건 정상`, and the Project tile read `이 기간에 움직인
+        Project가 없다`. Three claims about the company, from a computation
+        that failed.
+        """
+        page = dashboard_server.render_html(
+            {
+                "generated_at": NOW.isoformat(),
+                "attention": [], "blocks": [],
+                "model": None, "model_error": "boom",
+                "build_ms": 1, "window": {"since": None, "until": None},
+            }
+        )
+
+        self.assertIn("Model을 만들지 못했다", page)
+        self.assertNotIn("셀 Event가 없다", page)
+        self.assertNotIn("0건<span class='verdict-word ok'>정상</span>", page)
+        self.assertNotIn("이 기간에 움직인 Project가 없다", page)
+        self.assertIn("Model을 만들지 못해 셀 수 없었다", page)
+
+    def test_a_failed_model_still_lets_the_attention_list_decide(self):
+        """The pair. The ATTENTION list comes from `ops_status.py`'s own
+        renderers, which ran — a model that could not be built does not make
+        those findings go away, and burying a P1 behind "모델을 못 만들었다"
+        would be the worse failure."""
+        page = dashboard_server.render_html(
+            {
+                "generated_at": NOW.isoformat(),
+                "attention": ["Runner가 9일째 실행되지 않았다"],
+                "blocks": [], "model": None, "model_error": "boom",
+                "build_ms": 1, "window": {"since": None, "until": None},
+            }
+        )
+
+        self.assertIn("<span class='v-word'>조치 필요</span>", page)
+        self.assertIn("ATTENTION 1건은 그대로 유효하다", page)
+        self.assertIn("python run_company_ops.py", page)
+
     def test_the_verdict_follows_the_attention_list(self):
         self.put("E1")
 
-        self.assertIn("이상 없음", self.page(attention=[]))
-        self.assertIn("ATTENTION 2건", self.page(attention=["a", "b"]))
+        clear = self.page(attention=[])
+        self.assertIn("<span class='v-word'>정상</span>", clear)
+        self.assertIn("지금 할 일 없음", clear)
+
+        busy = self.page(attention=["a", "b"])
+        self.assertIn("ATTENTION 2건", busy)
+        self.assertNotIn("<span class='v-word'>정상</span>", busy)
 
     def test_an_empty_attention_list_says_so_rather_than_saying_nothing(self):
         self.put("E1")
@@ -1845,6 +2011,72 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
                     continue
                 self.assertIn(f"<span class='pkey'>{panel['key']}</span>", page)
 
+    def test_no_panel_is_drawn_twice(self):
+        """C133 added a third roster — `_PANEL_PLACEMENT`, which routes each
+        panel to one of five regions. A key listed in two regions, or a
+        region rendered twice, duplicates a panel; a reader then meets the
+        same table in two places and cannot tell whether they are the same
+        instant. The page said `<h2>패널</h2>` once before this and could
+        not have the problem."""
+        page = self.page()
+        keys = re.findall(r"<span class='pkey'>([A-Z_]+)</span>", page)
+
+        self.assertEqual(sorted(keys), sorted(set(keys)), keys)
+
+    def test_every_panel_lands_in_exactly_one_region(self):
+        """The routing itself, checked against the model rather than against
+        the map: a panel added upstream must be placed, not dropped."""
+        panels = self.payload()["panels"]
+        regions = {}
+        for panel in panels:
+            regions.setdefault(dashboard_server.panel_placement(panel), []).append(
+                panel["key"]
+            )
+
+        placed = sorted(k for keys in regions.values() for k in keys)
+        self.assertEqual(placed, sorted(p["key"] for p in panels))
+        self.assertEqual(regions["KPI"], ["METRICS"])
+        self.assertIn("PROJECTS", regions["PROJECTS"])
+
+    def test_a_panel_this_page_has_never_heard_of_is_still_shown(self):
+        """`EVIDENCE`, not nowhere. An unknown panel is one nobody has
+        decided about, and dropping it would make adding a panel upstream a
+        silent no-op on the only surface a person reads."""
+        placement = dashboard_server.panel_placement(
+            {"key": "SOMETHING_NEW", "status": "SOURCED", "rows": [{"values": {}}]}
+        )
+
+        self.assertEqual(placement, "EVIDENCE")
+
+    def test_an_empty_risk_table_is_not_left_at_the_top_of_the_screen(self):
+        """`RISKS` moves between the first region and the last depending on
+        whether it has rows. An open Blocker is priority ①; an empty Risk
+        table is the sentence "이 기간의 증거에 이 항목이 하나도 없었다", and a
+        clean company that always carried a red empty box would learn to
+        ignore the box."""
+        empty = {"key": "RISKS", "status": "SOURCED", "rows": []}
+        full = {"key": "RISKS", "status": "SOURCED", "rows": [{"values": {}}]}
+
+        self.assertEqual(dashboard_server.panel_placement(empty), "EVIDENCE")
+        self.assertEqual(dashboard_server.panel_placement(full), "ACTION")
+
+    def test_the_blocker_section_is_never_behind_a_disclosure(self):
+        """The rule this whole redesign is measured against: P1 / Blocker /
+        승인 필요 must not be collapsed."""
+        self.put("B2", project="P2", day=15, event_type="BLOCKED",
+                 status="BLOCKED", blocker="waiting on a vendor")
+        page = self.page()
+
+        self.assertIn("<section class='blockers'", page)
+        # No *unclosed* `<details>` above it — i.e. it is not nested inside
+        # one. Counted from `</style>` onward: `_CSS`'s own comments mention
+        # `<details>` twice, and counting those made this measure the
+        # stylesheet rather than the document.
+        body = page[page.index("</style>") :]
+        head = body[: body.index("<section class='blockers'")]
+
+        self.assertEqual(head.count("<details"), head.count("</details>"), head[-400:])
+
     def test_the_panel_order_names_only_panels_that_exist(self):
         keys = {p["key"] for p in self.payload()["panels"]}
 
@@ -2079,6 +2311,157 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
         self.assertIn("<code>코드</code>", page)
         self.assertNotIn("<script>x", page)
 
+    def test_every_line_carries_what_to_do_about_it(self):
+        """C133. The list described conditions and prescribed nothing.
+
+        The portfolio-reporting rule this was measured against is explicit:
+        every red or amber entry needs one line saying what happens next.
+        Before this, none of the eleven had one.
+        """
+        page = dashboard_server.render_html(
+            _bare_payload(attention=[
+                "Runner가 9일째 실행되지 않았다",
+                "3일 이상 아무것도 오지 않은 Desktop: X",
+            ])
+        )
+
+        self.assertEqual(page.count("<b>다음 행동</b>"), 2)
+        self.assertIn("python run_company_ops.py", page)
+        self.assertIn("python run_agent.py", page)
+
+    def test_an_unclassified_line_admits_it_has_no_remedy(self):
+        """Inventing a remedy for a line nothing classified is the failure
+        `?` exists to prevent one field over."""
+        page = dashboard_server.render_html(
+            _bare_payload(attention=["무엇인지 알 수 없는 새 경보"])
+        )
+
+        self.assertIn("att-do none", page)
+        self.assertIn("정해 두지 않았다", page)
+
+    def test_the_remedy_is_never_folded_behind_the_p2_disclosure(self):
+        """An item worth showing is an item worth showing the remedy for."""
+        long_p2 = "3일 이상 아무것도 오지 않은 Desktop: " + "X" * 400
+        page = dashboard_server.render_html(_bare_payload(attention=[long_p2]))
+
+        head = page[: page.index("<details class='more'>")]
+        self.assertIn("전체 보기", page)
+        self.assertNotIn("<b>다음 행동</b>", head)
+        # ...and it is outside the disclosure, after it, not inside.
+        disclosure = page[
+            page.index("<details class='more'>") : page.index("</details>")
+        ]
+        self.assertNotIn("<b>다음 행동</b>", disclosure)
+        self.assertIn("<b>다음 행동</b>", page)
+
+    def test_every_rule_the_module_classifies_has_a_remedy(self):
+        """Guards the guard. A phrase added to `RULES` with no entry in
+        `ACTIONS` classifies a line and then tells its reader nothing, which
+        is worse than leaving it `?` — the badge would claim the screen
+        understood the line."""
+        from controltower import attention as attention_module
+
+        for phrase, level, _why in attention_module.RULES:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, attention_module.ACTIONS)
+                self.assertTrue(attention_module.ACTIONS[phrase].strip())
+
+    def test_the_conditions_the_probe_tree_exposed_are_classified(self):
+        """C133. Four real conditions fell through as `?`.
+
+        Measured on a probe tree with one blocked Project: 3 ATTENTION items,
+        2 of them `?`, and one of those was the open Blocker — the single
+        most actionable line this Dashboard shows, rendered as "이 화면이
+        분류하지 못한 줄".
+        """
+        cases = {
+            "5일째 막혀 있는 Project: P [CTO Backend] — waiting on a vendor": "P2",
+            "같은 event_id를 두고 내용이 다른 파일이 둘 있다: E1": "P1",
+            "Desktop과 role이 어긋난 Event: E1 — DESKTOP_1에서 왔는데": "P2",
+            "작업일은 3일 이상 지났지만 최근 파일이 도착한 Desktop: D "
+            "(꺼져 있다가 밀린 분을 보낸 것으로 보인다 — Agent는 살아 있다)": "P2",
+            "사람 검토를 기다리는 History Candidate 2건": "P2",
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line[:26]):
+                level, why = dashboard_server.attention_severity(line)
+
+                self.assertEqual(level, expected)
+                self.assertTrue(why)
+                self.assertTrue(dashboard_server._attention_action(line))
+
+    def test_every_shape_ops_status_can_raise_is_classified_and_actionable(self):
+        """The whole roster, not a sample.
+
+        `ops_status.py` builds these lines by f-string concatenation across
+        several source lines, so grepping the file for a phrase does not
+        prove the phrase reaches the classifier — the assembled string does.
+        These are the assembled shapes. Before C133 four of the eleven came
+        out `?`, including the open Blocker, which is the most actionable
+        line this Dashboard shows.
+
+        Ordering is checked implicitly and it matters: `RULES` is
+        first-match-wins with P1 listed first, so a P2 shape that happens to
+        contain a P1 phrase would be escalated. That direction is safe; the
+        reverse would not be, and this is what would notice.
+        """
+        cases = {
+            "OPEN_BLOCKER": ("P2",
+                "5일째 막혀 있는 Project: P [CTO Backend] — waiting on a vendor "
+                "(증거 E1.json) — Blocker는 파이프라인이 스스로 지우지 않는다. 그 팀이 "
+                "RESUMED / ISSUE_RESOLVED / COMPLETED를 보고할 때까지 열려 있다"),
+            "OPEN_BLOCKER_TOTAL": ("P2",
+                "막혀 있는 Project 총 5건 — 위 3건 외 2건이 더 있다. Blocker는 "
+                "파이프라인이 스스로 지우지 않으므로 이 수는 줄지 않는다"),
+            "EVENT_ID_CONFLICT": ("P1",
+                "같은 event_id를 두고 내용이 다른 파일이 둘 있다: E1 — Control Tower는 "
+                "a를 세었고 b는 세지 않았다"),
+            "ROLE_MISMATCH": ("P2",
+                "Desktop과 role이 어긋난 Event: E1 — DESKTOP_1에서 왔는데 role은 "
+                "CMO라고 말한다. 거부하지 않는 이유와 필요한 결정은 BACKLOG"),
+            "ROLE_MISMATCH_TOTAL": ("P2",
+                "Desktop과 role이 어긋난 Event 총 5건 — 위 3건 외 2건은 같은 종류다"),
+            "SILENT": ("P2",
+                "3일 이상 아무것도 오지 않은 Desktop: DESKTOP_1 (꺼져 있거나, 보고할 "
+                "일이 없었거나, Agent가 멈췄다)"),
+            "CAUGHT_UP": ("P2",
+                "작업일은 3일 이상 지났지만 최근 파일이 도착한 Desktop: DESKTOP_1 "
+                "(꺼져 있다가 밀린 분을 보낸 것으로 보인다 — Agent는 살아 있다)"),
+            "REVIEW_WAITING": ("P2",
+                "사람 검토를 기다리는 History Candidate 3건 "
+                "(runtime/history_candidates/review/) — docs/05 §24"),
+            "NOTION_UNEXERCISED": ("P2",
+                "Notion 자격증명이 전달돼 있지만 그것으로 Notion 단계를 시도한 실행이 "
+                "아직 없다 — run_company_ops.py를 한 번 실행해 확인해야 한다"),
+            "RUNNER_STALE": ("P1",
+                "Runner가 9일째 실행되지 않았다 (마지막 실행 2026-08-18)"),
+            "REJECTED": ("P1",
+                "Collector가 거부한 Event 2건 — 사람이 확인해야 한다"),
+            "E17": ("P1",
+                "KEEP Candidate 1건이 저장돼 있는데 그 날짜의 Daily History에 없다: E1"),
+        }
+        for name, (expected, line) in cases.items():
+            with self.subTest(shape=name):
+                level, why = dashboard_server.attention_severity(line)
+
+                self.assertEqual(level, expected, line[:60])
+                self.assertTrue(why, "classified with no stated reason")
+                self.assertTrue(
+                    dashboard_server._attention_action(line),
+                    "classified with no remedy",
+                )
+
+    def test_only_the_review_queue_asks_for_a_decision(self):
+        """The FIX / DECIDE split is narrow on purpose. `사람이 확인해야 한다`
+        is appended to fault lines too, so it does not separate the two —
+        the review queue does, because `docs/05 §24` forbids deciding those
+        automatically."""
+        review = "사람 검토를 기다리는 History Candidate 3건"
+        fault = "Collector가 거부한 Event 2건 — 사람이 확인해야 한다"
+
+        self.assertEqual(dashboard_server._attention_kind(review), "DECIDE")
+        self.assertEqual(dashboard_server._attention_kind(fault), "FIX")
+
     def test_severity_is_derived_not_stored(self):
         """Guards the guard: the rule table must actually discriminate."""
         self.assertEqual(
@@ -2143,6 +2526,19 @@ class TheCompanyLineSeparatesQuietFromEmptyTests(unittest.TestCase):
 
         self.assertEqual(self._verdict(page)[0], "warn")
 
+    def test_no_field_renders_as_the_word_none(self):
+        """C133. `overall_status` was spelled out with `str()` instead of
+        `_e()`, so a Run Manifest that carried no status put the literal
+        word `None` on the tile a five-second reader looks at first.
+        Measured with `ops={"run": {}}`. Every other value on the page goes
+        through `_e()`, which is where the em-dash-for-nothing rule lives."""
+        for ops in ({"run": {}}, {"run": {"days_ago": 0.2}}, {"agent": {}}):
+            with self.subTest(ops=ops):
+                page = dashboard_server.render_html(_bare_payload(ops=ops))
+
+                self.assertNotIn(">None<", page)
+                self.assertNotIn(">None ", page)
+
     def test_a_missing_record_is_not_a_zero(self):
         """`operational_facts()` answers `None` for a source it could not
         read, and the difference has to survive to the screen."""
@@ -2190,6 +2586,49 @@ class TheTwoNotionSyncsAreNeverOneStatusTests(unittest.TestCase):
         publish = page[page.index("Dashboard publish"):]
         self.assertIn("이 머신에 기록이 없다", publish)
         self.assertNotIn("2026-08-27T09:00:00+09:00", publish[:600])
+
+    def test_the_page_says_whether_this_process_can_see_the_credentials(self):
+        """C133, found by publishing to the live workspace.
+
+        Same instant, same company: the browser page said `ATTENTION 1건`
+        and the Notion page said `2건`. Neither was wrong —
+        `publish_control_tower.py` had been started from a shell with the
+        token exported and the server had not, so the NOTION block raised a
+        line in one process and not the other. Neither surface said which of
+        the two states it had rendered under, and two screens describing one
+        company must not be able to disagree in silence.
+        """
+        seen = self._page(notion_credentials=True)
+        blind = self._page(notion_credentials=False)
+
+        self.assertIn("이 프로세스에 전달됨", seen)
+        self.assertIn("이 프로세스에 없음", blind)
+        self.assertIn("ATTENTION은 그만큼 적을 수 있다", blind)
+
+    def test_a_credential_state_this_screen_could_not_read_is_not_a_no(self):
+        """`None` is not `False`. "이 프로세스에 없음" is a claim about the
+        environment; a screen that could not look has not made it."""
+        page = self._page()
+
+        self.assertIn("확인하지 못했다", page)
+        self.assertNotIn("이 프로세스에 없음", page)
+
+    def test_no_credential_value_can_reach_the_page(self):
+        """Whether, never what."""
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(
+            os.environ,
+            {"NOTION_API_TOKEN": "secret-token-value",
+             "NOTION_PROJECTS_DATABASE_ID": "secret-db-id"},
+        ):
+            facts = dashboard_server.operational_facts(NOW)
+
+        self.assertIs(facts["notion_credentials"], True)
+        page = dashboard_server.render_html(_bare_payload(ops=facts))
+        self.assertNotIn("secret-token-value", page)
+        self.assertNotIn("secret-db-id", page)
 
     def test_an_unreadable_queue_is_not_reported_as_empty(self):
         page = self._page(run={}, notion_queue=None, notion_pending=None)
@@ -2256,6 +2695,39 @@ class OneValueRepeatedIsNotAColumnTests(unittest.TestCase):
 
         self.assertEqual(kept, ["a", "b", "c"])
         self.assertEqual(folded, [])
+
+    def test_a_single_rows_empty_columns_still_fold(self):
+        """C133. `RISKS` is a union of three row shapes, so one open Blocker
+        cannot fill `claimed_role` / `expected_role` / `kept` / `ignored`.
+
+        Measured on a probe tree: one row, six columns of `—`, on the table
+        this page puts at the top. Those are not missing values — they are
+        columns that do not apply — and an always-empty column has nothing
+        in it to lose by folding.
+        """
+        kept, folded = dashboard_server._fold_constant_columns(
+            ["kind", "blocker", "claimed_role", "kept"],
+            [{"values": {"kind": "OPEN_BLOCKER", "blocker": "x",
+                         "claimed_role": None, "kept": ""}}],
+        )
+
+        self.assertEqual(kept, ["kind", "blocker"])
+        self.assertEqual(folded, [("claimed_role", None), ("kept", "")])
+
+    def test_a_single_rows_first_column_never_folds_even_when_empty(self):
+        """The row would lose the thing that identifies it."""
+        kept, _folded = dashboard_server._fold_constant_columns(
+            ["id", "b"], [{"values": {"id": None, "b": None}}]
+        )
+
+        self.assertEqual(kept, ["id"])
+
+    def test_the_note_covers_both_reasons_a_column_folded(self):
+        """It said "같은 값인 열" only, which is a false description of a
+        column that is empty in a one-row table."""
+        note = dashboard_server._folded_html([("claimed_role", None)], 1)
+
+        self.assertIn("비어 있는", note)
 
 
 class TimeAndWidthAreReadableTests(unittest.TestCase):

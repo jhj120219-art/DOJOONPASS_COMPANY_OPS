@@ -57,14 +57,19 @@ one gets its own sentence here; none of them is allowed to render as `0`.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from oplog import one_line, redact
 
+from . import verdict as _verdict
+from .attention import next_action as _attention_action
 from .attention import rank as _attention_rank
 from .attention import severity as _attention_severity
 from .attention import tally as _attention_tally
+from .columns import labels as _column_labels
 
 # ------------------------------------------------------------------ limits
 
@@ -101,7 +106,7 @@ MAX_TABLE_ROWS = 20
 #: readable, and `_panel_table()` states the ones it left out.
 PANEL_LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("RISKS", ("kind", "project_id", "team", "blocker", "days_open")),
-    ("PROJECTS", ("project_id", "status", "teams", "events", "last_seen", "days_idle")),
+    ("PROJECTS", ("project_id", "state", "blocker", "days_blocked", "days_idle", "last_seen")),
     ("TEAMS", ("display_name", "events", "projects", "blocked_project_count", "last_seen")),
     ("DESKTOPS", ("source", "display_name", "events", "last_seen", "days_silent")),
     ("METRICS", ("label", "value", "evidence_count")),
@@ -200,6 +205,49 @@ def _text(
     }
 
 
+#: `**bold**` and `` `code` `` — this project's convention, in one regex.
+#:
+#: Non-greedy and anchored on the markers themselves, so an unmatched
+#: marker is left alone as ordinary text rather than swallowing the rest of
+#: the line. `ops_status.py` writes balanced pairs; a truncated line may not,
+#: and the failure mode of a greedy match there is an entire alert rendered
+#: in bold.
+_MARKUP = re.compile(r"\*\*(.+?)\*\*|`(.+?)`", re.S)
+
+
+def _rich(content: str) -> list[dict[str, Any]]:
+    """`content` as Notion rich-text runs, honouring the markup in it.
+
+    Returns one run for plain stretches and one per emphasised span. The
+    total is what `RICH_TEXT_LIMIT` bounds per run — splitting cannot make a
+    single run longer than it was.
+
+    Nothing here can introduce emphasis the author did not write: the only
+    inputs that become annotations are the spans between their own markers.
+
+    **Which text gets this, and which deliberately does not.** It is applied
+    to the strings written in this project's convention — `ops_status.py`'s
+    ATTENTION lines, its NOTION block, and the Model's panel notes. It is
+    **not** applied to `blocker` or `summary`, which a person typed into a
+    Signal: an asterisk there is an asterisk they meant, and stripping it
+    would delete their text rather than render it.
+    """
+    runs: list[dict[str, Any]] = []
+    cursor = 0
+    for match in _MARKUP.finditer(content):
+        if match.start() > cursor:
+            runs.append(_text(content[cursor : match.start()]))
+        bold, code = match.group(1), match.group(2)
+        if bold is not None:
+            runs.append(_text(bold, bold=True))
+        else:
+            runs.append(_text(code, code=True))
+        cursor = match.end()
+    if cursor < len(content):
+        runs.append(_text(content[cursor:]))
+    return runs or [_text(content)]
+
+
 def _heading(content: str, level: int = 2) -> dict[str, Any]:
     key = f"heading_{level}"
     return {"object": "block", "type": key, key: {"rich_text": [_text(content)]}}
@@ -213,24 +261,52 @@ def _paragraph(content: str = "", *, link: str | None = None) -> dict[str, Any]:
     }
 
 
-def _bullet(content: str) -> dict[str, Any]:
+def _bullet(content: str, *, markup: bool = False) -> dict[str, Any]:
+    """One bullet. `markup=True` for text an author wrote in the project's
+    `**bold**` / `` `code` `` convention — ATTENTION lines and panel notes."""
     return {
         "object": "block",
         "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": [_text(content)]},
+        "bulleted_list_item": {
+            "rich_text": _rich(content) if markup else [_text(content)]
+        },
     }
 
 
-def _callout(content: str, emoji: str, colour: str) -> dict[str, Any]:
+def _callout(
+    content: str, emoji: str, colour: str, *, markup: bool = False
+) -> dict[str, Any]:
     return {
         "object": "block",
         "type": "callout",
         "callout": {
-            "rich_text": [_text(content)],
+            "rich_text": _rich(content) if markup else [_text(content)],
             "icon": {"type": "emoji", "emoji": emoji},
             "color": colour,
         },
     }
+
+
+def _toggle_heading(content: str, children: Sequence[dict[str, Any]], level: int = 3):
+    """A heading that reads as a heading and folds like a toggle.
+
+    `heading_N` with `is_toggleable: true`, which is how Notion itself
+    builds a collapsible section — verified against this workspace before
+    it was used, along with the two-level nesting a table inside one needs
+    (`heading_3 > table > table_row`). That check was not optional:
+    `publish()` archives the live page **before** it appends the new body,
+    so a block type the API refuses does not fail safely — it leaves the
+    company's Control Tower empty (the C113 shape).
+
+    Empty `children` would render a toggle that opens onto nothing, so the
+    caller gets a plain heading instead.
+    """
+    key = f"heading_{level}"
+    body: dict[str, Any] = {"rich_text": [_text(content)]}
+    if children:
+        body["is_toggleable"] = True
+        body["children"] = list(children)
+    return {"object": "block", "type": key, key: body}
 
 
 def _divider() -> dict[str, Any]:
@@ -304,17 +380,32 @@ def _absence_note(payload: Mapping[str, Any], panel: Mapping[str, Any]) -> str |
     return "해당 없음 — Event는 있으나 이 표에 들어갈 항목이 없다 (예: 열려 있는 Blocker 0건)."
 
 
-def _panel_table(payload: Mapping[str, Any], panel: Mapping[str, Any], columns: Sequence[str]):
-    """One panel as (blocks, warnings)."""
+def _panel_table(
+    payload: Mapping[str, Any],
+    panel: Mapping[str, Any],
+    columns: Sequence[str],
+    *,
+    heading: int | None = 3,
+):
+    """One panel as (blocks, warnings).
+
+    `heading=None` renders the table with no heading of its own, for a
+    caller that has already written one (a toggle heading, say).
+    """
     blocks: list[dict[str, Any]] = []
     warnings: list[str] = []
 
+    # The panel key is **not** in the heading any more (C134). `RISKS`,
+    # `COMPLETIONS`, `METRICS` are the Model's identifiers; on the surface
+    # this company's non-developers read they were noise beside a title
+    # that already said the same thing in Korean.
     title = str(panel.get("title") or panel.get("key"))
-    blocks.append(_heading(f"{title}  ·  {panel.get('key')}", 3))
+    if heading is not None:
+        blocks.append(_heading(title, heading))
 
     absence = _absence_note(payload, panel)
     if absence is not None:
-        blocks.append(_callout(absence, "⚪", "gray_background"))
+        blocks.append(_callout(absence, "⚪", "gray_background", markup=True))
         return blocks, warnings
 
     available = list(panel.get("columns") or [])
@@ -324,7 +415,11 @@ def _panel_table(payload: Mapping[str, Any], panel: Mapping[str, Any], columns: 
     visible = rows[:MAX_TABLE_ROWS]
 
     table_rows = [[_fmt((r.get("values") or {}).get(c)) for c in shown] for r in visible]
-    blocks.append(_table(shown, table_rows))
+    # Headers a person can read, not the Model's field names. Measured on
+    # the published page before C134: `display_name`, `blocked_project_count`,
+    # `days_silent`, `evidence_count` were the column headings on the one
+    # surface this company's non-developers read.
+    blocks.append(_table(_column_labels(shown), table_rows))
 
     if total > len(visible):
         blocks.append(
@@ -335,7 +430,11 @@ def _panel_table(payload: Mapping[str, Any], panel: Mapping[str, Any], columns: 
         )
     dropped = [c for c in available if c not in shown]
     if dropped:
-        blocks.append(_paragraph(f"이 표에 싣지 않은 열: {', '.join(dropped)}"))
+        # Named the way a reader would name them. This line used to print
+        # `key, derived_from` — internal identifiers — under every panel.
+        blocks.append(
+            _paragraph(f"이 표에 싣지 않은 열: {', '.join(_column_labels(dropped))}")
+        )
     return blocks, warnings
 
 
@@ -378,140 +477,169 @@ def build_control_tower_blocks(
     attention = list(payload.get("attention") or [])
     window = payload.get("window") or {}
 
-    # ---- 1. overall state -------------------------------------------------
+    panels = {p.get("key"): p for p in model.get("panels") or []}
+    layout = dict(PANEL_LAYOUT)
+
+    def metric(key: str):
+        """One METRICS row's value, or None when the Model did not carry it.
+
+        `None`, never 0. A number this page could not find is not a number
+        that measured zero, and every other honesty rule here depends on
+        that distinction holding.
+        """
+        panel = panels.get("METRICS")
+        for row in (panel or {}).get("rows") or []:
+            values = row.get("values") or {}
+            if values.get("key") == key:
+                return values.get("value")
+        return None
+
+    def metric_row(key: str):
+        panel = panels.get("METRICS")
+        for row in (panel or {}).get("rows") or []:
+            if (row.get("values") or {}).get("key") == key:
+                return row
+        return None
+
+    # ================================================== (1) STATUS
+    #
+    # One line, and it is the only thing a reader who has ten seconds will
+    # take away. Vocabulary from `controltower/verdict.py` so the browser
+    # page and this one cannot describe one company in two languages.
+    counts = _attention_tally(attention)
+    severe = counts.get("P1", 0) + counts.get("?", 0)
     if payload.get("model_error"):
-        blocks.append(
-            _callout(
-                "Control Tower 모델을 만들지 못했다 — 아래 운영 지표는 비어 있거나 "
-                # An exception message, which is authored text as surely
-                # as a blocker is: it routinely quotes the value that broke.
-                f"불완전하다: {_safe(payload['model_error'])}",
-                "\U0001f6d1",
-                "red_background",
-            )
+        tone = "bad"
+        headline = (
+            "Control Tower 모델을 만들지 못했다 — 아래 지표는 비어 있거나 "
+            # An exception message, which is authored text as surely as a
+            # blocker is: it routinely quotes the value that broke.
+            f"불완전하다: {_safe(payload['model_error'])}"
         )
         warnings.append("model_error present")
+    elif severe:
+        tone = "bad"
+        headline = (
+            f"{len(attention)}건, 그중 P1 {counts.get('P1', 0)}건"
+            + (f" · 미분류 {counts['?']}건" if counts.get("?") else "")
+            + " · 아래 ②를 위에서부터 읽는다."
+        )
     elif attention:
-        counts = _attention_tally(attention)
-        severe = counts.get("P1", 0) + counts.get("?", 0)
-        blocks.append(
-            _callout(
-                (
-                    f"주의 {len(attention)}건 — 그중 P1 {counts.get('P1', 0)}건"
-                    + (f" · 미분류 {counts['?']}건" if counts.get("?") else "")
-                    + ". 아래 ATTENTION을 위에서부터 읽는다."
-                )
-                if severe
-                else f"주의 {len(attention)}건 — 사람이 확인해야 할 항목이 있다.",
-                "⚠️",
-                "red_background" if severe else "orange_background",
-            )
+        tone = "warn"
+        headline = f"{len(attention)}건 · 사람이 확인해야 할 항목이 있다."
+    elif not model.get("events_read"):
+        # "할 일 없음"과 "셀 것이 없음"은 다르다. An empty corpus with an
+        # empty ATTENTION list is not a healthy company; it is a company
+        # nobody has evidence about, and the green callout said the first.
+        tone = "warn"
+        headline = (
+            "셀 Event가 없다 — '문제 없음'이 아니라 '판단할 증거가 없다'. "
+            "수집된 Event가 하나도 없어 아래 숫자는 전부 0이다."
         )
     else:
-        blocks.append(
-            _callout(
-                "ATTENTION 없음 — 자동 점검이 문제를 찾지 못했다. "
-                "이것은 '확인된 항목이 없다'는 뜻이며 회사가 잘 돌아간다는 뜻은 아니다.",
-                "✅",
-                "green_background",
-            )
+        tone = "ok"
+        headline = (
+            "ATTENTION 없음 — 자동 점검이 문제를 찾지 못했다. "
+            "이것은 '확인된 항목이 없다'는 뜻이며 회사가 잘 돌아간다는 뜻은 아니다."
         )
-
-    # ---- 2. when, and over what ------------------------------------------
-    blocks.append(_heading("이 화면의 범위", 2))
-    scope = [
-        f"마지막 갱신: {_fmt(payload.get('generated_at'))}",
-        f"데이터 기간: {_fmt(window.get('since'))} ~ {_fmt(window.get('until'))}"
-        + ("  (필터 없음 = 전체 기간)" if not (window.get("since") or window.get("until")) else ""),
-        f"읽은 Event: {_fmt(model.get('events_read'))}건",
-        f"증거 범위: {_fmt(coverage.get('evidence_from'))} ~ {_fmt(coverage.get('evidence_to'))}",
-        f"읽을 수 없던 파일: {_fmt(coverage.get('unreadable'))}건"
-        f" · 중복 파일: {_fmt(coverage.get('duplicates'))}건",
-    ]
-    blocks.extend(_bullet(s) for s in scope)
-
-    if not coverage.get("history_checked"):
-        blocks.append(
-            _callout(
-                "Company History를 아무도 확인하지 않았다 — 아래 숫자는 "
-                "'빈틈 없음'을 뜻하지 않는다.",
-                "⚠️",
-                "yellow_background",
-            )
-        )
-    elif not coverage.get("complete"):
-        blocks.append(
-            _callout(
-                "증거 범위에 빈틈이 있다"
-                + (
-                    f" — {coverage.get('history_uncovered_from')}부터 확인되지 않았다."
-                    if coverage.get("history_uncovered_from")
-                    else "."
-                ),
-                "⚠️",
-                "yellow_background",
-            )
-        )
-
-    # ---- 3. is this real work, or a probe? -------------------------------
-    #
-    # The mission asks the page to say. The honest answer is that the system
-    # cannot: `events.Event` has no field marking an Event as a probe, so
-    # any label here would be this module guessing from a name. Reporting
-    # the *absence of the distinction* is the same answer `UNSOURCED` gives
-    # a missing layer, and it is the only one that cannot be wrong.
-    blocks.append(_heading("이 데이터는 실제 업무인가", 2))
     blocks.append(
         _callout(
-            "이 시스템은 구별하지 못한다. Event Schema(docs/02)에 Event가 실제 업무인지 "
-            "Engineering Probe인지 표시하는 필드가 없다. 아래 Project 목록을 보고 "
-            "사람이 판단해야 한다.",
-            "⚪",
-            "gray_background",
+            f"{_verdict.word(tone)} — {headline}",
+            _verdict.emoji(tone),
+            _verdict.colour(tone),
         )
     )
-    projects_panel = next(
-        (p for p in model.get("panels") or [] if p.get("key") == "PROJECTS"), None
-    )
-    if projects_panel and projects_panel.get("rows"):
-        ids = [
-            _fmt((r.get("values") or {}).get("project_id"))
-            for r in projects_panel["rows"]
-        ]
-        blocks.append(_paragraph("현재 집계된 Project ID: " + ", ".join(ids)))
 
-    # ---- 4. attention ----------------------------------------------------
-    #
-    # **Ranked, and the ranking is labelled (C129).** This was a flat bullet
-    # list in the order `ops_status.py` happened to build it, so on the page
-    # the whole workspace reads, "Runner가 열흘째 실행되지 않았다" sat below
-    # "3일 이상 조용한 Desktop" and looked the same as it.
-    #
-    # `controltower/attention.py` holds the rule, shared with the browser
-    # page so the two surfaces cannot rank the same list differently. The
-    # prefix says which reading it is; a line the rule does not recognise is
-    # `?` and sorts to the top rather than being filed as minor.
-    #
-    # Truncation follows the rank, not the arrival order — if only twenty of
-    # forty fit, the twenty that fit must be the twenty that matter.
-    blocks.append(_heading("ATTENTION", 2))
-    if attention:
-        counts = _attention_tally(attention)
-        summary = " · ".join(
-            f"{level} {counts[level]}건"
-            for level in ("P1", "?", "P2")
-            if counts.get(level)
+    blocks.append(_heading("① 지금 상태", 2))
+    open_blockers = metric("open_blockers")
+    silent_rows = [
+        r for r in (panels.get("DESKTOPS") or {}).get("rows") or []
+        if isinstance((r.get("values") or {}).get("days_silent"), (int, float))
+        and not isinstance((r.get("values") or {}).get("days_silent"), bool)
+        and (r.get("values") or {}).get("days_silent") >= SILENT_AFTER_DAYS
+    ]
+    fleet = len((panels.get("DESKTOPS") or {}).get("rows") or [])
+    blocks.extend(
+        _bullet(line)
+        for line in (
+            f"전체 상태: {_verdict.word(tone)}",
+            f"마지막 갱신: {_fmt(payload.get('generated_at'))} "
+            "(사람이 publish_control_tower.py를 실행한 시각)",
+            "열려 있는 Blocker: "
+            + ("확인 불가 — 이 값을 읽지 못했다" if open_blockers is None
+               else f"{open_blockers}건"),
+            f"즉시 조치(P1): {counts.get('P1', 0)}건 · 확인 필요(P2): "
+            f"{counts.get('P2', 0)}건"
+            + (f" · 미분류: {counts['?']}건" if counts.get("?") else ""),
+            f"{SILENT_AFTER_DAYS}일 이상 조용한 Desktop: {len(silent_rows)}/{fleet}",
+            # Asked for by the brief, and the honest answer is that there is
+            # no such thing here to report. `SPRINTS` is UNSOURCED: neither
+            # the Event Schema nor the Company Repository has a Sprint or a
+            # Cycle, so a number in this slot would be invented.
+            "현재 Cycle / Sprint: 원천 없음 — 이 시스템에 Sprint 계층이 없다 "
+            "(⑥의 '원천이 없는 계층' 참조)",
         )
+    )
+
+    # ================================================== (2) ATTENTION
+    #
+    # **Ranked, labelled, and each line carries its remedy.** The ranking
+    # rule is `controltower/attention.py`, shared with the browser page so
+    # two surfaces cannot order one list differently. A line the rule does
+    # not recognise is `?` and sorts to the top rather than being filed as
+    # minor.
+    #
+    # Truncation follows the rank, not arrival order — if only twenty of
+    # forty fit, the twenty that fit must be the twenty that matter.
+    blocks.append(
+        _heading(
+            f"② 지금 봐야 할 것 — {len(attention)}건" if attention else "② 지금 봐야 할 것",
+            2,
+        )
+    )
+    if attention:
         blocks.append(
             _paragraph(
-                f"{summary} — 심각도는 이 페이지의 분류이며 각 줄에 근거를 "
-                "붙였다. Event Schema에도 Run Manifest에도 심각도 필드는 없다."
+                " · ".join(
+                    f"{level} {counts[level]}건"
+                    for level in ("P1", "?", "P2")
+                    if counts.get(level)
+                )
+                + " — 심각도와 다음 행동은 이 페이지의 분류이며 각 줄에 근거를 붙였다. "
+                "Event Schema에도 Run Manifest에도 심각도 필드는 없다."
             )
         )
-        for item in sorted(attention, key=_attention_rank)[:MAX_TABLE_ROWS]:
-            level, why = _attention_severity(item)
-            prefix = f"[{level}] " + (f"({why}) " if why else "(분류 불가) ")
-            blocks.append(_bullet(prefix + _safe(item)))
+        shown = sorted(attention, key=_attention_rank)[:MAX_TABLE_ROWS]
+        for group, emoji, title in (
+            ("P1", "🔴", "즉시 조치"),
+            ("?", "🟣", "분류하지 못함 — 직접 읽어야 한다"),
+            ("P2", "🟡", "확인 필요"),
+        ):
+            items = [i for i in shown if _attention_severity(i)[0] == group]
+            if not items:
+                continue
+            blocks.append(_paragraph(f"{emoji} {title} ({len(items)}건)"))
+            for item in items:
+                level, why = _attention_severity(item)
+                prefix = f"[{level}] " + (f"({why}) " if why else "(분류 불가) ")
+                action = _attention_action(item)
+                suffix = (
+                    f" → 다음 행동: {_safe(action)}"
+                    if action
+                    else " → 다음 행동: 이 페이지가 정해 두지 않았다 — 줄 전문을 "
+                    "읽고 사람이 판단한다."
+                )
+                # **The remedy is what survives the 2,000-character cut, not
+                # what falls off it.** `_text()` trims from the right and the
+                # remedy is on the right, so a long line would have lost
+                # exactly the sentence saying what to do — on exactly the
+                # item where a reader most needs it. Nothing bounds `blocker`
+                # or `summary` upstream, so the long case is reachable.
+                room = RICH_TEXT_LIMIT - len(prefix) - len(suffix)
+                text = _safe(item)
+                if room > 0 and len(text) > room:
+                    text = text[: max(0, room - 1)] + "…"
+                blocks.append(_bullet(prefix + text + suffix, markup=True))
         if len(attention) > MAX_TABLE_ROWS:
             blocks.append(
                 _paragraph(
@@ -520,84 +648,286 @@ def build_control_tower_blocks(
                 )
             )
     else:
-        blocks.append(_paragraph("없음."))
+        blocks.append(_paragraph("없음. 사람이 지금 확인해야 할 항목은 없다."))
 
-    # ---- 5. the panels ---------------------------------------------------
+    # ================================================== (3) KPI
+    #
+    # Five callouts, not a nine-row table. A person reads one big number far
+    # faster than a ten-column grid, and the executive-dashboard rule this
+    # was measured against puts three to five headline numbers above the
+    # fold. The full nine stay one toggle away in ⑥ rather than being cut.
+    #
+    # Every tile carries a **word** for its state as well as a colour: three
+    # of the nine have a direction and six are volume, and a reader must not
+    # have to guess which kind they are looking at.
+    blocks.append(_heading("③ 핵심 숫자", 2))
+    # Whether there is anything to count at all. Every verdict below is
+    # conditioned on it — see `verdict.metric_verdict()`.
+    measured = bool(model.get("events_read"))
+    metrics_panel = panels.get("METRICS")
+    if metrics_panel is None or not (metrics_panel.get("rows") or []):
+        blocks.append(
+            _callout(
+                "지표를 만들지 못했다 — 아래 ⑥에서 원인을 확인한다.",
+                "⚪",
+                "gray_background",
+            )
+        )
+    else:
+        if not measured:
+            blocks.append(
+                _callout(
+                    "아래 0은 '일이 없었다'가 아니라 '셀 Event가 없다'는 뜻이다 — "
+                    "수집된 Event가 하나도 없어 어떤 숫자도 판정할 수 없다.",
+                    "🟡",
+                    "yellow_background",
+                )
+            )
+        for key, icon in _verdict.HEADLINE_METRICS:
+            row = metric_row(key)
+            if row is None:
+                continue
+            values = row.get("values") or {}
+            value = values.get("value")
+            word, metric_tone = _verdict.metric_verdict(key, value, measured=measured)
+            evidence = row.get("evidence_count", 0)
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [
+                            _text(f"{_fmt(values.get('label'))}   "),
+                            _text(_fmt(value), bold=True),
+                            _text(f"   {word}"),
+                            _text(
+                                f"   ·  증거 {evidence}건"
+                                if evidence
+                                else "   ·  증거 파일 없음"
+                            ),
+                        ],
+                        "icon": {"type": "emoji", "emoji": icon},
+                        "color": _verdict.colour(metric_tone),
+                    },
+                }
+            )
+
+    # ================================================== (4) PROJECTS
+    blocks.append(_heading("④ Project", 2))
+    projects = panels.get("PROJECTS")
+    if projects is None:
+        warnings.append("panel PROJECTS missing from the model")
+    else:
+        project_blocks, project_warnings = _panel_table(
+            payload, projects, layout["PROJECTS"], heading=None
+        )
+        blocks.extend(project_blocks)
+        warnings.extend(project_warnings)
+        # Owner and Next Action are asked for and are **not** derived. The
+        # Model carries `teams` (which Desktop reported it), and that is not
+        # the same as a person who owns the outcome; a next action per
+        # project exists nowhere in this system. Saying so once beats an
+        # empty column that reads as "nobody is on it".
+        blocks.append(
+            _paragraph(
+                "Owner / Next Action 열은 없다 — 이 시스템에 Project 담당자와 "
+                "다음 작업의 원천이 없다. Team은 그 Event를 보고한 Desktop이지 "
+                "책임자가 아니다. 막힌 Project의 다음 행동은 ②에 있다."
+            )
+        )
+
+    # ================================================== (5) ACTIVITY
+    blocks.append(_heading("⑤ 최근 변화", 2))
+    activity = panels.get("ACTIVITY")
+    if activity is None:
+        warnings.append("panel ACTIVITY missing from the model")
+    else:
+        panel_blocks, panel_warnings = _panel_table(
+            payload, activity, layout["ACTIVITY"], heading=None
+        )
+        blocks.extend(panel_blocks)
+        warnings.extend(panel_warnings)
+
+    # ================================================== (6) DETAILS
+    #
+    # Everything a reader consults rather than scans, behind toggle headings
+    # so the page stops at ⑤ for anyone who does not need it. Nothing is
+    # deleted by the move: every panel the Model builds still renders
+    # exactly once, and the sections that used to sit between ATTENTION and
+    # the panels are here in full.
     blocks.append(_divider())
-    panels = {p.get("key"): p for p in model.get("panels") or []}
-    for key, columns in PANEL_LAYOUT:
+    blocks.append(_heading("⑥ 상세 — 필요할 때만 펼친다", 2))
+
+    scope_children = [
+        _bullet(line)
+        for line in (
+            f"마지막 갱신: {_fmt(payload.get('generated_at'))}",
+            f"데이터 기간: {_fmt(window.get('since'))} ~ {_fmt(window.get('until'))}"
+            + (
+                "  (필터 없음 = 전체 기간)"
+                if not (window.get("since") or window.get("until"))
+                else ""
+            ),
+            f"읽은 Event: {_fmt(model.get('events_read'))}건",
+            f"증거 범위: {_fmt(coverage.get('evidence_from'))} ~ "
+            f"{_fmt(coverage.get('evidence_to'))}",
+            f"읽을 수 없던 파일: {_fmt(coverage.get('unreadable'))}건"
+            f" · 중복 파일: {_fmt(coverage.get('duplicates'))}건",
+        )
+    ]
+    if not coverage.get("history_checked"):
+        scope_children.append(
+            _callout(
+                "Company History를 아무도 확인하지 않았다 — 위 숫자는 "
+                "'빈틈 없음'을 뜻하지 않는다.",
+                "🟡",
+                "yellow_background",
+            )
+        )
+    elif not coverage.get("complete"):
+        scope_children.append(
+            _callout(
+                "증거 범위에 빈틈이 있다"
+                + (
+                    f" — {coverage.get('history_uncovered_from')}부터 확인되지 않았다."
+                    if coverage.get("history_uncovered_from")
+                    else "."
+                ),
+                "🟡",
+                "yellow_background",
+            )
+        )
+    blocks.append(_toggle_heading("이 화면의 범위 · 데이터 Coverage", scope_children))
+
+    # Is this real work, or a probe? The honest answer is that the system
+    # cannot tell: `events.Event` has no field marking an Event as a probe,
+    # so any label here would be this module guessing from a name.
+    blocks.append(
+        _toggle_heading(
+            "이 데이터는 실제 업무인가",
+            [
+                _callout(
+                    "이 시스템은 구별하지 못한다. Event Schema(docs/02)에 Event가 "
+                    "실제 업무인지 Engineering Probe인지 표시하는 필드가 없다. "
+                    "④의 Project 목록을 보고 사람이 판단해야 한다.",
+                    "⚪",
+                    "gray_background",
+                )
+            ],
+        )
+    )
+
+    if metrics_panel is not None:
+        full_kpi, kpi_warnings = _panel_table(
+            payload, metrics_panel, layout["METRICS"], heading=None
+        )
+        warnings.extend(kpi_warnings)
+        # The title says the relationship out loud. ③ shows five of these
+        # nine and this shows all nine, which is "summary first, detail on
+        # demand" and not a second copy — but a reader who meets the same
+        # five numbers twice with nothing said is entitled to read it as
+        # one, and "동일 정보 반복 금지" is the rule it would be breaking.
+        _total_metrics = len(metrics_panel.get("rows") or [])
+        _headline_metrics = sum(
+            1 for key, _icon in _verdict.HEADLINE_METRICS if metric_row(key)
+        )
+        blocks.append(
+            _toggle_heading(
+                f"전체 지표 ({_total_metrics}개"
+                + (f" — ③의 {_headline_metrics}개를 포함한다)"
+                   if _total_metrics > _headline_metrics else ")"),
+                full_kpi,
+            )
+        )
+
+    for key, title in (
+        ("RISKS", "Risk / Blocker 상세"),
+        # A filtered view of ⑤, not a second source. Kept because "무엇이
+        # 끝났는가" is its own question, folded because the rows are already
+        # above.
+        ("COMPLETIONS", "최근 완료만 따로 보기"),
+        ("TEAMS", "팀별 진행현황"),
+        ("DESKTOPS", "Desktop별 보고 현황"),
+    ):
         panel = panels.get(key)
         if panel is None:
             warnings.append(f"panel {key} missing from the model")
             continue
-        panel_blocks, panel_warnings = _panel_table(payload, panel, columns)
-        blocks.extend(panel_blocks)
+        panel_blocks, panel_warnings = _panel_table(
+            payload, panel, layout[key], heading=None
+        )
         warnings.extend(panel_warnings)
+        blocks.append(_toggle_heading(title, panel_blocks))
 
-    # ---- 6. layers this system has no source for -------------------------
     unsourced = [
-        p for p in model.get("panels") or []
-        if str(p.get("status")) != "SOURCED" and p.get("key") not in dict(PANEL_LAYOUT)
+        p
+        for p in model.get("panels") or []
+        if str(p.get("status")) != "SOURCED" and p.get("key") not in layout
     ]
     if unsourced:
-        blocks.append(_divider())
-        blocks.append(_heading("원천이 없는 계층", 2))
-        for panel in unsourced:
-            blocks.append(
-                _bullet(
-                    f"{panel.get('title')} ({panel.get('key')}) — "
-                    f"{panel.get('note') or '이 시스템에 원천이 없다.'}"
-                )
+        blocks.append(
+            _toggle_heading(
+                f"원천이 없는 계층 ({len(unsourced)}개)",
+                [
+                    _paragraph(
+                        "비어 있는 것이 아니라 물어볼 곳이 없다 — 이 시스템에 "
+                        "해당 계층의 데이터가 존재하지 않는다."
+                    )
+                ]
+                + [
+                    _bullet(
+                        f"{panel.get('title')} — "
+                        f"{panel.get('note') or '이 시스템에 원천이 없다.'}",
+                        markup=True,
+                    )
+                    for panel in unsourced
+                ],
             )
+        )
 
-    # ---- 7. approvals / next work ----------------------------------------
-    #
-    # Deliberately not derived. "Which decision is blocking what" lives in
-    # BACKLOG.md and is written by a person; inventing it from Events would
-    # be this page's first fabricated fact.
-    blocks.append(_divider())
-    blocks.append(_heading("승인 병목 · 다음 작업", 2))
+    # Approvals / next work: deliberately not derived. "Which decision is
+    # blocking what" lives in BACKLOG.md and is written by a person;
+    # inventing it from Events would be this page's first fabricated fact.
     blocks.append(
-        _callout(
-            "자동화하지 않는다. 승인 대기 항목과 다음 Sprint는 사람이 BACKLOG.md에 "
-            "적는 판단이며, Event에서 유도하면 이 화면의 첫 번째 지어낸 사실이 된다.",
-            "⚪",
-            "gray_background",
+        _toggle_heading(
+            "승인 병목 · 다음 Sprint",
+            [
+                _callout(
+                    "자동화하지 않는다. 승인 대기 항목과 다음 Sprint는 사람이 "
+                    "BACKLOG.md에 적는 판단이며, Event에서 유도하면 이 화면의 "
+                    "첫 번째 지어낸 사실이 된다.",
+                    "⚪",
+                    "gray_background",
+                )
+            ],
         )
     )
 
-    # ---- 7b. is the projection itself working? ---------------------------
-    #
     # Two different syncs share the word, and conflating them is how an
     # operator reads "up to date" off a page that is not:
     #
     #   Runner Notion Sync   writes Event state onto the PROJECTS **rows**,
-    #                        on the Runner's schedule. This is the one the
-    #                        block below reports.
+    #                        on the Runner's schedule.
     #   this page's publish  rewrites this page, only when a person runs
     #                        `publish_control_tower.py`.
     #
-    # The first can be broken for days while the second keeps succeeding —
-    # this page would render perfectly and the row data underneath it would
-    # be stale. So both timestamps are shown, and they are labelled as the
-    # different things they are.
-    blocks.append(_divider())
-    blocks.append(_heading("동기화 상태", 2))
-    blocks.append(
+    # The first can be broken for days while the second keeps succeeding.
+    sync_children = [
         _bullet(
             f"이 페이지가 쓰인 시각: {_fmt(payload.get('generated_at'))} "
             "(publish_control_tower.py 실행 시각)"
         )
-    )
+    ]
     sync_lines = _operational_block_lines(payload, "NOTION")
     if sync_lines:
-        blocks.append(
+        sync_children.append(
             _paragraph("Runner의 Notion Sync — PROJECTS Row에 Event 상태를 쓰는 쪽:")
         )
-        for line in sync_lines:
-            blocks.append(_bullet(_safe(line)))
+        sync_children.extend(
+            _bullet(_safe(line), markup=True) for line in sync_lines
+        )
     else:
-        blocks.append(
+        sync_children.append(
             _callout(
                 "Runner의 Notion Sync 상태를 읽지 못했다 — 이 페이지가 최신이어도 "
                 "Row 데이터는 오래됐을 수 있다.",
@@ -605,27 +935,22 @@ def build_control_tower_blocks(
                 "gray_background",
             )
         )
-    blocks.append(
+    sync_children.append(
         _paragraph(
             "두 시각은 다른 것이다. 이 페이지는 사람이 명령을 실행할 때 갱신되고, "
             "PROJECTS Row는 Runner가 돌 때 갱신된다 — 한쪽이 며칠 멈춰 있어도 "
             "다른 쪽은 정상으로 보인다."
         )
     )
+    blocks.append(_toggle_heading("동기화 상태", sync_children))
 
-    # ---- 8. how to reach the live Dashboard ------------------------------
-    #
-    # Asked for explicitly, and it is not a link — that is the honest part.
-    # `dashboard_server.py` binds 127.0.0.1 and is not configurable
-    # (its own docstring says why), so the address below opens the Control
-    # Tower **only on the machine running the server**. A clickable link
-    # here would be a link that fails for every other reader, and a page
-    # that hands someone a dead link has told them something false about
-    # the system.
-    blocks.append(_divider())
-    blocks.append(_heading("실시간 화면(Dashboard)에 가려면", 2))
+    # The live Dashboard, and it is **not** a link — that is the honest
+    # part. `dashboard_server.py` binds 127.0.0.1 and is not configurable,
+    # so the address opens the Control Tower only on the machine running
+    # the server. A clickable link here fails for every other reader.
+    reach_children = []
     if dashboard_url:
-        blocks.append(
+        reach_children.append(
             _callout(
                 f"{dashboard_url} — 단, 이 주소는 Dashboard 서버를 켠 그 컴퓨터에서만 "
                 "열린다. 127.0.0.1(loopback) 전용이며 다른 기기에서는 열리지 않는다.",
@@ -633,18 +958,19 @@ def build_control_tower_blocks(
                 "blue_background",
             )
         )
-    blocks.append(_paragraph("그 컴퓨터에서 실행: python dashboard_server.py  (종료는 Ctrl+C)"))
-    blocks.append(
-        _paragraph(
-            "같은 사실을 터미널에서만 보려면: python ops_status.py "
-            "(ATTENTION이 있으면 exit 3)"
+    reach_children.extend(
+        (
+            _paragraph("그 컴퓨터에서 실행: python dashboard_server.py  (종료는 Ctrl+C)"),
+            _paragraph(
+                "같은 사실을 터미널에서만 보려면: python ops_status.py "
+                "(ATTENTION이 있으면 exit 3)"
+            ),
+            _paragraph(
+                "이 Notion 페이지를 지금 상태로 갱신하려면: python publish_control_tower.py"
+            ),
         )
     )
-    blocks.append(
-        _paragraph(
-            "이 Notion 페이지를 지금 상태로 갱신하려면: python publish_control_tower.py"
-        )
-    )
+    blocks.append(_toggle_heading("실시간 화면(Dashboard)에 가려면", reach_children))
 
     blocks.append(_divider())
     blocks.append(
@@ -1083,6 +1409,25 @@ def build_database_summary(
     def rows_of(key):
         return len((panels.get(key) or {}).get("rows") or [])
 
+    def open_blockers() -> int:
+        """Rows of `RISKS` that are actually **Blockers**.
+
+        `RISKS` is a union of three row shapes — `OPEN_BLOCKER`,
+        `ROLE_MISMATCH`, `EVENT_ID_CONFLICT` — and this summary counted all
+        of them as blockers (C134). Measured: one open Blocker beside two
+        role mismatches rendered `열린 Blocker 3` on the PROJECTS database
+        description, which is the **first** thing a person sees when they
+        open Notion (this integration can see exactly one top-level object).
+
+        Overstating a blocker count is the direction that costs someone an
+        afternoon: they go looking for two projects that are not stuck.
+        """
+        return sum(
+            1
+            for row in (panels.get("RISKS") or {}).get("rows") or []
+            if (row.get("values") or {}).get("kind") == "OPEN_BLOCKER"
+        )
+
     lines: list[str] = []
 
     if payload.get("model_error"):
@@ -1114,7 +1459,7 @@ def build_database_summary(
             f"Event {events}건"
             f" ({_fmt(coverage.get('evidence_from'))}~{_fmt(coverage.get('evidence_to'))})"
             f" · Project {rows_of('PROJECTS')}"
-            f" · 열린 Blocker {rows_of('RISKS')}"
+            f" · 열린 Blocker {open_blockers()}"
         )
         if window.get("since") or window.get("until"):
             scope += f" · 기간필터 {_fmt(window.get('since'))}~{_fmt(window.get('until'))}"

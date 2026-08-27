@@ -698,34 +698,95 @@ python dashboard_server.py
 없다 — ATTENTION 목록은 `ops_status.py`가 만드는 그 목록이고(비어 있으면
 exit 0에 해당), 운영 블록 다섯은 그 화면의 출력을 그대로 싣는다. Control Tower만
 
-**화면을 위에서부터 읽는 순서 (C129).**
+**화면을 위에서부터 읽는 순서 (C133).**
 
-| 순서 | 무엇 | 답하는 질문 |
+일곱 구역이고, 순서는 **데이터 모델의 순서가 아니라 질문의 순서**다.
+
+| 순서 | 무엇 | 답하는 질문 | 접히나 |
+|---|---|---|---|
+| **① 지금 회사 상태** | 한 줄 판정 + 타일 6개 | 지금 문제가 있는가 (5초) | 아니오 |
+| **② 지금 해야 할 일** | ATTENTION + **다음 행동** | 무엇을 처리해야 하는가 | **절대 아니오** |
+| **②-b 막혀 있는 것** | 열린 Blocker · 무결성 결함 | 무엇이 멈춰 있는가 | **절대 아니오** (있을 때만 뜬다) |
+| **③ 진행 중인 Project** | 상태 칩 + PROJECTS 표 | 일이 어디까지 왔는가 | 아니오 |
+| **④ 실행 · 자동화** | Runner · Agent · Backup · Notion sync 2개 | 기계가 도는가 | 아니오 |
+| **⑤ 핵심 지표** | KPI 9개, 각각 판정 낱말과 함께 | 숫자가 정상인가 | 아니오 |
+| **⑥ 최근 변화** | ACTIVITY · COMPLETIONS | 최근 무엇이 바뀌었나 | 비어 있으면 접힘 |
+| **⑦ 근거 · 상세** | Coverage · 기간 필터 · 나머지 패널 · 원천 없는 계층 · 터미널 출력 | 이 숫자를 믿어도 되는가 | **접힘** |
+
+C129까지의 순서는 COMPANY → ATTENTION → **NOTION SYNC** → **기간 필터** →
+Coverage → KPI → 패널 10개(평평하게) → 운영 상태였다. 한 하위 시스템의 sync 상태가
+세 번째였고, 폼 컨트롤이 네 번째였고, 회사를 이루는 Project는 똑같은 카드 열 개
+사이 어딘가에 있었다. **실측(빈 트리, 1440px)**:
+
+| | C129 | C133 |
 |---|---|---|
-| **COMPANY** | 한 줄 판정 + 사실 6개 | 회사가 지금 어떤 상태인가 |
-| **ATTENTION** | P1/P2/? 배지 + 출처 블록 + 근거 | 무엇부터 봐야 하는가 |
-| **NOTION SYNC** | 두 sync를 나란히 | Notion이 최신인가 — 어느 쪽이? |
-| 기간 / Coverage / KPI | 숫자의 범위와 근거 | 이 숫자를 믿어도 되는가 |
-| 패널 7개 | PROJECTS·TEAMS·DESKTOPS·ACTIVITY·COMPLETIONS·RISKS·(원천 없음 3개) | 어디서 무슨 일이 있었나 |
-| 운영 상태 | `ops_status.py` 출력 그대로 | 원문이 필요할 때 |
+| 페이지 높이 | 4,163 px | **2,245 px** |
+| PROJECTS까지 스크롤 | y=1,703 | **y=569** |
+| 첫 화면의 `<pre>` 로그 | 6개 (첫 것이 y=3,351) | **0개** (전부 ⑦ 안에 접힘) |
+| 원천 없는 패널이 차지한 패널 면적 | 458 / 1,599 px = **29%** | 접힌 `<details>` 한 줄 |
+| 상태를 낱말로도 말하는 곳 | 0 | 14 |
+| 접히는 구역(progressive disclosure) | 1 | 7 |
 
-**COMPANY의 한 줄은 ATTENTION의 심각도에서 나온다** — 헤더 배지, 그리고
+390px(휴대폰)에서도 7,538 px → **4,627 px**이고, 가로 스크롤은 **어느 폭에서도
+0**이다(표는 자기 `.scroll` 안에서만 가로로 움직인다 — 실측 1440/1024/760/390).
+
+**왜 이 구조인가 — 조사한 것과 출처 (C133).**
+
+구조는 이 저장소의 취향이 아니라 **회사 운영/개발 대시보드가 실제로 쓰이는
+방식**을 조사해서 골랐다. 조사한 유형: Executive / Company Operations,
+Project·Portfolio, Engineering·SRE, Incident·Risk, KPI, Notion 기반 운영
+Dashboard. 각 유형에서 본 것은 "예쁜가"가 아니라 **무엇을 첫 화면에 두고,
+무엇을 상세로 내리고, 무엇이 실제 의사결정에 쓰이는가**였다.
+
+| 채택한 규칙 | 근거 | 이 화면에 적용된 곳 |
+|---|---|---|
+| **5초 규칙** — 필터·스크롤·범례 없이 5초 안에 상태를 안다. 주요 화면의 KPI는 5~9개. 설명 문단이 아니라 지표·방향으로 맥락을 준다 | [Designing actionable dashboards: the 5-second rule](https://customerscience.com.au/customer-experience-2/designing-actionable-dashboards-the-5-second-rule-for-executives/) · [Executive dashboard design best practices](https://appdeck.com/blog/executive-dashboard-design-best-practices) | ① 타일 6개 · 헤더 배지 · KPI 9개 |
+| **역피라미드** — 위에 판정, 가운데 원인, 아래 상세 | 위와 같음 | ①→②→③④⑤→⑥→⑦ |
+| **Overview first, zoom and filter, details on demand** (Shneiderman) — 상세는 요청할 때 드러낸다 | [Progressive disclosure (IxDF)](https://ixdf.org/literature/topics/progressive-disclosure) · [UXPin](https://www.uxpin.com/studio/blog/what-is-progressive-disclosure/) | ⑦이 접혀 있고, ⑥은 내용이 있을 때만 열린다 |
+| **어느 대시보드에도 노출되지 않고 어느 경보에도 쓰이지 않는 신호는 제거 후보** · 계측 과잉이 경보 피로를 만든다 | [Google SRE — Monitoring distributed systems](https://sre.google/sre-book/monitoring-distributed-systems/) · [SRE alerting best practices](https://incident.io/blog/sre-alerting-best-practices) | 원천 없는 계층 3개를 ⑦ 안 한 줄로 · 터미널 `<pre>` 6개를 ⑦으로 |
+| **모든 Red/Amber 항목에는 "다음에 무엇이 일어나는가"가 한 줄 붙는다** · 스무 개의 상태 문단보다 색 하나가 빠르다 · 갱신되지 않은 지표는 회색으로 구분한다 | [RAG status in project management](https://portfoliohub.io/blog/rag-status) · [Project status dashboard guide](https://appdeck.com/blog/project-status-dashboard-guide) | ②의 `다음 행동` · ③의 상태 칩 · `UNSOURCED` 점선 패널 |
+| **색만으로 상태를 표현하지 않는다** — 아이콘이나 글자를 함께 쓴다 | [WCAG 2.1 SC 1.4.1 Use of Color (W3C)](https://www.w3.org/WAI/WCAG21/Understanding/use-of-color.html) | 헤더 배지 `●/▲/■` + 낱말 · KPI·① 타일의 판정 낱말 |
+| **최상단 callout에 핵심 요약, 나머지는 toggle로** (Notion 운영 대시보드 관행) | [Notion 회사 대시보드 만들기](https://www.thebricks.com/resources/how-to-create-a-company-dashboard-in-notion) | Notion 페이지의 맨 위 callout + `원천이 없는 계층` 묶음 |
+
+**따르지 않은 것도 적어 둔다.** 위 자료 다수가 추세선·전월 대비·목표 대비를
+권한다. 이 시스템에는 **목표의 원천이 없고**(⑦의 `원천이 없는 계층` 참조)
+기간 비교를 위한 저장된 스냅샷도 없다. 없는 것을 그려 넣으면 이 화면의 첫 번째
+지어낸 사실이 되므로, KPI는 값과 판정 낱말까지만 간다. 같은 이유로
+`승인 필요` **절은 만들지 않았다** — Event Schema에 승인 요청을 뜻하는
+event_type이 없다(`DECISION_APPROVED`는 이미 끝난 일이다). 실제로 존재하는
+사람 대기 항목은 `runtime/history_candidates/review/`의 검토 대기뿐이고,
+그것은 ②의 `판단` 무리에 있다.
+
+**② 모든 줄에 `다음 행동`이 붙는다 (C133).** 전에는 열한 줄이 전부 *무엇이
+잘못됐는지*만 말하고 *무엇을 하라*는 말이 하나도 없었다. 규칙은 심각도와 **같은
+표**(`src/controltower/attention.py`)에 있어서, 한 줄이 P1 배지와 P2의 처방을
+동시에 다는 일이 생길 수 없다. 이 화면이 분류하지 못한 줄에는 처방을 **지어내지
+않는다** — `이 화면이 정해 두지 않았다`라고 적고 멈춘다.
+
+**②는 두 무리로 나뉜다** — `조치(사람이 손대야 한다)`와 `판단(사람이 정해야
+한다)`. 후자는 `runtime/history_candidates/review/`의 검토 대기 Candidate 하나뿐이고
+(docs/05 §24가 자동 판정을 금지한다), 무리가 하나뿐이면 제목은 뜨지 않는다.
+
+**②-b는 있을 때만 뜬다.** 깨끗한 회사가 늘 빨간 빈 상자를 이고 있으면 사람은 그
+상자를 무시하는 법을 배운다.
+
+**①의 한 줄은 ②의 심각도에서 나온다** — 헤더 배지, 그리고
 `ops_status.py`의 종료 코드가 말하는 것과 **같은 사실**이다. 세 번 렌더링되는 하나이지
 네 번째 의견이 아니다. 그리고 **Event가 0건이면 "할 일 없음"이라고 하지 않는다**:
 `셀 Event가 없다 — '문제 없음'이 아니라 '판단할 증거가 없다'`. C77이 Coverage 배너에서
 없앤 그 혼동이 그것을 요약하는 절에 다시 생기지 않게 한다.
 
-**ATTENTION의 심각도는 이 화면의 분류다.** Event Schema에도 Run Manifest에도 심각도
+**②의 심각도는 이 화면의 분류다.** Event Schema에도 Run Manifest에도 심각도
 필드가 없으므로, 규칙은 `src/controltower/attention.py` 한 곳에 적혀 있고 각 줄 옆에
 **무엇을 보고 그렇게 분류했는지**가 붙는다. 규칙이 못 알아본 줄은 `?`로 **맨 위에**
 남는다 — 새 경보가 조용히 하위로 분류되는 것이 가장 나쁜 실패이기 때문이다.
 같은 모듈을 Notion 페이지가 함께 쓰므로 **두 표면이 같은 목록을 다르게 정렬할 수 없다.**
 
 **P1과 미분류는 접히지 않는다 (C130).** 긴 경보는 210자에서 `전체 보기`로 접히지만
-**P2만** 그렇다. 가장 급한 줄을 사람이 펼쳐야 보이게 두면 ATTENTION 절이 하는 일이
+**P2만** 그렇고, `다음 행동`은 그 안에 들어가지 않는다. 가장 급한 줄을 사람이 펼쳐야 보이게 두면 ATTENTION 절이 하는 일이
 사라진다 — 미분류가 접히지 않는 이유는 위와 같다.
 
-**NOTION SYNC는 절대 한 상태로 합치지 않는다.** Runner의 Sync는 PROJECTS **Row**를
+**④ 안의 Notion 두 카드는 절대 한 상태로 합치지 않는다.** Runner의 Sync는 PROJECTS **Row**를
 Runner 일정으로 쓰고, publish는 **페이지**를 사람이 명령할 때만 쓴다. 한쪽이 며칠
 멈춰도 다른 쪽은 계속 성공하므로 하나로 합치면 둘 중 어느 쪽에 대해서도 거짓이 된다.
 **publish 쪽은 이 머신에 기록이 없다** — `publish_control_tower.py`는 시각을 Notion
@@ -733,10 +794,24 @@ Runner 일정으로 쓰고, publish는 **페이지**를 사람이 명령할 때�
 Runner의 시각을 빌려 쓰는 것이 바로 이 절이 막으려는 합치기다.
 
 **표는 반복을 접는다.** 모든 행이 같은 값인 열은 표에서 빠지고 아래에 한 줄로 적힌다
-(`모든 행(4건)이 같은 값인 열은 …: 상태 IN_PROGRESS · 판정 ACTIVE · …`). 실측:
-PROJECTS 16열 → 9열, ACTIVITY 12열 → 10열. 값은 사라지지 않고 `/api/dashboard.json`도
-그대로다. 첫 열은 행을 식별하므로 절대 접지 않고, 행이 2개 미만이면 아무것도 접지
-않는다(1행이면 모든 열이 자명하게 '같은 값'이다).
+(`모든 행(4건)에서 값이 같거나 비어 있는 열은 …: 상태 IN_PROGRESS · 판정 ACTIVE · …`).
+실측: PROJECTS 16열 → 9열, ACTIVITY 12열 → 10열. 값은 사라지지 않고
+`/api/dashboard.json`도 그대로다. 첫 열은 행을 식별하므로 절대 접지 않는다.
+
+**1행짜리 표는 '비어 있는 열'만 접는다 (C133).** 1행이면 모든 열이 자명하게 '같은
+값'이므로 일반 규칙을 적용하면 표가 사라진다. 하지만 **언제나 비어 있는 열**은
+다르다 — 잃을 값이 없다. `RISKS`는 `OPEN_BLOCKER`·`ROLE_MISMATCH`·
+`EVENT_ID_CONFLICT` 세 모양의 합집합이라, 열린 Blocker 하나는 12열 중 5열만 채울
+수 **있고** 나머지는 채울 수 없다. 실측: 1행 표에 `—`가 여섯 열, 그것도 이 화면이
+맨 위에 두는 표에서.
+
+**상태 낱말은 절대 가운데서 잘리지 않는다 (C133).** `overflow-wrap:anywhere`는
+브라우저가 셀의 최소 너비를 한 글자로 계산하게 만들어서, 열다섯 열짜리 표는
+짧은 낱말까지 쪼개질 때까지 압축된다. 실측(1440px): `IN_PROGRESS`가 `IN_PROG` /
+`RESS`로, `COMPLETE`가 `COMPL` / `ETE`로 — 사람이 표를 훑는 이유인 바로 그 낱말이.
+이제 24자 이하의 대문자 토큰(상태·판정·role·kind)은 `white-space:nowrap`이고 모든
+셀에 최소 너비가 있다. 400자짜리 `event_id`는 여전히 줄바꿈한다 — 그것이
+`anywhere`가 아직 있는 이유다.
 
 시각은 `08-05 18:00`으로 줄이고 연도는 흐리게, 원본은 `title`에 둔다. 좁은 화면용
 `@media` 규칙이 있고, 화면 어디에도 `text-overflow:ellipsis`로 잘리는 글자는 없다.
@@ -771,7 +846,11 @@ curl http://127.0.0.1:8765/healthz     # -> ok
 
 | 보이는 것 | 뜻 |
 |---|---|
-| 우상단 빨간 배지 | ATTENTION이 있다 (= `ops_status.py` exit 3) |
+| 우상단 배지 `● 조치 필요` / `▲ 주의` / `■ 정상` | 이 화면 전체의 판정. **모양·낱말·색 셋 다**로 말한다(WCAG 1.4.1 — 색만으로는 상태를 표현하지 않는다) |
+| KPI 타일 옆 `정상` / `주의` / `참고` | 방향이 있는 지표 3개(`열려 있는 Blocker`·`조용한 Team`·`Desktop과 role이 어긋난 Event`)만 정상/주의로 읽힌다. 나머지 6개는 **참고** — 조용한 주가 나쁜 주는 아니다 |
+| ② 각 줄의 `다음 행동` | 이 화면이 정한 처방. 분류하지 못한 줄에는 처방을 지어내지 않는다 |
+| ④ `자격증명` | **이 프로세스가** 두 이름을 볼 수 있는지. 값은 절대 싣지 않는다. `.env`는 자동으로 읽히지 않으므로, `없음`이면 이 화면의 ATTENTION은 Notion 페이지의 것보다 적을 수 있다 |
+| ④ `다음 실행 — 기록 없음` | 이 저장소에 일정이 없다. Windows 작업 스케줄러가 들고 있으며 이 화면은 그것을 읽지 못한다 |
 | `증거가 하나도 없다` | 0은 "일이 없었다"가 아니라 **"셀 Event가 없다"** |
 | `UNSOURCED` 점선 패널 | 비어 있는 것이 아니라 **물어볼 곳이 없다** |
 | `해당 없음` (실선 패널) | 원천은 있고, 이 기간에 하나도 없었다 |
@@ -851,16 +930,72 @@ Event를 쓰지 않는다. 백 번 돌려도 페이지는 하나다 — 제목�
 `마지막 갱신`이 그 숫자들이 언제의 것인지 말한다. 예약 실행이 필요하면 Task
 Scheduler에 `run_company_ops.py`와 나란히 등록한다.
 
+**페이지를 위에서부터 읽는 순서 (C134).** 여섯 구역이고, 6d의 브라우저 화면과
+**같은 번호·같은 낱말**을 쓴다 — 두 화면을 오가는 사람이 어휘를 두 벌 외우지
+않도록.
+
+| 순서 | 무엇 | 접히나 |
+|---|---|---|
+| 상단 콜아웃 | 한 줄 판정 — `정상` / `주의` / `조치 필요` + 이모지 | 아니오 |
+| **① 지금 상태** | 전체 상태 · 마지막 갱신 · 열린 Blocker · P1/P2 건수 · 조용한 Desktop · 현재 Cycle | 아니오 |
+| **② 지금 봐야 할 것** | 🔴 즉시 조치 / 🟣 분류 못 함 / 🟡 확인 필요로 묶은 ATTENTION, **각 줄에 `다음 행동`** | 아니오 |
+| **③ 핵심 숫자** | KPI **5개를 콜아웃 카드로** — 이모지 + 큰 숫자 + 판정 낱말 + 증거 건수 | 아니오 |
+| **④ Project** | Project · 판정 · Blocker · 막힌 일수 · 정지 일수 · 마지막 | 아니오 |
+| **⑤ 최근 변화** | 최근 활동 (ACTIVITY) | 아니오 |
+| **⑥ 상세** | Coverage · Probe 여부 · 전체 지표 9개 · Risk · 최근 완료 · 팀 · Desktop · 원천 없는 계층 · 승인 병목 · 동기화 · Dashboard 주소 | **전부 접힘** |
+
+C133까지의 순서는 콜아웃 → `이 화면의 범위` → `이 데이터는 실제 업무인가` →
+ATTENTION → 평평한 `###` 패널 7개(RISKS·PROJECTS·TEAMS·DESKTOPS·**METRICS**·
+ACTIVITY·COMPLETIONS) → 원천 없는 계층 → 승인 병목 → 동기화 → Dashboard였다.
+**KPI가 일곱 패널 중 다섯째**였고, 십 초를 가진 사람이 첫 문제를 만나기 전에
+출처 설명 두 절을 먼저 읽어야 했다. 실측(빈 트리): 최상위 블록 **56 → 40개**,
+⑥의 열한 절이 전부 접힌 채로 들어간다.
+
+**③은 표가 아니라 카드다.** 사람은 열 칸짜리 표보다 큰 숫자 하나를 훨씬 빨리
+읽고, 참고한 자료들이 공통으로 권하는 것이 "상단에 3~5개의 headline 숫자"다.
+Notion에는 카드 위젯이 없으므로 **콜아웃**을 쓴다 — 이모지가 상태를, 굵은 숫자가
+값을, 낱말이 판정을 말한다. 나머지 네 개는 ⑥의 `전체 지표`에 그대로 있고,
+제목이 "③의 5개를 포함한다"고 밝혀 중복으로 읽히지 않게 한다.
+
+**낱말과 모양은 `src/controltower/verdict.py` 한 곳에서 온다.** 브라우저 화면은
+`● 조치 필요 / ▲ 주의 / ■ 정상`, Notion은 `🔴 / 🟡 / 🟢` — 같은 tone의 다른
+렌더링이며 **낱말은 동일하다.** 색만으로 상태를 말하지 않는다(WCAG 1.4.1):
+Notion 콜아웃 색은 스크린샷에서 구별이 어렵고, 이모지와 낱말은 어디서든 남는다.
+
+**증거가 하나도 없으면 어떤 숫자도 판정하지 않는다 (C134).** 실측: 빈 트리에서
+③이 `열려 있는 Blocker 0 정상`을 찍고 있었다. 필드는 참이고 문장은 거짓이다 —
+Blocker가 없는 것이 아니라 **셀 Event가 없다.** 이제 `판정 보류`로 적고, ③ 맨
+위에 그 이유를 한 줄로 놓는다. 같은 규칙이 브라우저 KPI 타일에도 적용된다.
+
+**표 머리글은 사람의 낱말이다 (C134).** 전에는 `display_name`,
+`blocked_project_count`, `days_silent`가 그대로 열 제목이었고 패널마다
+`이 표에 싣지 않은 열: key, derived_from`이 붙었다. 번역표는 있었지만
+`dashboard_server.py`(진입점) 안에 있어 이 모듈이 닿을 수 없었다 —
+`src/controltower/columns.py`로 내렸고 두 렌더러가 같은 것을 쓴다. 제목 옆의
+내부 키(`Project · PROJECTS`)도 뺐다.
+
+**작성자의 강조는 살리고 기호는 지운다 (C134).** `ops_status.py`는 ATTENTION
+줄을 이 저장소의 `**굵게**` / `` `코드` `` 규약으로 쓴다. 전에는 그 별표와
+백틱이 Notion에 **글자 그대로** 실렸다(실측: `뜻이 **아니다**`,
+`` `python run_company_ops.py` ``). 이제 Notion의 `annotations`로 나누어 보내
+굵게·코드로 렌더링된다.
+
+**Owner / Next Action 열은 없다.** 요구는 있었지만 원천이 없다 — Model의
+`teams`는 그 Event를 **보고한 Desktop**이지 책임자가 아니고, Project별 다음
+작업은 이 시스템 어디에도 없다. 빈 열을 두면 "아무도 안 하고 있다"로 읽히므로
+없다고 한 번 적는다. 막힌 Project의 다음 행동은 ②에 있다.
+
 | 페이지에 있는 것 | 뜻 |
 |---|---|
-| 상단 콜아웃 | ATTENTION 건수 (= `ops_status.py` exit 3) |
-| `이 화면의 범위` | 마지막 갱신·데이터 기간·읽은 Event 수·증거 범위 |
-| `이 데이터는 실제 업무인가` | **시스템은 구별하지 못한다.** Event Schema에 그 필드가 없다 |
+| 상단 콜아웃 | 한 줄 판정 + ATTENTION 건수 (= `ops_status.py` exit 3) |
+| `판정 보류` | 증거가 0건이라 이 숫자를 판정하지 않았다 |
+| `이 화면의 범위` (⑥) | 마지막 갱신·데이터 기간·읽은 Event 수·증거 범위 |
+| `이 데이터는 실제 업무인가` (⑥) | **시스템은 구별하지 못한다.** Event Schema에 그 필드가 없다 |
 | `원천 없음` (회색) | 비어 있는 것이 아니라 물어볼 곳이 없다 |
 | `기간 내 Event 없음` | 원천은 있고, 그 기간에 없었다 |
 | `아직 입력되지 않음` | 수집된 Event가 0건이다 |
-| `승인 병목 · 다음 작업` | 자동화하지 않는다. 사람이 BACKLOG.md에 적는 판단이다 |
-| `동기화 상태` | **두 sync를 구분한다** — 이 페이지가 쓰인 시각(사람이 명령 실행)과 Runner의 Notion Sync 상태(PROJECTS Row) |
+| `승인 병목 · 다음 Sprint` (⑥) | 자동화하지 않는다. 사람이 BACKLOG.md에 적는 판단이다 |
+| `동기화 상태` (⑥) | **두 sync를 구분한다** — 이 페이지가 쓰인 시각(사람이 명령 실행)과 Runner의 Notion Sync 상태(PROJECTS Row) |
 
 실행하면 네 줄이 나온다 — `블록 기록/보관`(하위 페이지), `DB 설명 갱신`(글자 수),
 `Notes 열 N건 갱신`, `Project Row N건 갱신`. 건너뛴 Row가 있으면 그 이름과 이유도

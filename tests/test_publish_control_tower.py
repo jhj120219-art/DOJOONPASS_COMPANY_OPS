@@ -892,23 +892,34 @@ class NothingRemoteReachesTheOperatorUnguardedTests(_Harness):
         """The exclusion above skips two attributes on the ground that they
         are `int`. That is checked here rather than believed — the day one
         becomes a string, the scanner must stop skipping it."""
-        import typing
-
         from controltower.notion_page import PublishResult, RowPageResult
 
+        # `__annotations__`, not `typing.get_type_hints()`.
+        #
+        # `notion_page.py` has `from __future__ import annotations`, so its
+        # annotations are strings and `get_type_hints()` **evaluates** them —
+        # including `url: str | None`, which is a `TypeError` on any
+        # interpreter before 3.10. Measured on this project's deployment
+        # runtime (3.9.7): `TypeError: unsupported operand type(s) for |:
+        # 'type' and 'NoneType'`, raised while checking two fields that are
+        # both plain `int` and have nothing to do with the annotation that
+        # blew up.
+        #
+        # The claim this test exists for is what the source *declares*, which
+        # is exactly what `__annotations__` holds and what a reader of the
+        # dataclass sees. Evaluating every sibling annotation to check two of
+        # them was work this test never needed to do.
+        seen = set()
         for model in (PublishResult, RowPageResult):
-            hints = typing.get_type_hints(model)
+            hints = model.__annotations__
+            seen |= set(hints)
             for field in self.NUMERIC_FIELDS & set(hints):
                 with self.subTest(model=model.__name__, field=field):
-                    self.assertIs(hints[field], int)
+                    self.assertEqual(hints[field], "int")
 
         # and the set is not empty against those models, or it excludes
         # nothing and says nothing
-        self.assertTrue(
-            self.NUMERIC_FIELDS
-            & (set(typing.get_type_hints(PublishResult))
-               | set(typing.get_type_hints(RowPageResult)))
-        )
+        self.assertTrue(self.NUMERIC_FIELDS & seen)
 
     def test_the_scanner_finds_an_unguarded_print_when_there_is_one(self):
         """Guards the guard, by feeding it the defect. The real file is

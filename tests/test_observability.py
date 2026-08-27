@@ -9981,7 +9981,16 @@ class SameInstantSkipReachesTheOperatorTests(unittest.TestCase):
         # block reads `os.environ` for its credential lines, so a test that
         # asserts on that block must pin them or it is also asserting on the
         # shell that started pytest.
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        # `start()` / `addCleanup(stop)`, not `self.enterContext(...)`.
+        # `TestCase.enterContext` is **Python 3.11+** and this project's
+        # deployment runtime is 3.9.7 — measured: all 31 tests in the four
+        # classes that used it errored with `AttributeError: ... has no
+        # attribute 'enterContext'` before reaching a single assertion.
+        # They were not failing; they were not running, and a class that
+        # cannot run reports nothing about the code it guards.
+        _env = mock.patch.dict(os.environ, {}, clear=False)
+        _env.start()
+        self.addCleanup(_env.stop)
         for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
                      "NOTION_OPS_RUNS_DATABASE_ID"):
             os.environ.pop(name, None)
@@ -10095,7 +10104,16 @@ class SameInstantSkipEndToEndTests(unittest.TestCase):
         # a real Runner and then renders the NOTION block, which reads
         # `os.environ` for its credential lines. Unpinned, it would also be
         # asserting on the shell that started pytest.
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        # `start()` / `addCleanup(stop)`, not `self.enterContext(...)`.
+        # `TestCase.enterContext` is **Python 3.11+** and this project's
+        # deployment runtime is 3.9.7 — measured: all 31 tests in the four
+        # classes that used it errored with `AttributeError: ... has no
+        # attribute 'enterContext'` before reaching a single assertion.
+        # They were not failing; they were not running, and a class that
+        # cannot run reports nothing about the code it guards.
+        _env = mock.patch.dict(os.environ, {}, clear=False)
+        _env.start()
+        self.addCleanup(_env.stop)
         for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
                      "NOTION_OPS_RUNS_DATABASE_ID"):
             os.environ.pop(name, None)
@@ -11959,7 +11977,16 @@ class NotionQueueVisibilityTests(unittest.TestCase):
         # Cleared rather than set: these classes are about the queue, and a
         # test that asserts on queue text must not also be asserting on which
         # credentials happen to be in the shell that started pytest.
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        # `start()` / `addCleanup(stop)`, not `self.enterContext(...)`.
+        # `TestCase.enterContext` is **Python 3.11+** and this project's
+        # deployment runtime is 3.9.7 — measured: all 31 tests in the four
+        # classes that used it errored with `AttributeError: ... has no
+        # attribute 'enterContext'` before reaching a single assertion.
+        # They were not failing; they were not running, and a class that
+        # cannot run reports nothing about the code it guards.
+        _env = mock.patch.dict(os.environ, {}, clear=False)
+        _env.start()
+        self.addCleanup(_env.stop)
         for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
                      "NOTION_OPS_RUNS_DATABASE_ID"):
             os.environ.pop(name, None)
@@ -12589,7 +12616,16 @@ class WrittenAndNeverReadFieldTests(unittest.TestCase):
         # Cleared rather than set: these classes are about the queue, and a
         # test that asserts on queue text must not also be asserting on which
         # credentials happen to be in the shell that started pytest.
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=False))
+        # `start()` / `addCleanup(stop)`, not `self.enterContext(...)`.
+        # `TestCase.enterContext` is **Python 3.11+** and this project's
+        # deployment runtime is 3.9.7 — measured: all 31 tests in the four
+        # classes that used it errored with `AttributeError: ... has no
+        # attribute 'enterContext'` before reaching a single assertion.
+        # They were not failing; they were not running, and a class that
+        # cannot run reports nothing about the code it guards.
+        _env = mock.patch.dict(os.environ, {}, clear=False)
+        _env.start()
+        self.addCleanup(_env.stop)
         for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID",
                      "NOTION_OPS_RUNS_DATABASE_ID"):
             os.environ.pop(name, None)
