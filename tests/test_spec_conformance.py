@@ -37,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC))
 
+import businessdate  # noqa: E402
 from collector.result import CollectorStatus  # noqa: E402
 from daily import generate_daily_history  # noqa: E402
 from events import EVENT_TYPES, ROLES, create_event, validate_event  # noqa: E402
@@ -115,6 +116,26 @@ class GitProhibitionGuardTests(unittest.TestCase):
         self.assertNotIn("--delete", self.code)
         self.assertNotRegex(self.code, r"remote[\"'\s,\]]+remove")
 
+    #: Every git command `git_ops.py` is allowed to run, and why it is here.
+    #: Adding a line is the reviewed act this class exists to force.
+    APPROVED_COMMANDS = {
+        "status --porcelain": "does the working tree differ from the last commit",
+        "add -A": "stage the synced Company History",
+        "commit -m": "the backup commit",
+        "rev-parse HEAD": "the commit hash, for the Backup Log entry",
+        "push": "docs/08 section 12; plain, no force, no upstream argument",
+        # C137. "Is the working tree clean" and "did that commit reach the
+        # remote" are different questions, and a failed push makes them
+        # disagree -- the tree goes clean while the Backup is still not backed
+        # up. Nothing here could ask the second one, so `backup/runner.py`
+        # inferred it from `backup_state.json` and reported BACKUP_NOT_REQUIRED
+        # over an unpushed commit. Read-only: `rev-list` counts commits and
+        # writes nothing, touches no ref and no working tree, so it is
+        # admissible under docs/08 section 5 for the same reason
+        # `status`/`rev-parse` are.
+        "rev-list --count @{u}..HEAD": "commits the upstream does not have",
+    }
+
     def test_git_ops_runs_only_the_approved_command_set(self):
         """A closed inventory. Adding any new git command to git_ops.py must
         be a deliberate, reviewed act — this test is the review gate."""
@@ -127,16 +148,35 @@ class GitProhibitionGuardTests(unittest.TestCase):
             args = [a for a in args if not a.startswith("repo") and not a.startswith("message")]
             commands.add(" ".join(args))
 
-        self.assertEqual(
-            commands,
-            {
-                "status --porcelain",
-                "add -A",
-                "commit -m",
-                "rev-parse HEAD",
-                "push",
-            },
+        self.assertEqual(commands, set(self.APPROVED_COMMANDS))
+
+    def test_every_approved_command_carries_its_reason(self):
+        """The roster is only a review gate while each entry says why it is
+        allowed — an unexplained line is one nobody reviewed."""
+        self.assertTrue(self.APPROVED_COMMANDS, "the roster went empty")
+        for command, reason in self.APPROVED_COMMANDS.items():
+            with self.subTest(command=command):
+                self.assertTrue(reason.strip(), f"{command} has no stated reason")
+
+    def test_the_only_commands_that_write_are_the_three_that_must(self):
+        """docs/08 section 5 is about what git_ops.py may *change*. Stated
+        directly rather than left implicit in a flat list: three commands are
+        allowed to modify something, and every other approved command must be
+        a read."""
+        writers = {"add -A", "commit -m", "push"}
+
+        self.assertTrue(
+            writers <= set(self.APPROVED_COMMANDS),
+            "a writing command left the roster; this test no longer means what it says",
         )
+        for command in set(self.APPROVED_COMMANDS) - writers:
+            with self.subTest(command=command):
+                verb = command.split()[0]
+                self.assertIn(
+                    verb,
+                    {"status", "rev-parse", "rev-list", "log", "show"},
+                    f"{command!r} is on the roster but is not a known read-only verb",
+                )
 
     def test_working_copy_is_never_copied_back_onto_local_master(self):
         """docs/08 section 13: Copy 방향은 한쪽뿐이다."""
@@ -655,46 +695,42 @@ class DecisionAuthorityCharacterizationTests(unittest.TestCase):
         self.assertNotIn("COO", EVENT_TYPES)
 
 
-class TimezoneGroupingCharacterizationTests(unittest.TestCase):
-    """BUG-26 (NOT FIXED — the fix needs a decision that has not been made).
+class TimezoneGroupingTests(unittest.TestCase):
+    """BUG-26 - FIXED in C135. This class was the characterization; it is now
+    the guarantee, exactly as its own docstring instructed:
 
-    CHARACTERIZATION: asserts today's behaviour, including the misfiling. It
-    will fail the day the grouping is normalised, and should then be rewritten
-    as the guarantee.
+        "CHARACTERIZATION: asserts today's behaviour, including the misfiling.
+         It will fail the day the grouping is normalised, and should then be
+         rewritten as the guarantee."
 
     docs/06 section 12 groups a candidate into the day its "Event timestamp
-    falls on". `daily/generator._candidate_date()` implements that as
-
-        datetime.fromisoformat(candidate.timestamp).date()
-
-    which takes the date *as written in the string* and ignores the UTC
-    offset entirely. Three things have to line up for that to be safe, and
-    only two of them do:
+    falls on", and docs/06 section 9 says which zone that day is measured in:
+    Asia/Seoul. Three things had to line up for reading the date straight off
+    the string to be safe, and only two did:
 
       1. docs/02's schema requires an offset to be present but does NOT
-         require it to be +09:00 — '+00:00', 'Z' and '-05:00' all validate.
-      2. `events.current_timestamp()` stamps the machine's local offset, so
+         require it to be +09:00 - '+00:00' and '-05:00' all validate. Still
+         true, and still deliberately so; the first test below keeps
+         asserting it.
+      2. `events.current_timestamp()` stamped the *machine's* local offset, so
          a Desktop running in UTC (a VM, a mis-set clock, a machine that
-         travelled) emits '+00:00' with no warning anywhere.
-      3. Nothing normalises to KST before grouping.
+         travelled) emitted '+00:00' with no warning anywhere.
+      3. Nothing normalised to KST before grouping.
 
-    Measured over the 24 hours of one UTC day, 9 land on the wrong calendar
-    day — every Event from 15:00 UTC onward, which is 00:00-08:59 the next
-    day in KST:
+    The fix is (3): `businessdate.business_date()` converts to Asia/Seoul and
+    every grouping site goes through it. That was chosen over the two
+    alternatives the characterization listed - constraining the schema to
+    +09:00, or normalising at Event creation - because it is the only one of
+    the three that follows from the Spec as already written (section 9 says
+    the zone; section 12 says the rule) rather than deciding something new,
+    and the only one that needs nothing done to the Events already on disk.
+    C135 also closed (2): `current_timestamp()` now stamps KST on any machine,
+    so new Events do not create the divergence in the first place; this class
+    covers the ones that already exist and any that arrive from elsewhere.
 
-        2026-08-05T14:00+00:00  = 2026-08-05 23:00 KST -> filed 2026-08-05  OK
-        2026-08-05T15:00+00:00  = 2026-08-06 00:00 KST -> filed 2026-08-05  wrong
-        2026-08-05T23:00+00:00  = 2026-08-06 08:00 KST -> filed 2026-08-05  wrong
-
-    Company History is README RULE 2's primary record, so this attributes work
-    to the wrong day in the record of last resort. It also compounds BUG-17:
-    a candidate misfiled into an already-closed day is one the Daily Close
-    will never pick up.
-
-    Not fixed here because the correct rule is a decision, not a cleanup —
-    normalise to KST at grouping, or constrain the schema to +09:00, or
-    normalise at Event creation. Those differ in what happens to Events
-    already on disk.
+    Measured over the 24 hours of one UTC day, 9 used to land on the wrong
+    calendar day - every Event from 15:00 UTC onward, which is 00:00-08:59 the
+    next day in KST. All 24 now land on their Seoul day.
     """
 
     def _candidate(self, event_id, timestamp):
@@ -710,13 +746,13 @@ class TimezoneGroupingCharacterizationTests(unittest.TestCase):
             filter_result=HistoryDecision.KEEP,
         )
 
-    def _filed_on(self, timestamp):
+    def _filed_on(self, timestamp, days=(date(2026, 8, 5), date(2026, 8, 6))):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         repo = FileHistoryRepository(keep_dir=root / "keep", review_dir=root / "review")
         repo.save(self._candidate("TZPROBE", timestamp))
-        for day in (date(2026, 8, 5), date(2026, 8, 6)):
+        for day in days:
             body = generate_daily_history(
                 repo, day, output_dir=root / "daily"
             ).read_text(encoding="utf-8")
@@ -725,7 +761,12 @@ class TimezoneGroupingCharacterizationTests(unittest.TestCase):
         return None
 
     def test_the_schema_accepts_a_non_kst_offset(self):
-        """Precondition 1: this is reachable, not hypothetical."""
+        """Precondition 1: this is reachable, not hypothetical.
+
+        Unchanged by the fix, and it must stay that way - the fix normalises
+        at grouping rather than narrowing what the schema accepts, so an
+        Event that arrives stamped '+00:00' is still a valid Event.
+        """
         for offset in ("+00:00", "-05:00", "+05:30"):
             with self.subTest(offset=offset):
                 data = create_event(
@@ -744,23 +785,70 @@ class TimezoneGroupingCharacterizationTests(unittest.TestCase):
                 self.assertEqual(validate_event(data), [])
 
     def test_a_kst_timestamp_is_filed_on_its_own_day(self):
-        """The path that works, so the test below cannot pass vacuously."""
+        """The path that always worked, so the tests below cannot pass
+        vacuously by filing everything nowhere."""
         self.assertEqual(self._filed_on("2026-08-05T23:00:00+09:00"), date(2026, 8, 5))
         self.assertEqual(self._filed_on("2026-08-06T00:30:00+09:00"), date(2026, 8, 6))
 
-    def test_a_utc_timestamp_after_15_00_is_filed_a_day_early(self):
-        """15:00 UTC is 00:00 the next day in KST, but it is filed as the 5th.
+    def test_a_utc_timestamp_after_15_00_is_filed_on_its_seoul_day(self):
+        """15:00 UTC is 00:00 the next day in KST, and is now filed as the 6th.
 
-        If this fails, BUG-26 was fixed — rewrite this class as the guarantee.
+        This is the assertion that was inverted before C135 (it asserted
+        `date(2026, 8, 5)` for both, under the name
+        `..._is_filed_a_day_early`). It is the whole of BUG-26 in two lines.
         """
-        self.assertEqual(self._filed_on("2026-08-05T15:00:00+00:00"), date(2026, 8, 5))
-        self.assertEqual(self._filed_on("2026-08-05T23:00:00+00:00"), date(2026, 8, 5))
+        self.assertEqual(self._filed_on("2026-08-05T15:00:00+00:00"), date(2026, 8, 6))
+        self.assertEqual(self._filed_on("2026-08-05T23:00:00+00:00"), date(2026, 8, 6))
 
-    def test_the_grouping_never_converts_to_a_common_timezone(self):
-        """The structural cause, so a refactor cannot lose the finding."""
+    def test_the_same_instant_is_filed_on_one_day_however_it_is_written(self):
+        """The property underneath the two assertions above.
+
+        These four spellings are the *same instant*. Before C135 they were
+        filed on three different days by three different Desktops reporting
+        the same moment of work.
+        """
+        spellings = (
+            "2026-08-05T15:00:00+00:00",
+            "2026-08-06T00:00:00+09:00",
+            "2026-08-05T10:00:00-05:00",
+            "2026-08-05T20:30:00+05:30",
+        )
+        instants = {datetime.fromisoformat(s) for s in spellings}
+        self.assertEqual(len(instants), 1, "the probe timestamps are not one instant")
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                self.assertEqual(self._filed_on(spelling), date(2026, 8, 6))
+
+    def test_every_hour_of_a_utc_day_lands_on_its_seoul_day(self):
+        """The full sweep the characterization measured (9 of 24 wrong).
+
+        15:00 UTC onward is the next Seoul day; before it is the same one.
+        """
+        for hour in range(24):
+            stamp = f"2026-08-05T{hour:02d}:00:00+00:00"
+            expected = date(2026, 8, 6) if hour >= 15 else date(2026, 8, 5)
+            with self.subTest(hour=hour):
+                self.assertEqual(self._filed_on(stamp), expected)
+
+    def test_the_grouping_converts_to_a_common_timezone(self):
+        """The structural cause, so a refactor cannot lose the fix.
+
+        The mirror image of the characterization's
+        `test_the_grouping_never_converts_to_a_common_timezone`, which
+        asserted `assertNotIn("astimezone", source)` on this same function.
+        """
         source = inspect.getsource(sys.modules["daily.generator"]._candidate_date)
-        self.assertIn("fromisoformat", source)
-        self.assertNotIn("astimezone", source)
+        self.assertIn("business_date", source)
+        self.assertIn(
+            "business_date",
+            inspect.getsource(sys.modules["daily.role_summary"]._candidate_date),
+            "the role summary must bucket by the same rule as the rendered file",
+        )
+        self.assertEqual(
+            businessdate.KST.utcoffset(None),
+            timedelta(hours=9),
+            "docs/06 section 9: Asia/Seoul is UTC+09:00",
+        )
 
 
 class EventTypeStatusCoherenceTests(unittest.TestCase):

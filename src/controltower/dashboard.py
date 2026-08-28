@@ -91,6 +91,7 @@ from datetime import date as date_type
 from datetime import datetime
 from typing import Any, Mapping
 
+from businessdate import business_date
 from oplog import bounded, one_line, redact
 
 from .rollup import (
@@ -644,7 +645,7 @@ def _evidence_day(iso: str | None) -> date_type | None:
     if not iso:  # pragma: no cover - see above
         return None
     try:
-        return datetime.fromisoformat(iso).date()
+        return business_date(datetime.fromisoformat(iso))
     except (TypeError, ValueError):  # pragma: no cover - see above
         return None
 

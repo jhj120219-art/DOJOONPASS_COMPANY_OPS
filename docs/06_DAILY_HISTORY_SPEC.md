@@ -196,6 +196,12 @@ Daily Close 기본 실행 시각:
 
 Event Timestamp에도 Timezone 정보를 유지한다.
 
+Event Timestamp가 `+09:00`이 **아닌** offset을 들고 올 수 있다는 뜻이기도 하다
+(docs/02는 offset이 있을 것만 요구하고 그 값을 정하지 않는다). 그런 Event가 §12의
+"어느 날에 속하는가"에 답할 때는 위 기준시간대로 환산한 뒤에 잰다. 구현은
+`src/businessdate.py`(`business_date()`)에 있고, 날짜를 매기는 모든 자리가 그것을
+지난다.
+
 ---
 
 ## 10. Daily Close Input

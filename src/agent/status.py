@@ -32,6 +32,8 @@ from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
 
+import businessdate
+from businessdate import clock_date
 from .agent import DEFAULT_REJECTED_SIGNALS_DIR, derive_event_id
 from .signals import DEFAULT_SIGNALS_DIR
 from .catchup import pending_dates
@@ -91,7 +93,7 @@ class AgentStatusSnapshot:
             reference = now.replace(tzinfo=None)
         else:
             reference = now
-        return max(0, (reference.date() - parsed.date()).days)
+        return max(0, (clock_date(reference) - clock_date(parsed)).days)
 
     def needs_attention(self, now: datetime, *, stale_after_days: int = 2) -> tuple[str, ...]:
         """Plain-language reasons a human should look at this Desktop.
@@ -146,10 +148,10 @@ class AgentStatusSnapshot:
         # rewrites the state or reprocesses a date. Same restraint as
         # `scheduler/consistency.py`: report, never repair.
         collected_through = self.last_successful_collection_date
-        if collected_through is not None and collected_through > now.date():
+        if collected_through is not None and collected_through > clock_date(now):
             reasons.append(
                 f"이 머신의 Agent state가 {collected_through.isoformat()}까지 수집했다고 "
-                f"말하는데 그 날짜는 미래다 (오늘은 {now.date().isoformat()}) — 그 날짜가 "
+                f"말하는데 그 날짜는 미래다 (오늘은 {clock_date(now).isoformat()}) — 그 날짜가 "
                 f"올 때까지 아무것도 수집되지 않는다"
             )
 
@@ -571,7 +573,7 @@ def read_status(
     since a first-ever run has no other way to know where counting starts
     (docs/07 §50: never guessed).
     """
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     state_path = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
     outbox_dir = Path(outbox_dir) if outbox_dir is not None else DEFAULT_OUTBOX_DIR
     sent_dir = Path(sent_dir) if sent_dir is not None else DEFAULT_SENT_DIR

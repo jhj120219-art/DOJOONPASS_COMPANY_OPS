@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime
 from pathlib import Path
 
+import businessdate
 from .result import CollectorError
 from .runtime import PROJECT_ROOT
 from .seen_store import SeenEventStore
@@ -153,5 +153,5 @@ class PersistentSeenEventStore(SeenEventStore):
         record for a human inspecting collector_state.json, not a value the
         Runtime branches on.
         """
-        self.last_run = timestamp or datetime.now().astimezone().isoformat(timespec="seconds")
+        self.last_run = timestamp or businessdate.now().isoformat(timespec="seconds")
         self._save()

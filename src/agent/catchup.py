@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
+from businessdate import clock_date
+
 
 def pending_dates(
     *,
@@ -47,7 +49,7 @@ def pending_dates(
         if last_successful_collection_date is not None
         else start_date
     )
-    end = now.date() - timedelta(days=1)
+    end = clock_date(now) - timedelta(days=1)
 
     dates: list[date] = []
     current = start

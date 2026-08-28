@@ -71,7 +71,6 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -82,6 +81,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import dashboard_server  # noqa: E402
+import businessdate  # noqa: E402
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 from controltower.notion_page import (  # noqa: E402
     ControlTowerPageError,
@@ -237,7 +237,7 @@ def main(argv=()) -> int:
         )
         return FAILED_EXIT
 
-    payload = dashboard_server.gather(datetime.now().astimezone())
+    payload = dashboard_server.gather(businessdate.now())
 
     # The address the operator would actually type, resolved by the server
     # module rather than restated here. `dashboard_server.py` owns the port,

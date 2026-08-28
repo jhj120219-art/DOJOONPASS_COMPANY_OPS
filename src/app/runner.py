@@ -56,6 +56,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_NOTION_SYNC_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "notion_sync.log"
 DEFAULT_LATE_UPDATE_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "daily_late_update.log"
 
+import businessdate  # noqa: E402
+from businessdate import business_date  # noqa: E402
 from backup.git_ops import GitOperationError, is_authentication_failure  # noqa: E402
 from backup.result import BackupStatus  # noqa: E402
 from backup.runner import run_once as backup_run_once  # noqa: E402  (backup/__init__.py 없음 — 서브모듈 직접 import)
@@ -389,7 +391,7 @@ def run_once(
     `notion_sync`를 주지 않으면(Notion 미설정) Notion Sync 단계는 건너뛰고
     다섯 번째 값은 빈 tuple이 된다 — 나머지 단계는 영향받지 않는다.
     """
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
 
     # 1. Runner Lock Acquire — docs/07 §37 step 1, §24-27, §25 "Lock으로
     #    하나의 Runner만 실행되게 한다". Runtime Stabilization Sprint(Critical
@@ -1011,7 +1013,7 @@ def run_once(
                 # 처리가 없다는 문서화된 성질(BUG-20 characterization,
                 # tests/test_architecture_invariants.py)을 코드 텍스트상으로
                 # 흐리게 만들 뿐 실제로 바뀌는 것은 없다.
-                kept_dates.add(datetime.fromisoformat(event.timestamp).date())
+                kept_dates.add(business_date(datetime.fromisoformat(event.timestamp)))
         recorder.ok(C_HISTORY_FILTER, kept_dates=len(kept_dates))
 
 
@@ -1708,7 +1710,7 @@ def run_once(
         run_summary = RunSummary(
             run_id=resolved_manifest_run_id,
             started_at=now_iso(now),
-            finished_at=now_iso(datetime.now().astimezone()),
+            finished_at=now_iso(businessdate.now()),
             components=tuple(recorder.components),
         )
         return RunResult(
@@ -1796,7 +1798,7 @@ def run_once(
             run_summary = RunSummary(
                 run_id=resolved_manifest_run_id,
                 started_at=now_iso(now),
-                finished_at=now_iso(datetime.now().astimezone()),
+                finished_at=now_iso(businessdate.now()),
                 components=tuple(recorder.components),
             )
         write_summary(resolved_run_summary_path, run_summary)

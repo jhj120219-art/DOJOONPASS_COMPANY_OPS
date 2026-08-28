@@ -18,9 +18,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from pathlib import Path
 
+import businessdate
+from businessdate import clock_date
 from .git_ops import (
     GitOperationError,
     check_working_copy_is_a_git_repository,
+    count_unpushed_commits,
     git_add_all,
     git_commit,
     git_head_commit,
@@ -68,7 +71,7 @@ def run_once(
     run_id: str | None = None,
     source: str | None = None,
 ) -> BackupLogEntry:
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     resolved_state_path = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
     resolved_run_id = run_id or now.isoformat(timespec="seconds")
     resolved_source = source or str(master_dir)
@@ -106,7 +109,7 @@ def run_once(
             deleted_files=(),
             commit_hash=None,
             push_result="secret files detected: " + ", ".join(secret_matches),
-            backup_end=datetime.now().astimezone(),
+            backup_end=businessdate.now(),
             final_status=final_status,
         )
         state.backup_status = final_status
@@ -141,7 +144,7 @@ def run_once(
             deleted_files=sync_result.deleted,
             commit_hash=None,
             push_result=None,
-            backup_end=datetime.now().astimezone(),
+            backup_end=businessdate.now(),
             final_status=final_status,
         )
         state.backup_status = final_status
@@ -164,7 +167,7 @@ def run_once(
                 f"mass modification detected: {len(sync_result.modified)} files "
                 f"modified (threshold {_MASS_MODIFICATION_THRESHOLD})"
             ),
-            backup_end=datetime.now().astimezone(),
+            backup_end=businessdate.now(),
             final_status=final_status,
         )
         state.backup_status = final_status
@@ -197,7 +200,7 @@ def run_once(
                 raise
 
             final_status = BackupStatus.SUCCESS
-            backup_end = datetime.now().astimezone()
+            backup_end = businessdate.now()
             entry = BackupLogEntry(
                 run_id=resolved_run_id,
                 backup_start=backup_start,
@@ -215,6 +218,58 @@ def run_once(
             save_state(resolved_state_path, state)
             return entry
 
+        # BUG-1 반쪽만 닫혀 있었다. 위 분기는 미push commit을 들고 있을 수 있는
+        # **두** 상태 중 하나(PENDING)만 본다. 같은 분류기의 반대편 팔이 쓰는
+        # BACKUP_FAILED도 정확히 같은 모양을 남긴다 — commit은 만들어졌고 push만
+        # 실패했으며, 그래서 Working Copy는 깨끗하다.
+        #
+        # 실측(실제 git, 실제 remote):
+        #
+        #   1) 정상                      BACKUP_SUCCESS
+        #   2) remote 파손 + 새 Daily    push 실패, state=BACKUP_PENDING,
+        #                                미push commit 1건
+        #   3) 변경 없음                 재시도 -> 또 실패, PENDING 유지  (옳다)
+        #   4) 변경 없음, state=FAILED   **BACKUP_NOT_REQUIRED**, 미push commit 1건
+        #
+        # 4번이 결함이다. Company History가 remote에 없는데 이 실행은 초록을
+        # 보고하고, 게다가 `save_state`가 FAILED를 NOT_REQUIRED로 **덮어써서**
+        # 그 실패가 있었다는 사실 자체를 지운다. `ops_status.py`의 ATTENTION은
+        # 그 다음부터 아무 말도 하지 않는다. README RULE 7이 금지하는 조용한
+        # 손실이고, docs/08 §62가 겨냥한 자격증명 실패가 바로 이 경로로 들어온다.
+        #
+        # push를 다시 시도하지는 **않는다.** §62가 금지하는 것이 그것이고,
+        # §21은 "사람이 개입해야 한다"고 못박는다. 고치는 것은 재시도가 아니라
+        # **거짓말**이다: 실패는 서 있는 채로 보고되고 상태는 그대로 남는다.
+        #
+        # `count_unpushed_commits()`에게 묻는다 — state 파일이 아니라 저장소에.
+        # 사람이 손으로 push해 놓았다면 remote는 최신이고 NOT_REQUIRED가 참이다.
+        # None(upstream 없음 등)은 0으로 읽지 않는다: "알 수 없다"는 "도달했다"가
+        # 아니고, 그 경우 초록을 보고하는 것이 정확히 이 결함이다.
+        if state.backup_status is BackupStatus.FAILED:
+            unpushed = count_unpushed_commits(working_copy_dir)
+            if unpushed != 0:
+                entry = BackupLogEntry(
+                    run_id=resolved_run_id,
+                    backup_start=backup_start,
+                    source=resolved_source,
+                    changed_files=(),
+                    deleted_files=(),
+                    commit_hash=git_head_commit(working_copy_dir),
+                    push_result=(
+                        "이전 실행의 BACKUP_FAILED가 아직 해소되지 않았다: "
+                        + (
+                            f"remote에 도달하지 않은 commit {unpushed}건"
+                            if unpushed is not None
+                            else "remote와 비교할 수 없다 (upstream 미설정)"
+                        )
+                        + ". docs/08 §21 — 사람이 개입해야 한다"
+                    ),
+                    backup_end=businessdate.now(),
+                    final_status=BackupStatus.FAILED,
+                )
+                # 상태는 건드리지 않는다. 이 분기의 요점이 그것이다.
+                return entry
+
         final_status = BackupStatus.NOT_REQUIRED
         entry = BackupLogEntry(
             run_id=resolved_run_id,
@@ -224,7 +279,7 @@ def run_once(
             deleted_files=(),
             commit_hash=None,
             push_result=None,
-            backup_end=datetime.now().astimezone(),
+            backup_end=businessdate.now(),
             final_status=final_status,
         )
         state.backup_status = final_status
@@ -287,7 +342,7 @@ def run_once(
         commit_hash = git_commit(
             working_copy_dir,
             _commit_message(
-                now.date(),
+                clock_date(now),
                 has_added=bool(sync_result.added),
                 has_modified=bool(sync_result.modified),
             ),
@@ -315,7 +370,7 @@ def run_once(
         raise
 
     final_status = BackupStatus.SUCCESS
-    backup_end = datetime.now().astimezone()
+    backup_end = businessdate.now()
     entry = BackupLogEntry(
         run_id=resolved_run_id,
         backup_start=backup_start,

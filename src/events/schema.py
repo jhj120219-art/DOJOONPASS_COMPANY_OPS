@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
+import businessdate
+
 SUPPORTED_SCHEMA_VERSION = "1.0"
 
 SOURCES = frozenset({"DESKTOP_1", "DESKTOP_2", "DESKTOP_3", "DESKTOP_4"})
@@ -53,7 +55,7 @@ def generate_event_id() -> str:
 
 
 def current_timestamp() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return businessdate.now().isoformat(timespec="seconds")
 
 
 def _timestamp_error(value: Any) -> str | None:

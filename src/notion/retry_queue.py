@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import businessdate
 from events import Event
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -171,7 +172,7 @@ def upsert_entry(
     of re-scanning `entries`; a brand-new entry's position is recorded in it.
     Omitted, this is byte-for-byte the original O(n)-scan behaviour.
     """
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     if index is not None:
         existing_index = index.get(event.event_id)
     else:

@@ -983,6 +983,119 @@ class AtomicStateWriteInvariantTests(unittest.TestCase):
                 self.assertIn("os.remove(tmp_path)", source)
 
 
+class AnEntrypointOrchestratesAndDoesNotWriteTests(unittest.TestCase):
+    """The unstated premise `EveryStateWriteStagesTests` rests on.
+
+    That class sweeps `SRC.rglob("*.py")` and nothing else, and its
+    completeness argument is therefore "every write in this project happens
+    under `src/`". That is true — measured in C135, **zero** write calls
+    across all six root entrypoints — and it was true by nobody's decision.
+    Two rosters in this repository had the same shape and both were wrong:
+    `ASilentlyDroppedEntryIsARosterNotAParagraphTests.ALSO_SCANNED` named the
+    root half and named four of six, and
+    `EnvironmentContractTests.ENTRYPOINTS` had been hand-corrected twice.
+
+    So this states the premise. A `write_text()` added to `ops_status.py`
+    would be a state write outside the reach of all six atomic-write gates —
+    not caught, not staged, not cleaned up on failure — and it would be
+    caught here instead, as the layering violation it is: an entrypoint's job
+    is to read configuration, call into `src/`, and turn the result into an
+    exit code.
+
+    **`print()` is not a write** and neither is a log line: those go through
+    `oplog.append_line()`, which is under `src/` and is declared append-only
+    by `EveryStateWriteStagesTests.APPEND_ONLY`. What is forbidden here is an
+    entrypoint putting bytes on disk itself.
+    """
+
+    #: The same call names `EveryStateWriteStagesTests` treats as a write, so
+    #: the two cannot drift into disagreeing about what "writing" means.
+    WRITE_ATTRS = {"write_text", "write_bytes"}
+    OPEN_NAMES = {"open", "fdopen"}
+
+    def _entrypoints(self):
+        return sorted(p for p in REPO_ROOT.glob("*.py") if p.is_file())
+
+    def _writes_in(self, source, label):
+        found = []
+        for node in ast.walk(ast.parse(source, filename=label)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in self.WRITE_ATTRS:
+                found.append((node.lineno, f".{func.attr}()"))
+            name = (
+                func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            )
+            if name in self.OPEN_NAMES:
+                mode = None
+                for index, argument in enumerate(node.args):
+                    if index == 1 and isinstance(argument, ast.Constant):
+                        mode = argument.value
+                for keyword in node.keywords:
+                    if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                        mode = keyword.value.value
+                if isinstance(mode, str) and any(c in mode for c in "wax+"):
+                    found.append((node.lineno, f"{name}(mode={mode!r})"))
+        return found
+
+    def test_the_scan_finds_the_entrypoints(self):
+        """Guards the guard: the assertion below is a negative over this
+        list, and a negative over nothing is true (C66 §1)."""
+        names = {p.name for p in self._entrypoints()}
+
+        self.assertIn("run_company_ops.py", names)
+        self.assertIn("ops_status.py", names)
+        self.assertGreaterEqual(len(names), 6, sorted(names))
+
+    def test_the_detector_finds_a_write_it_is_meant_to_find(self):
+        """The predicate, on inputs it must flag and ones it must not."""
+        for source in (
+            "path.write_text('x', encoding='utf-8')\n",
+            "path.write_bytes(b'x')\n",
+            "open(path, 'w').close()\n",
+            "open(path, mode='a').close()\n",
+        ):
+            with self.subTest(source=source.strip()):
+                self.assertTrue(self._writes_in(source, "probe.py"), source)
+
+        for benign in (
+            "print('hello')\n",
+            "text = path.read_text(encoding='utf-8')\n",
+            "handle = open(path, 'r')\n",
+            "handle = open(path)\n",
+        ):
+            with self.subTest(benign=benign.strip()):
+                self.assertEqual(self._writes_in(benign, "probe.py"), [], benign)
+
+    def test_no_entrypoint_writes_to_disk_itself(self):
+        offenders = []
+        for path in self._entrypoints():
+            source = path.read_text(encoding="utf-8")
+            for line, how in self._writes_in(source, str(path)):
+                offenders.append(f"{path.name}:{line}: {how}")
+
+        self.assertEqual(
+            offenders,
+            [],
+            "an entrypoint writes to disk directly; every atomic-write gate "
+            "in this repository sweeps src/ only, so this write is staged by "
+            "nothing and cleaned up by nothing",
+        )
+
+    def test_the_sweep_those_gates_run_really_does_stop_at_src(self):
+        """Why the test above is load-bearing rather than decorative.
+
+        If `EveryStateWriteStagesTests` ever widened to the repository root,
+        this class would be redundant — and it would be better to notice that
+        than to keep two overlapping rules.
+        """
+        source = inspect.getsource(EveryStateWriteStagesTests)
+
+        self.assertIn("SRC.rglob", source)
+        self.assertNotIn("REPO_ROOT.glob", source)
+
+
 class EveryStateWriteStagesTests(unittest.TestCase):
     """The atomic-write family discovers its members by `mkstemp` — so a
     writer that never stages is not a member, and no gate says anything.
@@ -1828,6 +1941,137 @@ class AtomicWritesReachTheDiskBeforeTheRenameTests(unittest.TestCase):
                             pending_fsync, 0, f"{name} renamed an unflushed file: {self.events}"
                         )
                         pending_fsync -= 1
+
+
+class TheDoubleKeepsTwoDatabasesApartTests(unittest.TestCase):
+    """The production wiring `InMemoryNotionTransport`'s own comment says
+    nothing mirrors. C136 writes the test that comment predicts.
+
+    `run_company_ops._build_notion_clients()` builds **one**
+    `RealNotionTransport` and hands it to **two** `NotionClient`s — one bound
+    to PROJECTS, one to OPS_RUNS. Real Notion keeps those apart by database
+    id. The double once ignored the id entirely, so every page lived in one
+    undifferentiated pool and `query_database()` would answer "find the
+    PROJECTS row for project X" with an OPS_RUNS run record. It carries a
+    `_page_database` map now, and beside it this note:
+
+        "No test does that today (checked), which is exactly why it was worth
+         fixing now: the trap only springs for a test that mirrors the
+         production wiring -- the most natural test anyone would write next --
+         and it springs as a silent pass, not a failure."
+
+    A silent pass is the part that matters. Every Notion test in this
+    repository builds one client on one database, so none of them can tell a
+    working `_page_database` from a missing one; the guard would have rotted
+    with the whole suite green. So the wiring is mirrored here on purpose.
+
+    What it would cost if it broke: `ExecutionPlanSync.sync()` calls
+    `find_project()` first and UPDATEs whatever comes back. A run record
+    answering that lookup means the Runner writes project state onto an
+    OPS_RUNS row and never creates the project's own.
+    """
+
+    PROJECTS = "db-projects"
+    OPS_RUNS = "db-ops-runs"
+
+    def setUp(self):
+        from notion.client import NotionClient
+        from notion.transport import InMemoryNotionTransport
+
+        self.transport = InMemoryNotionTransport()
+        self.projects = NotionClient(
+            transport=self.transport, database_id=self.PROJECTS
+        )
+        self.runs = NotionClient(transport=self.transport, database_id=self.OPS_RUNS)
+
+    @staticmethod
+    def _project_id_property(value):
+        return {"rich_text": [{"text": {"content": value}}]}
+
+    def test_one_transport_really_serves_both_clients(self):
+        """Guards the guard. If the two clients ever stopped sharing a
+        transport, every assertion below would pass by construction and prove
+        nothing about the production wiring."""
+        self.assertIs(self.projects._transport, self.runs._transport)
+        self.assertNotEqual(self.projects._database_id, self.runs._database_id)
+
+    def test_a_run_record_does_not_answer_a_project_lookup(self):
+        """The trap itself. The decoy carries the same property name and the
+        same value the PROJECTS filter matches on, so only the database id
+        can tell them apart."""
+        decoy = self.runs.create_project(
+            {
+                "Project ID": self._project_id_property("SEARCH_BACKEND"),
+                "Run ID": {"title": [{"text": {"content": "RUN-2026-08-12"}}]},
+            }
+        )
+
+        self.assertIsNotNone(decoy.get("id"))
+        self.assertIsNone(
+            self.projects.find_project("SEARCH_BACKEND"),
+            "an OPS_RUNS run record answered a PROJECTS lookup",
+        )
+
+    def test_the_real_project_row_is_still_found(self):
+        """The positive control. A guard that answered None to everything
+        would pass the test above and would break every sync instead."""
+        self.runs.create_project(
+            {"Project ID": self._project_id_property("SEARCH_BACKEND")}
+        )
+        real = self.projects.create_project(
+            {
+                "Project ID": self._project_id_property("SEARCH_BACKEND"),
+                "Project": {"title": [{"text": {"content": "Search Backend"}}]},
+            }
+        )
+
+        found = self.projects.find_project("SEARCH_BACKEND")
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.get("id"), real.get("id"))
+
+    def test_each_client_sees_only_its_own_database(self):
+        """Both directions. The OPS_RUNS client must not start answering with
+        PROJECTS rows either."""
+        decoy = self.runs.create_project(
+            {"Project ID": self._project_id_property("SEARCH_BACKEND")}
+        )
+        real = self.projects.create_project(
+            {"Project ID": self._project_id_property("SEARCH_BACKEND")}
+        )
+
+        self.assertEqual(
+            self.projects.find_project("SEARCH_BACKEND").get("id"), real.get("id")
+        )
+        self.assertEqual(
+            self.runs.find_project("SEARCH_BACKEND").get("id"), decoy.get("id")
+        )
+
+    def test_the_wiring_this_mirrors_is_the_one_production_uses(self):
+        """The claim above about `_build_notion_clients()`, read off the
+        source rather than trusted. If production ever stops sharing one
+        transport, this class is mirroring something that no longer exists.
+        """
+        import ast
+
+        source = (REPO_ROOT / "run_company_ops.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        builder = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_build_notion_clients"
+        )
+        body = ast.unparse(builder)
+
+        self.assertEqual(
+            body.count("RealNotionTransport("), 1, "production built more than one transport"
+        )
+        self.assertEqual(
+            body.count("NotionClient("), 2, "production no longer builds two clients"
+        )
+        self.assertIn("projects_database_id", body)
+        self.assertIn("ops_runs_database_id", body)
 
 
 class TestDoubleFidelityTests(unittest.TestCase):
@@ -3821,18 +4065,55 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
     give a reason: re-deriving from Events would duplicate the History
     Filter and let Daily and Monthly disagree about the same day.
 
-    The strongest way to guarantee that is structural. `monthly` imports
-    nothing from this project at all: not `history`, not `collector`, not
-    `events`. It cannot re-apply a filter it has no access to, and it cannot
-    read a Repository it cannot import. A future change that reaches for one
-    of them fails here rather than producing a Monthly that quietly
-    contradicts its own Daily files.
+    The strongest way to guarantee that is structural. `monthly` may not
+    import anything it could read data out of: not `history`, not
+    `collector`, not `events`. It cannot re-apply a filter it has no access
+    to, and it cannot read a Repository it cannot import. A future change
+    that reaches for one of them fails here rather than producing a Monthly
+    that quietly contradicts its own Daily files.
+
+    **Two things changed in C135, and the first is a hole rather than a
+    concession.** `LOCAL_PACKAGES` was a hand-written literal of eleven names,
+    frozen when this class was written. `oplog`, `cli`, `runsummary`,
+    `controltower` and `businessdate` all arrived afterwards and **none of
+    them was in it** — so for five of this project's modules the assertion
+    below was a negative over an empty set. `from controltower import ...`
+    inside `src/monthly/` would have passed. That is precisely the failure
+    `test_repository_hygiene.py::DependencyGuardTests` had already found in
+    its own copy of this roster and fixed by deriving it from disk (its
+    comment: "it failed exactly that way when `oplog.py` arrived"), and the
+    same fix applies here: read `src/`.
+
+    The second is `ALLOWED_LEAVES`. Deriving the roster makes it complete,
+    and completeness immediately catches `businessdate`, which C135 added to
+    `monthly/generator.py` so that "which month is closed" is asked of the
+    Seoul calendar rather than of whatever offset `now` carries. That import
+    is permitted, and the permission is checked rather than asserted: §13's
+    rule is about **where Monthly gets its facts**, and a module that touches
+    no path and opens no file cannot be where any fact came from.
+    `test_every_allowed_leaf_cannot_be_a_data_source` holds that, so the
+    permit-list cannot quietly grow to include something that reads.
     """
 
-    LOCAL_PACKAGES = {
-        "agent", "app", "backup", "collector", "daily", "events",
-        "history", "notion", "reporter", "scheduler", "transport",
+    #: Modules `monthly` may import despite the rule above. Each must pass
+    #: `test_every_allowed_leaf_cannot_be_a_data_source`.
+    ALLOWED_LEAVES = {
+        "businessdate": (
+            "docs/06 §9's Asia/Seoul as arithmetic. `pending_months()` asks "
+            "which month is closed, which is a business question, and the "
+            "Seoul answer differs from a UTC-framed one for nine hours at "
+            "every month boundary. It reads nothing, so it cannot be a "
+            "source of Monthly's facts."
+        ),
     }
+
+    @property
+    def LOCAL_PACKAGES(self):
+        """Everything importable from `src/`, read from disk — never a
+        literal. See the class docstring for what the literal missed."""
+        return {
+            p.name for p in SRC.iterdir() if p.is_dir() and p.name != "__pycache__"
+        } | {p.stem for p in SRC.glob("*.py") if not p.stem.startswith("__")}
 
     def _project_imports(self, path: Path) -> set[str]:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -3862,15 +4143,82 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
         modules = sorted((SRC / "monthly").glob("*.py"))
         self.assertGreaterEqual(len(modules), 4, modules)
 
-    def test_monthly_imports_nothing_from_the_rest_of_the_project(self):
+    def test_the_local_package_set_is_derived_not_hardcoded(self):
+        """Guards the guard. The literal this replaced was missing five of
+        this project's own modules, which made the assertion below vacuous
+        for every one of them."""
+        self.assertIn("oplog", self.LOCAL_PACKAGES)
+        self.assertIn("controltower", self.LOCAL_PACKAGES)
+        self.assertIn("businessdate", self.LOCAL_PACKAGES)
+        self.assertIn("history", self.LOCAL_PACKAGES)
+        self.assertNotIn("__pycache__", self.LOCAL_PACKAGES)
+
+    def test_monthly_imports_nothing_it_could_read_data_out_of(self):
         for path in sorted((SRC / "monthly").glob("*.py")):
             with self.subTest(module=path.name):
                 self.assertEqual(
-                    self._project_imports(path),
+                    self._project_imports(path) - set(self.ALLOWED_LEAVES),
                     set(),
                     f"src/monthly/{path.name} reaches outside the package; "
                     f"docs/09 §13 requires Monthly to consolidate Daily files only",
                 )
+
+    def test_every_allowed_leaf_cannot_be_a_data_source(self):
+        """The permission is earned, not declared.
+
+        §13's rule is about where Monthly's facts come from. A module that
+        opens no file and touches no path cannot be where one came from, so
+        that — not a name on a list — is what lets it through. Anything added
+        to `ALLOWED_LEAVES` that reads fails here.
+        """
+        for name, why in self.ALLOWED_LEAVES.items():
+            with self.subTest(leaf=name):
+                self.assertGreater(len(why), 40, "an allowed leaf needs a reason")
+                source_path = SRC / f"{name}.py"
+                self.assertTrue(
+                    source_path.is_file(),
+                    f"ALLOWED_LEAVES names {name}, which is not a single module",
+                )
+                tree = ast.parse(source_path.read_text(encoding="utf-8"))
+                reads = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        reads |= {a.name.split(".")[0] for a in node.names}
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        reads.add(node.module.split(".")[0])
+                    elif isinstance(node, ast.Call):
+                        target = node.func
+                        called = (
+                            target.attr
+                            if isinstance(target, ast.Attribute)
+                            else getattr(target, "id", None)
+                        )
+                        if called in ("open", "read_text", "read_bytes", "iterdir",
+                                      "glob", "rglob", "listdir"):
+                            reads.add(f"call:{called}")
+                forbidden = reads & {
+                    "pathlib", "os", "io", "json", "shutil", "sqlite3", "subprocess",
+                    "call:open", "call:read_text", "call:read_bytes",
+                    "call:iterdir", "call:glob", "call:rglob", "call:listdir",
+                }
+                self.assertEqual(
+                    forbidden,
+                    set(),
+                    f"src/{name}.py can reach data ({sorted(forbidden)}), so "
+                    f"src/monthly may not import it",
+                )
+
+    def test_the_data_source_check_would_notice_a_reader(self):
+        """The predicate, on a module that does read. `daily/generator.py`
+        opens files, so it must fail the check the leaves pass."""
+        tree = ast.parse((SRC / "daily" / "generator.py").read_text(encoding="utf-8"))
+        modules = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module.split(".")[0])
+        self.assertTrue(modules & {"pathlib", "os", "io", "json"})
 
     #: Directories Monthly may not reach for. Components, not joined strings:
     #: see `_path_components()`.
@@ -4221,7 +4569,7 @@ class LayeringInvariantTests(unittest.TestCase):
     # package -> packages it is allowed to import. Leaf packages map to an
     # empty set. `app` is the composition root and may use anything.
     ALLOWED = {
-        "events": set(),
+        "events": {"businessdate"},
         "oplog": set(),
         # `sys.argv` handling for the four entrypoints, which read no
         # arguments at all. A leaf for the same reason as `oplog` and
@@ -4234,16 +4582,24 @@ class LayeringInvariantTests(unittest.TestCase):
         # `ops_status.py` and anything else that reports on a run, and a
         # module those can all import must sit below all of them.
         "runsummary": set(),
+        # docs/06 §9's `Asia/Seoul` written down once, so that "which day did
+        # this happen on" stops depending on the machine's clock zone. A leaf
+        # for the same reason as `oplog`, `cli`, and `runsummary`: everything
+        # that dates anything sits above it (C135).
+        "businessdate": set(),
         "transport": {"events"},
         "reporter": {"events", "transport"},
         "history": {"events"},
-        "notion": {"events"},
-        "collector": {"events", "oplog"},
-        "daily": {"events", "history"},
-        "scheduler": {"daily", "history"},
-        "monthly": set(),
-        "backup": set(),
-        "agent": {"events", "oplog", "reporter", "scheduler", "transport"},
+        "notion": {"businessdate", "events"},
+        "collector": {"businessdate", "events", "oplog"},
+        # `businessdate` joined in C135: docs/06 section 12 buckets a
+        # candidate by the day its timestamp falls on, and section 9 says
+        # which zone that day is measured in. A leaf, so it closes no cycle.
+        "daily": {"businessdate", "events", "history"},
+        "scheduler": {"businessdate", "daily", "history"},
+        "monthly": {"businessdate"},
+        "backup": {"businessdate"},
+        "agent": {"businessdate", "events", "oplog", "reporter", "scheduler", "transport"},
         # `cli` joined in C79, when this became the fifth entrypoint to
         # refuse a command-line argument. A leaf, like `oplog` and
         # `runsummary`, so it closes no cycle.
@@ -4272,7 +4628,7 @@ class LayeringInvariantTests(unittest.TestCase):
         # other derivations rather than under them. `reporter` is a writer
         # package, but the edge reaches `profiles.py` — pure vocabulary — and
         # `reporter` imports nothing from here, so the graph stays acyclic.
-        "controltower": {"events", "notion", "oplog", "reporter"},
+        "controltower": {"businessdate", "events", "notion", "oplog", "reporter"},
         "app": None,  # composition root: unrestricted
     }
 
@@ -4423,7 +4779,16 @@ class LayeringInvariantTests(unittest.TestCase):
         """`oplog` is imported by `collector`, `agent` and `app`, and `app`
         depends on the other two — so it has to be a leaf or it closes a
         cycle. Stated separately because it is the reason the module is
-        top-level rather than inside any package."""
+        top-level rather than inside any package.
+
+        C135 wanted `businessdate` here, so that an operator log line and the
+        Events it is about are timestamped in one zone. It took the copy
+        instead (`oplog.KST`, held in step by
+        `EveryDuplicatedConstantIsHeldInStepTests`) — the same trade
+        `transport/intake` already makes for `INCOMPLETE_WRITE_PREFIX`, and
+        for the same reason: the layering forbids the import that would
+        remove the duplication. So this stays `== set()`, at full strength.
+        """
         edges = self._edges()
 
         self.assertEqual(edges["oplog"], set())
@@ -5485,21 +5850,273 @@ class EveryDuplicatedConstantIsHeldInStepTests(unittest.TestCase):
             "out of it. Checked as a relationship by "
             "test_the_late_events_heading_and_its_reader_correspond."
         ),
+        # The five below became visible in C135, when this scan started
+        # reading constants that are not literals. None of them is a defect;
+        # all five were simply outside what the scan could see.
+        "DEFAULT_LOCK_PATH": (
+            "One name per package for that package's own default, and they "
+            "must **differ**: agent/agent.py names the Agent's lock, "
+            "scheduler/lock.py the system-wide Runner lock. Two subsystems "
+            "sharing one lock file is the failure, so the relationship that "
+            "replaces equality is distinctness — "
+            "test_every_per_package_default_path_is_its_own."
+        ),
+        "DEFAULT_LOG_PATH": (
+            "Same shape as DEFAULT_LOCK_PATH: agent/agent.py and "
+            "collector/runtime.py each name their own log. Distinctness is "
+            "checked by test_every_per_package_default_path_is_its_own; "
+            "sharing one would interleave two subsystems into one file."
+        ),
+        "DEFAULT_STATE_PATH": (
+            "Five packages, five state files (agent, backup, collector, "
+            "monthly, scheduler). A collision here would have two subsystems "
+            "overwriting each other's state, which is why the check is "
+            "distinctness rather than equality — "
+            "test_every_per_package_default_path_is_its_own."
+        ),
+        "_LABEL_BULLET": (
+            "daily/markdown.py writes the item labels, monthly/parser.py "
+            "reads them. The two differ **only in source text**, because "
+            "each builds the same pattern from its own copy of the label "
+            "tuple, and those tuples are held equal by test_monthly_history"
+            ".py::test_the_two_readers_of_this_format_agree. The compiled "
+            "patterns are asserted identical by "
+            "test_the_two_label_bullet_patterns_compile_to_one_regex. "
+            "BACKLOG records what their drifting cost once: a missing space "
+            "after a colon in one copy produced unbounded Late Event "
+            "duplication."
+        ),
+        "PROJECT_ROOT": (
+            "Every module computes the same directory from its own depth: "
+            "`parents[2]` two levels down inside `src/`, `parent` at the "
+            "repository root. They must **differ** in spelling and must "
+            "resolve to **one** directory — a split root is the permanent "
+            "STATE_INCONSISTENCY `run_company_ops._one_runtime_root_or_refuse"
+            "()` exists to refuse (BACKLOG C34 section 3). Checked as a "
+            "relationship by test_every_project_root_resolves_to_one_place."
+        ),
+        "_EVENT_ID_LINE_PREFIX": (
+            "A writer/reader pair, like `_EVENT_ID_LINE` and "
+            "`LATE_SECTION_TITLE` above. `ops_status.py` holds the whole "
+            "rendered prefix including its trailing space and both matches "
+            "and builds with it; `monthly/parser.py` holds the prefix "
+            "without it and only matches, so it also reads a line whose "
+            "space is missing. Deliberately not equal; both must read the "
+            "line `daily/markdown` actually writes, which is what "
+            "test_both_event_id_prefixes_read_the_rendered_line checks."
+        ),
+        "_EVENT_ID_LINE": (
+            "Genuinely different, and deliberately so. daily/late_events.py "
+            "asks 'is this Event already in this document' and was loosened "
+            "in C31 so a rendered blank id still matches; monthly/parser.py "
+            "asks 'may this be consolidated' and stays strict, because "
+            "consolidating several unknown ids under '' would merge distinct "
+            "items. Recorded in test_monthly_history.py::"
+            "test_an_item_with_an_empty_event_id_is_not_consolidated, and the "
+            "relationship that replaces equality — the reader matches what "
+            "the writer writes — is checked by "
+            "test_the_event_id_reader_matches_what_the_writer_writes."
+        ),
     }
+
+    def test_every_per_package_default_path_is_its_own(self):
+        """The relationship that replaces equality for the three
+        `DEFAULT_*_PATH` names: they must all be **different**.
+
+        Equality is the wrong question — each package names its own file — but
+        "no question at all" was the wrong answer too. Two packages resolving
+        one path would have them overwriting each other's state, or writing
+        two subsystems into one log, and nothing looked.
+        """
+        constants = self._module_level_constants()
+
+        for name in ("DEFAULT_LOCK_PATH", "DEFAULT_LOG_PATH", "DEFAULT_STATE_PATH"):
+            with self.subTest(name=name):
+                modules = constants[name]
+                self.assertGreater(len(modules), 1, f"{name} is no longer duplicated")
+                self.assertEqual(
+                    len(set(modules.values())),
+                    len(modules),
+                    f"two packages resolve {name} to the same file: {modules}",
+                )
+
+    def test_every_project_root_resolves_to_one_place(self):
+        """`PROJECT_ROOT`'s copies differ in spelling and must not in effect.
+
+        Twenty-five modules compute it, each from its own depth. If one were
+        wrong the tree would split — Company History written under one root,
+        state under another — and `run_company_ops.py` carries a whole
+        function refusing to start when that happens. Nothing checked the
+        static side of it.
+
+        Computed the way each module does, from that module's own path,
+        rather than by importing twenty-five modules.
+        """
+        constants = self._module_level_constants()
+        self.assertIn("PROJECT_ROOT", constants, "PROJECT_ROOT is no longer duplicated")
+
+        resolved = {}
+        for relative, expression in sorted(constants["PROJECT_ROOT"].items()):
+            path = (REPO_ROOT / relative).resolve()
+            if expression == "Path(__file__).resolve().parent":
+                root = path.parent
+            elif expression == "Path(__file__).resolve().parents[2]":
+                root = path.parents[2]
+            else:  # pragma: no cover - a third spelling needs a human
+                self.fail(
+                    f"{relative} computes PROJECT_ROOT as {expression!r}, "
+                    "which this check does not know how to resolve"
+                )
+            resolved.setdefault(root, []).append(relative)
+
+        self.assertEqual(
+            len(resolved),
+            1,
+            f"PROJECT_ROOT resolves to more than one directory: "
+            f"{ {str(k): v for k, v in resolved.items()} }",
+        )
+        self.assertEqual(next(iter(resolved)), REPO_ROOT.resolve())
+
+    def test_both_event_id_prefixes_read_the_rendered_line(self):
+        """`_EVENT_ID_LINE_PREFIX`'s two copies differ on the trailing space
+        and must agree about the line Daily History actually renders."""
+        import sys
+
+        ops_status = self._ops_status_module()
+        import monthly.parser as monthly_parser
+
+        line = "- Event ID: EVT-2026-08-09-0001"
+        for label, prefix in (
+            ("ops_status", ops_status._EVENT_ID_LINE_PREFIX),
+            ("monthly/parser", monthly_parser._EVENT_ID_LINE_PREFIX),
+        ):
+            with self.subTest(module=label):
+                self.assertTrue(
+                    line.startswith(prefix),
+                    f"{label} cannot read the line daily/markdown writes",
+                )
+        self.assertNotEqual(
+            ops_status._EVENT_ID_LINE_PREFIX,
+            monthly_parser._EVENT_ID_LINE_PREFIX,
+            "the two are equal now — delete the KNOWN_DIFFERENT entry",
+        )
+
+    @staticmethod
+    def _ops_status_module():
+        import importlib.util
+        import sys
+
+        if "ops_status" in sys.modules:
+            return sys.modules["ops_status"]
+        spec = importlib.util.spec_from_file_location(
+            "ops_status", REPO_ROOT / "ops_status.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["ops_status"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_widened_sweep_sees_the_root(self):
+        """C135. The sweep read `src/` only, which was an unstated claim that
+        no root file shares a constant with anything. Named here so a future
+        narrowing fails rather than passing quietly with fewer pairs."""
+        constants = self._module_level_constants()
+
+        self.assertIn("DEGRADED_EXIT", constants)
+        self.assertIn("init_notion.py", constants["DEGRADED_EXIT"])
+        self.assertIn("publish_control_tower.py", constants["DEGRADED_EXIT"])
+        self.assertIn("ops_status.py", constants["SILENT_AFTER_DAYS"])
+
+    def test_the_two_label_bullet_patterns_compile_to_one_regex(self):
+        """`_LABEL_BULLET`'s copies differ in source and must not in effect.
+
+        The scan compares text, which is all it can do without importing;
+        this compares the compiled patterns, which is what actually matters.
+        """
+        import daily.markdown as daily_markdown
+        import monthly.parser as monthly_parser
+
+        self.assertEqual(
+            daily_markdown._LABEL_BULLET.pattern,
+            monthly_parser._LABEL_BULLET.pattern,
+        )
+
+    def test_the_event_id_reader_matches_what_the_writer_writes(self):
+        """`_EVENT_ID_LINE`'s copies differ on purpose, but not on the line
+        the writer actually produces.
+
+        The two regexes disagree about a *blank* id, which is the documented
+        difference. They must agree about a real one, or a consolidated
+        Monthly would lose items that reached Daily History.
+        """
+        import daily.late_events as late_events
+        import monthly.parser as monthly_parser
+
+        line = "- Event ID: EVT-2026-08-09-0001"
+        for module in (late_events, monthly_parser):
+            with self.subTest(module=module.__name__):
+                match = module._EVENT_ID_LINE.match(line)
+                self.assertIsNotNone(match, f"{module.__name__} cannot read its own format")
+                self.assertEqual(match.group(1), "EVT-2026-08-09-0001")
+
+    def test_the_scan_no_longer_counts_a_re_export_as_a_copy(self):
+        """`controltower/projection.py` does
+        `RICH_TEXT_LIMIT = _NOTION_RICH_TEXT_LIMIT`, an alias for the value
+        `notion/properties.py` owns. Before C135 skipped bare-Name values it
+        read as a third, disagreeing definition of a constant that has one."""
+        constants = self._module_level_constants()
+
+        self.assertNotIn("controltower/projection.py", constants.get("RICH_TEXT_LIMIT", {}))
+        import controltower.projection as projection
+        import notion.properties as properties
+
+        self.assertEqual(projection.RICH_TEXT_LIMIT, properties.RICH_TEXT_LIMIT)
 
     @staticmethod
     def _module_level_constants():
-        """`{NAME: {module: repr(value)}}` for literal module-level constants.
+        """`{NAME: {module: repr(value)}}` for module-level constants.
 
         Module level only, so an enum member (`FAILED = "FAILED"` inside a
         `class`) is not mistaken for a shared contract — measured, that alone
         was the difference between 13 apparent duplicates and 5 real ones.
+
+        **Not literals only, since C135.** This called `ast.literal_eval` and
+        skipped anything that raised, so a constant built by *calling*
+        something was invisible to the whole class. Measured on the tree that
+        introduced one:
+
+            businessdate.KST = timezone(timedelta(hours=9), "KST")
+            oplog.KST        = timezone(timedelta(hours=9), "KST")
+
+            before   `_module_level_constants()["KST"]` -> KeyError
+            after    two modules, compared, equal
+
+        The second copy exists because the layering forbids the import that
+        would remove it (`oplog` must stay a strict leaf), which is exactly
+        the situation this class was written for — and it was the one shape
+        of duplication the scan could not see. A `timedelta`, a `frozenset`,
+        a `re.compile`, a `Path`: none of them is a literal, and all of them
+        are things two modules could hold two versions of.
+
+        Non-literals are compared by their **source text** (`ast.unparse`)
+        rather than by value, because evaluating them would mean importing
+        and running the module. Two spellings of one value therefore read as
+        a disagreement, which is the safe direction: it asks a human to look,
+        rather than passing something nobody checked.
         """
         import ast
         from collections import defaultdict
 
         found = defaultdict(dict)
-        for path in sorted(SRC.rglob("*.py")):
+        # `src/` **and the repository root** (C135). Sweeping `src/` alone was
+        # an unstated claim that no root file defines a constant any other
+        # file also defines, and it was false: `DEGRADED_EXIT` had three
+        # copies, `RUNTIME_DIR` three, and `ops_status.py` held copies of
+        # `SILENT_AFTER_DAYS` and `_READ_WORKERS`. All agreed — which is the
+        # point, because agreeing is not the same as being checked.
+        paths = [p for p in sorted(SRC.rglob("*.py")) if "__pycache__" not in p.parts]
+        paths += sorted(REPO_ROOT.glob("*.py"))
+        for path in paths:
             if "__pycache__" in path.parts:
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -5511,16 +6128,57 @@ class EveryDuplicatedConstantIsHeldInStepTests(unittest.TestCase):
                     continue
                 if not target.id.lstrip("_").isupper():
                     continue
-                try:
-                    value = ast.literal_eval(node.value)
-                except Exception:  # noqa: BLE001 - not a literal, not a constant
+                if isinstance(node.value, ast.Name):
+                    # `RICH_TEXT_LIMIT = _NOTION_RICH_TEXT_LIMIT` — a
+                    # re-export, not a second copy. It *is* the other value,
+                    # so it cannot drift from it, and counting it would make
+                    # every re-export look like a disagreement.
                     continue
-                found[target.id][path.relative_to(SRC).as_posix()] = repr(value)
+                try:
+                    rendered = repr(ast.literal_eval(node.value))
+                except Exception:  # noqa: BLE001 - not a literal; use its source
+                    rendered = ast.unparse(node.value)
+                found[target.id][path.relative_to(REPO_ROOT).as_posix()] = rendered
         return {
             name: modules
             for name, modules in found.items()
             if len(modules) > 1
         }
+
+    def test_the_scan_sees_a_constant_that_is_not_a_literal(self):
+        """The hole C135 closed, pinned by the case that revealed it.
+
+        `KST` is defined in two modules by a call expression. Before this
+        scan read non-literals it appeared in neither the duplicate set nor
+        anywhere else, so nothing compared the copies while a comment in
+        `oplog.py` said something did.
+        """
+        constants = self._module_level_constants()
+
+        self.assertIn(
+            "KST",
+            constants,
+            "a call-expression constant duplicated across modules is invisible",
+        )
+        self.assertEqual(
+            sorted(constants["KST"]),
+            ["src/businessdate.py", "src/oplog.py"],
+        )
+        self.assertEqual(
+            len(set(constants["KST"].values())),
+            1,
+            f"the two KST definitions have drifted: {constants['KST']}",
+        )
+
+    def test_the_two_kst_definitions_are_the_same_object_at_runtime(self):
+        """Source equality is what the scan can check; this checks the thing
+        source equality is a proxy for. Cheap, and it would catch a drift
+        that happened to keep the same spelling in different scopes."""
+        import businessdate
+        import oplog
+
+        self.assertEqual(oplog.KST, businessdate.KST)
+        self.assertEqual(oplog.KST.utcoffset(None), timedelta(hours=9))
 
     def test_the_scan_finds_the_duplications_we_know_about(self):
         """C66 §1: this class asserts negatives over a scan, so the scan is
@@ -5589,6 +6247,16 @@ class EveryDuplicatedConstantIsHeldInStepTests(unittest.TestCase):
             "daily/markdown.ITEM_LABELS writes them, monthly/parser._ITEM_LABELS "
             "reads them. Held equal by test_monthly_history.py::"
             "test_the_two_readers_of_this_format_agree."
+        ),
+        "'No material company history recorded.'": (
+            "daily/markdown.EMPTY_DAY_SENTENCE writes docs/06 §25's Empty Day "
+            "body; monthly/parser.EMPTY_DAY_MARKER reads it back. Must be "
+            "**equal** — Monthly asks whether a Daily says it is empty, and a "
+            "reader that no longer recognises the writer's sentence would "
+            "call every quiet day unreadable instead. The import that would "
+            "remove the duplication is the one docs/09 §13 forbids (Monthly "
+            "reaches for nothing), the same wall LATE_SECTION_TITLE is behind. "
+            "Held by test_the_empty_day_sentence_and_its_reader_agree."
         ),
         "{'CTO_BACKEND': 'CTO Backend', 'CTO_FRONTEND': 'CTO Frontend', "
         "'CMO': 'CMO', 'COO': 'COO'}": (
@@ -5680,6 +6348,44 @@ class EveryDuplicatedConstantIsHeldInStepTests(unittest.TestCase):
         """The other direction, as for `KNOWN_DIFFERENT`."""
         present = set(self._duplicated_values())
         self.assertEqual(sorted(set(self.KNOWN_ALIASED) - present), [])
+
+    def test_the_empty_day_sentence_and_its_reader_agree(self):
+        """The writer and the reader of docs/06 §25's Empty Day body.
+
+        Equal, not merely corresponding: `monthly/parser` matches the whole
+        sentence with `in text`. If the two drifted, a quiet day would stop
+        being recognised as quiet — `is_empty_day` False with no items — and
+        C135 measured what that costs on the *other* side of the same string:
+        a day whose sentence was stale read as "nothing happened" above eight
+        recorded milestones.
+        """
+        import daily.markdown as daily_markdown
+        import monthly.parser as monthly_parser
+
+        self.assertEqual(
+            daily_markdown.EMPTY_DAY_SENTENCE, monthly_parser.EMPTY_DAY_MARKER
+        )
+
+    def test_the_reader_recognises_a_document_the_writer_produced(self):
+        """The relationship the equality above stands for, end to end — the
+        writer's real output through the reader's real parser."""
+        import tempfile
+        from datetime import date as date_type
+        from pathlib import Path as _Path
+
+        from daily.markdown import render_daily_markdown
+        from monthly.parser import read_daily_document
+
+        day = date_type(2026, 8, 9)
+        body = render_daily_markdown(day, (), "2026-08-10T11:00:00+09:00")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _Path(tmp) / f"{day.isoformat()}.md"
+            path.write_text(body, encoding="utf-8")
+            document = read_daily_document(path, target_date=day)
+
+        self.assertTrue(document.is_empty_day)
+        self.assertEqual(document.items, ())
 
     def test_the_late_events_heading_and_its_reader_correspond(self):
         """The relationship equality cannot express, and the one this class
@@ -6954,30 +7660,92 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
     #: class whose entire thesis is that a silently dropped entry has to be a
     #: roster rather than a paragraph. `test_every_entry_here_resolves`
     #: is that thesis applied to this tuple.
-    ALSO_SCANNED = (
-        "ops_status.py",
-        "run_company_ops.py",
-        "run_agent.py",
-        "init_notion.py",
-    )
+    #: **Derived, not listed, since C135.** The tuple that used to sit here
+    #: named four files and there are six at the repository root:
+    #: `dashboard_server.py` and `publish_control_tower.py` were never in it.
+    #: Measured at the time of the fix, with this class's own detector run
+    #: over the two by hand: **0 silent handlers in each**, so nothing was
+    #: being missed *yet* — which is the whole shape this class exists to
+    #: refuse. A roster that happens to be harmless today is still a roster
+    #: nobody is checking, and the next `except OSError: continue` written in
+    #: either file would have been invisible to the one gate whose entire
+    #: thesis is that such a handler must be declared out loud.
+    #:
+    #: This is the fourth time this repository has found a hand-written
+    #: roster behind a rule that was itself correct (C79, C80, C81, and
+    #: C135's `MonthlyBoundaryInvariantTests`). The contract of this half is
+    #: "files `SRC.rglob()` does not reach", and that is a fact about the
+    #: filesystem, so it is read off the filesystem.
+    @classmethod
+    def also_scanned(cls):
+        """Every `*.py` at the repository root, as repo-relative names."""
+        return tuple(
+            sorted(
+                path.name
+                for path in REPO_ROOT.glob("*.py")
+                if path.is_file()
+            )
+        )
 
-    def test_every_entry_here_resolves(self):
-        """The roster must not be able to shrink quietly (C81).
+    def test_the_root_half_is_derived_and_not_empty(self):
+        """Guards the guard, in the two ways the old tuple could be wrong.
 
-        `_oserror_handlers_that_discard()` drops what does not exist, which is
-        the right thing to do with a path and the wrong thing to do with a
-        *declaration*: the filter cannot tell "this tool was removed" from
-        "somebody wrote the path wrong", and it answered both by scanning
-        less and saying nothing.
+        **Emptiness**, because every assertion in this class is a negative
+        over the sweep and a negative over nothing is true (C66 §1). And
+        **completeness**, which is what the tuple actually got wrong: it is
+        asserted here against the tools this repository is known to have
+        rather than against itself.
         """
-        for name in self.ALSO_SCANNED:
-            with self.subTest(entry=name):
-                self.assertTrue(
-                    (REPO_ROOT / name).is_file(),
-                    f"{name} is declared here and is not there — the "
-                    "`.exists()` filter in `_oserror_handlers_that_discard()` "
-                    "would drop it and scan one file fewer in silence",
-                )
+        found = self.also_scanned()
+
+        self.assertGreaterEqual(len(found), 6, found)
+        for name in (
+            "ops_status.py",
+            "run_company_ops.py",
+            "run_agent.py",
+            "init_notion.py",
+            "dashboard_server.py",
+            "publish_control_tower.py",
+        ):
+            with self.subTest(entrypoint=name):
+                self.assertIn(name, found)
+
+    def test_the_two_files_the_old_roster_missed_are_swept_now(self):
+        """The regression, named by the thing it was.
+
+        Stated as "these files reach the sweep" rather than "these files have
+        no silent handler": the second is true today and is not the property
+        — `test_every_silent_handler_is_on_the_roster` already enforces that
+        for everything swept, and it can only enforce it for what it sees.
+        """
+        swept = {module for module, _line, _records in self._all_handlers_seen()}
+
+        for name in ("dashboard_server.py", "publish_control_tower.py"):
+            with self.subTest(entrypoint=name):
+                self.assertIn(name, swept)
+
+    @classmethod
+    def _all_handlers_seen(cls):
+        """Every `except OSError` handler the sweep looks at, silent or not.
+
+        `_oserror_handlers_that_discard()` returns only the silent ones, so a
+        file with none is indistinguishable from a file that is not being
+        read at all — which is exactly the confusion this class was written
+        to remove, and it applied to the class's own coverage.
+        """
+        seen = []
+        paths = [p for p in sorted(SRC.rglob("*.py")) if "__pycache__" not in p.parts]
+        paths += [REPO_ROOT / name for name in cls.also_scanned()]
+        for path in paths:
+            name = path.relative_to(REPO_ROOT).as_posix()
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ExceptHandler):
+                    continue
+                seen.append((path.name if path.parent == REPO_ROOT else name,
+                             node.lineno, False))
+        return seen
 
     def test_the_src_half_still_covers_the_tool_this_roster_gave_up(self):
         """Why removing the entry was the fix rather than correcting it.
@@ -6997,9 +7765,14 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
         # The contract, not the one string. A first draft asserted
         # `"review_cli.py" not in ALSO_SCANNED`, and a mutation that re-added
         # it as `"src/review_cli.py"` passed -- a different string, the same
-        # mistake, and the file scanned twice. What the tuple means is
+        # mistake, and the file scanned twice. What the roster means is
         # "files `SRC.rglob()` does not reach", so that is what is checked.
-        for entry in self.ALSO_SCANNED:
+        #
+        # Still worth asserting now that the roster is derived (C135): a
+        # `glob("*.py")` at the root cannot reach into `src/` today, and this
+        # is the line that would fail if that derivation were ever widened to
+        # `rglob` and started double-scanning the whole tree.
+        for entry in self.also_scanned():
             with self.subTest(entry=entry):
                 self.assertFalse(
                     (REPO_ROOT / entry).resolve().is_relative_to(SRC.resolve()),
@@ -7130,11 +7903,12 @@ class ASilentlyDroppedEntryIsARosterNotAParagraphTests(unittest.TestCase):
     def _oserror_handlers_that_discard():
         """The whole sweep: `src/` plus the tools `SRC.rglob()` cannot reach."""
         cls = ASilentlyDroppedEntryIsARosterNotAParagraphTests
-        roots = [
-            REPO_ROOT / name
-            for name in cls.ALSO_SCANNED
-            if (REPO_ROOT / name).exists()
-        ]
+        # No `.exists()` filter any more: `also_scanned()` reads the
+        # filesystem, so every path it returns is there by construction. The
+        # filter was what let a mistyped entry vanish without a word (C81),
+        # and deriving the list removes the thing it was guarding against
+        # rather than guarding it better.
+        roots = [REPO_ROOT / name for name in cls.also_scanned()]
         found = []
         for path in sorted(SRC.rglob("*.py")) + roots:
             if "__pycache__" in path.parts:

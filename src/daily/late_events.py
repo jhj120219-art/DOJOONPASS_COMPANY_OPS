@@ -46,7 +46,12 @@ from typing import Sequence
 
 from history import HistoryCandidate
 
-from .markdown import _render_item_block, item_block_bounds, summary_line_indices
+from .markdown import (
+    EMPTY_DAY_SENTENCE,
+    _render_item_block,
+    item_block_bounds,
+    summary_line_indices,
+)
 
 LATE_SECTION_TITLE = "## Late Events"
 METADATA_TITLE = "## Metadata"
@@ -316,6 +321,57 @@ def _update_metadata(lines: list[str], *, now_iso: str, added: int, total_events
     lines[insert_at:insert_at] = new_lines
 
 
+def _without_the_empty_day_sentence(lines: list[str]) -> list[str]:
+    """Drop "No material company history recorded." — it is about to stop
+    being true.
+
+    An Empty Day (docs/06 §25) is a closed day that had no candidates, and a
+    Desktop offline all week produces exactly that. When its work arrives
+    late, `append_late_events()` writes the items and `_update_metadata()`
+    raises `Event Count` — and until C135 the sentence stayed. Measured on
+    this repository's own Company History, `runtime/local_master/daily/
+    2026-08-09.md`:
+
+        # DOJOONPASS Company History — 2026-08-09
+
+        No material company history recorded.
+
+        ## Late Events
+        … eight milestone items …
+
+        - Event Count: 8
+
+    A day with eight recorded milestones read as a day when nothing happened,
+    directly above the eight and directly above its own count. README RULE 2
+    makes Company History the record of last resort, and that is the document
+    the sentence was wrong in.
+
+    **No data was lost**, and it is worth saying why rather than leaving it to
+    be re-derived: `monthly/parser` sets `is_empty_day=is_empty_day and not
+    items`, so a stale marker beside real items never made Monthly skip the
+    day. Verified on the file above — 8 items parsed, `is_empty_day` False.
+    This is a repair to what a person reads, not to what the pipeline carries.
+
+    Only the machine-written sentence is removed, and only on the line where
+    it stands alone. `ManualEditPreservationTests` fixes that this file is
+    appended to rather than re-rendered so the COO's hand edits survive
+    (docs/06 §57, docs/11 §71); a sentence a person typed that happens to
+    quote this one keeps its surrounding text and is left alone.
+    """
+    kept = [line for line in lines if line.strip() != EMPTY_DAY_SENTENCE]
+    if len(kept) == len(lines):
+        return lines
+
+    # The sentence stood in its own paragraph, so removing it leaves two
+    # blank lines where the writer had put one.
+    collapsed: list[str] = []
+    for line in kept:
+        if not line.strip() and collapsed and not collapsed[-1].strip():
+            continue
+        collapsed.append(line)
+    return collapsed
+
+
 def append_late_events(
     markdown: str, candidates: Sequence[HistoryCandidate], *, now_iso: str
 ) -> str:
@@ -329,7 +385,7 @@ def append_late_events(
     if not candidates:
         return markdown
 
-    lines = markdown.splitlines()
+    lines = _without_the_empty_day_sentence(markdown.splitlines())
     # `include_category=True`: see `_render_item_block()` — a late item is
     # the only kind whose category is not implied by the heading above it,
     # and Monthly History has to be able to file it.

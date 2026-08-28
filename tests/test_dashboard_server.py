@@ -629,6 +629,108 @@ class TheScreenShowsTheModelsOwnNumbersTests(PageTestCase):
         self.assertNotIn("<td>None</td>", page)
 
 
+class ADerivedNumberIsNotAnUnsourcedOneTests(unittest.TestCase):
+    """C135, found by rendering the page against the live tree and reading it.
+
+    The KPI strip said this, every run:
+
+        기록된 Event      16   증거 16건
+        움직인 Project     4   증거 파일 없음
+
+    Both numbers come from the same sixteen files. `움직인 Project` is how
+    many distinct `project_id`s are among them, and `rollup._roll_metrics()`
+    gives it no `evidence` refs **on purpose** — it counts projects, not
+    Events, so "one file per counted thing" does not exist, and
+    `EveryMetricIsClassifiedByHowItCitesItsFilesTests` records that decision
+    with its reasoning. That decision is right and is not what this class
+    changes.
+
+    What was wrong is the sentence built on top of it. "Carries no per-item
+    refs" and "has no evidence" are different claims, and the renderer
+    collapsed them into the second. `Metric`'s docstring says a Control Tower
+    number nobody can trace is a rumour; the page was calling a perfectly
+    traceable number a rumour, on the one surface a person reads — the exact
+    inversion of the defect C134 fixed, which was a number with *no* evidence
+    being reported as 정상.
+
+    Three states now, and the third is the fix: counted, derived, or nothing
+    to count. A zero keeps `증거 파일 없음`, where it is true.
+    """
+
+    def _cite(self, count, value):
+        return dashboard_server._kpi_cite(count, value)
+
+    def test_a_counted_number_cites_its_files(self):
+        self.assertIn("증거 16건", self._cite(16, 16))
+
+    def test_a_zero_still_says_there_is_nothing_to_cite(self):
+        """The state that was always true, kept. Nothing happened, so there
+        is no file to point at, and saying so is honest."""
+        self.assertIn("증거 파일 없음", self._cite(0, 0))
+
+    def test_a_derived_number_is_not_called_unsourced(self):
+        """The defect. A non-zero value with no per-item refs came from
+        somewhere, and the tile's own `derived_from` line says where."""
+        rendered = self._cite(0, 4)
+
+        self.assertNotIn("증거 파일 없음", rendered)
+        self.assertIn("파생", rendered)
+
+    def test_the_live_shape_no_longer_calls_projects_active_unsourced(self):
+        """End to end, on a rollup with more Events than projects — the shape
+        that produced the measurement above."""
+        from controltower import build_company_rollup
+        from controltower.dashboard import build_dashboard
+        from events import Event
+
+        events = []
+        for index, project in enumerate(("OPS", "SEARCH", "PAY", "WEB")):
+            events.append(
+                (
+                    Event(
+                        schema_version="1.0", event_id=f"D{index}",
+                        source="DESKTOP_4", role="COO", project_id=project,
+                        event_type="MILESTONE_COMPLETED", status="COMPLETED",
+                        summary="s", history_candidate=True, milestone=f"M{index}",
+                        timestamp=f"2026-08-0{index + 1}T09:00:00+09:00",
+                    ),
+                    f"D{index}.json",
+                )
+            )
+        model = build_dashboard(build_company_rollup(now=NOW, events=events), now=NOW)
+        metrics = next(p for p in model.panels if p.key == "METRICS")
+
+        active = next(r for r in metrics.rows if r.values["key"] == "projects_active")
+        self.assertEqual(active.values["value"], 4)
+        self.assertEqual(active.values["evidence_count"], 0)
+
+        rendered = self._cite(
+            active.values["evidence_count"], active.values["value"]
+        )
+        self.assertNotIn("증거 파일 없음", rendered)
+
+    def test_both_surfaces_say_the_same_thing_about_the_same_number(self):
+        """A COO reads Notion and an operator reads the browser. C110's whole
+        lesson is that one word meaning two things on two surfaces is how
+        they start disagreeing, and C133/C134 rebuilt both screens to keep
+        them in step. So the two clauses are compared rather than promised.
+        """
+        from controltower.notion_page import _metric_cite
+
+        for count, value in ((16, 16), (0, 0), (0, 4), (1, 1)):
+            with self.subTest(count=count, value=value):
+                browser = self._cite(count, value)
+                notion = _metric_cite(count, value)
+
+                for phrase in ("증거 파일 없음", "파생"):
+                    self.assertEqual(
+                        phrase in browser,
+                        phrase in notion,
+                        f"the two surfaces disagree about {phrase!r} for "
+                        f"count={count} value={value}: {browser!r} / {notion!r}",
+                    )
+
+
 class AuthoredTextCannotBecomeMarkupTests(PageTestCase):
     """`project_id`, `blocker` and `summary` are strings a person typed on
     another Desktop, and `validate_event()` only type-checks them.

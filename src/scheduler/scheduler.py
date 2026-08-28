@@ -21,6 +21,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import businessdate
+from businessdate import clock_date
 from daily import DEFAULT_DAILY_DIR, build_keep_index, generate_daily_history
 from history import HistoryDecision, HistoryRepository
 
@@ -67,7 +69,7 @@ def run_once(
     State 규칙을 따른다") must leave this False (the default) — Scheduler
     then still protects itself with its own lock exactly as before.
     """
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     state_path = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
     daily_dir = Path(daily_output_dir) if daily_output_dir is not None else DEFAULT_DAILY_DIR
 
@@ -112,7 +114,13 @@ def _generate_pending_dates(
         if state.last_successful_daily_close is not None
         else history_start_date
     )
-    end = now.date() - timedelta(days=1)  # today is never processed
+    # `business_date`, not `now.date()`: docs/07 section 4 fixes this
+    # Scheduler's timezone at Asia/Seoul, and "yesterday" has to mean the same
+    # day on every machine that runs it. Measured before C135, at 08:48 KST on
+    # 2026-08-28, a Runner whose clock zone was UTC read 2026-08-27T23:48 and
+    # set `end` to 08-26 -- the 11:00 run would then close D-2 and leave D-1
+    # for the following day.
+    end = clock_date(now) - timedelta(days=1)  # today is never processed
 
     pending_dates = _pending_dates(start, end)
 

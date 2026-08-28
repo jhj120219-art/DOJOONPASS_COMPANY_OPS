@@ -35,6 +35,14 @@ _SECTION_TITLE_BY_CATEGORY = {
     "LEARNING": "Learnings",
 }
 
+#: docs/06 §25's Empty Day sentence — the whole body of a closed day that had
+#: no candidates. Named rather than inlined (C135) because two other places
+#: act on the exact string: `late_events` removes it when a Late Event makes
+#: it untrue, and `monthly/parser.EMPTY_DAY_MARKER` reads it. The layering
+#: forbids Monthly importing it (docs/09 §13), so that copy stays a declared
+#: duplicate; this one does not have to be.
+EMPTY_DAY_SENTENCE = "No material company history recorded."
+
 _ROLE_DISPLAY_NAMES = {
     "CTO_BACKEND": "CTO Backend",
     "CTO_FRONTEND": "CTO Frontend",
@@ -289,7 +297,7 @@ def render_daily_markdown(
     blocks = [f"# DOJOONPASS Company History — {target_date.isoformat()}"]
 
     if not candidates:
-        blocks.append("No material company history recorded.")
+        blocks.append(EMPTY_DAY_SENTENCE)
         blocks.append(_metadata_block(target_date, generated_at, 0))
         return "\n\n".join(blocks) + "\n"
 

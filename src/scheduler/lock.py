@@ -101,7 +101,43 @@ def _is_process_running(pid: object) -> bool:
                 timeout=5,
             )
         except (OSError, subprocess.SubprocessError):
-            return False
+            # BUG-54. The probe learned nothing -- it did not learn that the
+            # process is gone. Answering False here means "stale", and stale
+            # means the caller unlinks a live holder's lock and takes the
+            # critical section: two Runners at once, which is the BUG-18/BUG-20
+            # condition the O_EXCL rewrite was written to remove. That rewrite
+            # does not help, because the second run legitimately unlinks the
+            # first one's lock and creates its own.
+            #
+            # Reachable without anything unusual. `tasklist` enumerates every
+            # process under a 5 s timeout, and the moment it is most likely to
+            # be slow -- heavy load -- is the moment two scheduled runs are
+            # most likely to overlap. A stripped PATH or a hardened image with
+            # no `tasklist` fails this way permanently.
+            #
+            # The direction is the whole thing, and the costs are not
+            # symmetric: skipping a run costs one cycle, and the next run
+            # catches up (docs/07 §20). Taking a live holder's lock costs
+            # Company History -- measured at up to 36% of History Candidates
+            # lost under that condition.
+            #
+            # This is not a new policy. It is the answer this same function
+            # already gives on POSIX, four lines below: `PermissionError` from
+            # `os.kill(pid, 0)` means "a process is there and it is not ours",
+            # and that arm returns True. Windows was the only branch that
+            # turned "I cannot tell" into "it is gone".
+            #
+            # Why the objection recorded against this no longer holds. It was
+            # that a probe which keeps failing would leave a lock nobody can
+            # ever reclaim, silently. Two checks written since then make that
+            # condition loud instead: `ops_status.py`'s
+            # LOCK_STUCK_AFTER_HOURS line reads `lock_held_since()` (which
+            # answers, on this path, precisely because the holder now counts
+            # as alive) and names this shape in as many words, and the
+            # Runner/Agent silence checks raise a run that stops happening
+            # after SILENT_AFTER_DAYS. A permanently unreclaimable lock is now
+            # reported; a broken mutual exclusion still would not be.
+            return True
         return result.returncode == 0 and str(pid) in result.stdout
     try:
         os.kill(pid, 0)

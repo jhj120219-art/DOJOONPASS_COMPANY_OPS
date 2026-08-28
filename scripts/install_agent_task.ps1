@@ -13,10 +13,11 @@
 
     This deliberately does NOT keep the PC awake, wake it on a schedule, or
     require it to stay on. docs/07 section 58 settles that question for
-    Company Ops ("OFF 허용 + Catch-up 구조가 더 적합하다"), and the Agent is
-    built the same way: whenever the machine next comes on, one run catches
-    up every date since `last_successful_collection_date`. Missing a day
-    costs nothing but a slightly longer catch-up.
+    Company Ops -- allowing the PC to be OFF, with catch-up, is the better
+    shape -- and the Agent is built the same way: whenever the machine next
+    comes on, one run catches up every date since
+    `last_successful_collection_date`. Missing a day costs nothing but a
+    slightly longer catch-up.
 
     A daily trigger is offered too (-DailyAt) for a machine that stays on
     across midnight and would otherwise not log on again for days. It is
@@ -167,7 +168,7 @@ $action = New-ScheduledTaskAction `
 #     New-ScheduledTaskTrigger -AtStartup              -> Access is denied
 #
 # That single missing argument is why this installer had never registered a
-# task on any non-administrator machine — and why the failure was recorded
+# task on any non-administrator machine -- and why the failure was recorded
 # as "this environment cannot register tasks at all", which is not true:
 # every other trigger shape registers fine in the very same session.
 $currentUser = "$env:USERDOMAIN\$env:USERNAME"

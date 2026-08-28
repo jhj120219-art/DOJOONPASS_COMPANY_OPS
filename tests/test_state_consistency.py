@@ -42,7 +42,8 @@ from notion.retry_queue import (  # noqa: E402
 )
 from runsummary import RunSummaryError, read_summary  # noqa: E402
 
-SRC = Path(__file__).resolve().parents[1] / "src"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "src"
 
 
 class StateConsistencyTestCase(unittest.TestCase):
@@ -893,21 +894,42 @@ class ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests(unittest.TestCase):
         (AGENT.md §1).
         """
         modules = [p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts]
+        modules += sorted(REPO_ROOT.glob("*.py"))
         self.assertGreater(len(modules), 50)
+
+        names = {p.name for p in modules}
+        self.assertIn(
+            "ops_status.py",
+            names,
+            "the sweep stopped reaching the root, where four json.loads calls "
+            "on other machines' files live",
+        )
 
     def test_the_roster_covers_every_loader_in_the_tree(self):
         """Guards the guard, the way `_atomic_writers()` does for the writers.
 
         A tenth state loader added with the old three-line shape would be
         invisible to every test above, because those iterate this roster. So
-        the roster is checked against the tree: every `except` clause in
-        `src/` that catches `(OSError, ValueError)` around a `json.loads`
-        must also catch `RecursionError`.
+        the roster is checked against the tree: every `except` clause that
+        catches `(OSError, ValueError)` around a `json.loads` must also catch
+        `RecursionError`.
+
+        **`src/` *and* the repository root, since C135.** The sweep read
+        `src/` alone, and `ops_status.py` — which is not under `src/` — makes
+        four `json.loads` calls on files other machines wrote. All four
+        already catch `RecursionError`; somebody applied the fix there by
+        hand when C22 closed BUG-40, and **nothing has kept them that way
+        since.** That file is the read-only diagnostic whose own docstring
+        promises it "must still produce an answer when part of the evidence
+        is damaged", so a `RecursionError` from one deeply nested Event would
+        take the whole status view down — the same failure BUG-40 caused for
+        the Runner, on the tool an operator reaches for when the Runner is
+        already broken.
         """
         offenders = []
-        for path in sorted(SRC.rglob("*.py")):
-            if "__pycache__" in path.parts:
-                continue
+        paths = [p for p in sorted(SRC.rglob("*.py")) if "__pycache__" not in p.parts]
+        paths += sorted(REPO_ROOT.glob("*.py"))
+        for path in paths:
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Try):
@@ -940,7 +962,7 @@ class ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests(unittest.TestCase):
                     continue
                 if not caught & {"RecursionError", "RuntimeError", "Exception",
                                  "BaseException", "bare"}:
-                    offenders.append(f"{path.relative_to(SRC)}:{node.lineno}")
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
 
         self.assertEqual(
             offenders,

@@ -90,6 +90,9 @@ Timezone:
 
     Asia/Seoul
 
+D-1은 **이 시간대의** 어제다 — Runner가 도는 기계의 시계 설정과 무관하다.
+구현은 `src/businessdate.py`(`clock_date()`)에 있다.
+
 실행 대상:
 
     기본적으로 D-1

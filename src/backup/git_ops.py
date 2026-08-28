@@ -274,6 +274,40 @@ def git_head_commit(repo_dir: Path) -> str:
     return _run_git(["rev-parse", "HEAD"], repo_dir).strip()
 
 
+def count_unpushed_commits(repo_dir: Path) -> int | None:
+    """Commits on HEAD that this branch's upstream does not have, or None
+    when git cannot answer.
+
+    `git status --porcelain` says whether the *working tree* differs from the
+    last commit. It says nothing about whether that commit reached the remote,
+    and those are different questions the moment a push fails: the tree goes
+    clean while the Backup is still not backed up. docs/08 §19's promise
+    ("다음 Runner에서 재시도") is about the second question, and until this
+    existed nothing could ask it -- `backup/runner.py` inferred the answer
+    from `backup_state.json` instead, which is a record of what a previous
+    run *believed* rather than what the repository *is*.
+
+    None rather than a number when the question has no answer here: no
+    upstream configured (`@{u}` fails), a detached HEAD, or a repository with
+    no commits at all. Callers must not read None as zero -- "git cannot tell
+    me whether the remote has this work" is not "the remote has this work".
+    Refusing to answer is the same choice `businessdate.business_date()`
+    makes for a naive timestamp, for the same reason.
+
+    Never raises: a caller reaching this is deciding how honest to be about a
+    failure that already happened, and a second exception there would replace
+    a reportable state with an unreportable one.
+    """
+    try:
+        output = _run_git(["rev-list", "--count", "@{u}..HEAD"], repo_dir)
+    except GitOperationError:
+        return None
+    try:
+        return int(output.strip())
+    except ValueError:
+        return None
+
+
 def git_push(repo_dir: Path) -> None:
     """docs/08 section 12, 32-36: plain push only, no pull, no force.
 

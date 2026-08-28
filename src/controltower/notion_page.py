@@ -82,6 +82,25 @@ from .columns import labels as _column_labels
 #: `test_the_quiet_threshold_matches_ops_status` so the two cannot drift.
 SILENT_AFTER_DAYS = 3
 
+
+def _metric_cite(evidence: int, value: object) -> str:
+    """The evidence clause beside one KPI number, in the Notion callout.
+
+    Byte-identical wording to `dashboard_server._kpi_cite()`, which carries
+    the reasoning: a non-zero number with no per-item refs is *derived*, not
+    unsourced, and saying `증거 파일 없음` about it was false on two of the
+    nine metrics. The two surfaces are held to the same three states by
+    `test_controltower_notion_page.py`, because a COO reading Notion and an
+    operator reading the browser must not be told different things about the
+    same number (C110's lesson, and C133/C134's).
+    """
+    if evidence:
+        return f"   ·  증거 {evidence}건"
+    if value:
+        return "   ·  파일을 세지 않는 파생값 — 아래 근거 참조"
+    return "   ·  증거 파일 없음"
+
+
 #: Notion refuses more than this many children in one append.
 MAX_CHILDREN_PER_APPEND = 100
 
@@ -700,11 +719,7 @@ def build_control_tower_blocks(
                             _text(f"{_fmt(values.get('label'))}   "),
                             _text(_fmt(value), bold=True),
                             _text(f"   {word}"),
-                            _text(
-                                f"   ·  증거 {evidence}건"
-                                if evidence
-                                else "   ·  증거 파일 없음"
-                            ),
+                            _text(_metric_cite(evidence, value)),
                         ],
                         "icon": {"type": "emoji", "emoji": icon},
                         "color": _verdict.colour(metric_tone),

@@ -38,6 +38,8 @@ from datetime import date as date_type
 from datetime import datetime
 from typing import Mapping, Sequence
 
+from businessdate import business_date
+
 from events import ROLES
 from history import HistoryCandidate
 
@@ -99,7 +101,12 @@ class DailyRoleSummary:
 
 
 def _candidate_date(candidate: HistoryCandidate) -> date_type:
-    return datetime.fromisoformat(candidate.timestamp).date()
+    """Deliberately identical to `daily.generator._candidate_date()`, KST
+    normalisation included (docs/06 sections 9 and 12) -- the summary and the
+    rendered file must never describe different sets of work, and they would
+    the moment one of the two converted and the other did not.
+    """
+    return business_date(datetime.fromisoformat(candidate.timestamp))
 
 
 def build_role_summary(

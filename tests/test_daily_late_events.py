@@ -324,6 +324,111 @@ class SpecSequenceTests(LateUpdateTestCase):
         self.assertIn("- Event Count: 1", after)
 
 
+class AnEmptyDayStopsSayingItIsEmptyTests(LateUpdateTestCase):
+    """C135, found by reading this repository's own Company History.
+
+    `runtime/local_master/daily/2026-08-09.md`, as it stood on disk:
+
+        # DOJOONPASS Company History — 2026-08-09
+
+        No material company history recorded.
+
+        ## Late Events
+        … eight milestone items …
+
+        - Event Count: 8
+
+    An Empty Day (docs/06 §25) is a closed day that had no candidates — a
+    Desktop offline all week produces exactly that shape, and
+    `test_an_empty_day_can_receive_its_first_late_event` above already drives
+    the case where its work arrives afterwards. What that test never asked is
+    whether the day is still *described* as empty once it is not, so the
+    sentence stayed while the items and `Event Count` went in around it.
+
+    README RULE 2 makes Company History the record of last resort. A day with
+    eight recorded milestones read as a day when nothing happened, directly
+    above the eight and directly above its own count.
+
+    **Nothing was lost, and the reason is worth keeping:** `monthly/parser`
+    computes `is_empty_day = EMPTY_DAY_MARKER in text and not items`, so a
+    stale marker beside real items never made consolidation skip the day.
+    Verified on the file above — 8 items parsed, `is_empty_day` False. This
+    is a repair to what a person reads.
+    """
+
+    SENTENCE = "No material company history recorded."
+
+    def test_the_sentence_is_gone_once_the_day_has_an_item(self):
+        path = self.close_day()
+        self.assertIn(self.SENTENCE, path.read_text(encoding="utf-8"))
+
+        self.update(candidate("EVT-LATE", summary="turned out there was work"))
+
+        after = path.read_text(encoding="utf-8")
+        self.assertNotIn(self.SENTENCE, after)
+        self.assertIn("turned out there was work", after)
+        self.assertIn("- Event Count: 1", after)
+
+    def test_a_day_that_is_still_empty_keeps_the_sentence(self):
+        """Precision. Removing it unconditionally would leave a genuinely
+        quiet day describing itself as nothing at all, which is the opposite
+        error and the one docs/06 §25 exists to prevent."""
+        path = self.close_day()
+
+        self.assertIn(self.SENTENCE, path.read_text(encoding="utf-8"))
+
+    def test_a_second_late_update_does_not_reintroduce_it(self):
+        path = self.close_day()
+        self.update(candidate("EVT-A", summary="first late item"))
+        self.update(candidate("EVT-B", summary="second late item"))
+
+        after = path.read_text(encoding="utf-8")
+        self.assertNotIn(self.SENTENCE, after)
+        self.assertIn("first late item", after)
+        self.assertIn("second late item", after)
+
+    def test_the_document_still_reads_as_one_paragraph_break(self):
+        """The sentence stood alone, so removing it must not leave the blank
+        line it sat between doubled up."""
+        path = self.close_day()
+        self.update(candidate("EVT-LATE", summary="work"))
+
+        after = path.read_text(encoding="utf-8")
+        self.assertNotIn("\n\n\n", after)
+
+    def test_monthly_still_reads_every_item_from_the_repaired_document(self):
+        """The end the fix must not have moved. Consolidation was already
+        safe against the stale marker; it must stay safe without it."""
+        from monthly.parser import read_daily_document
+
+        path = self.close_day()
+        self.update(candidate("EVT-LATE", summary="turned out there was work"))
+
+        document = read_daily_document(path, target_date=DAY)
+
+        self.assertFalse(document.is_empty_day)
+        self.assertEqual([item.event_id for item in document.items], ["EVT-LATE"])
+
+    def test_a_hand_written_line_quoting_the_sentence_survives(self):
+        """docs/06 §57 / docs/11 §71: the COO may edit official History by
+        hand. Only the machine's own standalone line is removed — a sentence
+        a person wrote that happens to contain those words keeps its text.
+        """
+        path = self.close_day()
+        original = path.read_text(encoding="utf-8")
+        path.write_text(
+            original + f"\n\nCOO note: I checked and {self.SENTENCE} was wrong.\n",
+            encoding="utf-8",
+        )
+
+        self.update(candidate("EVT-LATE", summary="work"))
+
+        after = path.read_text(encoding="utf-8")
+        self.assertIn(
+            f"COO note: I checked and {self.SENTENCE} was wrong.", after
+        )
+
+
 class ManualEditPreservationTests(LateUpdateTestCase):
     """docs/06 §57 / docs/11 §71: the COO may edit official History by hand,
     and a Late Event update must not be an excuse to discard those edits.

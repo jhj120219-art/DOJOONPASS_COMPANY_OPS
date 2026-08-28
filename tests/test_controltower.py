@@ -1572,18 +1572,26 @@ class LookupsAndBoundariesTests(ControlTowerTestCase):
         rollup = build_company_rollup(now=NOW, events=pairs)
         project = rollup.project("P")
 
-        # A naive timestamp still has a *date*, so it is placed — after the
-        # comparable one, by the two-tier sort key, so one unorderable value
-        # does not decide the order of everything around it.
-        self.assertEqual([ref.event_id for ref in project.evidence], ["GOOD", "NAIVE"])
-        self.assertEqual(project.event_count, 2)
-        self.assertEqual(rollup.events_read, 2)
+        # Only the comparable one is placed. **This changed in C135** and the
+        # direction it changed in is the point: a naive timestamp used to be
+        # placed on the date written in the string, which is a day in an
+        # unknown zone being reported as a Seoul day (docs/06 §9). It is now
+        # undatable, and undatable is REPORTED rather than dropped — so the
+        # Event did not become invisible, it became visible as a problem.
+        self.assertEqual([ref.event_id for ref in project.evidence], ["GOOD"])
+        self.assertEqual(project.event_count, 1)
+        self.assertEqual(rollup.events_read, 1)
 
-        # The one with no readable date at all is REPORTED, not dropped: the
-        # difference between `events_read` and the directory has to have a
-        # reason a person can see.
-        self.assertEqual([name for name, _why in rollup.unreadable], ["BAD.json"])
-        self.assertIn("timestamp", rollup.unreadable[0][1])
+        # Neither of the two is dropped: the difference between `events_read`
+        # and the directory has to have a reason a person can see, and both
+        # reasons name the value that caused them.
+        self.assertEqual(
+            sorted(name for name, _why in rollup.unreadable), ["BAD.json", "NAIVE.json"]
+        )
+        reasons = dict(rollup.unreadable)
+        self.assertIn("timestamp", reasons["BAD.json"])
+        self.assertIn("yesterday", reasons["BAD.json"])
+        self.assertIn("2026-08-05T09:00:00", reasons["NAIVE.json"])
 
     def test_a_repeated_milestone_is_listed_once(self):
         self.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 1,
@@ -2083,6 +2091,128 @@ class TheRowIsExactlyTheFoldOverWhatReachedItTests(unittest.TestCase):
         # only testing one half of the property.
         self.assertGreater(with_skip, 0)
         self.assertGreater(without_skip, 0)
+
+
+class ColumnsStaySeparatedWhenAValueOverflowsTests(ControlTowerTestCase):
+    """C135, found by running `ops_status.py` against the live tree and
+    reading the output — the method that produced C77 and C78.
+
+    The CONTROL TOWER Project table printed this, every run:
+
+        COMPANY_OPS   COO/CTO Frontend/CTO Backend/CMOEvent 11  IN_PROGRESS
+
+    `{teams:<26}` written straight against `Event` reads correctly only
+    while every team list is shorter than 26 characters. `COO/CTO Frontend/
+    CTO Backend/CMO` is 32, so the cell and the next column became one token
+    and an operator cannot tell where the team list ends — is the team
+    `CMOEvent`? is the count 11?
+
+    It is not an exotic row. `COMPANY_OPS` is the project **every** Desktop
+    reports on, so it is the widest row in the table and the first to
+    overflow, and nothing was asserting the shape. Four such column
+    boundaries existed; the other three had values short enough not to have
+    collided yet.
+
+    Padded, not truncated: cutting the cell to fit would silently drop a
+    team name, which is worse than a wide line. See `ops_status._column()`.
+    """
+
+    def _rendered(self):
+        import contextlib
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_columns", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = self.processed.parent.parent
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_control_tower(NOW)
+        return buffer.getvalue()
+
+    def setUp(self):
+        super().setUp()
+        runtime = self.processed.parent / "runtime"
+        (runtime / "events").mkdir(parents=True)
+        self.processed.rename(runtime / "events" / "processed")
+        self.processed = runtime / "events" / "processed"
+
+    def _all_four_roles_on_one_project(self):
+        """The live shape: one project every Desktop reports on."""
+        for index, role in enumerate(
+            ("COO", "CTO_FRONTEND", "CTO_BACKEND", "CMO")
+        ):
+            self.put(
+                f"WIDE-{index}", "COMPANY_OPS", role,
+                "MILESTONE_COMPLETED", "COMPLETED", 5 + index,
+                milestone=f"M{index}",
+            )
+
+    def test_the_team_list_does_not_run_into_the_event_count(self):
+        self._all_four_roles_on_one_project()
+        rendered = self._rendered()
+
+        self.assertNotIn("CMOEvent", rendered)
+        self.assertIn("COMPANY_OPS", rendered)
+
+    def test_the_probe_really_does_overflow_the_field(self):
+        """Guards the guard. If the team list ever stopped being wider than
+        its column, the assertion above would pass while measuring nothing.
+        """
+        self._all_four_roles_on_one_project()
+        rendered = self._rendered()
+
+        teams = [
+            line for line in rendered.splitlines()
+            if "COMPANY_OPS" in line and "Event" in line and "/" in line
+        ]
+        self.assertTrue(teams, f"no multi-team project row rendered:\n{rendered}")
+        listed = teams[0].split("COMPANY_OPS", 1)[1].split("Event")[0].strip()
+        self.assertGreater(
+            len(listed), 26,
+            f"the probe no longer overflows the 26-wide field: {listed!r}",
+        )
+
+    def test_every_column_boundary_keeps_at_least_one_space(self):
+        """The property, over every row of both tables rather than the one
+        pair that was measured broken.
+
+        A cell and the word after it must never touch. Checked by looking for
+        a letter immediately followed by one of the fixed labels this block
+        prints — the shape `CMOEvent` had.
+        """
+        self._all_four_roles_on_one_project()
+        rendered = self._rendered()
+
+        for label in ("Event", "Project"):
+            for line in rendered.splitlines():
+                if label not in line:
+                    continue
+                for index in [
+                    i for i in range(1, len(line) - len(label) + 1)
+                    if line[i:i + len(label)] == label
+                ]:
+                    with self.subTest(label=label, line=line.strip()[:60]):
+                        self.assertFalse(
+                            line[index - 1].isalnum(),
+                            f"{label!r} touches the cell before it: {line.strip()!r}",
+                        )
+
+    def test_a_short_team_list_is_unchanged(self):
+        """Precision: the fix must not have moved the ordinary rows.
+
+        A one-team project's cell is far inside its field, so the guaranteed
+        space replaced padding that was already there.
+        """
+        self.put("NARROW", "SEARCH_BACKEND", "CTO_BACKEND",
+                 "MILESTONE_COMPLETED", "COMPLETED", 5, milestone="M")
+        rendered = self._rendered()
+
+        rows = [l for l in rendered.splitlines() if "SEARCH_BACKEND" in l and "Event" in l]
+        self.assertTrue(rows, rendered)
+        self.assertIn("CTO Backend", rows[0])
+        self.assertRegex(rows[0], r"CTO Backend\s+Event\s+1")
 
 
 class ControlTowerBlockTests(ControlTowerTestCase):
@@ -2719,10 +2849,11 @@ class TheEvidenceRangeCheckSurvivesBadInputTests(CompanyHistoryCanOutliveTheEvid
         return module
 
     def test_an_unreadable_timestamp_is_not_a_date(self):
-        """`_event_day()` is handed `ProjectRollup.first_seen`, which is an
-        Event's `timestamp` field read back out of a JSON file. Every value
-        below has been seen in this repository's own fixtures for damaged or
-        hand-written Events."""
+        """`_event_day()`'s caller passes `Coverage.evidence_from`, which
+        `dashboard._coverage()` builds as `min(days).isoformat()` -- a bare
+        date. It also accepts an Event `timestamp` (the shape this seam used
+        to carry, kept because the values below have all been seen in this
+        repository's fixtures for damaged or hand-written Events)."""
         module = self._module()
         for value in (None, "", "not a date", "2026-13-45T00:00:00+09:00", 7):
             with self.subTest(value=value):
@@ -2735,6 +2866,53 @@ class TheEvidenceRangeCheckSurvivesBadInputTests(CompanyHistoryCanOutliveTheEvid
 
         self.assertEqual(
             module._event_day("2026-08-09T10:00:00+09:00"), date(2026, 8, 9)
+        )
+
+    def test_a_bare_date_is_returned_as_itself(self):
+        """The shape the caller actually passes, which nothing pinned.
+
+        C135 changed this function to convert its input to Seoul time, on the
+        belief that it received a timestamp. It receives a date;
+        `datetime.fromisoformat("2026-08-01")` is naive; `business_date()`
+        refuses a naive value; the refusal became `None`; and the caller reads
+        `None` as "no evidence to compare against" and printed the 증거 범위 밖
+        qualifier over a healthy tree. Four tests caught it, all of them by
+        the *symptom* -- none of them named the shape, so nothing said which
+        of the two ends was wrong.
+        """
+        module = self._module()
+
+        self.assertEqual(module._event_day("2026-08-01"), date(2026, 8, 1))
+
+    def test_the_caller_really_does_pass_a_bare_date(self):
+        """The other end of the same seam, so the pair cannot drift.
+
+        Asserted against the real `Coverage` a real rollup produces rather
+        than against a literal -- a test that hardcodes the shape would keep
+        passing on the day `_coverage()` starts emitting something else.
+        """
+        from controltower import build_company_rollup
+        from controltower.dashboard import build_dashboard
+        from events import Event
+
+        events = [
+            (
+                Event(
+                    schema_version="1.0", event_id="SHAPE", source="DESKTOP_4",
+                    role="COO", project_id="OPS", event_type="STARTED",
+                    status="IN_PROGRESS", summary="s", history_candidate=True,
+                    timestamp="2026-08-09T10:00:00+09:00",
+                ),
+                "SHAPE.json",
+            )
+        ]
+        coverage = build_dashboard(
+            build_company_rollup(now=NOW, events=events), now=NOW
+        ).coverage
+
+        self.assertEqual(coverage.evidence_from, "2026-08-09")
+        self.assertEqual(
+            self._module()._event_day(coverage.evidence_from), date(2026, 8, 9)
         )
 
     def test_a_daily_file_that_cannot_be_opened_is_skipped_not_fatal(self):

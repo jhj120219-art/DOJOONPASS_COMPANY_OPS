@@ -49,6 +49,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from businessdate import business_date
 from oplog import SECRET_PATTERNS, SECRET_RE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -238,7 +239,7 @@ def parse_signal(
             raise SignalError(signal_id, f"timestamp is not valid ISO-8601 ({exc})") from exc
         if parsed.tzinfo is None:
             raise SignalError(signal_id, "timestamp must include a timezone offset")
-        if parsed.date() != target_date:
+        if business_date(parsed) != target_date:
             # Daily History buckets by the Event's own timestamp (docs/06
             # §12). A Signal filed under 08-09 but stamped 08-10 would be
             # marked collected on one date and rendered on another — a

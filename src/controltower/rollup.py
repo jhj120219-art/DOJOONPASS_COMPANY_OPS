@@ -81,12 +81,13 @@ Same posture as `history/reconciliation.py`, and for the same reason.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
+from businessdate import business_date
 from events import ROLES, Event
 from notion.properties import ROLE_DISPLAY_NAMES, _type_specific_properties
 
@@ -510,12 +511,14 @@ def _whole_days_between(iso: str | None, now: datetime) -> int | None:
         return None
     if (parsed.tzinfo is None) != (now.tzinfo is None):
         return None
-    return max(0, (now.date() - parsed.date()).days)
+    if parsed.tzinfo is None:  # both naive: no instant, so no zone to convert to
+        return max(0, (now.date() - parsed.date()).days)
+    return max(0, (business_date(now) - business_date(parsed)).days)
 
 
 def _event_date(event: Event) -> date_type | None:
     try:
-        return datetime.fromisoformat(event.timestamp).date()
+        return business_date(datetime.fromisoformat(event.timestamp))
     except (TypeError, ValueError):  # pragma: no cover - validate_event blocks it
         return None
 

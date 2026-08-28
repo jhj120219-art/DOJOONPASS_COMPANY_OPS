@@ -333,5 +333,237 @@ class PendingRetryClassifiesTheSameWayTests(BackupRunnerTestCase):
         self.assertEqual(source.count("is_authentication_failure(str(exc))"), 2)
         self.assertEqual(source.count("else BackupStatus.PENDING"), 2)
 
+
+
+class AFailedBackupIsNotQuietlyDowngradedToNotRequiredTests(BackupRunnerTestCase):
+    """Step 6 decided "nothing to do" from `backup_state.json` alone, and one
+    of the two states that can hold an unpushed commit was missing from it.
+
+    `git status --porcelain` answers "does the working *tree* differ from the
+    last commit". After a failed push those two questions come apart: the tree
+    is clean and the Backup is still not backed up. Step 6 handled that for
+    BACKUP_PENDING (BUG-1) and not for BACKUP_FAILED -- which the other arm of
+    the very same classifier writes, for exactly the same shape of event: the
+    commit was created, only the push failed.
+
+    Measured before the fix, with real git against a real remote:
+
+        run                            reported              unpushed
+        healthy                        BACKUP_SUCCESS               0
+        new Daily, remote broken       raises, state=PENDING        1
+        nothing new (state PENDING)    raises, state=PENDING        1   correct
+        nothing new (state FAILED)     **BACKUP_NOT_REQUIRED**      1   defect
+
+    Two things were wrong with the last row. The run's own verdict was green
+    -- that is what the Run Manifest and the exit code carry -- while Company
+    History sat only on one disk; and `save_state` then overwrote FAILED with
+    NOT_REQUIRED, **erasing the record that a backup had ever failed**. The
+    credential failure docs/08 section 62 is written about arrives by this
+    exact route.
+
+    One signal did survive, and saying so is the difference between this
+    class and an overstatement. `ops_status._history_newer_than_the_last_backup()`
+    still fires, because it reads `last_successful_backup`, which neither the
+    old behaviour nor the fix touches (measured: it names the unbacked
+    `2026-08-20.md` exactly). So the defect is narrower than "nobody was
+    told": what was missing is the Backup's own verdict. The surviving net is
+    an indirect mtime-versus-pointer comparison that `ops_status.py`'s own
+    comment records can be blinded permanently by a single future-dated
+    `last_successful_backup` (measured there: 1 alert -> 0), and that neither
+    the Manifest nor the exit code consults at all.
+
+    The fix does not push again -- section 62 forbids retrying that, and
+    section 21 says a person must act. It removes the false statement, not the
+    policy: the failure stands and the state is left alone.
+
+    The question is put to git (`count_unpushed_commits`) rather than to the
+    state file, so an operator who pushed by hand gets the truthful
+    NOT_REQUIRED back. `test_a_hand_pushed_remote_is_allowed_to_be_current`
+    is that half; without it this class would be satisfied by a fix that
+    simply never says NOT_REQUIRED again.
+    """
+
+    def _failed_backup_with_an_unpushed_commit(self):
+        """The state a failed push leaves: a commit the remote does not have,
+        a clean tree, and a state file that says FAILED.
+
+        Built by actually failing a push rather than by writing the state
+        file, so the premise cannot drift away from what the code produces.
+        """
+        remote = self._init_working_copy_with_remote()
+        (self.master_dir / "daily" / "2026-08-19.md").write_text("# 19\n", encoding="utf-8")
+        run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        # The remote stops being a repository. A real misconfiguration; no
+        # patching of this project's own code.
+        broken = self.root / "not_a_repository"
+        broken.mkdir()
+        _run_git(["remote", "set-url", "origin", str(broken)], cwd=self.working_copy_dir)
+
+        (self.master_dir / "daily" / "2026-08-20.md").write_text("# 20\n", encoding="utf-8")
+        with self.assertRaises(GitOperationError):
+            run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        # That push failure classifies as PENDING today (BUG-52 -- a
+        # misconfiguration is not a credential problem, and the classifier has
+        # no third answer). This class is about what step 6 does with FAILED,
+        # so the state is put into the shape the *credential* arm writes.
+        from backup.state import BackupState, save_state
+
+        loaded = load_state(self.state_path)
+        save_state(
+            self.state_path,
+            BackupState(
+                last_successful_backup=loaded.last_successful_backup,
+                last_backup_commit=loaded.last_backup_commit,
+                backup_status=BackupStatus.FAILED,
+            ),
+        )
+        return remote
+
+    def _unpushed(self):
+        out = _run_git(["log", "--oneline", "origin/main..HEAD"], cwd=self.working_copy_dir)
+        return [line for line in out.strip().splitlines() if line]
+
+    def test_the_premise_is_real_a_commit_exists_that_the_remote_does_not_have(self):
+        """Stated first: everything below is vacuous if the push actually
+        succeeded or no commit was ever made."""
+        self._failed_backup_with_an_unpushed_commit()
+
+        from backup.git_ops import git_status
+
+        self.assertFalse(git_status(self.working_copy_dir).has_changes)
+        self.assertEqual(len(self._unpushed()), 1)
+        self.assertIs(load_state(self.state_path).backup_status, BackupStatus.FAILED)
+
+    def test_a_run_with_nothing_new_still_reports_the_failure(self):
+        self._failed_backup_with_an_unpushed_commit()
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.FAILED)
+
+    def test_the_failure_is_not_erased_from_the_state(self):
+        """The half that made the defect silent rather than merely wrong."""
+        self._failed_backup_with_an_unpushed_commit()
+
+        run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(load_state(self.state_path).backup_status, BackupStatus.FAILED)
+
+    def test_the_entry_says_what_is_still_unpushed(self):
+        """`push_result` is what `app/runner.py` copies into the Run
+        Manifest's `reason`, and an empty one is how BUG-39 hid a deletion."""
+        self._failed_backup_with_an_unpushed_commit()
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIsNotNone(entry.push_result)
+        self.assertIn("1", entry.push_result)
+        self.assertIn("21", entry.push_result)
+        self.assertIsNotNone(entry.commit_hash)
+
+    def test_it_does_not_push_again(self):
+        """docs/08 section 62. The fix is to stop lying, not to start
+        retrying -- a credential failure retried on every scheduled run is the
+        loop section 62 names, and this branch is reached by that failure.
+
+        Asserted by the outcome a retry would have produced: the remote is
+        still broken, so an attempted push would raise instead of returning,
+        and the remote would still be missing the commit either way.
+        """
+        self._failed_backup_with_an_unpushed_commit()
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.FAILED)
+        self.assertEqual(len(self._unpushed()), 1)
+
+    def test_a_hand_pushed_remote_is_allowed_to_be_current(self):
+        """The other direction, and the reason this asks git rather than the
+        state file. An operator who fixed the remote and pushed by hand has a
+        Backup that IS current; reporting FAILED forever would be the same
+        kind of false statement pointing the other way."""
+        remote = self._failed_backup_with_an_unpushed_commit()
+        _run_git(["remote", "set-url", "origin", str(remote)], cwd=self.working_copy_dir)
+        _run_git(["push", "origin", "main"], cwd=self.working_copy_dir)
+        self.assertEqual(self._unpushed(), [])
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.NOT_REQUIRED)
+        self.assertIs(load_state(self.state_path).backup_status, BackupStatus.NOT_REQUIRED)
+
+    def test_a_failed_backup_with_no_commit_behind_it_is_allowed_to_clear(self):
+        """FAILED is also written by the gates that stop before any git
+        command -- secret scan (section 29), deletion (section 31), mass
+        modification (section 46). Those leave NO commit, so once the
+        condition is gone there is genuinely nothing to push, and holding
+        FAILED would be a permanent false alarm of the kind C26 warns trains
+        people to skim ATTENTION."""
+        from backup.state import BackupState, save_state
+
+        self._init_working_copy_with_remote()
+        (self.master_dir / "daily" / "2026-08-19.md").write_text("# 19\n", encoding="utf-8")
+        run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+        self.assertEqual(self._unpushed(), [])
+
+        save_state(self.state_path, BackupState(backup_status=BackupStatus.FAILED))
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.NOT_REQUIRED)
+
+
+class CountUnpushedCommitsTests(BackupRunnerTestCase):
+    """The new question, asked of real repositories in every shape step 6 can
+    meet it in. `None` is not a number and must never be read as zero -- that
+    reading is exactly the false green this was written to remove."""
+
+    def test_a_pushed_branch_counts_zero(self):
+        from backup.git_ops import count_unpushed_commits
+
+        self._init_working_copy_with_remote()
+
+        self.assertEqual(count_unpushed_commits(self.working_copy_dir), 0)
+
+    def test_a_local_commit_that_never_reached_the_remote_counts_one(self):
+        from backup.git_ops import count_unpushed_commits
+
+        self._init_working_copy_with_remote()
+        (self.working_copy_dir / "a.md").write_text("a", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.working_copy_dir)
+        _run_git(["commit", "-m", "a"], cwd=self.working_copy_dir)
+
+        self.assertEqual(count_unpushed_commits(self.working_copy_dir), 1)
+
+    def test_no_upstream_cannot_be_answered(self):
+        """`git init` + `git remote add`, never pushed -- the first-run shape
+        docs/11 section 26 is about. git has nothing to compare against, and
+        answering 0 here would report a Backup as current that has never
+        reached a remote at all."""
+        from backup.git_ops import count_unpushed_commits
+
+        self.working_copy_dir.mkdir(parents=True)
+        _run_git(["init", "-b", "main"], cwd=self.working_copy_dir)
+        _run_git(["config", "user.email", "test@example.invalid"], cwd=self.working_copy_dir)
+        _run_git(["config", "user.name", "Backup Runner Test"], cwd=self.working_copy_dir)
+        (self.working_copy_dir / "a.md").write_text("a", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.working_copy_dir)
+        _run_git(["commit", "-m", "a"], cwd=self.working_copy_dir)
+
+        self.assertIsNone(count_unpushed_commits(self.working_copy_dir))
+
+    def test_it_does_not_raise_on_a_directory_that_is_not_a_repository(self):
+        """Called on the failure path, where a second exception would replace
+        a reportable state with an unreportable one."""
+        from backup.git_ops import count_unpushed_commits
+
+        plain = self.root / "plain"
+        plain.mkdir()
+
+        self.assertIsNone(count_unpushed_commits(plain))
+
+
 if __name__ == "__main__":
     unittest.main()

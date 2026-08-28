@@ -360,6 +360,28 @@ Action:
 
     Company Ops Runner
 
+**손으로 만들지 말고 설치 스크립트를 쓴다.** 먼저 `-WhatIf`로 무엇이 바뀔지
+확인한다 — 아무것도 바꾸지 않고 예정된 작업만 출력한다.
+
+```powershell
+cd scripts
+powershell -ExecutionPolicy Bypass -File .\install_runner_task.ps1 `
+    -HistoryStartDate 2026-08-10 -WhatIf
+```
+
+출력이 예상과 맞으면 `-WhatIf`만 빼고 다시 실행한다. 재실행은 안전하다(`-Force`).
+
+스크립트가 대신 해 주는 것: logon trigger의 `-User` 스코프(없으면 비관리자
+머신에서 등록 자체가 거부되고, 다른 계정 로그온에도 발화한다 — Agent
+Installer가 C13에서 치른 대가다), `MultipleInstances=IgnoreNew`(docs/07 §55),
+`StartWhenAvailable`(§20의 목적), logon trigger 지연(docs/07 §54),
+그리고 등록됐다고 보고했지만 실제로 없는 경우의 검출.
+
+**Notion 자격증명은 이 스크립트가 다루지 않는다.** `NOTION_API_TOKEN`은 비밀이고
+매개변수로 받으면 명령줄·프로세스 목록·PowerShell 기록에 남는다. 운영자가 직접
+설정하며, 없으면 Notion Sync만 건너뛰고 수집·Company History·Backup은 정상
+동작한다(`python ops_status.py`가 부재를 보고한다).
+
 ---
 
 # 20. Startup Catch-up
@@ -373,6 +395,8 @@ Action:
     오전 11시 PC OFF
 
 상황 복구.
+
+§19의 설치 스크립트가 이 트리거를 함께 등록한다 — 별도 작업이 아니다.
 
 ---
 
@@ -446,6 +470,19 @@ Product Repository와 섞지 않는다.
 ---
 
 # 26. 최초 Backup 테스트
+
+Working Copy는 **clone으로 만든다**:
+
+    git clone <Private Repository URL> runtime/backup_working_copy
+
+`git push`는 Working Copy에 이미 설정된 upstream tracking branch에만
+의존한다(docs/08 §30, `src/backup/git_ops.py`). `clone`은 그것을 자동으로 잡고,
+`git init` + `git remote add`는 잡지 않는다 — 후자로 만들면 첫 Backup이
+`fatal: The current branch ... has no upstream branch`로 실패한다.
+
+그 실패는 자격증명 오류가 아니므로 BACKUP_PENDING(일시)으로 분류되어
+**매 실행 재시도되지만 사람이 upstream을 설정할 때까지 성공하지 않는다**
+(BACKLOG F-2b / BUG-52). 그래서 여기서 clone을 지정한다.
 
 Local Test History 생성:
 

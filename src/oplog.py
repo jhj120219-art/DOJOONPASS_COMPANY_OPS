@@ -23,8 +23,25 @@ its own log path, because those answer to different specs.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+#: Byte-identical copy of `businessdate.KST`, which carries the full
+#: reasoning (docs/06 §9: this project's timezone is Asia/Seoul).
+#:
+#: Copied rather than imported for the same reason
+#: `transport/intake.INCOMPLETE_WRITE_PREFIX` is copied from
+#: `reporter/local_output`: the layering forbids the import that would remove
+#: the duplication. `oplog` is used by `collector`, `agent` and `app`, and
+#: `app` depends on the other two, so it has to sit below everything — and
+#: `test_oplog.py::test_oplog_imports_nothing_from_this_project` checks that
+#: by importing this module in a subprocess and asserting no project module
+#: was pulled in, transitively. An import here would fail it, and that test is
+#: stricter than the AST layering table on purpose.
+#:
+#: `EveryDuplicatedConstantIsHeldInStepTests` compares the two values on every
+#: run, so the copy cannot drift.
+KST = timezone(timedelta(hours=9), "KST")
 
 # Secret-shaped content. The first three patterns are byte-for-byte the ones
 # tests/test_repository_hygiene.py::test_no_secret_material_in_any_tracked_file
@@ -336,7 +353,7 @@ def append_line(log_path: Path, body: str) -> None:
     """
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        timestamp = datetime.now(KST).isoformat(timespec="seconds")
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(f"{timestamp} {redact(one_line(body))}\n")
     except OSError:

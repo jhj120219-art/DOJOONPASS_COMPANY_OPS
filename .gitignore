@@ -8,4 +8,9 @@ __pycache__/
 *.tmp
 runtime/
 .coverage
+# coverage's parallel mode writes one file per process
+# (`.coverage.<host>.<pid>.<random>`), which is how BACKLOG E-1b/E-0b
+# measures an entrypoint that this suite drives as a subprocess. Without
+# this line one such measurement leaves dozens of untracked files behind.
+.coverage.*
 .pytest_cache/

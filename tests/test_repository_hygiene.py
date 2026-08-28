@@ -25,6 +25,7 @@ Nothing here changes production code, Runtime behaviour, or any spec.
 
 import ast
 import inspect
+import os
 import re
 import subprocess
 import sys
@@ -291,6 +292,36 @@ class SecretExposureGuardTests(unittest.TestCase):
         for pattern in (".env", ".env.*", "runtime/", "*.log"):
             self.assertIn(pattern, text)
 
+    def test_a_measurement_this_backlog_recommends_leaves_nothing_behind(self):
+        """C135. `.coverage` was ignored and `.coverage.*` was not.
+
+        Those are the per-process files coverage writes in **parallel mode**,
+        which is the only way to see inside a subprocess — and this suite
+        drives every entrypoint as a subprocess on purpose, so it is the
+        technique BACKLOG E-1b/E-0b names for measuring them. Measured: one
+        such run left **50** untracked `.coverage.<host>.<pid>.<random>`
+        files in the repository root, each of which `git status` offers to
+        commit. A repository that makes its own recommended measurement
+        messy is a repository where that measurement stops being taken.
+
+        Asked of `git check-ignore` rather than of the file's text: the
+        question is whether git ignores the name, and a pattern can be
+        present and still not match (`.coverage` does not match
+        `.coverage.x`, which is exactly how this was wrong).
+        """
+        for name in (
+            ".coverage",
+            ".coverage.DESKTOP-EXAMPLE.pid1234.XyZ0aBcD.HqRs1TuV2wXy",
+        ):
+            with self.subTest(name=name):
+                result = _git("check-ignore", name)
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"git does not ignore {name!r}; a coverage run in "
+                    f"parallel mode would leave it in `git status`",
+                )
+
     def test_no_env_file_is_tracked(self):
         tracked = {p.name for p in _tracked_files()}
         self.assertNotIn(".env", tracked)
@@ -347,9 +378,14 @@ class DependencyGuardTests(unittest.TestCase):
         import, and anything living under `src/` is local by definition.
         Deriving it keeps the guard honest and removes the edit.
         """
-        return {p.name for p in SRC.iterdir() if p.is_dir() and p.name != "__pycache__"} | {
-            p.stem for p in SRC.glob("*.py") if not p.stem.startswith("__")
-        }
+        return (
+            {p.name for p in SRC.iterdir() if p.is_dir() and p.name != "__pycache__"}
+            | {p.stem for p in SRC.glob("*.py") if not p.stem.startswith("__")}
+            # The root tools too, since C135 widened the sweep to reach them:
+            # `publish_control_tower.py` imports `dashboard_server`, and a
+            # sibling entrypoint is as local as anything under `src/`.
+            | {p.stem for p in REPO_ROOT.glob("*.py") if not p.stem.startswith("__")}
+        )
 
     def test_the_local_package_set_is_derived_not_hardcoded(self):
         """Guards the guard: if this ever shrinks to a literal again, a new
@@ -358,6 +394,38 @@ class DependencyGuardTests(unittest.TestCase):
         self.assertIn("review_cli", self.LOCAL_PACKAGES)
         self.assertIn("collector", self.LOCAL_PACKAGES)
         self.assertNotIn("__pycache__", self.LOCAL_PACKAGES)
+
+    def _shipped_files(self):
+        """Every file that has to run on a deployment machine.
+
+        **`src/` *and* the repository root (C135).** This swept `src/` alone,
+        which made it an assertion about a package rather than about the
+        property its own docstring names — that `python -m pytest` and every
+        tool work "with no install step at all" (docs/11 §101's Release
+        Environment Check). An operator does not run `src/`; they run
+        `run_company_ops.py` from Task Scheduler and `ops_status.py` by hand.
+        A third-party import in either would have failed on a fresh machine
+        with this gate green the whole time.
+
+        Measured when the sweep was widened: **no third-party import in any
+        of the six entrypoints**, so this is a fence rather than a repair —
+        the fourth such widening in C135, all found by asking each gate what
+        it cannot see rather than whether its rule is right.
+        """
+        files = [p for p in SRC.rglob("*.py") if "__pycache__" not in str(p)]
+        files += [p for p in REPO_ROOT.glob("*.py") if p.is_file()]
+        return sorted(files)
+
+    def test_the_dependency_sweep_covers_the_tools_an_operator_runs(self):
+        """Guards the guard. `test_src_imports_only_the_standard_library`
+        asserts an empty dict, and a sweep that lost the root would keep
+        asserting it — over less."""
+        names = {path.name for path in self._shipped_files()}
+
+        self.assertIn("run_company_ops.py", names)
+        self.assertIn("ops_status.py", names)
+        self.assertIn("businessdate.py", names)
+        self.assertGreater(len(names), 50, sorted(names))
 
     def test_src_imports_only_the_standard_library(self):
         # sys.stdlib_module_names was added in Python 3.10; fall back to
@@ -373,9 +441,7 @@ class DependencyGuardTests(unittest.TestCase):
                 if name:
                     stdlib.add(name)
         third_party = {}
-        for path in SRC.rglob("*.py"):
-            if "__pycache__" in str(path):
-                continue
+        for path in self._shipped_files():
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 names = []
@@ -503,6 +569,96 @@ class SourceEncodingGuardTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class APowerShellScriptStaysPureAsciiTests(unittest.TestCase):
+    r"""C136. A `.ps1` in this repository may contain no character above
+    ASCII, because on the machines it is written for it cannot survive one.
+
+    **Windows PowerShell 5.1 reads a `.ps1` as ANSI unless the file carries a
+    UTF-8 BOM.** AGENT.md §2.2 tells an operator to run the installer with
+    `powershell -ExecutionPolicy Bypass -File`, and the Desktops are Korean
+    Windows, so "ANSI" is cp949. A UTF-8 file without a BOM is therefore
+    decoded with the wrong table and every non-ASCII character is mojibake.
+
+    Measured on this machine before the fix (PowerShell 5.1.26100.9168,
+    `[Text.Encoding]::Default` = `ks_c_5601-1987`), reading the installer's
+    own comment-based help back through `Get-Help`:
+
+        source   Company Ops ("OFF 허용 + Catch-up 구조가 더 적합하다")
+        Get-Help Company Ops ("OFF ?덉슜 + Catch-up 援ъ“媛 ???곹빀?섎떎")
+
+    That block is `.SYNOPSIS`/`.DESCRIPTION`, so `Get-Help
+    .\install_agent_task.ps1` is a surface an operator actually reads — the
+    C135 shape exactly: the code is correct and the rendered output is not.
+
+    **Why ASCII rather than a BOM.** Adding a BOM would fix the decode and
+    would contradict `test_no_tracked_file_starts_with_a_utf8_bom`, which
+    this repository applies to every text file it gates. Between "add the one
+    thing the repo forbids" and "write the comment in ASCII", the second
+    costs nothing: the two offending spots were a Korean phrase quoted inside
+    an English sentence and an em dash, and both say the same thing in ASCII.
+
+    This also closes a scope gap rather than only a defect. `_TEXT_SUFFIXES`
+    — which drives the UTF-8 and BOM gates — is `{.py, .md, .json, .example,
+    .gitignore}` and has never included `.ps1`, so the only executable file
+    in `scripts/` was outside both. (The **secret** scan is unaffected: it
+    walks every tracked file and does not consult that set.)
+    """
+
+    def _scripts(self):
+        return sorted(
+            path
+            for path in (REPO_ROOT / "scripts").rglob("*.ps1")
+            if path.is_file()
+        )
+
+    def test_the_scan_finds_the_installer(self):
+        """Guards the guard: the assertion below is a negative over this
+        list, and a negative over nothing is true (C66 §4)."""
+        names = {p.name for p in self._scripts()}
+
+        self.assertIn("install_agent_task.ps1", names)
+
+    def test_no_powershell_script_contains_a_character_above_ascii(self):
+        offenders = []
+        for path in self._scripts():
+            text = path.read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), 1):
+                bad = sorted({c for c in line if ord(c) > 127})
+                if bad:
+                    offenders.append(
+                        f"{path.relative_to(REPO_ROOT).as_posix()}:{number}: "
+                        f"{''.join(bad)!r}"
+                    )
+        self.assertEqual(
+            offenders,
+            [],
+            "Windows PowerShell 5.1 decodes a BOM-less .ps1 with the system "
+            "codepage, so these characters reach the operator as mojibake",
+        )
+
+    def test_no_powershell_script_carries_a_bom_either(self):
+        """The other half of the same rule. A BOM would make non-ASCII safe
+        and is the thing this repository forbids everywhere else; the file
+        must be ASCII *and* BOM-less, so neither escape is taken quietly."""
+        for path in self._scripts():
+            with self.subTest(script=path.name):
+                self.assertFalse(
+                    path.read_bytes().startswith(b"\xef\xbb\xbf"),
+                    f"{path.name} starts with a UTF-8 BOM",
+                )
+
+    def test_the_suffix_set_the_other_encoding_gates_use_still_omits_ps1(self):
+        """Why this class exists as its own rule rather than one more suffix.
+
+        Adding `.ps1` to `_TEXT_SUFFIXES` would subject it to the UTF-8 and
+        no-BOM gates, and both already pass — but neither of them says
+        anything about ASCII, which is the property that actually matters
+        here. If somebody does add the suffix later, this test fails and the
+        reader is sent to this docstring instead of assuming the gap closed.
+        """
+        self.assertNotIn(".ps1", _TEXT_SUFFIXES)
+
+
 class DocumentationGapCharacterizationTests(unittest.TestCase):
     """Audit finding BUG-12. README and docs/ are specification documents;
     this Sprint may not edit them, so the gaps are recorded here instead.
@@ -560,6 +716,126 @@ class DocumentationGapCharacterizationTests(unittest.TestCase):
         self.assertIn("scan_for_secrets(master_dir)", runner)
         self.assertNotIn("is not called from", working_copy)
         self.assertNotIn("Issue #3, still unresolved", working_copy)
+
+
+class UnusedImportTests(unittest.TestCase):
+    """No production file may import a name it does not use.
+
+    This project has no linter — `test_repository_hygiene.py
+    ::DependencyGuardTests` exists precisely because it ships with no
+    third-party dependency, and that includes no flake8 — so nothing was
+    checking. C135 ran the scan by hand and found five, three of which its own
+    edits had just created by replacing the last caller of a `datetime`
+    import. A change that removes the last use of an import leaves no trace
+    anywhere else, which is exactly the kind of thing a gate is for.
+
+    An unused import is not merely untidy here. `DependencyGuardTests` derives
+    "what this project depends on" from the import statements, and
+    `LayeringInvariantTests` derives the whole dependency graph the same way —
+    so an import nothing uses is a false edge in both, and can make a layering
+    violation that was really deleted look like one that is still there.
+
+    Two things are deliberately not flagged, and each has a reason rather than
+    an exception:
+
+      * `from __future__ import annotations` binds no name and is used by the
+        compiler, not by any expression;
+      * a name re-exported for a caller outside this file. The allowlist below
+        carries those, one line each with why, and it is asserted to be
+        accurate rather than assumed — an entry that stops being needed fails
+        this test as loudly as a new unused import does.
+    """
+
+    #: (path relative to the repository root, imported name) -> why it stays.
+    ALLOWED = {
+        ("src/app/runner.py", "_MAX_LOG_ERROR"): (
+            "Re-exported for the tests that assert this Runner's log lines are "
+            "bounded (test_runner_failure_paths.py reads it as "
+            "`runner_module._MAX_LOG_ERROR`). The alias exists so the bound and "
+            "the assertion cannot drift apart; the Runner itself passes the "
+            "value through `oplog` rather than reading it."
+        ),
+    }
+
+    def _production_files(self):
+        files = sorted(SRC.rglob("*.py")) + sorted(REPO_ROOT.glob("*.py"))
+        return [f for f in files if "__pycache__" not in f.parts]
+
+    def _unused_in(self, path):
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+
+        bound = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    bound[alias.asname or alias.name.split(".")[0]] = node.lineno
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == "__future__":
+                    continue
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    bound[alias.asname or alias.name] = node.lineno
+
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        # A name can also be reached as a string: `__all__`, `getattr`, and
+        # this project's own source-reading gates all do it. Quoted use counts.
+        return {
+            name: lineno
+            for name, lineno in bound.items()
+            if name not in used
+            and f'"{name}"' not in text
+            and f"'{name}'" not in text
+        }
+
+    def test_the_scan_finds_the_files_that_exist(self):
+        """Guards the guard: an empty scan passes vacuously (C76 §4)."""
+        names = {f.name for f in self._production_files()}
+        self.assertIn("ops_status.py", names)
+        self.assertIn("businessdate.py", names)
+        self.assertGreater(len(names), 50)
+
+    def test_the_scan_can_actually_detect_an_unused_import(self):
+        """The predicate, on an input it must flag and one it must not."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "good.py"
+            good.write_text("import os\nprint(os.sep)\n", encoding="utf-8")
+            bad = Path(tmp) / "bad.py"
+            bad.write_text("import os\nprint(1)\n", encoding="utf-8")
+
+            self.assertEqual(self._unused_in(good), {})
+            self.assertEqual(list(self._unused_in(bad)), ["os"])
+
+    def test_no_production_file_imports_a_name_it_does_not_use(self):
+        offenders = []
+        for path in self._production_files():
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            for name, lineno in sorted(self._unused_in(path).items()):
+                if (relative, name) in self.ALLOWED:
+                    continue
+                offenders.append(f"{relative}:{lineno}: {name}")
+        self.assertEqual(offenders, [])
+
+    def test_every_allowlisted_import_is_still_unused(self):
+        """An allowlist that outlives its reason is the failure mode this
+        repository keeps finding (C76, C111, C114): a note about the code
+        surviving the code. If one of these is used now, the entry is the
+        thing to delete."""
+        stale = []
+        for (relative, name), _why in self.ALLOWED.items():
+            path = REPO_ROOT / relative
+            self.assertTrue(path.is_file(), f"allowlist names a missing file: {relative}")
+            if name not in self._unused_in(path):
+                stale.append(f"{relative}:{name}")
+        self.assertEqual(stale, [], "these allowlist entries are no longer needed")
+
+    def test_every_allowlisted_entry_says_why(self):
+        for key, why in self.ALLOWED.items():
+            with self.subTest(entry=key):
+                self.assertGreater(len(why), 40, "an allowlist entry needs a reason")
 
 
 class DeadCodeCharacterizationTests(unittest.TestCase):
@@ -707,22 +983,56 @@ class EnvironmentContractTests(unittest.TestCase):
     So the two are checked against each other in both directions.
     """
 
-    ENTRYPOINTS = (
-        "run_company_ops.py",
-        "run_agent.py",
-        "init_notion.py",
-        "ops_status.py",
-        # `dashboard_server.py` reads `COMPANY_OPS_DASHBOARD_PORT`. Left out
-        # of this roster it would have been the one tool whose variable
-        # nothing checked against `.env.example` — which is the gap C80
-        # closed for the two rosters below and the same gap in this one.
-        "dashboard_server.py",
-        # C105. Reads the same two `NOTION_*` variables `init_notion.py`
-        # does and declares no variable of its own — deliberately: where the
-        # page goes is discovered from PROJECTS rather than pasted into a
-        # file (see its module docstring).
-        "publish_control_tower.py",
-    )
+    #: The root-level half of the sweep: `src/` is reached by `rglob` in
+    #: `_read_variables()`, and these are the files it cannot see.
+    #:
+    #: **Derived since C135, and it was complete when it was derived** — this
+    #: is a fence, not a repair. It had been wrong twice before and each
+    #: correction was a line added by hand: `dashboard_server.py` (C80, "the
+    #: one tool whose variable nothing checked against `.env.example`") and
+    #: `publish_control_tower.py` (C105). Two corrections to one tuple is the
+    #: signal; the third was never going to be caught by the same method.
+    #:
+    #: `src/review_cli.py` is deliberately not here and does not need to be:
+    #: it is under `SRC`, so `_read_variables()` already reads it through the
+    #: `rglob` half. Measured — it looks up no environment variable at all,
+    #: and if it ever does, `test_every_variable_the_code_reads_is_documented`
+    #: sees it through that half.
+    @property
+    def ENTRYPOINTS(self):
+        return tuple(
+            sorted(path.name for path in REPO_ROOT.glob("*.py") if path.is_file())
+        )
+
+    def test_the_entrypoint_roster_is_derived_and_complete(self):
+        """Guards the guard. Several assertions in this class are negatives
+        over this list, and the two tools it has historically been missing
+        are named so that a derivation which silently narrows fails here."""
+        found = self.ENTRYPOINTS
+
+        self.assertGreaterEqual(len(found), 6, found)
+        for name in (
+            "run_company_ops.py",
+            "run_agent.py",
+            "init_notion.py",
+            "ops_status.py",
+            "dashboard_server.py",
+            "publish_control_tower.py",
+        ):
+            with self.subTest(entrypoint=name):
+                self.assertIn(name, found)
+
+    def test_the_roster_does_not_restate_what_the_src_half_reads(self):
+        """`_read_variables()` is `SRC.rglob()` plus this. An entry that is
+        also under `src/` would be read twice and would move a variable's
+        attribution; `src/review_cli.py` is the file that would do it."""
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                self.assertFalse(
+                    (REPO_ROOT / name).resolve().is_relative_to(SRC.resolve()),
+                    f"{name} is inside src/ and is already read by the "
+                    "SRC.rglob() half",
+                )
 
     def _declared_variables(self) -> set[str]:
         declared = set()
@@ -3304,6 +3614,416 @@ class AnEntrypointRefusesArgumentsItCannotHonourTests(unittest.TestCase):
         self.assertIsNotNone(
             unexpected_arguments(["run_agent.py", "x"], tool="t", configured_by=("A",))
         )
+
+
+class TheShippingCodeUsesNothingNewerThanTheTestsDoTests(unittest.TestCase):
+    """C135, Release audit. A-25 records that nothing in this repository
+    declares a supported Python version. Choosing one is a decision and stays
+    in A-25; **measuring what the code actually requires** is not, and this is
+    that measurement, kept as a test so it cannot quietly stop being true.
+
+    Why it matters here specifically: this project is deliberately run from
+    four machines (AGENT.md §1), each with its own interpreter, and
+    `EveryTrackedModuleParsesOnThisInterpreterTests` only ever checks the one
+    the suite happens to be running on. A construct that parses here and not
+    on Desktop 2 is a Desktop that silently stops reporting — and C50 records
+    that exact shape, where one 3.10-only annotation stopped the whole suite.
+
+    That class states the gap and then leaves it open, in these words:
+
+        "Measured in C76 … across all 139 tracked `.py` files, **zero**
+         post-3.9 AST constructs. Nothing has drifted; **nothing would
+         notice if it did.**"
+
+    This is what notices. It does not close the part that genuinely needs a
+    decision — *which* interpreter is supported, A-25 — because it declares
+    no version at all. It compares the repository against itself: the two
+    halves have different floors today, the shipping half is the lower one,
+    and that ordering is the thing a mixed-version fleet depends on.
+
+    Measured (C135, 87 files):
+
+        src/ + the six entrypoints    0 constructs above the 3.8 baseline
+        tests/                        3.9  (ast.unparse x18, removesuffix x2)
+
+    So the shipping code asks for **less** than the tests do, and that is the
+    property asserted: whatever floor the suite establishes, `src/` may not
+    raise it. A test-only helper reaching for something newer is fine and
+    stays fine; the same reach inside `src/` is a machine that cannot run.
+
+    **This decides nothing.** It does not say 3.8 is supported, or that 3.13
+    is. It says the two halves of the repository have not drifted apart, and
+    it will fail loudly the day someone puts a `match` statement in
+    `src/`, which is when the A-25 decision actually has to be made.
+
+    Not covered here, because it is not syntax: `datetime.fromisoformat()`
+    accepts a trailing `Z` from 3.11 and refuses it before (A-24). That is a
+    *behavioural* split across versions and the reason A-25 is filed as a
+    multi-machine contract rather than a packaging chore.
+    """
+
+    #: Construct -> the version that introduced it. Hand-written, and
+    #: `test_the_detector_finds_a_construct_it_is_meant_to_find` exists
+    #: because a roster nobody probes is how this repository has been wrong
+    #: three times (C79, C80, C81).
+    NEWER_THAN_BASELINE = {
+        "unparse": "ast.unparse (3.9)",
+        "removeprefix": "str.removeprefix (3.9)",
+        "removesuffix": "str.removesuffix (3.9)",
+        "zoneinfo": "zoneinfo (3.9)",
+        "pairwise": "itertools.pairwise (3.10)",
+        "aiter": "aiter() (3.10)",
+        "anext": "anext() (3.10)",
+        "tomllib": "tomllib (3.11)",
+        "ExceptionGroup": "ExceptionGroup (3.11)",
+        "Self": "typing.Self (3.11)",
+        "batched": "itertools.batched (3.12)",
+        "override": "typing.override (3.12)",
+    }
+
+    def _shipping_files(self):
+        files = sorted(SRC.rglob("*.py")) + sorted(REPO_ROOT.glob("*.py"))
+        return [f for f in files if "__pycache__" not in f.parts]
+
+    def _newer_constructs_in(self, source, label):
+        """`[(line, why)]` for constructs above the baseline.
+
+        Annotations are not inspected: every module here carries
+        `from __future__ import annotations`, so `int | None` in an
+        annotation is a string at runtime and costs nothing. A `X | Y` that
+        is *evaluated* — inside `isinstance()` — is a different matter and is
+        caught below.
+        """
+        found = []
+        tree = ast.parse(source, filename=label)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Match):
+                found.append((node.lineno, "match statement (3.10)"))
+            elif isinstance(node, ast.TryStar):
+                found.append((node.lineno, "except* (3.11)"))
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", None)
+                )
+                if name in self.NEWER_THAN_BASELINE:
+                    found.append((node.lineno, self.NEWER_THAN_BASELINE[name]))
+                if name == "isinstance" and len(node.args) == 2:
+                    second = node.args[1]
+                    if isinstance(second, ast.BinOp) and isinstance(second.op, ast.BitOr):
+                        found.append((node.lineno, "X | Y inside isinstance() (3.10)"))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    head = alias.name.split(".")[0]
+                    if head in self.NEWER_THAN_BASELINE:
+                        found.append((node.lineno, self.NEWER_THAN_BASELINE[head]))
+            elif isinstance(node, ast.ImportFrom):
+                head = (node.module or "").split(".")[0]
+                if head in self.NEWER_THAN_BASELINE:
+                    found.append((node.lineno, self.NEWER_THAN_BASELINE[head]))
+                for alias in node.names:
+                    if alias.name in self.NEWER_THAN_BASELINE:
+                        found.append((node.lineno, self.NEWER_THAN_BASELINE[alias.name]))
+        return found
+
+    def test_the_scan_finds_the_shipping_tree(self):
+        """Guards the guard: the assertion below is a negative over this
+        list, and a negative over nothing is true (C76 §4)."""
+        names = {f.name for f in self._shipping_files()}
+
+        self.assertIn("businessdate.py", names)
+        self.assertIn("run_company_ops.py", names)
+        self.assertIn("ops_status.py", names)
+        self.assertGreater(len(self._shipping_files()), 50)
+
+    def test_the_detector_finds_a_construct_it_is_meant_to_find(self):
+        """The predicate, on inputs it must flag and one it must not.
+
+        Without this the assertion below passes whether the walk works or
+        not — and the roster it walks is hand-written.
+        """
+        for source, expected in (
+            ("match x:\n    case 1:\n        pass\n", "match"),
+            ("import tomllib\n", "tomllib"),
+            ("from itertools import pairwise\n", "pairwise"),
+            ("y = 'ab'.removeprefix('a')\n", "removeprefix"),
+            ("isinstance(v, int | str)\n", "isinstance"),
+        ):
+            with self.subTest(source=source.splitlines()[0]):
+                found = self._newer_constructs_in(source, "probe.py")
+                self.assertTrue(found, f"{expected} was not detected")
+
+        plain = "from __future__ import annotations\n\n\ndef f(x: int | None) -> str | None:\n    return None\n"
+        self.assertEqual(
+            self._newer_constructs_in(plain, "probe.py"),
+            [],
+            "a deferred annotation is not a runtime requirement",
+        )
+
+    def test_no_shipping_file_uses_a_construct_newer_than_the_baseline(self):
+        offenders = []
+        for path in self._shipping_files():
+            source = path.read_text(encoding="utf-8")
+            for line, why in self._newer_constructs_in(source, str(path)):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT).as_posix()}:{line}: {why}"
+                )
+
+        self.assertEqual(
+            offenders,
+            [],
+            "src/ and the entrypoints raised the interpreter floor; A-25's "
+            "decision (which version is supported) now has to be made",
+        )
+
+
+class AFirstRunOnAnUnconfiguredMachineStopsBeforeItTouchesAnythingTests(
+    unittest.TestCase
+):
+    """C135, found by E-1b. What an operator sees the very first time they
+    type the command on a machine where nothing is exported yet.
+
+    `AnEntrypointRefusesArgumentsItCannotHonourTests` covers the *argument*
+    half of that first contact and runs each tool as a real subprocess for
+    the right reason -- "what the operating system sees when a person types
+    the command". Its own `test_no_arguments_still_reaches_the_tool` covers
+    the no-argument half for exactly one tool, `ops_status.py`, and its
+    docstring says of the others only that they "stop at their own
+    environment check, which is the pre-existing behaviour and a different
+    message". Nothing asserted that.
+
+    Per-entrypoint coverage (E-1b, C135) is what made the gap visible:
+
+        run_company_ops.py   148 stmts   84%   216-325 = the whole of main()
+
+    Those numbers understate the truth, because `coverage run` cannot see
+    into a subprocess and this repository tests entrypoints as subprocesses
+    on purpose. But the two halves agree on this much: `main()`'s body past
+    the argument refusal is executed by no test, in-process or out.
+
+    Three properties, and the third is the one worth having:
+
+      1. it exits non-zero, so a scheduler or a shell `&&` chain stops;
+      2. it says on **stderr** what to set, naming a variable this project
+         actually reads;
+      3. **it writes nothing.** A tool that gets halfway into a run before
+         discovering it has no configuration leaves a partial state behind,
+         and the next properly-configured run inherits it. Measured here by
+         comparing the whole `runtime/` tree before and after.
+
+    The roster is derived, minus three exclusions that each name a reason —
+    and each exclusion is itself checked below, because an exclusion nobody
+    re-examines is how `AnEntrypointRefusesArgumentsItCannotHonourTests`
+    came to miss `src/review_cli.py` for a whole release (C79).
+    """
+
+    #: Tools this class does not run, and why. Not "not applicable" — each is
+    #: a tool whose no-argument behaviour is deliberately something else.
+    NOT_RUN = {
+        "ops_status.py": (
+            "The one tool that runs with no configuration at all: it is the "
+            "read-only diagnostic an operator reaches for precisely when "
+            "nothing is set up yet. Its no-argument behaviour is already "
+            "asserted by AnEntrypointRefusesArgumentsItCannotHonourTests::"
+            "test_no_arguments_still_reaches_the_tool."
+        ),
+        "dashboard_server.py": (
+            "Binds a TCP port and serves until interrupted. Running it here "
+            "would either hang the suite or fight whatever else holds the "
+            "port; its configuration errors are executed in-process by "
+            "test_dashboard_server.py instead."
+        ),
+        "src/review_cli.py": (
+            "Interactive by design — with no arguments it prints a live KEEP "
+            "Candidate and waits at an edit prompt. Measured: exit 3 only "
+            "because stdin was closed. It is covered by test_review_cli.py, "
+            "which drives it with an injected input function."
+        ),
+    }
+
+    @property
+    def ENTRYPOINTS(self):
+        return tuple(n for n in _entrypoint_files() if n not in self.NOT_RUN)
+
+    #: Variables the project reads. A refusal that names something else is
+    #: sending the operator to a knob that does not exist (C117's shape).
+    def _readable_variables(self):
+        return EnvironmentContractTests()._declared_variables()
+
+    @staticmethod
+    def _runtime_fingerprint():
+        """Every file under `runtime/`, by path and size.
+
+        Sizes rather than mtimes: a file rewritten with identical content is
+        still a write this class wants to see, and mtime granularity on
+        Windows is coarse enough to miss a fast one.
+        """
+        root = REPO_ROOT / "runtime"
+        if not root.is_dir():
+            return ()
+        return tuple(
+            sorted(
+                (str(f.relative_to(root)).replace("\\", "/"), f.stat().st_size)
+                for f in root.rglob("*")
+                if f.is_file()
+            )
+        )
+
+    def _scrubbed_environment(self):
+        """This process's environment minus every variable the project reads.
+
+        **This is a safety boundary, not a convenience.** Two of these tools
+        talk to Notion. On an operator's own machine `NOTION_API_TOKEN` is
+        exported, and a scrub list that came back empty — or that lost a name
+        — would have the suite make a **real API call to a real workspace**.
+        So the list is checked here rather than trusted, on every call.
+        """
+        readable = self._readable_variables()
+        self.assertGreaterEqual(
+            len(readable), 6, f"the scrub list collapsed: {sorted(readable)}"
+        )
+        for credential in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID"):
+            self.assertIn(
+                credential,
+                readable,
+                "the scrub list does not name a credential these tools use; "
+                "running them would reach a real workspace",
+            )
+
+        environment = dict(os.environ)
+        for variable in readable:
+            environment.pop(variable, None)
+        environment["PYTHONIOENCODING"] = "utf-8"
+
+        leaked = sorted(
+            name
+            for name in environment
+            if name.startswith("NOTION_") or name.startswith("COMPANY_OPS_")
+        )
+        self.assertEqual(leaked, [], f"configuration survived the scrub: {leaked}")
+        return environment
+
+    def test_the_scrub_removes_a_credential_that_is_actually_set(self):
+        """The predicate, on an environment that has one.
+
+        On a developer machine none of these is exported, so every assertion
+        above passes without the scrub doing anything. This sets one and
+        checks it is gone.
+        """
+        os.environ["NOTION_API_TOKEN"] = "secret-probe-value"
+        try:
+            environment = self._scrubbed_environment()
+        finally:
+            os.environ.pop("NOTION_API_TOKEN", None)
+
+        self.assertNotIn("NOTION_API_TOKEN", environment)
+        self.assertNotIn(
+            "secret-probe-value",
+            "".join(environment.values()),
+            "the token survived under another name",
+        )
+
+    def _run_unconfigured(self, name):
+        """`name`, as a subprocess, with every variable this project reads
+        removed from the environment."""
+        environment = self._scrubbed_environment()
+
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / name)],
+            cwd=str(REPO_ROOT),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+        )
+
+    def test_the_roster_is_not_empty_and_names_the_runner(self):
+        """Guards the guard: every assertion below is a loop over this list,
+        and a loop over nothing passes (C76 §4)."""
+        self.assertIn("run_company_ops.py", self.ENTRYPOINTS)
+        self.assertIn("run_agent.py", self.ENTRYPOINTS)
+        self.assertGreaterEqual(len(self.ENTRYPOINTS), 3, self.ENTRYPOINTS)
+
+    def test_every_exclusion_is_still_a_real_entrypoint(self):
+        """An exclusion for a file that no longer exists, or that stopped
+        being an entrypoint, is a note outliving its reason."""
+        for name, why in self.NOT_RUN.items():
+            with self.subTest(excluded=name):
+                self.assertGreater(len(why), 60, "an exclusion needs a reason")
+                self.assertIn(
+                    name,
+                    _entrypoint_files(),
+                    f"{name} is excluded from a roster it is no longer in",
+                )
+
+    def test_an_unconfigured_run_exits_non_zero(self):
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                result = self._run_unconfigured(name)
+                self.assertNotEqual(
+                    result.returncode,
+                    0,
+                    f"{name} reported success with no configuration:\n"
+                    f"{result.stdout}\n{result.stderr}",
+                )
+
+    def test_an_unconfigured_run_says_what_to_set_on_stderr(self):
+        """On stderr, not stdout: a scheduler captures the two separately and
+        this is a diagnostic, not output. And it must name a variable that
+        exists — `EnvironmentContractTests` owns that roster."""
+        readable = self._readable_variables()
+
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                result = self._run_unconfigured(name)
+
+                self.assertIn("[FAILED]", result.stderr)
+                named = [v for v in readable if v in result.stderr]
+                self.assertTrue(
+                    named,
+                    f"{name}'s refusal names no variable this project reads:\n"
+                    f"{result.stderr}",
+                )
+
+    def test_an_unconfigured_run_writes_nothing(self):
+        """The property this class exists for.
+
+        Each tool is checked against the tree as it was immediately before
+        that tool ran, so one failure cannot be masked or caused by another.
+        """
+        for name in self.ENTRYPOINTS:
+            with self.subTest(entrypoint=name):
+                before = self._runtime_fingerprint()
+                self._run_unconfigured(name)
+                after = self._runtime_fingerprint()
+
+                self.assertEqual(
+                    before,
+                    after,
+                    f"{name} wrote to runtime/ before discovering it has no "
+                    f"configuration",
+                )
+
+    def test_the_fingerprint_would_notice_a_write(self):
+        """The predicate, on a tree that did change. Without this,
+        `test_an_unconfigured_run_writes_nothing` passes whether or not the
+        fingerprint sees anything at all."""
+        root = REPO_ROOT / "runtime"
+        if not root.is_dir():
+            self.skipTest("no runtime/ tree on this machine")
+
+        before = self._runtime_fingerprint()
+        probe = root / ".hygiene-write-probe"
+        probe.write_text("x", encoding="utf-8")
+        try:
+            self.assertNotEqual(before, self._runtime_fingerprint())
+        finally:
+            probe.unlink()
+        self.assertEqual(before, self._runtime_fingerprint())
 
 
 class EveryTrackedModuleParsesOnThisInterpreterTests(unittest.TestCase):

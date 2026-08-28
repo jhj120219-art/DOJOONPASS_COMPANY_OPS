@@ -209,6 +209,126 @@ class AuthenticationFailureClassificationTests(unittest.TestCase):
         self.assertTrue(is_authentication_failure("FATAL: AUTHENTICATION FAILED"))
 
 
+class APermanentMisconfigurationIsClassifiedTransientTests(GitOpsTestCase):
+    """CHARACTERIZATION (BUG-52, widened by C135) — asserts today's behaviour,
+    **including the misclassification**. It will fail the day the split is
+    changed, and should then be rewritten as the guarantee.
+
+    `is_authentication_failure()` is the only predicate between two outcomes:
+
+        True   -> BACKUP_FAILED   permanent; a human must act (docs/08 §21)
+        False  -> BACKUP_PENDING  transient; the next Runner retries (§19)
+
+    There is no third answer, so **every permanent failure that is not a
+    credential problem is reported as transient** and retried on every run
+    forever — the unbounded retry loop docs/08 §62 forbids, reached by a
+    route the classification cannot see.
+
+    BUG-52 records this as "실제 자격증명 실패 3종이 transient로 분류" and
+    frames the remedy as widening the auth marker list. C135 drove real
+    `git push` failures against a real remote and found the defect is
+    **broader than credentials**:
+
+        case                        exit  classified      retry can fix?
+        no upstream branch          128   BACKUP_PENDING  no
+        no remote configured        128   BACKUP_PENDING  no
+        remote is not a repository  128   BACKUP_PENDING  no
+        non-fast-forward rejection    1   BACKUP_PENDING  not without a human
+
+    None of the first three is a credential failure, so widening an *auth*
+    marker list is the wrong shape of fix for them. The open question is
+    therefore not "which strings belong in the list" but "does this
+    classifier need a third category" — which is why the fix stays a
+    decision (BUG-52) and this class only pins what happens now.
+
+    Reachable rather than exotic: the first case is what a Working Copy
+    created with `git init` + `git remote add` does on its very first push.
+    docs/08 §30 says to "prepare the remote repository in the working copy
+    area" and neither it nor docs/11 §24-26 mentions an upstream tracking
+    branch; `git clone` sets one implicitly, `git init` does not.
+
+    Real git throughout: these messages are git's, and pinning them as
+    literals would make this test agree with a version of git nobody runs.
+    """
+
+    def _remote(self, name="remote.git"):
+        path = self.repo_dir.parent / name
+        _run_git(["init", "--bare", "-b", "main", str(path)], cwd=self.repo_dir.parent)
+        return path
+
+    def _commit_something(self, repo=None):
+        repo = repo or self.repo_dir
+        (repo / "daily").mkdir(exist_ok=True)
+        (repo / "daily" / "2026-08-10.md").write_text("# probe\n", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=repo)
+        _run_git(["commit", "-m", "probe"], cwd=repo)
+
+    def _push_failure(self):
+        """The `GitOperationError` a real failing push raises, as text."""
+        with self.assertRaises(GitOperationError) as caught:
+            git_push(self.repo_dir)
+        return str(caught.exception)
+
+    def test_a_working_copy_with_no_upstream_is_called_transient(self):
+        """`git init` + `git remote add`, never pushed — the first-run shape."""
+        self._commit_something()
+        _run_git(["remote", "add", "origin", str(self._remote())], cwd=self.repo_dir)
+
+        message = self._push_failure()
+
+        self.assertIn("upstream", message.lower())
+        self.assertFalse(
+            is_authentication_failure(message),
+            "if this now passes, the classifier grew a third answer — rewrite "
+            "this class as the guarantee and close BUG-52",
+        )
+
+    def test_a_working_copy_with_no_remote_at_all_is_called_transient(self):
+        self._commit_something()
+
+        message = self._push_failure()
+
+        self.assertFalse(is_authentication_failure(message))
+
+    def test_a_remote_that_is_not_a_repository_is_called_transient(self):
+        self._commit_something()
+        missing = self.repo_dir.parent / "not_a_repository"
+        missing.mkdir()
+        _run_git(["remote", "add", "origin", str(missing)], cwd=self.repo_dir)
+        _run_git(["config", "push.default", "current"], cwd=self.repo_dir)
+
+        message = self._push_failure()
+
+        self.assertFalse(is_authentication_failure(message))
+
+    def test_the_predicate_still_recognises_a_real_credential_failure(self):
+        """The control. A class that only asserts False would pass with a
+        predicate that answered False to everything, and then it would be
+        characterising nothing."""
+        self.assertTrue(
+            is_authentication_failure(
+                "git push failed (exit 128): fatal: Authentication failed for 'https://example.invalid/'"
+            )
+        )
+
+    def test_every_case_here_is_one_no_retry_can_fix(self):
+        """The property that makes the three above a defect rather than a
+        preference: each needs a human to change configuration, so the
+        retry docs/08 §19 promises can never succeed.
+
+        Asserted structurally — the push fails identically on a second
+        attempt, which is what "the next Runner retries" would do.
+        """
+        self._commit_something()
+        _run_git(["remote", "add", "origin", str(self._remote())], cwd=self.repo_dir)
+
+        first = self._push_failure()
+        second = self._push_failure()
+
+        self.assertEqual(first, second, "a retry changed the outcome")
+        self.assertFalse(is_authentication_failure(second))
+
+
 class GitPushSuccessTests(GitOpsTestCase):
     def test_push_to_a_reachable_remote_succeeds(self):
         bare_remote_dir = self.repo_dir.parent / "remote.git"

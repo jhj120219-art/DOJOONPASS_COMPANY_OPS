@@ -39,6 +39,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import businessdate
+from businessdate import business_date
 from history import HistoryCandidate, HistoryDecision, HistoryRepository
 
 from .late_events import append_late_events, select_late_candidates
@@ -49,7 +51,17 @@ DEFAULT_DAILY_DIR = PROJECT_ROOT / "runtime" / "daily"
 
 
 def _candidate_date(candidate: HistoryCandidate) -> date_type:
-    return datetime.fromisoformat(candidate.timestamp).date()
+    """Which Daily History day this candidate belongs to (docs/06 §12).
+
+    `business_date`, not `.date()`: §12's "the Event's timestamp falls on
+    this date" is evaluated in §9's Asia/Seoul, not in whatever offset the
+    producing Desktop happened to write. Those agree for a `+09:00`
+    timestamp and disagree for every other one — measured, the same instant
+    as `...T01:00+09:00` and `...T16:00+00:00` used to land on two different
+    days (C135), which is the silent misfile `agent/signals.py` already
+    refuses one level up.
+    """
+    return business_date(datetime.fromisoformat(candidate.timestamp))
 
 
 def build_keep_index(
@@ -104,7 +116,7 @@ def generate_daily_history(
     two paths produce for that date (docs/06 §25).
     """
     output_dir = Path(output_dir) if output_dir is not None else DEFAULT_DAILY_DIR
-    generated_at = generated_at or datetime.now().astimezone().isoformat(timespec="seconds")
+    generated_at = generated_at or businessdate.now().isoformat(timespec="seconds")
 
     if keep_index is not None:
         matching_candidates = list(keep_index.get(target_date, ()))
@@ -216,7 +228,7 @@ def update_daily_history(
     and the same Events are still pending next time.
     """
     output_dir = Path(output_dir) if output_dir is not None else DEFAULT_DAILY_DIR
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     final_path = output_dir / f"{target_date.isoformat()}.md"
 
     # `is_file()`, not `exists()`: this function's whole precondition is

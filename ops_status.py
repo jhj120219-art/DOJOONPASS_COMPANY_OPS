@@ -58,6 +58,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+import businessdate  # noqa: E402
 from agent.delivery import find_undelivered_events  # noqa: E402
 from agent.status import read_status  # noqa: E402
 from app.desktop_activity import read_company_activity  # noqa: E402
@@ -553,7 +554,15 @@ def _history_newer_than_the_last_backup(local_master: Path, last_backup: datetim
     skipped = 0
     for path in candidates:
         try:
-            written = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+            # `tz=KST` rather than a bare `.astimezone()` on a naive value
+            # (C135): an mtime is an epoch, so it names an instant, and the
+            # frame it is read in should be this project's stated one rather
+            # than whatever zone the machine is set to. The comparison below
+            # is instant-based either way -- this removes the naive-then-
+            # assume-local step, not a defect.
+            written = datetime.fromtimestamp(
+                path.stat().st_mtime, tz=businessdate.KST
+            )
         except OSError:
             # C68: counted, not swallowed. This function answers "is what is
             # on this machine actually off it?", and a file whose mtime
@@ -1432,7 +1441,7 @@ def _read_keep_candidates(
         if candidate_errors(data):
             return None
         try:
-            when = datetime.fromisoformat(data["timestamp"]).date()
+            when = businessdate.business_date(datetime.fromisoformat(data["timestamp"]))
         except (TypeError, ValueError):
             return None
         event_id = data["event_id"]
@@ -2777,7 +2786,7 @@ def _print_history(now: datetime) -> list[str]:
         # An hour is far beyond any run's duration (the git subprocess
         # timeout alone is 300 s) and far below "effectively permanent".
         if last_backup is not None:
-            wall_clock = datetime.now().astimezone()
+            wall_clock = businessdate.now()
             reference = (
                 wall_clock
                 if last_backup.tzinfo is not None
@@ -2972,11 +2981,11 @@ def _print_history(now: datetime) -> list[str]:
     # would mean deciding which date Company History should resume from,
     # which is docs/10 §46's prohibition and §64's operator call.
     close = consistency.last_successful_daily_close
-    if close is not None and close > now.date():
+    if close is not None and close > businessdate.clock_date(now):
         print(f"  daily state 정합성  : 미래 날짜 ({close.isoformat()})")
         attention.append(
             f"Daily State가 미래 날짜를 마지막 Daily Close로 기록하고 있다: "
-            f"{close.isoformat()} (오늘은 {now.date().isoformat()}) — Scheduler는 "
+            f"{close.isoformat()} (오늘은 {businessdate.clock_date(now).isoformat()}) — Scheduler는 "
             f"그 다음 날부터 어제까지를 처리하므로 **그 날짜가 올 때까지 어떤 "
             f"Daily History도 생성되지 않는다.** 그동안 수집된 Event는 전부 "
             f"Candidate로만 쌓이고, Scheduler는 COMPLETED를, 정합성 검사는 "
@@ -4337,11 +4346,34 @@ def _print_agent(now: datetime) -> list[str]:
 
 
 def _event_day(iso: str | None) -> date | None:
-    """The date part of an Event timestamp, or None if it cannot be read."""
+    """`Coverage.evidence_from` / `evidence_to` as a `date`, or None.
+
+    **This reads a date, not a timestamp**, and the difference cost four
+    tests in C135. `dashboard._coverage()` builds both fields as
+    `min(days).isoformat()` over values that already went through
+    `_evidence_day()` -- so they arrive as `"2026-08-01"`, and the Seoul
+    conversion has already happened one layer down. Converting again here is
+    not merely redundant: `datetime.fromisoformat("2026-08-01")` is *naive*,
+    `businessdate.business_date()` refuses a naive value on purpose, and the
+    refusal landed in the `except` below as `None`. The caller reads that
+    `None` as "there is no evidence to compare against" and printed the
+    "증거 범위 밖" qualifier over a perfectly healthy tree, naming the same
+    date on both sides of the sentence.
+
+    Both shapes are accepted, because both have been true of this seam: a
+    bare date is returned as itself, and a timestamp is converted to its
+    Seoul day the way every other date in this file is. The date is tried
+    first -- `date.fromisoformat` rejects a full timestamp, so the two
+    branches cannot both claim the same value.
+    """
     if not iso:
         return None
     try:
-        return datetime.fromisoformat(iso).date()
+        return date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return businessdate.business_date(datetime.fromisoformat(iso))
     except (TypeError, ValueError):
         return None
 
@@ -4487,15 +4519,46 @@ def _comparable(reference: datetime, other: datetime) -> datetime:
     Both directions matter and they resolve oppositely. A naive stored value
     drags the reference down to naive, because there is no offset to invent.
     A naive **reference** is lifted to aware instead, because the caller's
-    `now` is a local wall clock and `astimezone()` is what that means. The
-    fourth copy of this rule lives on `AgentStatusSnapshot`, where it is a
+    `now` is a local wall clock -- and docs/06 section 9 says which wall this
+    project reads: Asia/Seoul. It used to lift with a bare `.astimezone()`,
+    which reads the *machine's* clock zone; on a Runner that was not in Seoul
+    that put the reference up to nine hours from where every other date in
+    this file sits, and did it silently (C135). `businessdate.clock_date()`
+    reads a naive `now` the same way, for the same stated reason.
+
+    The fourth copy of this rule lives on `AgentStatusSnapshot`, where it is a
     method on the value it guards rather than a helper over two of them.
     """
     if other.tzinfo is None:
         return reference.replace(tzinfo=None)
     if reference.tzinfo is None:
-        return reference.astimezone()
+        return reference.replace(tzinfo=businessdate.KST)
     return reference
+
+
+def _column(text: object, width: int) -> str:
+    """One table cell: padded to `width`, and **always** followed by a space.
+
+    The space is the point. `f"{value:<26}"` written straight against the
+    next column reads correctly only while every value is shorter than its
+    field, and silently runs the two together the moment one is not.
+    Measured on the live tree (C135), the CONTROL TOWER Project table:
+
+        COMPANY_OPS   COO/CTO Frontend/CTO Backend/CMOEvent 11  IN_PROGRESS
+
+    `COO/CTO Frontend/CTO Backend/CMO` is 32 characters in a 26-wide field,
+    so `CMO` and `Event` became one token and an operator cannot tell where
+    the team list ends. It is the row for `COMPANY_OPS` — the project every
+    Desktop reports on, so the most-populated row and the one that overflows
+    first. Every day, on the panel this file exists to print.
+
+    Padded rather than truncated: cutting the cell to fit would drop a team
+    name, and a view that quietly shows three of four teams is the failure
+    this file keeps removing (C77's two disagreeing numbers, C85's sentence
+    that stopped at the reassuring half). A wide row is ugly; a wrong one is
+    not recoverable by looking harder.
+    """
+    return f"{text:<{width}} "
 
 
 def _print_control_tower(now: datetime) -> list[str]:
@@ -4707,8 +4770,10 @@ def _print_control_tower(now: datetime) -> list[str]:
         mismatches = values["role_mismatches"]
         bad = f"  ! role 어긋남 {mismatches}" if mismatches else ""
         print(
-            f"    {one_line(values['source']):<12}{one_line(values['display_name']):<14}"
-            f"Event {values['events']:<4}Project {len(values['projects']):<3}{when}{bad}"
+            f"    {_column(one_line(values['source']), 11)}"
+            f"{_column(one_line(values['display_name']), 13)}"
+            f"Event {_column(values['events'], 3)}"
+            f"Project {_column(len(values['projects']), 2)}{when}{bad}"
         )
 
     if project_rows:
@@ -4741,8 +4806,9 @@ def _print_control_tower(now: datetime) -> list[str]:
                     + (f" ({idle}일 전)" if idle else "")
                 )
             print(
-                f"    {marker} {_authored(values['project_id']):<20} {teams:<26}"
-                f"Event {values['events']:<4}{state}"
+                f"    {marker} {_column(_authored(values['project_id']), 20)}"
+                f"{_column(teams, 25)}"
+                f"Event {_column(values['events'], 3)}{state}"
             )
         if len(project_rows) > len(shown):
             print(f"      외 {len(project_rows) - len(shown)}건")
@@ -5008,7 +5074,7 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
         # against different references — harmless in production (both are
         # real now) and a trap in a fixture, which is exactly where a pinned
         # `started_at` compared against wall-clock time was already found.
-        lock_reference = _comparable(now or datetime.now().astimezone(), held_since)
+        lock_reference = _comparable(now or businessdate.now(), held_since)
         held_hours = (lock_reference - held_since).total_seconds() / 3600
         print(f"  Runner Lock : 보유 중 (획득 {held_since.isoformat(timespec='seconds')})")
         if held_hours >= LOCK_STUCK_AFTER_HOURS:
@@ -5096,7 +5162,7 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     # The naive/aware guard is the same one the lock check below uses — a
     # hand-edited manifest can carry an offset-less timestamp, and comparing
     # it to an aware `now` raises TypeError.
-    reference = now or datetime.now().astimezone()
+    reference = now or businessdate.now()
     try:
         started = datetime.fromisoformat(summary.started_at)
     except (TypeError, ValueError):
@@ -5354,7 +5420,7 @@ def main(argv: Sequence[str] = ()) -> int:
         print(f"[FAILED] {refusal}", file=sys.stderr)
         return CONFIG_ERROR_EXIT
 
-    now = datetime.now().astimezone()
+    now = businessdate.now()
     print(f"DOJOONPASS Company Ops — Status @ {now.isoformat(timespec='seconds')}")
     print()
 

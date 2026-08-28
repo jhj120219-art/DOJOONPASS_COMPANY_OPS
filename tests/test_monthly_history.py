@@ -578,6 +578,89 @@ class PendingMonthTests(unittest.TestCase):
         self.assertEqual(months, [(2026, 12), (2027, 1)])
 
 
+class PendingMonthIsMeasuredInSeoulTests(unittest.TestCase):
+    """C135. "Which month is closed" is a business question, so docs/06 §9's
+    Asia/Seoul is the calendar it is asked of — not whatever offset the
+    caller's `now` happens to carry.
+
+    `pending_months()` read `now.year` / `now.month` straight off the value.
+    Those two disagree for nine hours at every month boundary, because
+    2026-09-01 05:00 KST is 2026-08-31 20:00 UTC — the same instant, one
+    month apart. Measured, before the fix:
+
+        now = 2026-09-01 05:00 +09:00   ->  [(2026, 7), (2026, 8)]
+        now = 2026-08-31 20:00 +00:00   ->  [(2026, 7)]
+
+    August is not lost in the second case — the next run picks it up — but a
+    Monthly History that should have been written this morning is not, and
+    nothing says why. `docs/09 §49` forbids consolidating a month still in
+    progress; it does not license disagreeing about which month that is.
+    """
+
+    KST = timezone(timedelta(hours=9))
+    UTC = timezone.utc
+
+    def _months(self, now):
+        return pending_months(
+            last_successful_monthly_close=None,
+            history_start_date=date(2026, 7, 1),
+            now=now,
+        )
+
+    def test_the_same_instant_gives_the_same_months_in_either_spelling(self):
+        as_kst = datetime(2026, 9, 1, 5, 0, tzinfo=self.KST)
+        as_utc = datetime(2026, 8, 31, 20, 0, tzinfo=self.UTC)
+
+        self.assertEqual(as_kst, as_utc, "the two probes are not one instant")
+        self.assertEqual(self._months(as_kst), self._months(as_utc))
+
+    def test_august_is_closed_once_seoul_has_entered_september(self):
+        """The half that was wrong. Both spellings must include August."""
+        for label, now in (
+            ("KST", datetime(2026, 9, 1, 5, 0, tzinfo=self.KST)),
+            ("UTC", datetime(2026, 8, 31, 20, 0, tzinfo=self.UTC)),
+        ):
+            with self.subTest(spelling=label):
+                self.assertIn((2026, 8), self._months(now))
+
+    def test_august_is_not_closed_while_seoul_is_still_in_august(self):
+        """The control, so the test above cannot pass by always including it.
+
+        2026-08-31 23:59 KST is still August here, whatever it is elsewhere.
+        """
+        as_kst = datetime(2026, 8, 31, 23, 59, tzinfo=self.KST)
+        as_utc = datetime(2026, 8, 31, 14, 59, tzinfo=self.UTC)
+
+        self.assertEqual(as_kst, as_utc)
+        for label, now in (("KST", as_kst), ("UTC", as_utc)):
+            with self.subTest(spelling=label):
+                self.assertNotIn((2026, 8), self._months(now))
+
+    def test_a_naive_now_is_read_as_the_seoul_wall_clock(self):
+        """Every other test in this file passes a naive `now`, which means
+        "the wall clock" — and docs/06 §9 says which wall. So the naive and
+        the KST-aware spellings of one reading must agree."""
+        self.assertEqual(
+            self._months(datetime(2026, 9, 1, 5, 0)),
+            self._months(datetime(2026, 9, 1, 5, 0, tzinfo=self.KST)),
+        )
+
+    def test_the_year_boundary_too(self):
+        """2027-01-01 05:00 KST is 2026-12-31 20:00 UTC: the year rolls as
+        well as the month, so December must close in both spellings."""
+        for label, now in (
+            ("KST", datetime(2027, 1, 1, 5, 0, tzinfo=self.KST)),
+            ("UTC", datetime(2026, 12, 31, 20, 0, tzinfo=self.UTC)),
+        ):
+            with self.subTest(spelling=label):
+                months = pending_months(
+                    last_successful_monthly_close="2026-11",
+                    history_start_date=date(2026, 7, 1),
+                    now=now,
+                )
+                self.assertEqual(months, [(2026, 12)])
+
+
 class MockTestNormalMonth(MonthlyTestCase):
     """docs/09 §91."""
 

@@ -32,6 +32,8 @@ from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
 
+import businessdate
+from businessdate import clock_date
 from .coverage import DailyCoverage, check_coverage
 from .markdown import METADATA_TITLE, MonthlyItem, render_monthly_markdown
 from .parser import DailyParseError, read_daily_document
@@ -173,7 +175,15 @@ def pending_months(
     if current < first_month:
         current = first_month
 
-    last_closed = _previous_month(now.year, now.month)
+    # `clock_date(now)`, not `now.year`/`now.month` (C135). Which month is
+    # closed is a business question, so it is asked of the Seoul calendar
+    # (docs/06 section 9) rather than of whatever offset `now` carries. The
+    # two disagree for nine hours at every month boundary: 2026-09-01 05:00
+    # KST is 2026-08-31 20:00 UTC, and a UTC-framed `now` would there report
+    # July as the last closed month and leave August unconsolidated for
+    # another run.
+    today = clock_date(now)
+    last_closed = _previous_month(today.year, today.month)
 
     months: list[tuple[int, int]] = []
     while (current[0], current[1]) <= (last_closed[0], last_closed[1]):
@@ -452,7 +462,7 @@ def run_once(
     rebuilds run afterwards and are independent — a month that is dirty has
     already been consolidated once, so it never blocks a later month.
     """
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     state_path = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
     state = load_state(state_path)
 

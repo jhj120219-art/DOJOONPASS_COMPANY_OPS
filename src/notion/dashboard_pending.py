@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import businessdate
 from .dashboard import RUN_ID_PROPERTY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -139,7 +140,7 @@ def save_pending(
 ) -> None:
     """Upsert one pending record. Re-queuing the same `run_id` updates the
     existing entry (attempt_count += 1) instead of duplicating it."""
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     records = load_pending(path)
     index = next((i for i, r in enumerate(records) if r.run_id == run_id), None)
 

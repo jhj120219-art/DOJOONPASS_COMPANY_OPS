@@ -75,6 +75,7 @@ from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
 
+from businessdate import KST, business_date, clock_date
 from events import SOURCES
 from collector.runtime import is_readable_event_file  # reuse Collector's own test
 from transport.intake import _is_parseable_json  # reuse intake's own test
@@ -129,7 +130,7 @@ class DesktopActivity:
         if self.last_event_at is None:
             return None
         try:
-            return datetime.fromisoformat(self.last_event_at).date()
+            return business_date(datetime.fromisoformat(self.last_event_at))
         except ValueError:
             return None
 
@@ -144,7 +145,7 @@ class DesktopActivity:
         last = self.last_event_date
         if last is None:
             return None
-        return max(0, (now.date() - last).days)
+        return max(0, (clock_date(now) - last).days)
 
     def days_since_arrival(self, now: datetime) -> int | None:
         """Whole days since a file from this Desktop last appeared here.
@@ -168,8 +169,14 @@ class DesktopActivity:
         """
         if self.last_arrival_at is None:
             return None
-        arrived = datetime.fromtimestamp(self.last_arrival_at, tz=now.tzinfo)
-        return max(0, (now.date() - arrived.date()).days)
+        # KST, not `tz=now.tzinfo` (C135). `last_arrival_at` is a file mtime
+        # — an epoch, so an absolute instant — and the day it fell on is a
+        # Seoul day like every other day this system counts (docs/06 §9).
+        # Passing `now`'s tzinfo made the frame depend on the caller, and
+        # when that was None `fromtimestamp` answered in the *machine's*
+        # zone, which is the one frame this project never means.
+        arrived = datetime.fromtimestamp(self.last_arrival_at, tz=KST)
+        return max(0, (clock_date(now) - business_date(arrived)).days)
 
     def caught_up_recently(self, now: datetime, *, days: int) -> bool:
         """True when this Desktop looks silent by work date but a file from

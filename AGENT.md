@@ -204,7 +204,7 @@ runtime/agent/signals/2026-08-10/search-api-done.json
 | `milestone` / `blocker` | | `BLOCKED`는 `blocker` 필수(docs/02) |
 | `evidence` | | 문자열 배열 |
 | `history_candidate` | | 기본 `false` |
-| `timestamp` | | 생략 시 그 날짜의 자정(로컬) |
+| `timestamp` | | 생략 시 그 날짜의 자정(KST, docs/06 §9) |
 
 **쓸 수 없는 필드**: `source`, `role`, `event_id`, `schema_version`.
 신원은 Profile에서 오고 `event_id`는 Agent가 결정론적으로 만든다. 이 필드를
@@ -213,6 +213,11 @@ runtime/agent/signals/2026-08-10/search-api-done.json
 `timestamp`를 직접 쓸 경우 **반드시 그 날짜여야 한다**. Daily History는
 Event 자신의 timestamp로 날짜를 나누므로(docs/06 §12), 어긋나면 수집된 날짜와
 기록되는 날짜가 달라진다. 그래서 거부한다.
+
+"그 날짜"는 **KST 기준**이다(docs/06 §9). offset은 `+09:00`이 아니어도 되지만,
+어느 offset으로 쓰든 그것이 가리키는 순간이 서울에서 그 날이어야 한다 —
+`2026-08-05T23:00:00+00:00`은 서울에서 08-06 08:00이므로 08-06으로 접수해야
+통과한다. 검사와 렌더링이 같은 기준을 쓰므로 둘이 어긋날 수 없다(C135).
 
 > **같은 날짜·같은 프로젝트에 Signal을 두 개 이상 쓸 때는 `timestamp`를 넣어라.**
 >

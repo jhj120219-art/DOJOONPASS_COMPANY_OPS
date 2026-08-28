@@ -151,6 +151,7 @@ import ops_status  # noqa: E402
 
 # The same loaders `ops_status.py` uses, so `operational_facts()` reads the
 # files rather than that module's rendering of them (C129).
+import businessdate  # noqa: E402
 from agent.status import read_status as read_agent_status  # noqa: E402
 from app.runner import DEFAULT_RUN_SUMMARY_PATH  # noqa: E402
 from backup.state import load_state as load_backup_state  # noqa: E402
@@ -1092,6 +1093,38 @@ def _kpi_verdict(key: str, value: Any, *, measured: bool = True) -> tuple[str, s
     return _verdict.metric_verdict(key, value, measured=measured)
 
 
+def _kpi_cite(count: int, value: Any) -> str:
+    """The evidence line under one KPI tile.
+
+    Three states, not two (C135). This said `증거 {n}건` or `증거 파일 없음`,
+    and the second was a **false sentence** for two of the nine metrics.
+    Measured on the live tree:
+
+        기록된 Event      16   증거 16건
+        움직인 Project     4   증거 파일 없음      <- not true
+
+    `움직인 Project` is the number of distinct `project_id`s among those same
+    16 files. `rollup._roll_metrics()` gives it no `evidence` refs **on
+    purpose** and the reason is good — it counts projects, not Events, so
+    "one file per counted thing" does not exist and inventing refs is the
+    invention that module refuses. But "carries no per-item refs" and "has no
+    evidence" are different claims, and only the first is true. `Metric`'s own
+    docstring says a Control Tower number nobody can trace is a rumour; this
+    line was calling a perfectly traceable number a rumour, on the surface a
+    person actually reads.
+
+    So a non-zero number with no refs says what it is — derived rather than
+    counted — and the tile's `derived_from` sentence, already on the page,
+    says derived from what. Only a **zero** keeps `증거 파일 없음`, where it
+    is true: nothing happened, so there is nothing to cite.
+    """
+    if count:
+        return f"<span class='cite'>증거 {count}건</span>"
+    if value:
+        return "<span class='cite derived'>파일을 세지 않는 파생값 — 아래 근거 참조</span>"
+    return "<span class='cite none'>증거 파일 없음</span>"
+
+
 def _kpi_html(panel: Mapping[str, Any] | None, *, measured: bool = True) -> str:
     """KPI tiles, each carrying its verdict and the file count behind it.
 
@@ -1119,11 +1152,7 @@ def _kpi_html(panel: Mapping[str, Any] | None, *, measured: bool = True) -> str:
             str(values.get("key") or ""), value, measured=measured
         )
         zero = "zero" if value == 0 else "live"
-        cite = (
-            f"<span class='cite'>증거 {count}건</span>"
-            if count
-            else "<span class='cite none'>증거 파일 없음</span>"
-        )
+        cite = _kpi_cite(count, value)
         tiles.append(
             f"<div class='kpi {zero} k-{tone}'>"
             f"<div class='kpi-top'><span class='kpi-value'>{_e(value)}</span>"
@@ -1158,7 +1187,7 @@ def _evidence_age_days(model: Mapping[str, Any]) -> int | None:
         return None
     try:
         then = date_type.fromisoformat(str(newest))
-        now = datetime.fromisoformat(str(model.get("generated_at"))).date()
+        now = businessdate.business_date(datetime.fromisoformat(str(model.get("generated_at"))))
     except (TypeError, ValueError):
         return None
     return max(0, (now - then).days)
@@ -3072,7 +3101,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "text/plain; charset=utf-8",
             )
             return
-        now = datetime.now().astimezone()
+        now = businessdate.now()
         try:
             data = gather(now, since=since, until=until)
         except Exception:  # noqa: BLE001

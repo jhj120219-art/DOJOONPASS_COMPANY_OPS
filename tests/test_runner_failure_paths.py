@@ -2504,10 +2504,13 @@ class IntakeRecursionErrorTests(unittest.TestCase):
 
 
 class BackupFailedStatusClearingTests(RunnerFailurePathTestCase):
-    """BUG-41 (NOT FIXED): BACKUP_FAILED is silently cleared by the next
-    no-op run — the same hazard that was fixed for BACKUP_PENDING.
+    """BUG-41 (FIXED): BACKUP_FAILED is cleared only when the work it was
+    about actually reached the remote.
 
-    CHARACTERIZATION: asserts today's behaviour.
+    GUARANTEE. This class was a characterization until the defect was fixed;
+    its own docstring said it "should then be rewritten as the guarantee", and
+    what follows is that rewrite. The measurement it recorded still stands and
+    is kept below, because it is the reason the guarantee is shaped this way.
 
     backup/runner.py's own comment, written for the approved Backup Pending
     자동복구 change, states the problem exactly:
@@ -2515,20 +2518,36 @@ class BackupFailedStatusClearingTests(RunnerFailurePathTestCase):
         backup_status가 PENDING -> NOT_REQUIRED로 덮어써져 미완료 신호까지
         사라진다. CEO 승인 A안: State가 PENDING이면 push를 먼저 재시도한다.
 
-    That fix covers PENDING. FAILED has the identical hole and was outside the
-    approved scope, so it was left. Measured: seed BACKUP_FAILED, run again
-    with no changes, and the state comes back BACKUP_NOT_REQUIRED.
+    That fix covered PENDING and left FAILED with the identical hole.
+    Measured then: seed BACKUP_FAILED, run again with no changes, and the
+    state came back BACKUP_NOT_REQUIRED.
 
     FAILED is not a transient state — it is produced by an authentication
     failure, a detected secret, or detected deletions, all of which need a
     human. Most runs have no new Daily file, so the very next run usually
-    takes the no-change path and erases the signal.
+    takes the no-change path and erased the signal.
 
-    Combined with BUG-36 (always exit 0) and BUG-37 (no Backup Log file),
-    a failed backup can leave no trace at all within one run cycle.
+    **What the fix is, and what it deliberately is not.** Re-measuring showed
+    the old framing was half right, and the half it got wrong is what makes
+    the guarantee testable. "FAILED must never be cleared by a no-change run"
+    is too strong: three of the four ways FAILED is written — the secret scan
+    (docs/08 §29), the deletion gate (§31) and the mass-modification gate
+    (§46) — stop *before* any git command, so they leave no commit. Once that
+    condition is gone there is genuinely nothing left to back up, and holding
+    FAILED would be the permanent false ATTENTION line C26 warns trains people
+    to skim past.
 
-    There is also no transition validation anywhere: `BackupState.backup_status`
-    is plain assignment, so any status can overwrite any other.
+    The fourth way is the failed push, and it is the one that matters: the
+    commit exists locally and the remote does not have it. So the deciding
+    question is not what the state file says but **whether the remote is
+    behind**, and `backup/runner.py` now asks git that (`count_unpushed_commits`)
+    instead of inferring it. It does not push again — §62 forbids retrying a
+    credential failure on a schedule, and §21 says a person must act. The lie
+    was removed, not the policy.
+
+    There is still no transition validation anywhere: `BackupState.backup_status`
+    is plain assignment, so any status can overwrite any other. That is
+    unchanged and remains a separate concern.
     """
 
     def _seed_status(self, status):
@@ -2561,10 +2580,18 @@ class BackupFailedStatusClearingTests(RunnerFailurePathTestCase):
 
         self.assertEqual(entry.final_status, BackupStatus.SUCCESS)
 
-    def test_a_failed_status_is_erased_by_the_next_no_change_run(self):
+    def test_a_failed_status_clears_when_nothing_was_left_unpushed(self):
+        """The gate failures (secret / deletion / mass modification) stop
+        before any git command, so they leave the remote current. Clearing is
+        correct here, and this is the half the old characterization measured.
+
+        The premise is asserted, not assumed: if a commit *were* sitting
+        unpushed this test would be measuring the other branch.
+        """
         (self.local_master_dir / "daily").mkdir(parents=True, exist_ok=True)
         (self.local_master_dir / "daily" / "2026-08-05.md").write_text("x", encoding="utf-8")
         self._run_backup()
+        self.assertEqual(self._unpushed_commit_count(), 0)
 
         self._seed_status(BackupStatus.FAILED)
         self.assertEqual(self._current_status(), BackupStatus.FAILED)
@@ -2574,12 +2601,38 @@ class BackupFailedStatusClearingTests(RunnerFailurePathTestCase):
         self.assertEqual(entry.final_status, BackupStatus.NOT_REQUIRED)
         self.assertEqual(self._current_status(), BackupStatus.NOT_REQUIRED)
 
-    def test_the_pending_sibling_is_handled(self):
-        """The approved fix, asserted so the asymmetry is explicit."""
+    def test_a_failed_status_survives_while_a_commit_is_still_unpushed(self):
+        """The half that was the defect. A failed push leaves a clean tree and
+        a commit the remote does not have; the next no-change run used to call
+        that BACKUP_NOT_REQUIRED and overwrite the FAILED with it, taking the
+        only record of the failure with it."""
+        (self.local_master_dir / "daily").mkdir(parents=True, exist_ok=True)
+        (self.local_master_dir / "daily" / "2026-08-05.md").write_text("x", encoding="utf-8")
+        self._run_backup()
+
+        # A real unpushed commit, made the way the Backup makes them.
+        (self.backup_working_copy_dir / "unpushed.md").write_text("x", encoding="utf-8")
+        self._run_git(["add", "-A"], cwd=self.backup_working_copy_dir)
+        self._run_git(["commit", "-m", "backup: not pushed"], cwd=self.backup_working_copy_dir)
+        self.assertEqual(self._unpushed_commit_count(), 1)
+
+        self._seed_status(BackupStatus.FAILED)
+
+        entry = self._run_backup()
+
+        self.assertEqual(entry.final_status, BackupStatus.FAILED)
+        self.assertEqual(self._current_status(), BackupStatus.FAILED)
+        self.assertEqual(self._unpushed_commit_count(), 1)
+
+    def test_both_statuses_that_can_hold_an_unpushed_commit_are_handled(self):
+        """The structural half. The asymmetry this asserted the absence of is
+        what the fix removed, so it now asserts the presence of both arms —
+        a refactor that drops either one puts the hole back."""
         source = inspect.getsource(sys.modules["backup.runner"].run_once)
 
         self.assertIn("if state.backup_status is BackupStatus.PENDING", source)
-        self.assertNotIn("if state.backup_status is BackupStatus.FAILED", source)
+        self.assertIn("if state.backup_status is BackupStatus.FAILED", source)
+        self.assertIn("count_unpushed_commits", source)
 
 
 class StateLossVersusProcessedFilesTests(unittest.TestCase):
@@ -2981,15 +3034,23 @@ class BackupTimestampProtectionTests(RunnerFailurePathTestCase):
     "when did we last actually back up" stays truthful however many no-op
     runs happen in between. That is exactly right, and nothing asserted it.
 
-    The contrast matters. The SAME function, in the SAME no-change path,
-    overwrites `backup_status` — which is how BACKUP_FAILED gets erased
-    (BUG-41). So the hazard was understood and defended against for two
-    fields and not for the third. That makes BUG-41 look less like an
-    oversight in analysis and more like an incomplete application of a rule
-    the author had already worked out.
+    The contrast is what pointed at BUG-41. The SAME function, in the SAME
+    no-change path, overwrites `backup_status` — which is how BACKUP_FAILED
+    got erased. The hazard had been understood and defended against for two
+    fields and not for the third, which made BUG-41 look less like an
+    oversight in analysis than an incomplete application of a rule the author
+    had already worked out.
 
-    This test exists so a future fix for BUG-41 cannot "simplify" the state
-    write and take the timestamp protection down with it.
+    BUG-41 is now fixed, and the asymmetry below is still real and still
+    correct. The two timestamps are unconditionally protected because a run
+    that did no work has nothing to say about when the last backup happened.
+    `backup_status` is a *verdict on this run* and must be free to change —
+    what BUG-41 was about is that the verdict was wrong, not that it was
+    written. `AFailedBackupIsNotQuietlyDowngradedToNotRequiredTests`
+    (tests/test_backup_runner.py) and
+    `BackupFailedStatusClearingTests` above hold the corrected verdict; this
+    class holds the fields that must not move with it, so that fix could not
+    "simplify" the state write and take the timestamp protection down.
     """
 
     def _write_daily(self, name="2026-08-05.md", content="entry"):
@@ -3034,8 +3095,11 @@ class BackupTimestampProtectionTests(RunnerFailurePathTestCase):
         self.assertEqual(after.last_backup_commit, before.last_backup_commit)
 
     def test_the_status_field_is_not_given_the_same_protection(self):
-        """BUG-41, stated as the asymmetry it is. If this starts failing,
-        BUG-41 was fixed and this class should be re-read as a whole."""
+        """The asymmetry, stated. It is deliberate: this run genuinely had
+        nothing to back up and the remote genuinely has everything, so
+        NOT_REQUIRED is the true verdict and the timestamps still describe the
+        last run that actually pushed. The case where overwriting the status
+        WOULD be a lie is held one class over."""
         self._write_daily()
         self._run_backup()
         before = self._state()
@@ -5730,7 +5794,23 @@ class NaiveAwareComparisonGuardTests(unittest.TestCase):
     `history/result.py` handle it.
     """
 
-    SRC = Path(__file__).resolve().parents[1] / "src"
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+    SRC = REPO_ROOT / "src"
+
+    @classmethod
+    def _swept(cls):
+        """`src/` **and the repository root** (C135).
+
+        This swept `src/` alone, which was an unstated claim that no root
+        tool compares two parsed timestamps. `ops_status.py` does — it holds
+        `_comparable()`, a whole helper for reconciling a naive stored value
+        against an aware reference, and C135 changed it. Measured when the
+        sweep was widened: **0 offenders at the root**, so this is a fence
+        rather than a repair — the same shape as the two rosters and the one
+        unstated premise C135 found by asking every gate what it cannot see.
+        """
+        paths = [p for p in sorted(cls.SRC.rglob("*.py")) if "__pycache__" not in str(p)]
+        return paths + sorted(cls.REPO_ROOT.glob("*.py"))
 
     def _innermost_guards(self, tree):
         guards = {}
@@ -5775,13 +5855,26 @@ class NaiveAwareComparisonGuardTests(unittest.TestCase):
                         best = node
         return best
 
+    def test_the_sweep_reaches_the_root_and_is_not_empty(self):
+        """Guards the guard, both ways it could be silent.
+
+        The assertion below is an exact-list comparison over a scan, so a
+        scan that found nothing would read as "one known site" only because
+        the known site is named — and a scan that quietly narrowed back to
+        `src/` would say nothing at all.
+        """
+        names = {path.name for path in self._swept()}
+
+        self.assertIn("sync.py", names)
+        self.assertIn("ops_status.py", names)
+        self.assertIn("run_company_ops.py", names)
+        self.assertGreater(len(names), 50, sorted(names))
+
     def test_no_timestamp_comparison_is_guarded_against_value_error_only(self):
         FORGIVING = {"TypeError", "Exception", "BaseException", "<bare>"}
         offenders = []
 
-        for path in sorted(self.SRC.rglob("*.py")):
-            if "__pycache__" in str(path):
-                continue
+        for path in self._swept():
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source, str(path))
             guards = self._innermost_guards(tree)

@@ -236,11 +236,12 @@ Notion 쪽 재료로 옮긴 것이며, 화면과 어긋나면 어긋난 쪽이 �
 ```powershell
 python -c @'
 import sys
-from datetime import datetime
 sys.path.insert(0, "src")
+import businessdate
 from controltower import build_company_rollup, build_dashboard
-model = build_dashboard(build_company_rollup(now=datetime.now().astimezone()),
-                        now=datetime.now().astimezone())
+now = businessdate.now()   # KST — docs/06 §9. `datetime.now().astimezone()`
+                           # reads the *machine's* zone and is what C135 removed.
+model = build_dashboard(build_company_rollup(now=now), now=now)
 for panel in model.panels:
     print(f"{panel.key:<15} {panel.status.value:<10} {panel.title}")
     print(f"                {panel.source or panel.note}")

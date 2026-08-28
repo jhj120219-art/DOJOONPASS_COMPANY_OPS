@@ -57,6 +57,8 @@ from datetime import date as date_type
 from datetime import datetime, time
 from pathlib import Path
 
+import businessdate
+from businessdate import KST
 from events import EventValidationError
 from oplog import append_line
 from reporter import Reporter
@@ -149,7 +151,7 @@ def derive_event_id(*, source: str, target_date: date_type, signal_id: str) -> s
 
 
 def _default_timestamp(target_date: date_type) -> str:
-    """Local midnight on the Signal's own date, with the local UTC offset.
+    """Seoul midnight on the Signal's own date (docs/06 §9).
 
     A Signal may state its own `timestamp` (validated in `signals.py` to
     fall on that date). When it does not, the Event still needs one, and it
@@ -158,10 +160,17 @@ def _default_timestamp(target_date: date_type) -> str:
     is the one value on that date that is the same for every Signal and for
     every re-run — using "now" instead would make a catch-up of 08-08 file
     its Events under the day the PC happened to be switched back on.
+
+    **KST midnight, not the machine's** (C135). `.astimezone()` on a naive
+    value reads the machine's clock zone, and midnight-there is not always
+    `target_date` here: at UTC+14 (Kiribati) `2026-08-08T00:00+14:00` is
+    2026-08-07 05:00 in Seoul, so the Signal the operator filed under 08-08
+    would be rendered on 08-07 — the misfile `signals.py` refuses when the
+    Signal states its own timestamp, arriving through the branch where it
+    does not. Anything east of UTC+09 has it; the offsets nearer Seoul do not,
+    which is why it survived.
     """
-    return (
-        datetime.combine(target_date, time(0, 0)).astimezone().isoformat(timespec="seconds")
-    )
+    return datetime.combine(target_date, time(0, 0), tzinfo=KST).isoformat(timespec="seconds")
 
 
 def _log(log_path: Path, message: str) -> None:
@@ -253,7 +262,7 @@ def run_once(
     precisely how dates get skipped.
     """
     resolved_profile = resolve_profile(profile)
-    now = now or datetime.now().astimezone()
+    now = now or businessdate.now()
     signals_dir = Path(signals_dir) if signals_dir is not None else DEFAULT_SIGNALS_DIR
     rejected_signals_dir = (
         Path(rejected_signals_dir)

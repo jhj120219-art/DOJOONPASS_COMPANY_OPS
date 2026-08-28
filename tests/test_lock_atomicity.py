@@ -373,11 +373,11 @@ class ReadOnlyLockTests(LockTestCase):
 
 
 class ProcessProbeFailureTests(LockTestCase):
-    """BUG-54 (NOT FIXED): when the liveness probe cannot answer, the answer
-    it gives is "not running" — so a LIVE holder's lock is taken over and
-    mutual exclusion breaks.
+    """BUG-54 (FIXED): when the liveness probe cannot answer, it no longer
+    answers "not running" — so a LIVE holder's lock is left alone.
 
-    CHARACTERIZATION: asserts today's behaviour.
+    GUARANTEE. This was a characterization until the direction was flipped;
+    the measurement it recorded is kept below because it is the argument.
 
     docs/07 section 27 decides staleness by whether the recorded process is
     running. On Windows that is:
@@ -415,9 +415,31 @@ class ProcessProbeFailureTests(LockTestCase):
     ("assume alive, skip this run"). Skipping a run costs one cycle; taking a
     live lock costs Company History.
 
-    Not fixed: defaulting to True on probe failure would make BUG-42's
-    read-only stale lock permanent in a new way (nothing could ever reclaim a
-    lock whose probe keeps failing), so the two have to be decided together.
+    **Why this stopped being a decision.** The recorded objection was that
+    defaulting to True would make a lock whose probe keeps failing
+    unreclaimable, in a new way and just as silently -- so it had to be
+    settled together with BUG-42. Two things turned out to be true.
+
+    The coupling to BUG-42 is not real. BUG-42's probe *succeeds* and
+    correctly says "dead"; what fails there is the `os.unlink()` of a
+    read-only file. This finding is about the probe failing. They are
+    different steps, and answering True here leaves BUG-42 exactly as it was.
+
+    The silence is no longer real either, and that is what changed since the
+    objection was written. A lock this path holds is reported: `ops_status.py`
+    reads `lock_held_since()` -- which answers on this path precisely because
+    the holder counts as alive -- and raises LOCK_STUCK_AFTER_HOURS, whose own
+    message names this shape ("죽은 Agent의 PID가 재사용돼 Lock이 영구히 잡힌
+    것으로 보이는 상태"). The Runner and Agent silence checks raise a run that
+    stops happening after SILENT_AFTER_DAYS. Neither check existed when BUG-54
+    was recorded.
+
+    And it was never a new policy. `_is_process_running()` already answers
+    True for the one "cannot fully tell" case it could see on POSIX --
+    `PermissionError` from `os.kill(pid, 0)`, a process that exists and is not
+    ours. Windows was the only branch that read "I cannot tell" as "it is
+    gone". `test_the_posix_branch_already_answered_this_way` pins that, since
+    it is the reason this is a transplant rather than an invention.
     """
 
     def _hold_lock_as_this_process(self):
@@ -448,7 +470,7 @@ class ProcessProbeFailureTests(LockTestCase):
 
         self.assertFalse(try_acquire_lock(self.lock_path, now=NOW))
 
-    def test_a_probe_timeout_lets_a_live_lock_be_stolen(self):
+    def test_a_probe_timeout_does_not_let_a_live_lock_be_stolen(self):
         import subprocess
 
         lock_module = self._with_failing_probe(
@@ -456,24 +478,50 @@ class ProcessProbeFailureTests(LockTestCase):
         )
         self._hold_lock_as_this_process()
 
-        self.assertFalse(lock_module._is_process_running(os.getpid()))
-        self.assertTrue(try_acquire_lock(self.lock_path, now=NOW))
+        self.assertTrue(lock_module._is_process_running(os.getpid()))
+        self.assertFalse(try_acquire_lock(self.lock_path, now=NOW))
 
-    def test_a_missing_tasklist_lets_a_live_lock_be_stolen(self):
+    def test_a_missing_tasklist_does_not_let_a_live_lock_be_stolen(self):
         lock_module = self._with_failing_probe(FileNotFoundError("tasklist not found"))
         self._hold_lock_as_this_process()
 
-        self.assertFalse(lock_module._is_process_running(os.getpid()))
-        self.assertTrue(try_acquire_lock(self.lock_path, now=NOW))
+        self.assertTrue(lock_module._is_process_running(os.getpid()))
+        self.assertFalse(try_acquire_lock(self.lock_path, now=NOW))
 
-    def test_the_probe_resolves_an_unknown_answer_permissively(self):
-        """The structural cause, so a refactor cannot lose the finding."""
+    def test_the_probe_resolves_an_unknown_answer_conservatively(self):
+        """The structural half, so a refactor cannot flip the direction back
+        without saying so."""
         source = inspect.getsource(sys.modules["scheduler.lock"]._is_process_running)
 
         self.assertIn("except (OSError, subprocess.SubprocessError)", source)
-        # The handler returns False — "assume dead" — not True.
         handler = source[source.index("except (OSError, subprocess.SubprocessError)") :]
-        self.assertIn("return False", handler.split("\n")[1])
+        self.assertIn("return True", handler)
+        self.assertNotIn(
+            "return False",
+            handler[: handler.index("return True")],
+            "the unknown-answer handler must not fall out as 'dead'",
+        )
+
+    def test_the_posix_branch_already_answered_this_way(self):
+        """Why this is a transplant and not an invention: the same function
+        already resolved its one other "cannot fully tell" case as alive."""
+        source = inspect.getsource(sys.modules["scheduler.lock"]._is_process_running)
+
+        after_permission_error = source[source.index("except PermissionError") :]
+        self.assertIn("return True", after_permission_error.split("\n")[1])
+
+    def test_a_lock_held_by_an_unanswerable_probe_is_still_visible(self):
+        """The objection this fix had to clear. If a probe keeps failing the
+        lock is never reclaimed, so the condition must not be silent --
+        `ops_status.py` reads exactly this to raise its
+        LOCK_STUCK_AFTER_HOURS line, and it can only answer while the holder
+        counts as alive."""
+        from scheduler.lock import lock_held_since
+
+        self._with_failing_probe(FileNotFoundError("tasklist not found"))
+        self._hold_lock_as_this_process()
+
+        self.assertIsNotNone(lock_held_since(self.lock_path))
 
     def test_the_probe_is_accurate_when_it_can_run(self):
         """The finding is about the failure path only — the probe itself is
