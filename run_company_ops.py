@@ -81,7 +81,7 @@ from scheduler import SchedulerStatus  # noqa: E402
 # strings of the same origin. `ops_status.py` already imports `one_line` for
 # this reason; the pair is needed here because this script prints text that
 # came out of a remote HTTP response.
-from oplog import one_line, redact  # noqa: E402
+from oplog import bounded, one_line, redact  # noqa: E402
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -205,8 +205,37 @@ def _resolve_history_start_date() -> date:
     try:
         return date.fromisoformat(raw)
     except ValueError:
+    # `bounded(redact(one_line(...)))` — the same composition every other
+    # sink in this project applies, on the one class of string that reached
+    # a sink without it.
+    #
+    # **Echoing the bad value is deliberate and stays.** The comment on the
+    # branch above says why: printing it is what distinguishes "never set"
+    # from "set to something wrong", and an operator staring at their own
+    # typo needs to see it. A malformed date is not secret-shaped, so
+    # `redact()` leaves it exactly as it was — measured.
+    #
+    # **What changed is where this line ends up.** Until C138 a scheduled
+    # run's stderr went to a handle nobody read; the installers now redirect
+    # it to `runtime/logs/scheduled_*.log`, so this sentence persists. Every
+    # other thing this system writes to a log goes through
+    # `oplog.append_line()`, which redacts, flattens and bounds. This one
+    # did not, and it interpolates an **environment value** — arbitrary
+    # length, arbitrary content, chosen by whoever set it.
+    #
+    # The realistic accident is not exotic: the one mistake that puts a
+    # credential in this variable is mixing up which variable takes the
+    # Notion token. Measured before this line existed, with a token-shaped
+    # value in `COMPANY_OPS_HISTORY_START_DATE`:
+    #
+    #     [FAILED] ... 형식이 올바르지 않습니다: 'ntn_AAAA…'   -> stderr -> the log
+    #
+    # `publish_control_tower.py` already reasoned this through for its own
+    # output ("`tool > log 2>&1` puts it on disk, which is the shape `oplog`
+    # exists to stop"); it simply was not true of anything yet.
         print(
-            f"[FAILED] COMPANY_OPS_HISTORY_START_DATE 형식이 올바르지 않습니다: {raw!r} (YYYY-MM-DD 필요)",
+            f"[FAILED] COMPANY_OPS_HISTORY_START_DATE 형식이 올바르지 않습니다: "
+            f"{bounded(redact(one_line(repr(raw))))} (YYYY-MM-DD 필요)",
             file=sys.stderr,
         )
         raise SystemExit(1)

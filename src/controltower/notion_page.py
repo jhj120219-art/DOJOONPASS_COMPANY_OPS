@@ -460,7 +460,7 @@ def _panel_table(
 def _operational_block_lines(payload: Mapping[str, Any], key: str) -> list[str]:
     """One of `ops_status.py`'s rendered blocks, as its own lines.
 
-    `gather()` carries these beside the model: the six operational blocks,
+    `gather()` carries these beside the model: the operational blocks,
     captured as the text `ops_status.py` printed. They are **not** part of
     `to_payload()`, so — like the ATTENTION list — nothing has redacted them
     (see `_safe()`), and the caller must.

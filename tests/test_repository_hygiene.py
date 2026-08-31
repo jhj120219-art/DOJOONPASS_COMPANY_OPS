@@ -659,6 +659,494 @@ class APowerShellScriptStaysPureAsciiTests(unittest.TestCase):
         self.assertNotIn(".ps1", _TEXT_SUFFIXES)
 
 
+
+
+class EveryInstallerPersistsWhatItsEntrypointNeedsTests(unittest.TestCase):
+    """The last hand-written list on the Python/PowerShell boundary.
+
+    Each installer test file asserted "every variable the entrypoint
+    requires is persisted" against a **transcribed list of three**. The
+    other direction was already derived -- the set is read out of the script
+    with a regex over `SetEnvironmentVariable(` -- so a variable the
+    *installer* gained was covered. A variable the *entrypoint* started
+    requiring was not: nothing linked the two, and the failure is a task
+    that registers cleanly and then exits 1 on every Desktop, every morning,
+    for want of a value the installer never wrote.
+
+    It is derivable, and from something this repository already keeps
+    honest. `cli.unexpected_arguments(configured_by=...)` is each tool's own
+    statement of what configures it, and three tests here already hold that
+    tuple to what the process actually reads
+    (`_advertised_variables()`, `test_every_variable_a_refusal_names_is_one
+    something_reads`, and `EnvironmentContractTests`). So it is a checked
+    declaration, not a comment.
+
+    **One rule separates what an installer may persist from what it must
+    not**, and it is the rule the project already applies rather than a new
+    one: `NOTION_*` are secrets, `COMPANY_OPS_*` are not. Every installer
+    says so in its own `.NOTES` -- a parameter would put a token in the
+    command line, the process list and PowerShell history -- and
+    `NoSecretIsHandledTests` enforces the refusal. So the derived
+    requirement is `configured_by` narrowed to `COMPANY_OPS_*`.
+    """
+
+    #: installer -> the entrypoint it registers. Two names, both of which
+    #: already have to be right for the installer to work at all: the script
+    #: refuses to run if the entrypoint is missing, and
+    #: `test_schedtask.py` checks the roster of installers itself.
+    PAIRS = {
+        "install_runner_task.ps1": "run_company_ops.py",
+        "install_agent_task.ps1": "run_agent.py",
+        "install_publish_task.ps1": "publish_control_tower.py",
+    }
+
+    def test_the_pairs_are_the_installers_that_exist(self):
+        """Guards the guard, and against the pairing going stale: each
+        installer really does name this entrypoint."""
+        found = {p.name for p in (REPO_ROOT / "scripts").glob("install_*_task.ps1")}
+        self.assertEqual(found, set(self.PAIRS))
+
+        for installer, entrypoint in self.PAIRS.items():
+            with self.subTest(installer=installer):
+                script = (REPO_ROOT / "scripts" / installer).read_text(encoding="utf-8")
+                self.assertIn(f"'{entrypoint}'", script)
+                self.assertTrue((REPO_ROOT / entrypoint).is_file())
+
+    @staticmethod
+    def _configured_by(entrypoint):
+        """The `configured_by` tuple that entrypoint passes, by AST.
+
+        Read rather than imported: importing an entrypoint runs its
+        module-level prologue, and two of these three reconfigure `stdout`.
+        """
+        tree = ast.parse((REPO_ROOT / entrypoint).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "configured_by":
+                    continue
+                return {
+                    element.value
+                    for element in keyword.value.elts
+                    if isinstance(element, ast.Constant)
+                }
+        return set()
+
+    def test_the_scan_reads_a_real_tuple_from_every_entrypoint(self):
+        """Guards the guard. An empty read would make the sweep below a
+        negative over nothing -- the vacuous pass this file keeps finding."""
+        for installer, entrypoint in self.PAIRS.items():
+            with self.subTest(entrypoint=entrypoint):
+                self.assertTrue(self._configured_by(entrypoint), entrypoint)
+
+    def test_every_non_secret_variable_the_entrypoint_needs_is_persisted(self):
+        """The property the transcribed lists could not give.
+
+        Narrowed to `COMPANY_OPS_*` because `NOTION_*` are secrets the
+        installers deliberately refuse to touch -- `run_company_ops.py`
+        names two of them in `configured_by`, and its installer must not
+        write either.
+        """
+        for installer, entrypoint in self.PAIRS.items():
+            script = (REPO_ROOT / "scripts" / installer).read_text(encoding="utf-8")
+            persisted = set(
+                re.findall(r"SetEnvironmentVariable\(\s*'([A-Z_]+)'", script)
+            )
+            required = {
+                name
+                for name in self._configured_by(entrypoint)
+                if name.startswith("COMPANY_OPS_")
+            }
+            with self.subTest(installer=installer):
+                self.assertEqual(
+                    required - persisted,
+                    set(),
+                    f"{entrypoint} is configured by these and {installer} "
+                    f"never writes them; the task would register and then "
+                    f"exit 1 every morning",
+                )
+
+    def test_no_installer_persists_a_secret(self):
+        """The other half of the same narrowing, so it cannot be read as an
+        excuse. What is excluded above must be excluded *because it is a
+        secret*, not because an installer quietly stopped writing it."""
+        for installer in self.PAIRS:
+            script = (REPO_ROOT / "scripts" / installer).read_text(encoding="utf-8")
+            persisted = set(
+                re.findall(r"SetEnvironmentVariable\(\s*'([A-Z_]+)'", script)
+            )
+            with self.subTest(installer=installer):
+                self.assertEqual(
+                    {name for name in persisted if name.startswith("NOTION_")}, set()
+                )
+
+    def test_the_publish_installer_persists_nothing_because_it_needs_nothing(self):
+        """The case that proves the narrowing is real rather than a way of
+        excusing an empty set: `publish_control_tower.py` is configured by
+        two variables and **both are secrets**, so its installer correctly
+        writes none at all -- and says so on the screen instead."""
+        required = self._configured_by("publish_control_tower.py")
+
+        self.assertTrue(required)
+        self.assertEqual(
+            {name for name in required if name.startswith("COMPANY_OPS_")}, set()
+        )
+        script = (REPO_ROOT / "scripts" / "install_publish_task.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("SetEnvironmentVariable", script)
+        for name in required:
+            with self.subTest(variable=name):
+                self.assertIn(name, script, "the operator is not told to set it")
+
+
+class NothingNewIsSpelledOutOnBothSidesOfTheBoundaryTests(unittest.TestCase):
+    """Every value written in both PowerShell and Python, and what holds it.
+
+    This project's deployment tooling is PowerShell and everything it
+    deploys is Python, so any value both sides need is a value that can be
+    written down twice. C138 did exactly that -- task names and log
+    filenames as literals in `src/schedtask.py` **and** in each installer,
+    with a test comparing the two -- and C139 removed the copies rather than
+    the drift: the installers now ask `schedtask` at install time.
+
+    What is left is swept here, because "we fixed the ones we knew about" is
+    not a property. The scan reads every quoted literal out of the
+    installers' **executable** text and asks whether any Python file spells
+    the same thing; each survivor has to be on the roster below with the
+    thing that keeps it honest.
+
+    The roster is reasons, and the scan is derived from disk -- the shape
+    this repository uses for `ALLOWED_SILENT`, `LayeringInvariantTests
+    .ALLOWED` and `KNOWN_DIFFERENT`. A new shared literal that nobody has
+    thought about fails here.
+    """
+
+    #: What each surviving cross-boundary literal is, and what stops it
+    #: drifting. Every entry names a test, and `test_every_reason_names_a
+    #: _test_that_exists` checks that the test is really there.
+    ACCOUNTED_FOR = {
+        "COMPANY_OPS_PROFILE": "EveryInstallerPersistsWhatItsEntrypointNeedsTests",
+        "COMPANY_OPS_AGENT_SYNC_FOLDER": "EveryInstallerPersistsWhatItsEntrypointNeedsTests",
+        "COMPANY_OPS_AGENT_START_DATE": "EveryInstallerPersistsWhatItsEntrypointNeedsTests",
+        "COMPANY_OPS_HISTORY_START_DATE": "EveryInstallerPersistsWhatItsEntrypointNeedsTests",
+        # The Desktop roster. `reporter/profiles.PROFILES` is docs/02
+        # section 8's own source->role table; the installer's ValidateSet is
+        # read out of the script and compared against it.
+        "DESKTOP_1": "test_the_desktop_id_is_restricted_to_the_real_profiles",
+        "DESKTOP_2": "test_the_desktop_id_is_restricted_to_the_real_profiles",
+        "DESKTOP_3": "test_the_desktop_id_is_restricted_to_the_real_profiles",
+        "DESKTOP_4": "test_the_desktop_id_is_restricted_to_the_real_profiles",
+        # Irreducible: an installer has to name the entrypoint it registers,
+        # and that file has to exist. Both are checked.
+        "run_company_ops.py": "test_the_pairs_are_the_installers_that_exist",
+        "run_agent.py": "test_the_pairs_are_the_installers_that_exist",
+        "publish_control_tower.py": "test_the_pairs_are_the_installers_that_exist",
+    }
+
+    #: **A test that used to be here was removed, and saying why matters
+    #: more than the test did.** `test_the_task_names_are_no_longer_written
+    #: _on_both_sides` asserted that no `DOJOONPASS_*` or `scheduled_*.log`
+    #: literal is shared across the boundary -- the pair C139 had just
+    #: stopped duplicating. It was written in the same Sprint as
+    #: `test_schedtask.py::TaskNamesMatchTheInstallersTests
+    #: ::test_no_installer_hard_codes_a_task_name`, which asserts the same
+    #: thing and more: that one fires whether or not Python also spells the
+    #: name, this one only fired when both sides did.
+    #:
+    #: Measured before removing it, by putting the literal back into
+    #: `install_publish_task.ps1`: three tests fired, and two of them were
+    #: the general properties (`test_no_installer_hard_codes_a_task_name`
+    #: and `test_every_value_written_on_both_sides_is_accounted_for`). The
+    #: third proved nothing the other two had not.
+    #:
+    #: Removed rather than kept because a redundant gate is not free: it is
+    #: a second place to edit, a second thing to read, and it makes a suite
+    #: look like it covers two properties when it covers one. The same
+    #: Sprint that wrote it spent its time deleting duplication elsewhere.
+
+    #: PowerShell vocabulary, not project values. Excluded by what they are
+    #: rather than by having been seen before.
+    _POWERSHELL_WORDS = frozenset(
+        {"SilentlyContinue", "Stop", "IgnoreNew", "User", "Continue"}
+    )
+
+    @staticmethod
+    def _installer_literals():
+        """Quoted literals in the installers' executable text.
+
+        Comment-based help and `#` lines are stripped: `.NOTES` quotes task
+        names for an operator to paste, and counting documentation as a
+        duplicated constant would report every correct script.
+        """
+        found = {}
+        for path in sorted((REPO_ROOT / "scripts").glob("*.ps1")):
+            text = re.sub(
+                r"<#.*?#>", "", path.read_text(encoding="utf-8"), flags=re.DOTALL
+            )
+            code = "\n".join(
+                line for line in text.splitlines() if not line.lstrip().startswith("#")
+            )
+            for token in re.findall(r"'([A-Za-z0-9_./\\-]{6,})'", code):
+                found.setdefault(token, set()).add(path.name)
+        return found
+
+    @staticmethod
+    def _python_files():
+        return [
+            path
+            for path in list(REPO_ROOT.glob("*.py")) + list(SRC.rglob("*.py"))
+            if "__pycache__" not in path.as_posix()
+        ]
+
+    def _shared(self):
+        literals = self._installer_literals()
+        self.assertGreater(len(literals), 10, "the literal scan found almost nothing")
+
+        sources = {p: p.read_text(encoding="utf-8") for p in self._python_files()}
+        shared = {}
+        for token, scripts in literals.items():
+            if token in self._POWERSHELL_WORDS:
+                continue
+            pattern = re.compile(r"""['"]""" + re.escape(token) + r"""['"]""")
+            if any(pattern.search(text) for text in sources.values()):
+                shared[token] = sorted(scripts)
+        return shared
+
+    def test_the_scan_still_finds_the_known_duplicates(self):
+        """Guards the guard. The assertion below is a negative over this
+        set, and a scan that stopped matching would pass for everything --
+        including a task name spelled out again in both places."""
+        shared = self._shared()
+
+        self.assertIn("COMPANY_OPS_PROFILE", shared)
+        self.assertIn("DESKTOP_1", shared)
+        self.assertGreaterEqual(len(shared), 8, sorted(shared))
+
+    def test_every_value_written_on_both_sides_is_accounted_for(self):
+        """The property. A value the installers and the Python both spell
+        out, with nothing holding the two together, is the defect C138
+        introduced and C139 removed -- this is what stops the next one."""
+        unaccounted = sorted(set(self._shared()) - set(self.ACCOUNTED_FOR))
+
+        self.assertEqual(
+            unaccounted,
+            [],
+            "these are written in both scripts/*.ps1 and Python with nothing "
+            "keeping them in step -- derive one side from the other, or add "
+            "the test that does keep them in step:\n  " + "\n  ".join(unaccounted),
+        )
+
+    def test_the_roster_does_not_name_a_value_that_is_gone(self):
+        """The other direction: a stale entry excuses a duplication that no
+        longer exists and hides one that might take its name."""
+        self.assertEqual(sorted(set(self.ACCOUNTED_FOR) - set(self._shared())), [])
+
+    def test_every_reason_names_a_test_that_exists(self):
+        """An entry pointing at a test nobody wrote is an excuse, not a
+        reason.
+
+        **Written wrong the first time, and the mistake is the interesting
+        part.** It searched the suite for the reason as a *substring*, and
+        the roster above lives in this file -- which is in the suite. So
+        every entry matched itself. The first name tried,
+        `test_the_desktop_ids_are_the_ones_the_project_defines`, is defined
+        nowhere at all, and the guard passed.
+
+        A reason must therefore name a **definition**: `class X` or `def X(`.
+        Measured after the fix -- the invented name fails and the real one
+        (`test_the_desktop_id_is_restricted_to_the_real_profiles`) passes.
+        """
+        suite = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((REPO_ROOT / "tests").glob("test_*.py"))
+        )
+        for value, reason in sorted(self.ACCOUNTED_FOR.items()):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    f"class {reason}" in suite or f"def {reason}(" in suite,
+                    f"{value} points at {reason}, which is defined nowhere",
+                )
+
+    def test_that_guard_would_notice_an_invented_name(self):
+        """The predicate, on the exact name that slipped through. It is
+        still quoted in the docstring above -- which is precisely why a
+        substring search was not enough."""
+        suite = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((REPO_ROOT / "tests").glob("test_*.py"))
+        )
+        invented = "test_the_desktop_ids_are_the_ones_the_project_defines"
+
+        self.assertIn(invented, suite)
+        self.assertNotIn(f"def {invented}(", suite)
+        self.assertNotIn(f"class {invented}", suite)
+    def _scripts(self):
+        return sorted((REPO_ROOT / "scripts").glob("install_*_task.ps1"))
+
+    @staticmethod
+    def _code(path):
+        text = re.sub(r"<#.*?#>", "", path.read_text(encoding="utf-8"), flags=re.DOTALL)
+        return "\n".join(
+            line for line in text.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    def test_the_scan_finds_every_installer(self):
+        """Guards the guard. Named individually so a renamed or deleted
+        installer fails here rather than shrinking the sweep in silence."""
+        self.assertEqual(
+            {path.name for path in self._scripts()},
+            {
+                "install_agent_task.ps1",
+                "install_runner_task.ps1",
+                "install_publish_task.ps1",
+            },
+        )
+
+    def test_the_comment_stripper_would_notice_a_rule_that_is_only_discussed(self):
+        """The predicate this class rests on. Every rule below appears in
+        prose in these files too, so a scan reading whole text would pass a
+        script that had lost the rule and kept the paragraph about it."""
+        sample = self._code(REPO_ROOT / "scripts" / "install_agent_task.ps1")
+
+        self.assertNotIn("#", sample.replace("$#", ""))
+        self.assertIn("Register-ScheduledTask", sample)
+
+    def test_every_logon_trigger_is_scoped_to_this_user(self):
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                if "-AtLogOn" not in code:
+                    continue
+                self.assertIn("New-ScheduledTaskTrigger -AtLogOn -User", code)
+
+    def test_every_installer_verifies_the_task_exists_afterwards(self):
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertIn("Get-ScheduledTask -TaskName $taskName", code)
+                self.assertLess(
+                    code.index("Register-ScheduledTask"),
+                    code.index("$registered = Get-ScheduledTask"),
+                    "the verification must follow the registration",
+                )
+                self.assertIn("Nothing is scheduled.", code)
+
+    def test_every_installer_drops_an_overlapping_run(self):
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                self.assertIn("-MultipleInstances IgnoreNew", self._code(path))
+
+    def test_every_installer_survives_a_machine_that_was_switched_off(self):
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                self.assertIn("-StartWhenAvailable", self._code(path))
+
+    def test_every_installer_is_safe_to_re_run(self):
+        """Every refusal message in these scripts tells the operator to fix
+        something and run again. That advice is only true with `-Force`."""
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                self.assertIn("-Force", self._code(path))
+
+    def test_every_installer_gives_the_scheduled_run_somewhere_to_print(self):
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertIn("2>&1", code)
+                self.assertIn('>> "{2}"', code)
+                self.assertIn("$comspec", code)
+
+    def test_every_installer_creates_the_log_directory_first(self):
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertIn("New-Item -ItemType Directory -Path $logDir", code)
+                self.assertLess(
+                    code.index("New-Item -ItemType Directory -Path $logDir"),
+                    code.index("Register-ScheduledTask"),
+                )
+
+    def test_every_installer_can_be_previewed(self):
+        """`-WhatIf` is the only way to see what an installer would do
+        without doing it, and it works only if the script declares support
+        for it. The Agent installer's environment writes once ran during a
+        preview because they sat outside the guard."""
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertIn("SupportsShouldProcess = $true", code)
+                self.assertIn("$PSCmdlet.ShouldProcess", code)
+
+    def test_no_installer_stores_a_secret(self):
+        """The Notion credentials are secrets; a parameter would put them in
+        the command line, the process list and PowerShell history."""
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertNotIn("SetEnvironmentVariable('NOTION", code)
+                self.assertNotIn('SetEnvironmentVariable("NOTION', code)
+                for forbidden in ("$Token", "$ApiToken", "$NotionToken", "$Secret"):
+                    self.assertNotIn(forbidden, code)
+
+    def test_the_publish_runs_after_the_runner_it_reports_on(self):
+        """The one relationship between two installers' defaults.
+
+        The Control Tower page shows what the Runner produced, so publishing
+        before the Runner has finished shows yesterday's numbers until the
+        next trigger. `install_publish_task.ps1` documents its 11:30 as
+        "after the Runner's 11:00 default" and docs/11 section 19b says the
+        same -- and nothing checked that the two defaults still stand in that
+        order.
+
+        A relationship, not a pair of literals: whatever the two are, the
+        publish must not be earlier. Moving the Runner and forgetting the
+        publish is exactly what this catches, and it is a plausible edit --
+        `-DailyAt` exists on both scripts precisely so the times can move.
+        """
+        times = {}
+        for name in ("install_runner_task.ps1", "install_publish_task.ps1"):
+            code = self._code(REPO_ROOT / "scripts" / name)
+            match = re.search(r"\$DailyAt\s*=\s*'([0-9]{2}):([0-9]{2})'", code)
+            self.assertIsNotNone(match, f"{name} has no $DailyAt default")
+            times[name] = int(match.group(1)) * 60 + int(match.group(2))
+
+        self.assertGreater(
+            times["install_publish_task.ps1"],
+            times["install_runner_task.ps1"],
+            "the publish would run before the Runner whose output it shows",
+        )
+
+    def test_the_logon_delays_stand_in_the_same_order(self):
+        """The same relationship on the other trigger. Both fire at logon,
+        and the publish's longer delay is what gives a startup catch-up run
+        time to finish first -- best-effort by design (nothing depends on
+        the order holding), but a publish delay shorter than the Runner's
+        would be the intent inverted."""
+        delays = {}
+        for name in ("install_runner_task.ps1", "install_publish_task.ps1"):
+            code = self._code(REPO_ROOT / "scripts" / name)
+            match = re.search(r"\$DelayMinutes\s*=\s*([0-9]+)", code)
+            self.assertIsNotNone(match, f"{name} has no $DelayMinutes default")
+            delays[name] = int(match.group(1))
+
+        self.assertGreater(
+            delays["install_publish_task.ps1"], delays["install_runner_task.ps1"]
+        )
+
+    def test_every_installer_explains_a_refusal_before_suggesting_elevation(self):
+        """The Agent installer's lesson: "this environment cannot register
+        tasks at all" was recorded as the diagnosis and was false — every
+        other trigger shape registered fine in the same session. Elevation
+        is the last candidate."""
+        for path in self._scripts():
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertLess(
+                    code.index("Get-Service Schedule"), code.index("elevated")
+                )
+
 class DocumentationGapCharacterizationTests(unittest.TestCase):
     """Audit finding BUG-12. README and docs/ are specification documents;
     this Sprint may not edit them, so the gaps are recorded here instead.
@@ -1516,6 +2004,11 @@ class OperatorGuideMatchesTheToolTests(unittest.TestCase):
         # blocked, and which team is silent.
         "CONTROL TOWER",
         "LAST RUN",
+        # C138. The only block not derived from this system's own
+        # files, and therefore the only one that can see a scheduled
+        # task which never started the process — the failure that
+        # leaves no evidence under `runtime/` at all.
+        "SCHEDULE",
         "NOTION",
         "AGENT",
         "ATTENTION",
@@ -4024,6 +4517,159 @@ class AFirstRunOnAnUnconfiguredMachineStopsBeforeItTouchesAnythingTests(
         finally:
             probe.unlink()
         self.assertEqual(before, self._runtime_fingerprint())
+
+
+
+class AMisconfiguredValueIsNamedWithoutBeingArchivedTests(unittest.TestCase):
+    """What a configuration error puts on **disk**, now that one can.
+
+    The class above asks what an unconfigured machine prints. This asks the
+    next question, which only became a question in C138: the installers now
+    register their action as `cmd /c "... >> runtime\\logs\\scheduled_*.log
+    2>&1"`, so a scheduled run's stderr persists instead of being discarded.
+
+    `publish_control_tower.py` had already reasoned it through for its own
+    output -- "`tool > log 2>&1` puts it on disk, which is the shape `oplog`
+    exists to stop" -- and it simply was not true of anything yet.
+
+    Three configuration errors interpolate an **environment value** back to
+    the operator, which is arbitrary in length and content:
+
+        run_company_ops.py   COMPANY_OPS_HISTORY_START_DATE
+        run_agent.py         COMPANY_OPS_AGENT_START_DATE
+        run_agent.py         COMPANY_OPS_PROFILE  (via resolve_profile)
+
+    Measured before the guard, with a token-shaped value in each:
+
+        [FAILED] COMPANY_OPS_HISTORY_START_DATE ... : 'ntn_AAAA...'
+
+    Every other thing this system writes to a log goes through
+    `oplog.append_line()`, which redacts, flattens and bounds. These did
+    not, and the one mistake that puts a credential in one of these three
+    variables is mixing up which variable takes the Notion token.
+
+    **Both halves are asserted, and the second is the one that keeps this
+    honest.** Masking everything would be trivially "safe" and would destroy
+    the diagnosis these messages exist for -- `run_company_ops.py`'s own
+    comment says printing the value is what separates "never set" from "set
+    to something wrong". So an ordinary typo must still come back verbatim.
+    """
+
+    #: Built by concatenation so this file never *contains* a
+    #: credential-shaped literal: `test_no_secret_material_in_any_tracked_file`
+    #: scans every tracked file and does not exempt tests, correctly -- a
+    #: fixture that looks like a secret is indistinguishable from one to a
+    #: scanner and to anyone reading the diff.
+    SECRET_SHAPED = "ntn_" + "A" * 44
+
+    #: `(entrypoint, {variable: value})`, with the variable under test last.
+    #: The companion values are the ones each tool needs to *reach* the
+    #: check being exercised.
+    CASES = (
+        ("run_company_ops.py", "COMPANY_OPS_HISTORY_START_DATE", {}),
+        ("run_agent.py", "COMPANY_OPS_PROFILE", {}),
+        (
+            "run_agent.py",
+            "COMPANY_OPS_AGENT_START_DATE",
+            {
+                "COMPANY_OPS_PROFILE": "DESKTOP_1",
+                "COMPANY_OPS_AGENT_SYNC_FOLDER": "C:/does-not-exist",
+            },
+        ),
+    )
+
+    def _run(self, name, variable, value, companions):
+        harness = AFirstRunOnAnUnconfiguredMachineStopsBeforeItTouchesAnythingTests()
+        harness.assertGreaterEqual = self.assertGreaterEqual
+        harness.assertIn = self.assertIn
+        harness.assertEqual = self.assertEqual
+        environment = harness._scrubbed_environment()
+        environment.update(companions)
+        environment[variable] = value
+
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / name)],
+            cwd=str(REPO_ROOT),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+
+    def test_the_cases_name_variables_this_project_reads(self):
+        """Guards the guard. A variable nothing reads would make every
+        assertion below pass against a tool that never looked at it."""
+        readable = AFirstRunOnAnUnconfiguredMachineStopsBeforeItTouchesAnythingTests(
+        )._readable_variables()
+
+        for _name, variable, _companions in self.CASES:
+            with self.subTest(variable=variable):
+                self.assertIn(variable, readable)
+
+    def test_a_credential_shaped_value_does_not_reach_the_stream(self):
+        for name, variable, companions in self.CASES:
+            with self.subTest(entrypoint=name, variable=variable):
+                result = self._run(
+                    name, variable, self.SECRET_SHAPED, companions
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertNotIn(self.SECRET_SHAPED, output)
+                self.assertIn("REDACTED", output)
+
+    def test_an_ordinary_mistake_is_still_quoted_back(self):
+        """The half that stops this from being fixed by muting the message.
+
+        A mistyped date and an unknown Desktop id are not secret-shaped, so
+        `redact()` leaves them alone -- and an operator staring at their own
+        typo needs to see it.
+        """
+        for name, variable, companions, typo in (
+            ("run_company_ops.py", "COMPANY_OPS_HISTORY_START_DATE", {}, "2026-8-1"),
+            ("run_agent.py", "COMPANY_OPS_PROFILE", {}, "DESKTOP_9"),
+            (
+                "run_agent.py",
+                "COMPANY_OPS_AGENT_START_DATE",
+                {
+                    "COMPANY_OPS_PROFILE": "DESKTOP_1",
+                    "COMPANY_OPS_AGENT_SYNC_FOLDER": "C:/does-not-exist",
+                },
+                "10 August 2026",
+            ),
+        ):
+            with self.subTest(entrypoint=name, variable=variable):
+                result = self._run(name, variable, typo, companions)
+                output = (result.stdout or "") + (result.stderr or "")
+
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn(typo, output)
+                self.assertNotIn("REDACTED", output)
+
+    def test_the_message_stays_one_line_and_bounded(self):
+        """An environment value is chosen by whoever set it. Unbounded, it
+        makes one log line as long as the value; unflattened, it forges as
+        many report lines as it likes -- into a file whose last lines
+        `ops_status.py` prints on the screen an operator reads when a
+        scheduled run has failed.
+        """
+        from oplog import MAX_LOG_ERROR
+
+        forged = "2026-01-01\n[FAILED] " + "z" * (MAX_LOG_ERROR * 2)
+        result = self._run(
+            "run_company_ops.py", "COMPANY_OPS_HISTORY_START_DATE", forged, {}
+        )
+        failures = [
+            line
+            for line in ((result.stderr or "") + (result.stdout or "")).splitlines()
+            if "[FAILED]" in line
+        ]
+
+        self.assertEqual(len(failures), 1, failures)
+        self.assertLess(len(failures[0]), MAX_LOG_ERROR * 2)
 
 
 class EveryTrackedModuleParsesOnThisInterpreterTests(unittest.TestCase):

@@ -774,12 +774,43 @@ class LockAtomicityCharacterizationTests(unittest.TestCase):
 
     def test_stale_takeover_still_follows_section_27(self):
         """docs/07 section 27: staleness is decided by whether the recorded
-        process is running, never by elapsed time — unchanged by the fix."""
+        process is running, never by elapsed time.
+
+        **The pin here used to be the literal `_is_process_running(pid)`, and
+        that was the wrong thing to hold.** section 27's rule is about *what
+        decides* staleness, not about the probe's argument list. In C138 the
+        probe gained the holder's image name -- because a pid alone cannot
+        answer section 27's own question ("해당 Process가 실제 실행 중인가?")
+        once Windows has reassigned it -- and this test failed for a change
+        that made the section-27 rule *more* exactly implemented.
+
+        It now asserts the rule against the decision itself: the
+        `except FileExistsError` handler, which is the only place staleness
+        is judged. The probe and the guarded takeover must both be in it, and
+        no clock may be.
+        """
         from scheduler import lock as lock_module
 
-        source = inspect.getsource(lock_module.try_acquire_lock)
-        self.assertIn("_is_process_running(pid)", source)
-        self.assertIn("_take_over_stale(lock_path, observed)", source)
+        source = textwrap.dedent(inspect.getsource(lock_module.try_acquire_lock))
+        handlers = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ExceptHandler)
+            and getattr(node.type, "id", None) == "FileExistsError"
+        ]
+        self.assertEqual(len(handlers), 1, "the staleness decision moved")
+        decision = "\n".join(ast.unparse(node) for node in handlers[0].body)
+
+        self.assertIn("_is_process_running(", decision)
+        self.assertIn("_take_over_stale(lock_path, observed)", decision)
+
+        # The half section 27 forbids: "단순 시간 경과만으로 실행 중인 정상
+        # Process를 강제 종료하지 않는다". `created_at` is written into every
+        # lock and deliberately never consulted here -- consulting it would
+        # be elapsed-time eviction, which kills slow but healthy runs.
+        for clock in ("created_at", "now", "datetime", "time.time", "timedelta"):
+            with self.subTest(clock=clock):
+                self.assertNotIn(clock, decision)
 
         takeover = inspect.getsource(lock_module._take_over_stale)
         # A stale lock is removed only if unchanged since it was read, so two
@@ -3558,6 +3589,147 @@ class ProjectsSchemaMappingTests(unittest.TestCase):
                 self.assertIn(kind, TARGET_PROPERTIES[name])
 
 
+
+class EveryProjectsColumnAWriterTouchesIsOwnedTests(unittest.TestCase):
+    """`ProjectsSchemaMappingTests` holds the **sync**'s payloads against the
+    schema `init_notion.py` creates. There is a second writer to the same
+    database and nothing held it against anything.
+
+    `controltower/notion_page.publish_project_notes()` writes the `Notes`
+    column on every publish, and **`Notes` is not in
+    `bootstrap.TARGET_PROPERTIES`.** Measured:
+
+        TARGET_PROPERTIES        11 columns, no `Notes`
+        notion_page.py writes    exactly one column: `Notes`
+
+    It works on this workspace because the PROJECTS database was made from a
+    Notion template, and docs/13 section 5 records those leftovers by name --
+    `Date` / `Notes` / `Tags`, "무해". So the surface AGENT.md section 6e
+    lists as one of four depends on a column **nobody in this repository
+    creates**, on a database an operator is free to tidy.
+
+    Nothing could have caught it. `ProjectsSchemaMappingTests` reads the
+    sync's payloads, not this one, and `TestDoubleFidelityTests` records
+    that `InMemoryNotionTransport` accepts "property name not in the schema"
+    -- so every Notion test in the suite passes with a column that does not
+    exist.
+
+    **The fix is not to create it.** docs/04 section 43 fixes the automated
+    property list at eleven, and a twelfth is a Spec decision. What is
+    approval-free, and what was missing, is saying so: an unowned column is
+    a dependency, and a dependency nobody wrote down is one the next person
+    removes. This asserts the roster is complete and that its one entry
+    degrades safely.
+    """
+
+    #: Columns a writer here touches that `init_notion.py` does **not**
+    #: create. Each entry is a dependency on the workspace rather than on
+    #: this repository, and has to say what happens when it is not met.
+    NOT_CREATED_BY_BOOTSTRAP = {
+        "Notes": (
+            "A Notion default-template leftover on this workspace's PROJECTS "
+            "database (docs/13 section 5 names Date/Notes/Tags as exactly "
+            "that). AGENT.md section 6e explains why writing it is safe -- it "
+            "is outside docs/04 section 43's automated eleven and outside "
+            "sections 44/45's protected lists, and a value not starting with "
+            "NOTE_MARKER is never overwritten. What it does not say is that "
+            "nothing creates it. On a PROJECTS database without the column "
+            "the write is a Notion 400, `publish_control_tower.py` catches "
+            "NotionAPIError non-fatally, and every publish exits 3 DEGRADED "
+            "naming `Notes 열` -- visible and bounded, which is why this is a "
+            "recorded dependency rather than a defect. Creating it is a "
+            "docs/04 section 43 change and needs approval."
+        ),
+    }
+
+    @staticmethod
+    def _columns_the_publisher_writes():
+        """PROJECTS column names passed to a page-write, by AST.
+
+        The dict literal handed to `update_project()` is the payload, and
+        its keys are property names. Read rather than imported because the
+        point is what the *source* says, and a name built at runtime would
+        be one this cannot see -- `test_the_scan_finds_what_it_writes`
+        exists so that going blind fails rather than passes.
+        """
+        tree = ast.parse(
+            (SRC / "controltower" / "notion_page.py").read_text(encoding="utf-8")
+        )
+        written = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "attr", None) not in (
+                "update_project",
+                "update_page",
+                "create_project",
+            ):
+                continue
+            for argument in node.args:
+                if isinstance(argument, ast.Dict):
+                    written |= {
+                        key.value
+                        for key in argument.keys
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    }
+        return written
+
+    def test_the_scan_finds_what_it_writes(self):
+        """Guards the guard. Both assertions below are negatives over this
+        set; an empty one passes them for free."""
+        self.assertEqual(self._columns_the_publisher_writes(), {"Notes"})
+
+    def test_every_column_the_publisher_writes_is_created_or_declared(self):
+        """The property. A column written by this project and created by
+        neither this project nor the roster is a dependency nobody wrote
+        down -- which is how the `Notes` one arrived."""
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        unowned = (
+            self._columns_the_publisher_writes()
+            - set(TARGET_PROPERTIES)
+            - set(self.NOT_CREATED_BY_BOOTSTRAP)
+        )
+
+        self.assertEqual(
+            unowned,
+            set(),
+            "these PROJECTS columns are written but nothing creates them; "
+            "add them to bootstrap (a docs/04 section 43 decision) or record "
+            f"the dependency and what happens without it: {sorted(unowned)}",
+        )
+
+    def test_the_roster_does_not_claim_a_column_bootstrap_creates(self):
+        """The other direction. If `Notes` is ever added to the schema this
+        entry becomes a false warning about a column the project owns, and a
+        stale exemption is the thing that hides the next real one."""
+        from notion.bootstrap import TARGET_PROPERTIES
+
+        self.assertEqual(
+            set(self.NOT_CREATED_BY_BOOTSTRAP) & set(TARGET_PROPERTIES), set()
+        )
+
+    def test_every_declared_dependency_says_what_happens_without_it(self):
+        """An exemption without a consequence is a permission slip. The one
+        thing that makes an unowned column tolerable is that its absence is
+        bounded and visible, so the entry has to name that."""
+        for column, reason in sorted(self.NOT_CREATED_BY_BOOTSTRAP.items()):
+            with self.subTest(column=column):
+                self.assertGreater(len(reason), 200, "a dependency needs a reason")
+                self.assertIn("DEGRADED", reason)
+
+    def test_the_unowned_write_really_is_non_fatal(self):
+        """The claim the roster rests on, checked against the call site
+        rather than trusted. If this write ever stopped being caught, an
+        absent `Notes` column would take the whole publish down instead of
+        degrading it -- and the entry above would still say otherwise."""
+        source = (REPO_ROOT / "publish_control_tower.py").read_text(encoding="utf-8")
+        call = source.index("publish_project_notes(")
+        window = source[source.rindex("try:", 0, call) : source.index("\n", call) + 400]
+
+        self.assertIn("except NotionAPIError", window)
+        self.assertNotIn("raise", window)
+
 class TransportIntakeConcurrencySafetyTests(unittest.TestCase):
     """Transport intake does the same thing Collector does — move a file into
     another directory — and it does it CORRECTLY under concurrency.
@@ -4587,6 +4759,15 @@ class LayeringInvariantTests(unittest.TestCase):
         # for the same reason as `oplog`, `cli`, and `runsummary`: everything
         # that dates anything sits above it (C135).
         "businessdate": set(),
+        # Windows Task Scheduler, read back — the one thing this system
+        # depends on that lives outside its own files, so the one failure no
+        # other block in `ops_status.py` can see. A leaf for the same reason
+        # as the four above: `ops_status.py` is its consumer today and any
+        # report on a run may want it, so it must sit under all of them
+        # (C138). It is deliberately absent from `MonthlyBoundaryInvariant
+        # Tests.ALLOWED_LEAVES` — it reaches outside the process for data,
+        # which is exactly what that list excludes.
+        "schedtask": set(),
         "transport": {"events"},
         "reporter": {"events", "transport"},
         "history": {"events"},

@@ -72,7 +72,7 @@ from transport import OneDriveTransport  # noqa: E402
 # line and `ops_status.py` applies to its ATTENTION block. `agent.py` already
 # `redact()`s these strings at the point it builds them; what it does not do
 # is stop one of them ending a line.
-from oplog import one_line  # noqa: E402
+from oplog import bounded, one_line, redact  # noqa: E402
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -135,7 +135,21 @@ def main(argv: Sequence[str] = ()) -> int:
         sync_folder = _resolve_sync_folder()
         start_date = _resolve_start_date()
     except (ConfigurationError, ReporterConfigError) as exc:
-        print(f"[FAILED] {exc}", file=sys.stderr)
+        # The one sink both configuration errors reach, and the only place
+        # this script prints an **environment value** back. Two of them do:
+        # `resolve_profile()` interpolates COMPANY_OPS_PROFILE (`unknown
+        # Desktop profile: 'x'`) and `_resolve_start_date()` interpolates
+        # COMPANY_OPS_AGENT_START_DATE.
+        #
+        # `bounded(redact(one_line(...)))` for the reason
+        # `run_company_ops._resolve_history_start_date()` records at length:
+        # until C138 a scheduled run's stderr was discarded, and the
+        # installers now redirect it into `runtime/logs/scheduled_agent.log`,
+        # where it persists. Naming the wrong value is still the diagnosis —
+        # `redact()` leaves a mistyped Desktop id alone and only masks
+        # something credential-shaped, which is the case where masking is
+        # the right answer rather than a lost message.
+        print(f"[FAILED] {bounded(redact(one_line(str(exc))))}", file=sys.stderr)
         return 1
 
     agent_dir = RUNTIME_DIR / "agent"

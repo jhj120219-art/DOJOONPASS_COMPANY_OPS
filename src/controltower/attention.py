@@ -41,6 +41,26 @@ RULES: tuple[tuple[str, str, str], ...] = (
     # absent from every rollup on the screen -- "work is not reaching
     # Company History" by the letter of this module's own P1 definition.
     ("같은 event_id를 두고 내용이 다른", "P1", "같은 id의 파일 둘 — 한쪽이 세어지지 않음"),
+    # C138. The SCHEDULE block reads Windows Task Scheduler — the only
+    # evidence in this report that is not a file this system wrote. Its
+    # lines came out `?` on every surface, measured by loading the rendered
+    # Dashboard: "이 화면이 분류하지 못한 줄", directly under an older alarm
+    # whose own remedy is "예약 작업(Windows 작업 스케줄러)이 꺼져 있는지
+    # 확인한다" — the manual check this block now performs.
+    #
+    # P1 by this module's own definition ("the pipeline is stopped"). A task
+    # that is absent, disabled, failing every trigger, or pointed at another
+    # checkout is a pipeline that will not run again on its own, and
+    # `실행되지 않았다` — already P1 — is the *symptom* of exactly these.
+    ("예약 실행이 등록돼 있지 않다", "P1", "예약된 실행이 없음 — 자동으로 아무것도 돌지 않는다"),
+    ("예약 실행이 사용 안 함 상태다", "P1", "Task가 꺼져 있음 — 트리거가 와도 시작되지 않는다"),
+    ("마지막 예약 실행이 실패로 끝났다", "P1", "예약 실행이 실패로 끝남"),
+    ("이 저장소가 아닌 곳을 실행한다", "P1", "다른 경로를 실행 중 — 이 저장소는 돌지 않는다"),
+    # The registered Agent task is for a different Desktop, so
+    # `ensure_desktop()` refuses it on every run: this Desktop's Events
+    # never leave the machine. "Work is not reaching Company History" by
+    # the letter of the definition above.
+    ("Desktop ID와 다르다", "P1", "등록된 Task가 다른 Desktop의 것 — 매번 거부된다"),
     # C133. An open Blocker is the most actionable line this list carries
     # and it was **unclassified** -- measured on a probe tree, it rendered
     # with a `?` badge and "이 화면이 분류하지 못한 줄".
@@ -70,6 +90,19 @@ RULES: tuple[tuple[str, str, str], ...] = (
     # a thing to repair.
     ("Notion 단계를 시도한 실행이", "P2", "Notion 도달 여부가 아직 확인되지 않음"),
     ("시작조차 되지 못한", "P2", "앞 단계가 중단시킴"),
+    # C138, the other half. None of these four is a stopped pipeline.
+    #
+    # Windows terminating an overrunning run is docs/07 §55 working: the run
+    # was cut off part-way and the next trigger resumes it. Discarding
+    # console output costs the *diagnosis*, not the run. And the last two
+    # are "this could not be determined", which must never be filed as a
+    # fault — the same posture `?` takes, but with a stated reason so the
+    # line does not sort with the genuine faults.
+    ("예약 실행을 Windows가 중단시켰다", "P2", "시간 제한 초과로 중단됨 — 다음 트리거가 이어받는다"),
+    ("예약 실행이 콘솔 출력을 버린다", "P2", "실패해도 이유가 남지 않음 — 관측만 약해진 상태"),
+    ("둘 이상 등록돼 있다", "P2", "Task가 둘 — 이 머신 것이 아닌 쪽은 매번 거부된다"),
+    ("예약 실행을 확인할 수 없다", "P2", "예약 여부를 알 수 없음"),
+    ("판단할 근거를 읽지 못했다", "P2", "이 머신이 Runner인지 판단할 수 없음"),
     # C133. The review queue was **unclassified** until now — measured:
     # `사람 검토를 기다리는 History Candidate 3건` matched no phrase and came
     # out `?`, which sorts with P1 and renders as "이 화면이 분류하지 못한
@@ -169,6 +202,49 @@ ACTIONS: dict[str, str] = {
     "검토를 기다리": (
         "`python src/review_cli.py` 로 내용을 읽고 KEEP/IGNORE를 정한다 "
         "(AGENT.md §5b). 고장이 아니라 사람이 할 일이다."
+    ),
+    "예약 실행이 등록돼 있지 않다": (
+        "줄이 이름을 댄 `scripts/install_*_task.ps1` 을 그 머신에서 실행한다 "
+        "(`-WhatIf` 로 먼저 미리 볼 수 있다). 등록 전까지 이 머신은 아무것도 "
+        "자동으로 실행하지 않는다."
+    ),
+    "예약 실행이 사용 안 함 상태다": (
+        "작업 스케줄러에서 그 Task를 다시 사용함으로 바꾼다 — 암호 변경 뒤 "
+        "Windows가 꺼 두는 것이 가장 흔한 원인이다."
+    ),
+    "마지막 예약 실행이 실패로 끝났다": (
+        "줄이 이름을 댄 `runtime/logs/scheduled_*.log` 의 끝을 읽는다 — "
+        "설정이 빠져 끝난 실행은 그 파일에만 이유를 남긴다."
+    ),
+    "이 저장소가 아닌 곳을 실행한다": (
+        "그 경로가 아직 있는지 확인한다. 이 저장소가 맞다면 여기서 "
+        "`scripts/install_*_task.ps1` 을 다시 실행해 Task를 다시 가리키게 한다."
+    ),
+    "Desktop ID와 다르다": (
+        "`COMPANY_OPS_PROFILE` 과 등록된 Task 중 어느 쪽이 맞는지 정한 뒤 "
+        "틀린 쪽을 고친다. **state 파일은 직접 지우지 않는다** — 아직 수집되지 "
+        "않은 날짜가 조용히 건너뛰어진다."
+    ),
+    "예약 실행을 Windows가 중단시켰다": (
+        "다음 실행이 정상으로 끝나는지 본다. 반복되면 그 Task의 실행 시간 "
+        "제한을 늘린다 — 첫 Catch-up은 길어질 수 있다."
+    ),
+    "예약 실행이 콘솔 출력을 버린다": (
+        "`scripts/install_*_task.ps1` 을 다시 실행한다 (`-Force`, 멱등). "
+        "Windows는 저장소가 바뀌었다고 Action을 갱신하지 않는다."
+    ),
+    "둘 이상 등록돼 있다": (
+        "쓰지 않는 Task를 `Unregister-ScheduledTask` 로 지운다 — 어느 쪽이 "
+        "이 머신 것인지는 `runtime/agent/state/agent_state.json` 의 "
+        "`desktop_id` 가 말해 준다."
+    ),
+    "예약 실행을 확인할 수 없다": (
+        "그 머신에서 `COMPANY_OPS_PROFILE` 을 확인한다 — 값이 없으면 이 화면은 "
+        "Task 이름을 만들 수 없어 등록 여부를 말하지 못한다."
+    ),
+    "판단할 근거를 읽지 못했다": (
+        "`runtime/` 아래 권한을 확인한다 — 이 화면은 그것을 읽지 못하면 "
+        "이 머신이 Desktop 4인지 아닌지를 말할 수 없다."
     ),
     "사람이 확인해야 한다": (
         "줄 전문을 읽고 사람이 판단한다 — 자동으로 처리되지 않는다."

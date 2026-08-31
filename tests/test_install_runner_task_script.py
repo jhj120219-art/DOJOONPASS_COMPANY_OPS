@@ -35,6 +35,7 @@ which parsed cleanly and could never have registered anything.
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -43,6 +44,8 @@ SCRIPT = REPO_ROOT / "scripts" / "install_runner_task.ps1"
 ENTRYPOINT = REPO_ROOT / "run_company_ops.py"
 
 sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import schedtask  # noqa: E402
 
 
 def _script_text() -> str:
@@ -201,8 +204,32 @@ class ParameterContractTests(unittest.TestCase):
         self.assertIn("SupportsShouldProcess", _script_code())
 
     def test_the_daily_time_defaults_to_the_spec_hour(self):
-        """docs/07 §4 and docs/11 §19 both fix the regular run at 11:00."""
-        self.assertRegex(_script_code(), r"\$DailyAt\s*=\s*'11:00'")
+        """docs/07 section 4 and docs/11 section 19 both fix the regular run
+        at 11:00, and this checks the installer against **them**.
+
+        It used to check it against `'11:00'` written here -- a third copy of
+        a value the specs own. The docstring already said where the value
+        comes from; nothing read it. Change the spec and this test goes on
+        passing while the installer keeps registering the old hour, which is
+        the shape C139 spent its time removing on the PowerShell/Python
+        boundary.
+
+        The time is read out of the installer and looked for in both specs.
+        Derived from the script rather than restated, so the assertion is
+        about whatever the installer actually defaults to.
+        """
+        match = re.search(r"\$DailyAt\s*=\s*'([0-9]{2}:[0-9]{2})'", _script_code())
+        self.assertIsNotNone(match, "the runner installer has no $DailyAt default")
+        default = match.group(1)
+
+        for spec in ("07_SCHEDULER_CATCHUP_SPEC.md", "11_DEPLOYMENT_RUNBOOK.md"):
+            with self.subTest(spec=spec):
+                self.assertIn(
+                    default,
+                    (REPO_ROOT / "docs" / spec).read_text(encoding="utf-8"),
+                    f"the installer defaults to {default} and docs/{spec} "
+                    f"does not name that time",
+                )
 
 
 class EntrypointContractTests(unittest.TestCase):
@@ -236,9 +263,27 @@ class EntrypointContractTests(unittest.TestCase):
     def test_the_task_launches_with_no_arguments(self):
         """Every entrypoint here refuses arguments it cannot honour
         (`cli.unexpected_arguments`), so the action must pass only the
-        script path — an extra argument would make the task exit 1 forever."""
+        script path — an extra argument would make the task exit 1 forever.
+
+        **The shape this reads changed in C138 and the property did not.**
+        The action used to be `python.exe "$entrypoint"` and is now
+        `cmd.exe /c ""python" "$entrypoint" >> "log" 2>&1"`, because a
+        scheduled run had nowhere to print and its failures left no
+        explanation anywhere. Everything after the entrypoint is cmd's
+        redirection, which cmd consumes.
+
+        So this asserts the same thing about the new string: the entrypoint
+        is followed immediately by the redirection, with no token in
+        between. It is the cheap half. The expensive half — running the
+        command line and reading `sys.argv` back — is
+        `TheScheduledRunHasSomewhereToPrintTests
+        ::test_the_entrypoint_still_receives_no_arguments`, and it is what
+        actually proves it: a static reading of cmd quoting is a guess.
+        """
         code = _script_code()
-        self.assertRegex(code, r"-Argument\s+\"`\"\$entrypoint`\"\"")
+        self.assertRegex(code, r'"\{1\}" >> ')
+        self.assertIn("$commandLine", code)
+        self.assertNotIn("-Argument \"`\"$entrypoint`\"\"", code)
 
 
 class NoSecretIsHandledTests(unittest.TestCase):
@@ -303,11 +348,26 @@ class SchedulerPolicyTests(unittest.TestCase):
         self.assertNotIn("$dailyTrigger.Delay", code)
 
     def test_the_task_name_is_the_one_the_runbook_names(self):
-        self.assertIn("DOJOONPASS_COMPANY_OPS_DAILY", _script_code())
+        """docs/11 section 19 names the task an operator will look for in
+        Task Scheduler. That contract is worth keeping and it now has a
+        different subject.
+
+        This used to read the name out of *this script* and check the
+        runbook said the same. The script no longer contains it -- it asks
+        `src/schedtask.py`, which is the single place the name is written
+        (see `test_schedtask.py::TaskNamesMatchTheInstallersTests`). So the
+        pair to hold in step is docs and that module, and the script's part
+        is only that it asks.
+        """
+        import schedtask
+
         runbook = (REPO_ROOT / "docs" / "11_DEPLOYMENT_RUNBOOK.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn("DOJOONPASS_COMPANY_OPS_DAILY", runbook)
+
+        self.assertIn(schedtask.RUNNER_TASK_NAME, runbook)
+        self.assertIn("import schedtask", _script_code())
+        self.assertIn("schedtask.RUNNER_TASK_NAME", _script_code())
 
     def test_the_task_does_not_keep_the_machine_awake(self):
         """docs/07 §58: the PC may be off; catch-up is the safety net."""
@@ -343,5 +403,149 @@ class RegistrationFailureHandlingTests(unittest.TestCase):
         self.assertGreater(elevated, service, "elevation is offered before the cheap checks")
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
+
+class TheScheduledRunHasSomewhereToPrintTests(unittest.TestCase):
+    """The action's output used to go nowhere, and the repository knew it.
+
+    Five entrypoints carry a measured comment about `line_buffering=True`
+    being needed because "under `> log 2>&1`, which is how a scheduled run
+    is captured, the two streams reorder against each other". No installer
+    ever set up that redirection. The action was `python.exe <entrypoint>`,
+    so a scheduled task's stdout and stderr were written to handles nothing
+    read.
+
+    What that loses is the entire diagnosis for failures that happen outside
+    the application. Every other thing `ops_status.py` can tell an operator
+    is derived from a file this system wrote, and a run that dies before it
+    writes one leaves only a `LastTaskResult` number — for the likeliest
+    failure of all, an unset `COMPANY_OPS_*`, that number is `1` every
+    morning while the sentence naming the missing variable is discarded.
+
+    These tests assert the property (the run has somewhere to print, and the
+    exit code still means what docs/14 §4 says) rather than the exact
+    string, except where the string is the thing that can silently be wrong
+    — cmd's quoting.
+    """
+
+    ENTRYPOINT_NAME = 'run_company_ops.py'
+    LOG_NAME = 'scheduled_runner.log'
+
+    def test_the_action_redirects_the_console_output_to_a_file(self):
+        """The redirection target is `$logPath`, which is
+        `$logDir` + the filename `schedtask.scheduled_log_name()` returned.
+
+        This used to assert the literal filename appeared in the script.
+        It no longer does, and that is the point -- the name lives in
+        `src/schedtask.py` alone now (see
+        `test_schedtask.py::TaskNamesMatchTheInstallersTests`). What is
+        checkable here is that the action redirects at all, and that it
+        redirects to the derived path rather than to one this script made
+        up.
+        """
+        code = _script_code()
+        self.assertIn("2>&1", code)
+        self.assertIn('>> "{2}"', code)
+        self.assertIn("$logPath = Join-Path $logDir $logFileName", code)
+    def test_the_log_lives_under_the_runtime_tree(self):
+        """Beside `collector.log` and the Run Manifest, which is where
+        `ops_status.py` and an operator already look."""
+        self.assertIn("runtime\\logs", _script_code())
+
+    def test_the_log_directory_is_created_before_the_task_is_registered(self):
+        """`runtime/` is git-ignored, so on a fresh clone it does not exist.
+        `>>` fails when the directory is absent — without this the first
+        scheduled run on a new machine would fail at the redirection itself,
+        which is the opposite of what the redirection is for."""
+        code = _script_code()
+        self.assertIn("New-Item -ItemType Directory -Path $logDir", code)
+        self.assertLess(
+            code.index("New-Item -ItemType Directory -Path $logDir"),
+            code.index("Register-ScheduledTask"),
+        )
+
+    def test_the_shell_is_named_by_path_and_not_left_to_path_lookup(self):
+        """A task started by the scheduler service does not necessarily have
+        the PATH an interactive shell has."""
+        code = _script_code()
+        self.assertIn("$comspec = $env:ComSpec", code)
+        self.assertIn("System32\\cmd.exe", code)
+        self.assertIn("-Execute $comspec", code)
+
+    def test_redirection_is_append_not_overwrite(self):
+        """`>` would let the next morning's run erase yesterday's traceback,
+        and the record of a failure is exactly what this exists to keep."""
+        code = _script_code()
+        self.assertNotRegex(code, r"[^>]> \"\{2\}")
+        self.assertIn('>> "{2}"', code)
+
+    # ------------------------------------------------ the string that runs
+
+    #: The **executed** half of this contract lives in
+    #: `test_schedtask.py::TaskNamesMatchTheInstallersTests` and covers all
+    #: three installers from one place.
+    #:
+    #: It was written here first, once per installer: twelve PowerShell
+    #: launches at ~1.2 s each, asserting one identical property three times
+    #: over. Measured with `--durations`, those twelve were the twelve
+    #: slowest tests in these files. Worse than the cost, it was three
+    #: hand-copies of a contract -- the roster shape this Sprint spent its
+    #: time removing, in a test file.
+    #:
+    #: What stays here is the static half, which is per-installer by nature:
+    #: **this** script builds the shape, redirects, appends rather than
+    #: overwrites, names the shell by path, and creates the log directory
+    #: first. The sweep over there asserts all three declare the *same*
+    #: shape and then executes it -- so an installer that declared a
+    #: different one fails there rather than going untested here.
+
+    def test_a_preview_creates_no_log_directory(self):
+        """`-WhatIf` exists to change nothing, and the Agent installer's
+        history in this file is what that rule was written from: its
+        environment writes once ran during a preview.
+
+        `New-Item` inherits `$WhatIfPreference` from this script's
+        `CmdletBinding`, which is a propagation rather than a guard anybody
+        wrote — so it is measured here rather than assumed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "runtime" / "logs"
+            probe = Path(tmp) / "probe.ps1"
+            probe.write_text(
+                "[CmdletBinding(SupportsShouldProcess = $true)]\n"
+                "param([string]$Dir)\n"
+                "if (-not (Test-Path -LiteralPath $Dir)) {\n"
+                "    New-Item -ItemType Directory -Path $Dir -Force | Out-Null\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", str(probe),
+                 "-Dir", str(target), "-WhatIf"],
+                capture_output=True, text=True, timeout=180,
+            )
+            self.assertFalse(target.exists(), "a preview created a directory")
+            # The same lines without -WhatIf must actually create it, or the
+            # assertion above would pass for the wrong reason.
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", str(probe),
+                 "-Dir", str(target)],
+                capture_output=True, text=True, timeout=180,
+            )
+            self.assertTrue(target.is_dir())
+
+    def test_the_log_path_is_the_one_python_expects_to_find(self):
+        """`ops_status.py` prints the end of this file when a scheduled run
+        failed, and for the failures that leave nothing under `runtime/` it
+        is the only evidence there is.
+
+        There is nothing to compare any more: the script asks
+        `schedtask.scheduled_log_name()` for the name, so the two cannot
+        disagree. What is asserted is that it asks -- and that the answer,
+        for this installer's task, is a name at all rather than `None`,
+        which is what the script would silently write into its path if the
+        task were one `schedtask` does not know.
+        """
+        code = _script_code()
+        self.assertIn("schedtask.scheduled_log_name(", code)
+        self.assertIsNotNone(schedtask.scheduled_log_name(schedtask.RUNNER_TASK_NAME))

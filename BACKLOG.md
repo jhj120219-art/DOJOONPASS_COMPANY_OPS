@@ -7,7 +7,11 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-08-28 (C137 — **실패한 Backup이 초록을 보고하고, 그 실패의
+마지막 갱신: 2026-08-31 (C138 — **무인 운영의 절반이 관측 밖에 있었다.**
+Task Scheduler에 물어보는 코드가 한 줄도 없었고, 예약 실행의 콘솔 출력은
+버려지고 있었으며(entrypoint 다섯이 그 리디렉션을 전제한 주석을 달고 있는
+채로), 재사용된 PID 하나가 Runner를 영구히 멈출 수 있었다.)
+이전 갱신: 2026-08-28 (C137 — **실패한 Backup이 초록을 보고하고, 그 실패의
 유일한 기록을 스스로 지우고 있었다. BUG-41은 결정 대기가 아니라 잘못된 질문이었다.
 같은 질문을 Lock에 던졌더니 BUG-54도 그랬다 — probe가 "모르겠다"고 할 때 그것을
 "죽었다"로 읽어 살아 있는 Lock을 뺏고 있었다.**
@@ -4584,6 +4588,879 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C138. 무인 운영의 절반이 관측 밖에 있었다 — Task Scheduler, 버려지던 콘솔 출력, 그리고 재사용된 PID
+
+이 저장소가 파일로 남기는 것은 전부 촘촘히 검사된다. **파일을 남기지 못한
+실행**은 하나도 검사되지 않고 있었다.
+
+세 결함이 같은 자리에서 나왔고, 셋이 하나의 사건을 이룬다: 예약 실행이
+멈추거나 실패했을 때 **아무도 그것을 알 수 없다.**
+
+### 1. `ops_status.py`가 사람에게 시키던 확인을 이제 자기가 한다 (신규 `src/schedtask.py`)
+
+LAST RUN의 침묵 경보는 이렇게 끝난다:
+
+    Runner가 N일째 실행되지 않았다 … **Task Scheduler 등록 상태를 확인해야 한다**
+
+이 프로젝트가 "예약 실행이 멈췄다"에 대해 가진 답의 전부였고, `SILENT_AFTER_DAYS`가
+지난 **뒤에야** 나오고, 이유를 말하지 못하며, 실제 확인은 다른 도구를 열어야 하는
+사람에게 넘긴다. Python 쪽에서 Windows에게 Task 상태를 물어본 코드는 **한 줄도
+없었다** — installer가 등록 직후 자기 쓰기를 확인하는 그 한 순간을 빼면.
+
+실측(이 머신, 아무것도 등록돼 있지 않다):
+
+    Runner가 13.9일째 실행되지 않았다 (마지막 실행 2026-08-17T12:07:42+09:00)
+      — … Task Scheduler 등록 상태를 확인해야 한다        <- 원인은 말하지 않는다
+
+    Runner 예약 실행이 등록돼 있지 않다 …                 <- 새 SCHEDULE 블록
+    Agent  예약 실행이 등록돼 있지 않다 …                     이것이 원인이다
+
+`schtasks.exe`가 아니라 PowerShell을 쓴다: `schtasks`의 출력은 **번역된다**
+(실측, ko-KR 머신). 필드 이름을 문자열로 맞추는 파서는 `backup/git_ops.py`가
+`LC_ALL=C`로 없앤 바로 그 결함이다. `Get-ScheduledTask`는 객체를 주고 속성
+이름은 불변이다. 배열이 아니라 NDJSON인 이유는 5.1의 `ConvertTo-Json`이
+1원소 배열을 객체로 펴기 때문이고(1개짜리와 2개짜리가 다른 모양이 된다),
+`DateTime`을 `/Date(943887600000)/`로 쓰기 때문이다.
+
+읽기 전용이다. 등록·해제·시작을 하지 않으며 그것을 강제하는 테스트가 있다.
+
+**판정에서 값이 나간 것은 무엇을 경보로 올리지 *않는가* 쪽이다.** 갓 등록돼
+아직 안 돈 Task(설치 직후 모든 Task가 그 상태다), 지금 실행 중인 Task,
+`IgnoreNew`가 건너뛴 트리거 — 셋 다 정상이다. 조회 자체가 실패했을 때는
+Task에 대해 **아무 말도 하지 않는다**(`UNKNOWN`과 이유만 찍는다). Runner Task는
+Desktop 4의 것이므로 1~3에서 "등록 안 됨"은 정상이고, 그 판단은 Runner만
+남기는 흔적으로 한다.
+
+**그 판단 근거를 읽지 못했을 때가 이 작업에서 스스로 만든 결함이었다.**
+초안의 `_this_machine_runs_the_runner()`는 `is_dir()`의 `EACCES`를 `pass`로
+받았다 — `runtime/` 아래 권한 하나가 바뀌면 Desktop 4가 Desktop 1처럼 보이고,
+그 머신이 의지하는 유일한 경보가 조용해진다.
+`ASilentlyDroppedEntryIsARosterNotAParagraphTests`가 **첫 실행에서** 잡았다
+(`ops_status.py: 3` → `4`). 명부 숫자를 올리지 않고 고쳤다.
+
+### 2. 예약 실행의 콘솔 출력은 **버려지고 있었다** — 그리고 저장소는 그것을 알고 있었다
+
+installer가 등록하던 Action은 리디렉션 없는 `python.exe <entrypoint>`였다.
+그런데 entrypoint **다섯 개**가 이런 주석을 달고 있다:
+
+    `line_buffering=True` … 스케줄 실행이 캡처되는 방식인 `> log 2>&1` 아래에서
+    두 스트림이 서로 순서가 뒤집히기 때문
+
+**아무 installer도 그 리디렉션을 만든 적이 없다.** 측정해서 고친 다섯 자리가
+아무도 읽지 않는 출력의 순서를 지키고 있었다. AGENT.md §6a는 한 발 더 나아가
+"Runner가 Task Scheduler 뒤에서 돌면 stdout은 아무도 보지 않으므로"라고
+**사실로** 적어 두었다.
+
+잃는 것은 **애플리케이션 밖에서 일어나는 실패의 진단 전부**다.
+`ops_status.py`가 말할 수 있는 모든 것은 이 시스템이 쓴 파일에서 파생되는데,
+파일을 하나도 쓰기 전에 죽는 실행은 종료 코드 하나만 남긴다:
+
+    python이 PATH에 없다        cmd: 지정된 경로를 찾을 수 없습니다
+    작업 디렉터리가 사라졌다     Python: can't open file '...'
+    import 실패                 traceback — 그리고 그것이 어디에도 남지 않는다
+    COMPANY_OPS_* 미설정        [FAILED] … 환경변수가 없습니다   (exit 1)
+
+마지막이 가장 흔하고 가장 나쁘다. **매일 아침** exit 1로 끝나고, `runtime/`에
+아무것도 쓰지 않으며, 어느 변수가 없는지 말해 주는 그 문장이 버려진다.
+
+`cmd.exe /c ""python" "entry" >> "log" 2>&1"`로 바꿨다. 실측으로 셋을 확인했다
+— 종료 코드가 그대로 통과하고(`exit 7` → `EXIT:7`, 그래서 `LastTaskResult`의
+뜻이 docs/14 §4 그대로 유지된다), entrypoint의 `sys.argv[1:]`가 `[]`이며
+(`cli.unexpected_arguments`가 발화하지 않는다), 존재하지 않는 python도 로그에
+남는다. 공백이 든 경로로 확인했다. `>` 아닌 `>>`인 이유: 실패의 기록을 잃지
+않으려고 만든 것이 다음 아침에 그것을 지우면 안 된다.
+
+`runtime/`은 git-ignore이므로 새 clone에는 없다 — `>>`는 디렉터리가 없으면
+실패하므로 installer가 만든다. `-WhatIf`가 `New-Item`으로 전파되는 것도
+실측했다(미리보기는 아무것도 만들지 않는다).
+
+**그리고 Windows는 저장소가 바뀌었다고 Action을 갱신하지 않는다.** 그래서
+SCHEDULE 블록이 등록된 Action 자체도 읽어서 "이 Task는 콘솔 출력을 버린다"를
+경보로 올린다. 판단은 **리디렉션이 있는가**로 하지 우리 로그 이름으로 하지
+않는다 — 운영자가 다른 곳으로 보내는 것은 선택이고, 아무 데도 안 보내는 것만이
+문제다. 실패한 실행에 대해서는 그 로그의 **끝 몇 줄**을 화면에 같이 띄우되,
+파일 **내용**이므로 `redact()`를 거친다.
+
+### 3. 재사용된 PID 하나가 Runner를 **영구히** 멈춘다 (BUG, 실측 재현)
+
+`_is_process_running()`은 "이 PID로 뭔가 돌고 있는가"에 답했다. PID는
+프로세스의 **영구한 이름이 아니다.** Lock 파일은 설계상 프로세스보다 오래
+산다 — `ExecutionTimeLimit` 만료(docs/07 §55가 등록한다), 정전, 강제 리셋.
+셋 다 PID가 든 파일을 남기고, 재부팅은 낮은 PID를 즉시 재배정한다.
+
+실측(이 머신, 실제 `tasklist`, 실제 `try_acquire_lock`):
+
+    lock:  {"process_id": 1336, "created_at": "2020-01-01T00:00:00+09:00"}
+    1336은 지금 svchost.exe의 것이다
+    _is_process_running(1336)  ->  True
+    try_acquire_lock(...)      ->  False
+
+그 뒤로 **매 실행 False**. Runner는 모든 트리거를 조용히 건너뛰고, 사람이
+파일을 지워야만 풀린다. `created_at`은 5년 전이고 아무도 보지 않는다 —
+일부러 그렇다. §27이 시간 경과만으로 판단하는 것을 금지하기 때문이다.
+
+**이 결함은 이미 적혀 있었고, 미룬 이유가 틀렸다.** `lock_held_since()`의
+docstring이 이 구멍을 정확히 서술한 뒤 이렇게 미뤄 두었다: *"Making the
+identity check exact means widening the lock file's contract, which is a
+decision (BACKLOG)."*
+
+**docs/07 §26은 "Lock에는 최소한 다음 정보를 기록할 수 있다"고 쓰고 둘을
+나열한다.** 스키마가 아니라 **하한**이다. 그러므로 홀더의 실행 파일 이름을
+PID 옆에 적는 것은 계약을 넓히는 것이 아니라 §27이 던지는 바로 그 질문 —
+*"해당 Process가 실제 실행 중인가?"* — 을 **구현하는** 것이다. BUG-26에서
+BACKLOG가 "정규화는 §12 변경"이라고 잘못 적었던 것과 같은 모양이다(E-11).
+
+**변화의 방향이 한쪽뿐이라서 안전하다.** 필터를 더하면 "실행 중"이 "실행
+아님"으로 바뀔 수만 있고, 그것도 그 PID가 **다른 실행 파일**을 돌리고 있을
+때만이다 — 그것은 이 Lock을 쓴 홀더일 수 없다. 살아 있는 홀더는 자기 이름과
+계속 일치하므로 BUG-18/BUG-20(Runner 둘)에는 이 경로로 도달할 수 없다.
+`image_name`이 없는 Lock(이 필드 이전에 쓰인 것, 배포된 머신에 지금 있다)은
+PID만 묻던 예전 동작 그대로다.
+
+남는 것은 "같은 실행 파일 이름을 가진 다른 프로세스가 PID를 재사용"이며,
+"아무 프로세스나"보다 훨씬 좁고, `ops_status.py`의 LOCK_STUCK_AFTER_HOURS가
+계속 보고한다.
+
+`lock_held_since()`와 `stale_lock_cannot_be_cleared()`도 같은 시야로 맞췄다 —
+후자의 주제가 *"`try_acquire_lock()`이 stale로 볼 Lock"* 이므로 둘의 probe가
+다르면 재사용 가능해진 Lock을 조용히 놓친다.
+
+### 4. 이번에 테스트를 두 번 고쳤고, 둘 다 "약화"가 아니다
+
+**`LockFileContractTests`의 정확한 필드 집합**은 §26이 요구하지 않는 것을
+고정하고 있었다. 필수 두 개는 부분집합으로 **강화**하고(지금까지 없던 단언),
+쓰이는 전체 집합은 셋으로 다시 고정했다 — 네 번째는 여전히 실패한다.
+`LockHeldSinceTests`의 같은 단언은 **그 클래스의 주제가 아니었다**(주제는
+`lock_held_since()`가 무엇을 읽는가다). 한 변경에 두 테스트가 깨지는 것은
+고정이 잔소리로 변하는 방식이므로, 모양은 계약 클래스 한 곳에 두고 이쪽은
+실제 성질을 직접 단언하게 했다.
+
+**`_print_schedule`을 쓰기 전에 쓴 위조 테스트 하나는 틀린 성질을 단언하고
+있었고, 통과해도 아무것도 증명하지 못했다.** `\r`과 `\u2028`이 든 한 줄을
+넣고 한 줄이 나오길 기대했는데 셋이 나왔다 — `str.splitlines()`가 둘 다
+줄바꿈으로 치므로 그 파일은 정말 세 줄이었다. 그 자리의 `one_line()`은 보험이지
+보장이 아니다. `splitlines()`에서 따라 나오지 **않는** 성질로 바꿨다: 내용이
+구분자를 몇 개 들고 있든 출력은 `_SCHEDULED_LOG_TAIL_LINES`를 넘지 않는다.
+
+### 5. 세 번째 예약 작업 — 문서가 시키는데 스크립트가 없던 것 (신규 `scripts/install_publish_task.ps1`)
+
+`AGENT.md` §6c는 운영자에게 `publish_control_tower.py`를 *"Task Scheduler에
+`run_company_ops.py`와 나란히 등록한다"* 고 말한다. 그 도구의 **exit 3
+(DEGRADED)은 바로 그 배포를 위해 만들어졌다** — 자기 docstring이 그렇게 적어
+두었다: *"Task Scheduler's only automatic health signal is the exit code."*
+
+**그런데 등록해 주는 스크립트가 없었다.** 도구는 예약 실행을 전제로 설계됐고,
+그 예약을 만드는 것은 아무것도 없었으며, 모든 운영자가 산문에서 Task를 손으로
+조립해야 했다. C136이 Desktop 4에 대해 닫은 그 구멍 — *"Desktop 4's task had to
+be built by hand from the runbook's prose"* — 이 세 번째 작업에 그대로 남아
+있었다.
+
+그리고 그것이 비싼 이유는 이 페이지의 존재 이유 자체다. **Notion Control
+Tower는 터미널을 열지 않는 사람들이 보는 자리다.** 예약되지 않으면 그 페이지는
+*누군가 마지막으로 터미널을 연 날*의 상태를 보여준다. `dashboard_server.py`가
+자기 화면에 그것을 이미 적어 두고 있었다 — `자동 실행: 없음 — 스스로 갱신되지
+않는다`.
+
+기본값은 매일 11:30(Runner 기본 11:00 뒤)과 로그온 10분 뒤다. **Runner와의
+순서는 보장되지 않으며 그래도 안전하다** — 이 도구는 지역 증거를 읽고 자기
+Notion 페이지만 다시 쓴다(Event 없음, Lock 없음, `runtime/` 쓰기 없음). 먼저
+돌면 몇 분 오래된 숫자를 보이고 다음 트리거가 바로잡는다. 환경변수는 **하나도**
+쓰지 않는다(둘 다 비밀이다).
+
+**SCHEDULE 블록에서 publish만 "없어도 정상"이다.** Runner와 Agent는 일이
+Company History가 되는 경로이고, publish는 결과가 사람에게 닿는 경로다.
+브라우저 Dashboard를 보기로 한 운영자는 잘못 설정한 것이 아니므로 **사실로
+적고 경보로 올리지 않는다**(등록하는 명령을 같이 찍는다). 등록돼 있는데
+고장난 것은 나머지 둘과 똑같이 경보다 — exit 1(자격증명 없음)도 exit 3(주변
+표면 누락)도.
+
+### 6. Dashboard와 Notion 페이지가 SCHEDULE을 **조용히 빼먹고 있었다**
+
+`dashboard_server._BLOCKS`와 `_RENDERERS`는 손으로 쓴 여섯 줄짜리 목록 둘이고,
+있는 게이트는 **그 둘이 서로 같은가**만 확인한다. `ops_status.main()`과 맞추는
+것은 아무것도 없었다.
+
+실측: `main()`에 SCHEDULE이 생겼고 두 목록은 여섯에 머물렀다. 터미널은
+보여주고 페이지는 보여주지 않았으며, **아무것도 그것을 보고하지 않았다.**
+그 페이로드는 `publish_control_tower.py`가 Notion 페이지를 그리는 바로 그
+`gather()` 결과이므로, 터미널을 열지 않는 사람들의 화면에서 한 절이 통째로
+빠진 채였다.
+
+둘 다 고쳤다 — SCHEDULE을 넣고, **`main()`에서 파생하는 게이트**를 붙였다
+(`test_this_page_shows_every_block_the_terminal_tool_prints`). 세 번째 손목록을
+만들지 않고 프로그램에서 뽑는다. 빈 스캔 가드도 함께 붙였다.
+
+렌더러가 `ops_status`의 **바로 그 함수**인지도 확인한다 — 지역 복사본은
+조용히 드리프트한다.
+
+비용은 페이지당 subprocess 하나(실측 0.6s, `gather()` 전체 1.4s)이고, 그것이
+감당되는 이유는 이 파일 머리말의 결정이다: *"The page does not refresh
+itself"*. 타이머가 아니라 사람이 연 페이지 한 번에 한 번 든다.
+
+**Notion 페이지 본문에 SCHEDULE 절을 따로 만들지는 않았다.** 그 페이지가
+운영 블록 중 본문에 싣는 것은 NOTION 하나뿐이고, 나머지는 ATTENTION 목록으로
+올라간다 — SCHEDULE의 경보도 그 경로로 이미 워크스페이스에 도착한다. 절을
+추가하는 것은 페이지 레이아웃 결정이다. **SKIP.**
+
+---
+
+### 7. 저장소를 옮기면 Task는 **설명할 수 없는 방식으로** 실패한다
+
+installer는 절대 경로 넷을 Action에 박는다 — 인터프리터, entrypoint, 작업
+디렉터리, 로그. Windows는 받은 대로 보관하므로 저장소를 옮기거나 이름을
+바꾸거나 사본을 하나 더 만들면 Task는 없는 디렉터리를 가리킨 채 남는다.
+
+**그 자체는 평범한 사고다. 나쁜 것은 실패하는 방식이다.** 리디렉션 대상도 같은
+사라진 디렉터리 안에 있으므로 `>>`가 열지 못하고, cmd가 exit 1로 끝나며,
+"can't open file"이라고 말했을 로그는 **쓰이지 않는다.** §2가 만든 로그가
+바로 이 경우에만 비어 있다. SCHEDULE 블록에서 보이는 것은 `exit 1`과 빈
+로그 — 이유가 제거된 실패다.
+
+등록된 entrypoint 경로를 이 저장소와 비교해서 그 이유를 이름으로 말한다.
+현재 Action 모양(`cmd /c ""py" "entry" >> "log" 2>&1"`)과 C138 이전
+모양(`py "entry"`) 둘 다에서 읽는다 — 인용된 경로 중 `.py`로 끝나는 첫 번째가
+entrypoint이고, 리디렉션 대상은 절대 `.py`가 아니다. 인용되지 않은 경로는
+**추측하지 않는다**(`redirect_target()`과 같은 이유: Windows 경로에는 공백이
+들어갈 수 있다).
+
+**거짓 경보 쪽을 더 조심했다.** 이 줄은 운영자에게 "저장소 사본이 둘이다"라고
+말하는 것이므로, 실제로 두 경로를 비교했을 때만 말한다 — 읽을 수 없는 Action,
+파싱 안 되는 경로, resolve 실패는 전부 **아무 말도 하지 않는다.** 비교는
+`resolve()` 후 대소문자 무시다(Windows에서 `C:/Repo`와 `c:/repo`는 한
+디렉터리이고, 어느 쪽이든 `..`를 달고 올 수 있다).
+
+---
+
+### 8. Agent Task가 **둘** 있어도 이름으로 물으면 둘 다 "정상"이라고 답한다
+
+Agent Task 이름에는 Desktop ID가 들어 있다(`..._AGENT_DESKTOP_1`). 그래서
+`-DesktopId`를 바꿔 다시 설치하면 **새 Task가 생기고 옛 Task는 남는다.**
+`Register-ScheduledTask -Force`는 *같은 이름*을 덮어쓸 뿐이다.
+
+둘 다 로그온에 발화한다. 그리고 `COMPANY_OPS_PROFILE`이 가리키는 이름 하나만
+물어보면 — SCHEDULE 블록이 §1에서 하던 그대로 — **그 하나는 "등록됨, 정상"이고
+나머지 하나는 존재하지 않는다.** 관측이 그 상태를 만들어 낼 수 없다.
+
+실제로 무슨 일이 벌어지는가는 `run_agent.py`가 이미 스무 줄로 적어 두었다:
+`agent_state.json`과 맞지 않는 쪽이 `ensure_desktop()`에서 거부된다. 그 거부는
+**옳다** — 받아들이면 한 Desktop이 다른 Desktop의
+`last_successful_collection_date`를 물려받아 그 사이 날짜를 **아무 오류도 없이**
+건너뛴다. 즉 안전장치는 작동하고 있고, 매일 실패하는 Task가 하나 있다는 사실만
+아무도 모른다.
+
+**접두사로도 묻는다.** `build_query(names, prefixes)`가
+`Get-ScheduledTask -TaskName 'DOJOONPASS_COMPANY_OPS_AGENT_*'`를 함께 돌린다 —
+이름을 알아야 물을 수 있다는 제약을 없앤다. 둘 이상이면 경보(둘 다 이름을 댄다),
+하나인데 이 머신 것이 아니면 그것도 경보다. 후자는 이름으로만 물었을 때
+**"Agent Task가 등록되지 않았다"** 로 보이며, 그 조언을 따르면 **세 번째** Task가
+생긴다.
+
+`*`는 호출자가 아니라 스크립트가 붙인다 — `_TASK_NAME_RE`는 와일드카드를 이미
+거부하므로, `Get-ScheduledTask`에 닿을 수 있는 와일드카드는 그 하나뿐이다.
+
+**발견된 이름은 우리 것이 아니다.** Windows가 돌려주는 값이므로
+`_TASK_NAME_RE`를 거치지 않았고, 사람이 손으로 만든 Task는 무엇이든 이름이 될
+수 있다. 전부 `one_line()`을 거친다(테스트가 위조 줄로 확인한다).
+
+**경보 문구는 state 파일을 지우라고 하지 않는다.** `run_agent.py`가 그것을
+거부하는 이유가 그대로 여기에도 적용되고, 도구가 거부하는 일을 화면이 권하면
+그 화면이 위험해진다.
+
+**그리고 그 상태를 만드는 쪽에도 붙였다.** `install_agent_task.ps1`이 등록
+직전에 다른 Desktop의 Agent Task가 이미 있는지 보고 **경고한다**. `-Force`가
+같은 이름만 대체한다는 사실이 이 시나리오의 전부이므로, 운영자가 아직 그
+자리에 서 있을 때 말하는 것이 가장 싸다. `Get-ScheduledTask`는 읽기 전용이라
+`-WhatIf` 미리보기에서도 수행된다 — 미리보기가 알려 주기에 정확히 알맞은
+사실이다.
+
+**지우지는 않는다.** 예약 작업 삭제는 되돌릴 수 없고, 이 스크립트가 만든
+Task도 아니며, 정말로 이전 중인 운영자는 한 시간쯤 둘 다 원할 수 있다. 대신
+지우는 명령을 정확히 찍어 준다. 삭제를 실행하지 **않는다**는 것 자체를
+테스트가 확인한다.
+
+### 9. 스스로 만든 것 하나를 되짚었다 — 무한히 커지는 파일을 통째로 읽고 있었다
+
+§2가 만든 `scheduled_*.log`는 이 Sprint가 추가한 것 중 **크기에 상한이 없는
+유일한 것**이다(보존 정책은 E-2의 미결 항목이다). 그리고 §2를 화면에 띄우는
+코드는 다섯 줄을 뽑기 위해 그 파일을 `read_text()`로 **통째로** 읽고 있었다.
+
+하루 두 번 발화하는 Task에서는 아무것도 아니다. 아무것도 아니지 않은 경우는
+Task가 루프로 실패할 때, 또는 Event마다 traceback을 찍는 실행이다 — **그때가
+바로 사람이 이 화면을 여는 때다.** 진단 도구가 상한 없는 파일을 메모리로
+읽어들이는 것은 BUG-40이 이미 한 번 치른 값이다.
+
+끝에서 64KB만 seek해서 읽는다. **창의 첫 줄은 버린다** — 바이트 오프셋은 줄
+중간에 떨어지고 UTF-8에서 줄 중간은 글자 중간이기도 하므로, `errors="replace"`가
+그 조각을 대체 문자로 그려 **쓰인 적 없는 줄**을 화면에 올린다. 한 줄을 버려
+나머지 넷을 참으로 만드는 쪽을 골랐다.
+
+그 과정에서 기존 테스트 하나가 깨졌다 — 권한 거부를 `Path.read_text`에
+주입하고 있었는데, 코드는 이제 `open()`을 쓴다. **주제는 그대로다**(읽을 수
+없는 로그가 블록을 죽이지 않는다). 주입 지점을 실제 경계로 옮기고, 주입이
+코드에 닿기는 하는지 확인하는 가드를 붙였다.
+
+---
+
+### 10. 자기가 만든 파일에 같은 질문을 다시 던졌다 — 설정 오류가 환경변수 **값**을 디스크에 적고 있었다
+
+§2가 예약 실행의 콘솔 출력을 디스크에 남기게 만들었다. 그러면 **거기에 무엇이
+적히는가**가 새 질문이 된다. 이 저장소가 로그에 쓰는 다른 모든 것은
+`oplog.append_line()`을 지나며 redact·flatten·bound된다. 이것만 지나지 않는다.
+
+**저장소가 이미 그 위험을 적어 두고 있었다.** `publish_control_tower._safe`의
+docstring: *"`tool > log 2>&1` puts it on disk, which is the shape `oplog`
+exists to stop."* 다만 그때까지는 그 리디렉션이 **아무 데도 없었다.**
+
+실측했다(다섯 entrypoint에 토큰 모양 값을 변수마다 넣고 stdout+stderr 검사):
+
+    run_company_ops.py   COMPANY_OPS_HISTORY_START_DATE   leaked
+    run_agent.py         COMPANY_OPS_PROFILE              leaked
+    run_agent.py         COMPANY_OPS_AGENT_START_DATE     leaked
+    publish_control_tower.py  NOTION_API_TOKEN            clean
+    init_notion.py            NOTION_API_TOKEN            clean
+
+비밀을 읽는 두 도구는 깨끗하다 — 이 프로젝트가 그은 경계는 성립한다. 새는 셋은
+**비밀이 아닌 변수**이고, 값을 되돌려 찍는 것은 의도된 진단이다
+(`run_company_ops.py`의 주석: 값을 찍어야 "설정 안 됨"과 "잘못 설정됨"이
+구분된다).
+
+그러므로 결함은 "비밀이 샌다"가 아니라 좁다: **길이도 내용도 임의인 환경변수
+값이, 이제 영구히 남는 파일에 unbounded·unredacted로 적힌다.** 그리고 그 셋
+중 하나에 자격증명이 들어가는 현실적인 경로가 정확히 하나 있다 — Notion 토큰을
+어느 변수에 넣는지 헷갈리는 것.
+
+`bounded(redact(one_line(...)))` 를 두 sink에 적용했다(run_agent는 두 오류가
+한 sink로 모인다). **새 헬퍼도 새 계층도 만들지 않았다** — 이 저장소가 다른
+모든 sink에서 쓰는 그 조합 그대로다. `reporter/profiles.py` 안에서 하지 않은
+이유는 layering이다(`reporter`는 `oplog`를 import할 수 없고, sink는 entrypoint에
+있다).
+
+**양쪽을 다 단언한다. 두 번째가 이 수정을 정직하게 만든다** — 전부 가리면
+"안전"하지만 이 메시지의 존재 이유가 사라진다. 실측:
+
+    'ntn_AAAA…'    -> '[REDACTED]'      가려진다
+    '2026-8-1'     -> '2026-8-1'        그대로 (평범한 오타는 진단이 살아 있다)
+    'DESKTOP_9'    -> 'DESKTOP_9'       그대로
+
+돌연변이로 확인했다: 가드를 되돌리면 leak 테스트와 bound 테스트가 즉시 실패한다.
+
+### 11. 내가 만든 명부 둘을 디스크에서 파생하도록 바꿨다
+
+C138이 스스로 만든 것 중 **손으로 쓴 명부**가 둘이었다.
+
+**installer ↔ Python 상수.** Task 이름과 로그 파일 이름은 PowerShell과 Python에
+각각 있고, C138은 그것을 installer마다 하나씩 손으로 확인했다 — 셋 중 하나는
+아예 다른 테스트 파일에 있었다. 네 번째 installer는 **아무것도 확인하지
+않는다.** 양쪽 다 디스크에서 파생하도록 바꿨다: `scripts/install_*_task.ps1`의
+`$taskName`/`$logPath`를 파싱해 `schedtask.scheduled_log_name()`과 대조하고,
+반대 방향(쓰이지 않는 항목)도 본다. 돌연변이 둘로 확인했다.
+
+> **§15가 이 문단을 대체했다.** 여기서 한 것은 **두 사본을 비교**한 것이고,
+> 비교는 드리프트를 *탐지*할 뿐 막지 못한다. §15에서 사본 자체를 없앴다 —
+> installer가 `schedtask`에게 물어본다.
+
+**installer 자신의 운영 속성.** `-User`, verify-after-register,
+`IgnoreNew`, `StartWhenAvailable`, `-Force`, 리디렉션, 로그 디렉터리 생성 —
+전부 installer마다 자기 파일에서 하나씩 확인되고 있었다. 그중 `-User` 하나가
+빠졌을 때 Agent installer는 **어떤 머신에서도 Task를 등록할 수 없었고 정적
+테스트 22건은 통과했다**(C13). `scripts/install_*_task.ps1` 전체를 훑는
+클래스 하나로 모았다 — 기존 `APowerShellScriptStaysPureAsciiTests`가 이미
+`scripts/`를 훑는 파일에, 새 파일을 만들지 않고 나란히. 돌연변이 셋으로
+확인했다(`-User` 제거, `IgnoreNew`→`Parallel`, `StartWhenAvailable` 제거).
+
+주석 제거본에 대해 검사한다 — 이 규칙들은 전부 그것을 설명하는 산문에도
+등장하므로, 원문을 훑는 스캔은 **규칙을 잃고 문단만 남은** 스크립트를
+통과시킨다. 그 predicate 자체도 테스트가 확인한다.
+
+---
+
+### 12. OS 경계를 성질로 적었다 — 그리고 처음 쓴 게이트 둘이 **거짓말이었다**
+
+`schedtask`는 이 프로젝트에서 프로세스 밖으로 나가는 유일한 모듈이고, 그것이
+나가는 곳은 Windows다. 그러므로 import 시점의 플랫폼 의존이 들어올 수 있는
+유일한 모듈이며, **이 프로젝트가 개발·배포되는 머신에서는 그것이 절대 실패하지
+않는다.** 실패하는 곳은 CI 컨테이너이고, 그것도 collection 시점에, 스위트
+전체를 들고 넘어진다.
+
+경계는 한 곳이다: `query()`가 호출 시점에 subprocess를 돌릴지 정하고, 나머지
+전부(판정·파서·로그 이름·Action 읽기)는 어디서나 도는 텍스트 처리다. 그것을
+게이트로 적었다 — `os.name == "nt"`가 **정확히 한 번**만 나오고 `sys.platform`은
+나오지 않으며, 블록 전체가 non-Windows 응답으로도 답하고 아무것도 경보하지
+않는다.
+
+**첫 번째 거짓말: `msvcrt`.** 금지 목록에 넣었더니 첫 실행에서 실패했다.
+실패를 근거로 목록을 줄이는 대신 재 봤다:
+
+    import subprocess          -> msvcrt in sys.modules: True
+    Lib/subprocess.py:71           import msvcrt        (if _mswindows: 안)
+
+표준 라이브러리가 자기 가드 안에서 Windows 분기를 탄 것이지 이 모듈이 들여온
+의존이 아니다. **옳은 코드에 발화하는 게이트는 heeded되지 않고 삭제된다.**
+
+**두 번째 거짓말이 더 값이 나갔다 — 게이트 하나가 자기가 겨눈 단 하나의
+경우를 구조적으로 볼 수 없었다.** subprocess에서 `import schedtask` 전후의
+`sys.modules`를 비교하는 probe를 썼는데, `import winreg`를 주입해 돌연변이
+검사하자 **발화하지 않았다.** 실측:
+
+    python    -c "'winreg' in sys.modules"   ->  True
+    python -S -c "'winreg' in sys.modules"   ->  True
+
+Windows는 사용자 코드가 돌기 전에 `winreg`를 올린다(`encodings`가 콘솔
+코드페이지를 찾느라 부른다). 그러니 "before" 스냅숏에 이미 들어 있고 차집합에
+영원히 나타나지 않는다. `-S`도 소용없다.
+
+그 probe에 남은 성질은 "서드파티를 안 들여온다" 하나뿐인데, **그것은 이미
+`DependencyGuardTests::test_src_imports_only_the_standard_library`가 바로 이
+파일에 대해 갖고 있다**(AST로 shipped 파일 전부를 훑고
+`sys.stdlib_module_names`와 대조한다).
+
+그래서 **방금 쓴 그 테스트를 지웠다.** 기존 테스트를 약화한 것이 아니라, 이
+Sprint가 만든 초록이면서 아무것도 증명하지 않는 게이트를 없앤 것이다. 지운
+자리에 왜 지웠는지를 적어 두었다 — 다음 사람이 같은 probe를 다시 쓰지 않도록.
+성질을 실제로 붙잡는 것은 AST 테스트이고, 그것은 주입한 `winreg`에 즉시
+발화한다(확인함).
+
+---
+
+### 13. 화면을 **실제로 띄워** 봤더니, 이번에 만든 경보 전부가 `?` 였다
+
+BACKLOG §B가 승인 없이 통하는 방법 넷을 적어 두었고 그 첫째가 **"실제로 돌리고
+결과를 읽는다"** 다(C77·C78이 거기서 나왔다). §6에서 Dashboard에 SCHEDULE을
+넣었지만 **렌더된 페이지를 한 번도 보지 않았다.** 페이로드와 명부는 테스트가
+확인했고, 그것으로 충분하다고 여겼다.
+
+띄워서 읽었다:
+
+    ?  SCHEDULE
+       이 화면이 분류하지 못한 줄 — 내용을 직접 읽어야 한다
+       Runner 예약 실행이 등록돼 있지 않다 …
+       다음 행동  이 화면이 정해 두지 않았다 — 줄 전문을 읽고 사람이 판단한다.
+
+이번 Sprint가 만든 경보 **열 개가 전부** 그랬다. 그리고 바로 위 줄이
+`Runner가 N일째 실행되지 않았다` 이고, 그 줄의 처방이
+**"계속 반복되면 예약 작업(Windows 작업 스케줄러)이 꺼져 있는지 확인한다"** 다 —
+이 블록이 대신 해 주는 바로 그 확인. 답을 아는 줄이 "분류 불가"로 찍히고, 그
+질문을 던진 줄이 P1로 찍혀 있었다.
+
+`controltower/attention.py`는 **세 표면이 공유하는** 분류기다(터미널·브라우저·
+Notion 페이지). 그러니 워크스페이스가 읽는 페이지에서도 똑같이 분류 불가였다.
+C133이 정확히 이 결함을 **발행된 Notion 페이지를 읽어서** 찾았다고 적어 두었는데,
+같은 자리에 같은 방식으로 다시 생겼다.
+
+**기존 테이블에 넣었다. 새 분류기도 새 표면도 만들지 않았다.** 이 모듈 자신의
+정의("P1은 일이 Company History에 닿지 않거나 파이프라인이 멈춘 것")로 갈랐다:
+
+    P1  등록 안 됨 / 사용 안 함 / 매번 실패 / 다른 저장소 / 다른 Desktop의 Task
+    P2  Windows가 중단시킴(다음 트리거가 이어받는다) · 콘솔 출력 버림(관측만
+        약해짐) · Task 둘(한쪽은 돈다) · 확인 불가 둘(고장이 아니다)
+
+실측 결과 열 줄 전부 severity·이유·다음 행동을 갖는다. 페이지를 다시 띄워
+확인했다: `P1 8건 · P2 3건`, `?` 0건.
+
+**그리고 이것을 잡았어야 할 게이트가 있었다.**
+`test_every_shape_ops_status_can_raise_is_classified_and_actionable`,
+docstring 첫 줄이 *"The whole roster, not a sample."* 열 개가 늘었는데 하나도
+합류하지 않았고 아무것도 실패하지 않았다 — **손으로 쓴 명부**이기 때문이다.
+
+그 명부가 손으로 쓰인 이유 자체는 옳고(문장이 여러 소스 줄의 f-string으로
+조립되므로 grep은 그것이 분류기에 닿는다는 것을 증명하지 못한다) 그래서 남겼다.
+대신 SCHEDULE 쪽은 **블록을 실제로 돌려 나온 줄을 분류하는** 게이트로 덮었다 —
+문자열은 여전히 조립된 것이고, 새 경보는 생기는 날 자동으로 합류한다. 빈 수집
+가드도 붙였다. 돌연변이로 확인했다(규칙 하나를 빼면 즉시 실패).
+
+거짓이 된 그 docstring도 고쳤다. "전체 명부"라고 계속 적혀 있으면 다음 사람이
+같은 함정에 다시 걸린다.
+
+---
+
+### 14. Performance Audit — 그리고 가장 느린 테스트 열둘이 전부 **내가 만든 중복**이었다
+
+전체 스위트가 651초에서 722초로 늘었다. `--durations`로 어디로 갔는지 봤다.
+
+가장 느린 열둘이 전부 PowerShell 기동(각 ~1.2s)이었고, **셋씩 같은 것을 세 번**
+하고 있었다. `TheScheduledRunHasSomewhereToPrintTests`를 installer 파일마다 하나씩
+썼는데, 그 안의 **실행** 테스트 넷은 셋 다 문자 그대로 같은 명령줄 패턴을
+돌리고 있었다. 비용보다 나쁜 것은 그것이 **손으로 베낀 계약 사본 셋**이라는
+것이다 — 이번 Sprint가 §11에서 없앤 바로 그 명부 모양이, 테스트 파일을 입고.
+
+하나로 합쳤다. `test_schedtask.py`의 파생 sweep에 두었고, **installer 목록에서
+파생**한다:
+
+    1. 세 installer가 선언한 `$commandLine` 패턴을 각각 파싱한다
+    2. 셋이 **같은지** 단언한다 (다르면 실패하고 사람이 정한다)
+    3. 그 패턴을 `Start-Process`로 한 번 돌려 넷을 확인한다
+
+    30.1s -> 22.7s  (이 네 파일, -25%)
+
+**커버리지는 오히려 늘었다.** 종료 코드는 파일당 하나(7 / 7 / 3)였는데 이제
+1·3·7을 전부 본다. 패턴은 파일마다 고정한 사본이 아니라 **디스크에서 읽는다** —
+installer가 다른 모양을 만들기 시작하면 이제 실패한다(돌연변이로 확인했다).
+
+installer 파일에 남긴 것은 **정적 절반**이고, 그것은 본래 installer마다 다른
+것이다: *이* 스크립트가 그 모양을 만들고, 리디렉션하고, 덮어쓰지 않고 덧붙이고,
+셸을 경로로 지목하고, 로그 디렉터리를 먼저 만든다.
+
+**죽은 헬퍼 셋도 같이 지웠다.** 처음 제거 스크립트가 `def name(self):` 만
+매치해서 `def name(self, program: str):` 셋을 남겼고, 그것들은 이미 지워진
+`COMMAND_LINE_PATTERN`을 참조하고 있었다 — 호출되면 AttributeError로 죽는
+코드가 초록 스위트 안에 남을 뻔했다. 실측으로 확인하고 지웠다.
+
+**정직하게 적어 둔다: 이득의 대부분은 속도가 아니다.** 722초 중 ~10초는 1.4%다.
+값이 나가는 것은 중복 제거 쪽이고, 그 중복은 이번 Sprint가 만든 것이다.
+
+---
+
+### 15. 사본을 비교하는 대신 **없앴다** — installer가 `schedtask`에게 물어본다
+
+§11이 Python과 PowerShell에 각각 있는 Task 이름·로그 파일 이름을 **디스크에서
+파생해 비교**하도록 만들었다. 그것은 드리프트를 *탐지*한다. **막지는 못한다.**
+그리고 이 저장소의 규율 전체가 손으로 쓴 명부를 없애는 것인데, C138은 그 명부를
+**두 언어에 걸쳐** 하나 새로 만든 셈이었다.
+
+literal 8개가 있었다:
+
+    install_runner_task.ps1    $taskName, $logPath
+    install_agent_task.ps1     $taskName, $logPath, 그리고 발견용 와일드카드
+    install_publish_task.ps1   $taskName, $logPath
+
+전부 없앴다. 각 installer가 python을 PATH에서 찾은 **직후** 이렇게 묻는다:
+
+    $taskFacts = @(& $python.Source -c $taskProbe)   # name, log filename
+
+**방향을 Python 쪽으로 잡은 이유.** `schedtask`가 이 값들을 가지고 *추론하는*
+쪽이다 — `ops_status.py`가 Windows에 물으려면 이름을 알아야 하고,
+`scheduled_log_name()`이 이름→로그를 매핑하며, `agent_task_name()`이 Desktop별
+형태를 만든다. PowerShell은 설치 시점에 한 번 적을 뿐이다.
+
+**새 의존성이 아니다.** 세 installer 모두 이미 python을 PATH에서 요구하고
+(`Get-Command python`), 이미 `$python.Source`를 Action에 박아 넣는다.
+
+**여기서 실패하는 것이 옳은 실패다.** 이 checkout에서 `import schedtask`가 안
+되면, 이 스크립트가 등록하려는 Task는 매일 아침 같은 트리를 import하는
+entrypoint를 돌린다. 등록하지 않는 편이 낫다. 빈 출력·비정상 종료를 전부
+검사하고 거부한다.
+
+**새 source of truth를 만들지 않았다.** 공유 JSON도, 공유 psm1도, 새 Python
+함수도 없다 — 이미 있던 `RUNNER_TASK_NAME` / `PUBLISH_TASK_NAME` /
+`agent_task_name()` / `scheduled_log_name()` / `AGENT_TASK_PREFIX`를 그대로
+읽는다.
+
+**실측으로 증명했다** — Python에서 이름 하나만 바꾸고 `.ps1`은 손대지 않았다:
+
+    RUNNER_TASK_NAME = "..._NIGHTLY"  (Python만)
+    install_runner_task.ps1 -WhatIf  ->  "..._NIGHTLY" 등록 예정
+    되돌린 뒤                        ->  "..._DAILY"
+
+**테스트 9개의 주제가 바뀌었다.** "두 사본이 일치한다"는 이제 단언할 것이
+없다(사본이 없다). 대신 사본이 **다시 생기지 않는다**를 단언한다: 어떤
+installer도 `DOJOONPASS_COMPANY_OPS` literal이나 `scheduled_*.log` literal을
+실행 코드에 갖지 않고, 셋 다 `schedtask`에게 물으며, 물어서 못 얻으면 등록
+전에 거부한다.
+
+주석 제거본에 대해 검사한다 — `install_agent_task.ps1`의 `.NOTES`는 운영자가
+복사해 쓰라고 Task 이름을 **일부러** 적어 두고, 원문을 훑는 스캔은 그
+문서를 위반으로 읽는다. 그 predicate 자체도 테스트가 확인한다.
+
+docs↔code 계약 하나는 대상만 바꿔서 살렸다: docs/11 §19가 이름을 적어 두는
+것은 여전히 지킬 값이 있고, 이제 그 짝은 `.ps1`이 아니라 `schedtask`다.
+
+---
+
+### 16. 같은 경계에 남아 있던 마지막 손목록 — "entrypoint가 요구하는 변수"
+
+§15가 Task 이름·로그 이름의 사본을 없앴다. 같은 경계에 하나가 더 있었다.
+
+installer 테스트 파일 셋이 각각 *"entrypoint가 요구하는 변수는 전부 persist
+된다"* 를 **셋짜리 전사 목록**에 대고 확인하고 있었다. 반대 방향은 이미
+파생돼 있다(스크립트에서 `SetEnvironmentVariable(`를 정규식으로 뽑는다) —
+그래서 **installer가** 변수를 하나 더 쓰면 걸린다. 걸리지 않는 것은
+**entrypoint가** 하나를 더 요구하기 시작한 경우이고, 그 실패는
+"Task는 깔끔하게 등록되고 그 다음 모든 Desktop에서 매일 아침 exit 1" 이다.
+
+파생할 것이 이미 있었다. `cli.unexpected_arguments(configured_by=...)` 는 각
+도구가 스스로 밝히는 "나를 설정하는 것"이고, **이 저장소는 그 튜플을 이미
+정직하게 유지하고 있다** — 테스트 셋이 그것을 실제 `os.environ.get()` 읽기와
+대조한다(C48이 지어낸 이름 셋을 그렇게 찾아냈다). 주석이 아니라 검증된 선언이다.
+
+**한 규칙이 "써도 되는 것"과 "쓰면 안 되는 것"을 가른다.** 새로 만든 규칙이
+아니라 이 프로젝트가 이미 쓰는 것이다: `NOTION_*`는 비밀, `COMPANY_OPS_*`는
+아니다. installer 셋 다 자기 `.NOTES`에 그렇게 적어 두었고
+`NoSecretIsHandledTests`가 거부를 강제한다. 그래서 파생된 요구사항은
+`configured_by ∩ COMPANY_OPS_*` 다.
+
+**그 좁힘이 변명이 아니라는 것도 같이 단언한다.** 반대편 — 어떤 installer도
+`NOTION_*`를 쓰지 않는다 — 과, 그 좁힘이 진짜라는 증거 하나:
+`publish_control_tower.py`는 변수 둘로 설정되는데 **둘 다 비밀**이므로 그
+installer는 정말로 아무것도 쓰지 않는다. 대신 화면에 무엇이 필요한지 찍는다.
+그 세 가지가 다 성립해야 통과한다.
+
+돌연변이로 확인했다: `run_agent.py`의 `configured_by`에 네 번째 이름을
+넣자(installer는 손대지 않고) 즉시 실패한다.
+
+**기존의 좁은 테스트 셋은 지우지 않았다.** 이 저장소의 선례가 그렇다 —
+`LayeringInvariantTests`가 패키지별 경계 테스트 여덟 쌍을 대체했을 때도
+지우지 않았고, 그 이유를 이렇게 적어 두었다: *"지우는 것은 커버리지 근거를
+줄이는 변경이라 별도 판단이 필요하고, 파일별 지역성에도 값이 있다."* 완전성은
+새 sweep이 갖고, 지역성은 그대로 둔다.
+
+---
+
+### 17. 경계 전체를 훑었다 — 그리고 그 게이트가 처음에 **자기 자신을 만족시켰다**
+
+§15와 §16이 아는 사본 둘을 없앴다. "아는 것은 고쳤다"는 성질이 아니다.
+경계 전체를 실측했다 — installer의 **실행 텍스트**에서 인용된 literal을 전부
+뽑아, Python 어딘가가 같은 것을 적는지 물었다.
+
+    11건. 셋으로 나뉜다.
+
+    환경변수 이름 4          §16의 파생 게이트가 붙잡는다
+    DESKTOP_1..4            기존 게이트가 ValidateSet을 PROFILES와 대조한다
+    entrypoint 파일명 3      §16의 pairing 게이트 + 줄일 수 없는 중복
+                            (installer는 자기가 등록하는 것을 이름으로 불러야 한다)
+
+    DOJOONPASS_* 0건 · scheduled_*.log 0건   <- §15가 없앴다
+
+**그 sweep을 게이트로 만들었다.** 명부는 이유이고 스캔은 디스크에서 파생한다 —
+`ALLOWED_SILENT` · `LayeringInvariantTests.ALLOWED` · `KNOWN_DIFFERENT`와 같은
+모양이다. 아무도 생각해 보지 않은 새 공유 literal이 생기면 실패한다(돌연변이로
+확인: installer에 `COMPANY_OPS_DASHBOARD_PORT`를 넣자 즉시 발화).
+
+**그리고 그 게이트의 가드 하나가 처음에 거짓이었다.**
+`test_every_reason_names_a_test_that_exists`가 명부의 이유(테스트 이름)를
+스위트 전체에서 **부분 문자열**로 찾았다. 그런데 **명부가 그 스위트 안에 있다.**
+모든 항목이 자기 자신과 매치했다. 처음 적은 이름
+`test_the_desktop_ids_are_the_ones_the_project_defines`는 **어디에도 정의돼
+있지 않은데** 통과했다.
+
+C76 §4가 게이트 35개에 "스캔이 비면?"을 주입해 찾아낸 것과 같은 종류이고,
+이번에는 **가드 자신이 자기가 검사하는 텍스트의 일부**라는 형태였다. 이유는
+이제 **정의**를 지목해야 한다(`class X` 또는 `def X(`). 진짜 이름은
+`test_the_desktop_id_is_restricted_to_the_real_profiles`였다. 그 지어낸 이름을
+그대로 predicate 테스트로 남겨 두었다 — docstring에 여전히 적혀 있으므로,
+부분 문자열 검색으로 되돌아가면 그 테스트가 실패한다.
+
+---
+
+### 18. Notion 쪽 경계를 같은 눈으로 봤다 — publish가 **아무도 만들지 않는 열**에 쓴다
+
+Python↔PowerShell을 끝내고 같은 질문을 다른 경계에 던졌다: *"한 곳을 바꾸면
+다른 곳이 자동으로 따라가는가?"*
+
+**Notion Property 이름**이 후보였다. 먼저 실측했더니 raw 겹침은 대부분 **가짜**다 —
+`Owner`는 `monthly/parser.py`가 파싱하는 markdown 필드이고, `Status`는
+`daily/markdown.py`의 제목이며, `Project`는 `controltower/columns.py`의 표시
+라벨이다. 이름만 같은 **다른 namespace**이고, 그것들을 하나로 묶는 것이야말로
+이번 지침이 금지하는 그 짓이다. **억지로 derive하지 않았다.**
+
+진짜 같은 namespace만 좁혔더니 하나가 남았다. `ProjectsSchemaMappingTests`가
+**sync의 payload**를 스키마와 대조한다. 그런데 같은 Database에 쓰는 writer가
+**둘**이고, 두 번째는 아무것과도 대조되지 않았다.
+
+    bootstrap.TARGET_PROPERTIES     11개, `Notes` 없음
+    notion_page.py가 쓰는 열        정확히 하나: `Notes`
+
+`publish_project_notes()`가 매 publish마다 `Notes`를 쓴다. **이 저장소는 그 열을
+만들지 않는다.** 지금 되는 이유는 이 Workspace의 PROJECTS가 Notion 기본
+템플릿에서 만들어졌기 때문이고, docs/13 §5가 그 셋을 **잔재**라고 적어 두었다 —
+지워도 이상하지 않은 열이다.
+
+**아무것도 잡을 수 없었다.** `ProjectsSchemaMappingTests`는 sync의 payload를 보고,
+`TestDoubleFidelityTests`는 `InMemoryNotionTransport`가 *"스키마에 없는 property
+이름"* 을 받아들인다고 이미 적어 두었다 — 그래서 스위트의 모든 Notion 테스트가
+없는 열에 대해 통과한다.
+
+**고치는 방법이 "만든다"는 아니다.** docs/04 §43이 자동화 Property를 11개로
+고정하고 열두 번째는 Spec 결정이다. **승인 필요 → SKIP.**
+
+승인 없이 할 수 있고 빠져 있던 것은 **그것을 말하는 것**이다. 주인 없는 열은
+의존성이고, 적어 두지 않은 의존성은 다음 사람이 지운다. 명부에 이유와 **없을 때
+무슨 일이 일어나는가**(400 → 비치명적 → 매번 DEGRADED, 보이고 한정됨)를 적고,
+그 비치명 처리가 **실제로 그런지** 호출 지점에서 확인하는 게이트를 붙였다.
+돌연변이로 확인했다(publish가 `Summary` 열을 쓰게 하면 즉시 실패).
+
+---
+
+### 19. 같은 질문을 docs 경계에 — 11:00이 **세 번째 사본**이었다
+
+`test_the_daily_time_defaults_to_the_spec_hour`의 docstring이 이렇게 적혀
+있었다: *"docs/07 §4 and docs/11 §19 both fix the regular run at 11:00."*
+그리고 단언은 이랬다:
+
+    self.assertRegex(_script_code(), r"\$DailyAt\s*=\s*'11:00'")
+
+**값이 어디서 오는지는 적어 두고, 아무도 그것을 읽지 않는다.** Spec을 10:00으로
+바꾸면 이 테스트는 계속 통과하고 installer는 계속 11:00을 등록한다. §15가
+PowerShell/Python 경계에서 없앤 것과 같은 모양이, 이번에는 docs 경계에서.
+
+installer에서 값을 **읽어** 두 Spec에 그 시각이 있는지 확인하도록 바꿨다.
+Spec이 주인이다(README §13: 명세가 이긴다). 돌연변이로 확인했다 — installer를
+13:00으로 옮기면 즉시 실패한다.
+
+**그리고 installer 둘 사이의 관계 하나가 아무 데도 검사되지 않았다.**
+`install_publish_task.ps1`은 11:30을 "§19의 11:00 뒤"라고 자기 문서와 docs/11
+§19b에 적어 두는데, 그 순서가 **여전히 성립하는지**는 아무것도 보지 않았다.
+Runner를 옮기고 publish를 잊는 것은 평범한 편집이고(`-DailyAt`이 양쪽에 있는
+이유가 그것이다), 그러면 Control Tower가 **그날 실행 전의** 숫자를 보여준다.
+
+리터럴 쌍이 아니라 **관계**로 적었다: 둘이 무엇이든 publish가 Runner보다
+빠르면 안 된다. 로그온 지연도 같은 방향으로 확인한다(publish 쪽이 길어야
+startup catch-up이 먼저 끝난다 — 보장이 아니라 의도이고, 뒤집히면 의도가
+뒤집힌 것이다).
+
+---
+
+### 20. git 명령 심사 게이트가 **파일 하나만** 보고 있었다
+
+Boundary Audit을 Python↔외부 CLI로 옮겼다. `backup/git_ops.py`의
+`APPROVED_COMMANDS`는 좋은 모양이다 — 명령 집합을 소스에서 파생하고, 항목마다
+이유가 있고, 읽기/쓰기를 따로 단언한다. docstring이 이렇게 말한다:
+
+> *"A closed inventory. Adding any new git command to git_ops.py must be a
+> deliberate, reviewed act — this test is the review gate."*
+
+**그 문장은 `git_ops.py`에 대해서만 참이었다.** 스캔이 그 파일 하나를 읽는다.
+
+실측 — 트리 전체의 git 호출:
+
+    src/backup/git_ops.py:178   ["git", *args]          <- 심사됨
+    ops_status.py:284           git ls-files ...        <- 아무것도 심사 안 함
+    ops_status.py:691           git rev-list ...        <- 아무것도 심사 안 함
+
+BACKLOG E-0a가 제기하고 C135가 다섯 번 답한 그 질문이다 —
+*"규칙은 옳고 그 규칙이 보는 범위가 좁다."* `DependencyGuardTests`와
+`ADeeplyNestedStateFile...`가 정확히 이 이유로 루트 entrypoint까지 넓혀졌다.
+이것은 넓혀지지 않았다.
+
+**파일 수가 시사하는 것보다 중요하다.** 두 호출 다 `cwd=`가 **Backup Working
+Copy** — Company History를 담은 진짜 git 저장소다. `ops_status.py`가 읽기
+전용이라는 것은 열두 개 테스트가 말하지만, **어떤 git 명령을 돌려도 되는지는
+아무것도 말하지 않았다.**
+
+둘 다 실제로는 읽기 전용이고(`ls-files`, `rev-list`) 올바르게 쓰여 있다.
+결함은 코드가 아니라 **심사 범위**였다.
+
+**기존 게이트를 넓혔다. 새 게이트를 만들지 않았다.** 스캔이 둘인 이유는 모양이
+정말 다르기 때문이다: `git_ops.py`는 전부 `_run_git()`으로 깔때기 처리하므로
+명령 단어가 그 자리에 literal로 없고(`["git", *args]`), 직접 호출은 전부
+적혀 있다. 그래서 두 번째 스캔은 AST로 `subprocess.run(["git", ...])`를 찾되
+**starred 원소가 있으면 건너뛴다** — 그것이 깔때기이고 첫 번째 명부가 읽는다.
+(첫 실행에서 그 깔때기를 빈 명령으로 집어 실패했다. 고쳤다.)
+
+`git_ops.py`가 계속 깔때기를 쓰는지도 단언한다 — 거기에 직접 호출이 생기면
+**어느 명부도 심사하지 않는다.**
+
+쓰기 동사 목록은 세 개가 아니라 스물여섯이다. `git_ops.py`는 백업을 쓰는 것이
+자기 일이라 셋을 허가받았고, 그 밖의 어디에도 그런 일은 없다.
+
+돌연변이로 확인했다: `ops_status.py`에 `git gc --prune`을 넣으면 **세 단언이
+따로따로** 발화한다(미승인 · 쓰기 동사 · 명부 불일치).
+
+---
+
+### 21. 자기 감사 — "문제를 고치는 대신 감시 코드만 늘린 것은 아닌가"
+
+이 질문을 자기 작업에 던졌다. §16~§20이 전부 **게이트**였다. 그중 실제
+production 코드를 고친 것은 하나도 없다(§15까지는 있었다 — PID 재사용, 리디렉션,
+redact 순서, 설정값 유출, 경계 파생). 방향이 감시 쪽으로 기울어 있었다.
+
+두 가지를 했다: **내 변경이 만든 실제 결과 하나를 찾고**, **내가 만든 중복 하나를
+지웠다.**
+
+#### 21a. §5가 만든 것 — publish는 Lock을 잡지 않는다
+
+`publish_control_tower.py`는 Lock을 잡지 않고, 그 이유가 docstring에 적혀 있다:
+*"Nothing here writes an Event, touches `runtime/`, acquires the Runner lock,
+or changes a PROJECTS row."* 그 판단은 **publish 대 Runner**에 대한 것이고
+옳다 — 둘은 다른 것을 만진다.
+
+**publish 대 publish에 대해서는 아무 말도 하지 않는다.** 그리고 §5 이전에는 그
+경우가 사실상 없었다: 사람이 명령을 칠 때만 돌았으니까. **§5가 그것을 예약
+실행으로 만들었다.** 이제 11:30 예약 실행과, AGENT.md §6e가 적극적으로 안내하는
+수동 실행(*"지금 갱신하려면: python publish_control_tower.py"*)이 겹칠 수 있다.
+
+겹치면: `publish()`가 기존 블록을 보관하고 새 블록을 덧붙이므로, 교차 실행은
+페이지에 내용이 두 번 들어가거나 일부가 비는 상태를 만들 수 있다.
+
+**그래도 Lock을 붙이지 않았다.** 판단 근거:
+
+* 예약 대 예약은 이미 `MultipleInstances IgnoreNew`가 막는다(§5).
+* 남는 창은 수동 대 예약뿐이고 좁다.
+* 잃는 것이 **뷰**이지 source가 아니다 — Company History는 건드리지 않는다.
+* **다음 publish가 스스로 고친다**(전부 보관하고 다시 붙인다). 자기 치유다.
+* Lock 파일은 `runtime/` 아래에 생긴다. 이 도구가 **의도적으로** 그러지 않기로
+  한 성질이고, 그래서 어디서나 아무 때나 돌 수 있다.
+
+**일시적이고 자기 치유되는 뷰 문제를 막으려고, 의도된 설계 성질을 깨고 새
+메커니즘을 넣는 것은 나쁜 거래다.** 이 저장소의 원칙 그대로 — 문제가 없으면
+억지로 바꾸지 않는다. 다만 **§5가 만든 경우**이므로 적어 둔다.
+
+#### 21b. 내가 만든 중복 하나를 지웠다
+
+`test_the_task_names_are_no_longer_written_on_both_sides`(§17)와
+`test_no_installer_hard_codes_a_task_name`(§15)은 **같은 것을 단언한다.**
+같은 Sprint에서 둘 다 썼다. 뒤엣것이 더 강하다 — Python이 그 이름을 적든 말든
+발화하는데, 앞엣것은 **양쪽 다** 적어야 발화한다.
+
+지우기 전에 **성질이 살아남는지 실측했다**: `install_publish_task.ps1`에 literal을
+되돌려 넣자 세 테스트가 발화했고, 그중 둘이 일반 성질이었다. 셋째는 나머지 둘이
+증명하지 않은 것을 하나도 증명하지 않았다. 지우고 다시 측정해 둘이 여전히
+발화하는 것을 확인했다.
+
+**중복 게이트는 공짜가 아니다** — 고칠 자리가 둘, 읽을 것이 둘이고, 성질 하나를
+덮으면서 둘을 덮는 것처럼 보이게 한다. 중복을 지우는 데 시간을 쓴 Sprint가
+스스로 하나를 만들었다.
+
+#### 21c. §6이 만든 것 — 전역 Lock 안에 subprocess가 들어갔다
+
+`dashboard_server.gather()`는 `_CAPTURE_LOCK`을 블록 전부에 걸쳐 잡는다(이유는
+정확하다 — 블록 사이의 틈이 다른 스레드가 자기 버퍼를 끼워 넣는 틈이다). 그리고
+그 함수의 docstring이 모델 빌드를 **일부러 Lock 밖**에 두며 이렇게 적는다:
+*"holding it over pure computation would queue requests for nothing."*
+
+§6이 SCHEDULE을 `_BLOCKS`에 넣으면서 **그 Lock 안에 subprocess를 넣었다.**
+서버는 `ThreadingHTTPServer`이므로 직렬화는 실제다.
+
+실측(이 머신, Task 202개):
+
+    이름으로만 조회            1.00 ~ 1.08s
+    이름 + 접두사(운영 경로)   1.30 ~ 1.36s     <- §8이 접두사를 더했다
+
+**그래도 바꾸지 않았다.** 근거:
+
+* renderer 계약이 `renderer(now)`이고 SCHEDULE은 **찍어야** 하므로 Lock 안에
+  있어야 한다. 밖으로 빼려면 `_block()` 시그니처를 바꾸거나(구조 변경) 모듈
+  전역을 스레드에서 갈아끼워야 한다(더 나쁘다).
+* 페이지는 **스스로 갱신하지 않는다**(이 파일 머리말의 결정). 사람이 연 한 번에
+  한 번 든다.
+* 탭 둘을 동시에 열면 두 번째가 0.8s 대신 2s쯤 기다린다. 그뿐이다.
+* 30초는 PowerShell이 걸렸을 때만 닿는 천장이고, 그 상태의 머신은 이미 다른
+  문제가 있다.
+
+**비례하지 않는 수정을 하지 않는 쪽을 골랐다.** 다만 `gather()`의 저 주석을
+읽고 "느린 것은 Lock 밖에 있다"고 믿을 다음 사람을 위해 숫자를 적어 둔다.
+
+---
+
+### 22. 승인 없이 할 수 없어 하지 않은 것
+
+* **실제 Task 등록.** 이 머신에 예약 작업을 만드는 것은 되돌려야 하는 시스템
+  변경이다. 대신 installer가 만드는 **명령줄 그 자체**를 `Start-Process`로
+  실행해 확인했다(Task Scheduler가 Action을 보는 방식과 같다) — 인자 0개,
+  종료 코드 통과, 공백 든 경로, 없는 python까지.
+* **E-1의 1~5**(실제 OneDrive 왕복, 실제 GitHub push, 실제 Notion 연결,
+  Developer Mode symlink) — 그대로 남아 있다.
+
+### 23. 남긴 것
+
+* SCHEDULE 블록은 `ops_status.py`가 **자기 밖의 상태**를 읽는 유일한 자리다.
+  `dashboard_server.py`에도 넣었다(§6) — 그때 "표시 계약 결정이라 SKIP"이라고
+  적었던 것이 틀렸다. 그 두 목록은 결정이 아니라 **`main()`과 맞추는 것이
+  없는 손목록**이었고, 빠져 있던 것은 선택이 아니라 드리프트였다.
+* 이미 등록된 Task의 Action 갱신은 **installer 재실행**이 필요하고, 그것은
+  운영자의 행동이다. 경보 문구가 그 명령을 그대로 적는다.
 
 ---
 

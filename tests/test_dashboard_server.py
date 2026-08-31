@@ -2207,7 +2207,7 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
                     )
 
     def test_the_roster_of_blocks_is_the_roster_of_renderers(self):
-        """`_BLOCKS` and `_RENDERERS` are two lists of the same six sections,
+        """`_BLOCKS` and `_RENDERERS` are two lists of the same sections,
         and a name in one and not the other is a `KeyError` at request
         time — on the page an operator opened because something looked
         wrong."""
@@ -2215,6 +2215,49 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
             [key for key, _title, _parity in dashboard_server._BLOCKS],
             list(dashboard_server._RENDERERS),
         )
+
+    def test_this_page_shows_every_block_the_terminal_tool_prints(self):
+        """The property those two hand-written lists could never give.
+
+        They are held in step with **each other** and with nothing else, and
+        this page exists to mirror `ops_status.py`. So a block added to the
+        tool reaches the terminal and silently never reaches the page — or
+        the Notion Control Tower, which `publish_control_tower.py` renders
+        from this same `gather()` payload. That is the seat for everyone who
+        does not open a terminal, and it would be missing a section with
+        nothing anywhere reporting the omission.
+
+        Measured: it had already happened. `ops_status.main()` grew a
+        SCHEDULE block and both lists here stayed at six, so the page and
+        the Notion page showed no scheduling state at all while the terminal
+        did (C138).
+
+        Derived from `main()` rather than restated, the same way
+        `test_observability.py`'s own roster guard is — a second hand-written
+        list would be a third thing to keep in step.
+        """
+        import inspect
+
+        source = inspect.getsource(ops_status.main)
+        printed = [
+            key
+            for key in re.findall(r'\(\s*"([A-Z][A-Z ]+)",\s*_print_\w+\)', source)
+        ]
+
+        self.assertTrue(printed, "the scan found no blocks — it has gone blind")
+        self.assertEqual(printed, list(dashboard_server._RENDERERS))
+
+    def test_the_renderers_are_the_tools_own_functions(self):
+        """Not a re-implementation. The page inherits `_block()`'s
+        damaged-tree guarantee and the tool's wording by using the same
+        callables, and a local copy of any of them would drift silently."""
+        for key, renderer in dashboard_server._RENDERERS.items():
+            with self.subTest(block=key):
+                self.assertIs(
+                    renderer,
+                    getattr(ops_status, renderer.__name__),
+                    f"{key} does not render through ops_status.{renderer.__name__}",
+                )
 
     def test_the_control_tower_block_is_the_one_kept_for_comparison(self):
         """The page renders the Control Tower twice on purpose — as panels,
@@ -2493,7 +2536,7 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
                 self.assertTrue(dashboard_server._attention_action(line))
 
     def test_every_shape_ops_status_can_raise_is_classified_and_actionable(self):
-        """The whole roster, not a sample.
+        """The assembled shapes, hand-written — and **not** the whole roster.
 
         `ops_status.py` builds these lines by f-string concatenation across
         several source lines, so grepping the file for a phrase does not
@@ -2501,6 +2544,22 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
         These are the assembled shapes. Before C133 four of the eleven came
         out `?`, including the open Blocker, which is the most actionable
         line this Dashboard shows.
+
+        **This docstring used to open "The whole roster, not a sample", and
+        C138 made that false without failing anything.** The SCHEDULE block
+        added ten alarms and joined none of them, which is what a
+        hand-written list does — measured by loading the rendered page, both
+        of its lines carried a `?` badge and no next action.
+
+        The reason above is still the reason this list is written by hand,
+        so it stays. What it cannot be is complete. `test_observability.py
+        ::TheScheduleBlockAsksWindowsWhatNoFileCanAnswerTests
+        ::test_every_alarm_this_block_raises_is_classified_and_actionable`
+        takes the other half for SCHEDULE: it **runs** the block through
+        each alarming state and classifies whatever comes out, so the
+        strings are still the assembled ones and a new alarm joins the sweep
+        the day it exists. A block that grows one is covered; a block whose
+        author writes a fresh hand-list is not.
 
         Ordering is checked implicitly and it matters: `RULES` is
         first-match-wins with P1 listed first, so a P2 shape that happens to

@@ -159,6 +159,10 @@ Get-ScheduledTaskInfo -TaskName DOJOONPASS_COMPANY_OPS_AGENT_<ID>   # LastTaskRe
 Start-ScheduledTask   -TaskName DOJOONPASS_COMPANY_OPS_AGENT_<ID>   # 지금 1회 실행
 ```
 
+**더 쉬운 방법은 `python ops_status.py`다.** SCHEDULE 블록이 세 Task를 한 번에
+보여주고, 마지막 실행이 실패했으면 그 실행이 화면에 찍은 것까지 같이 보여준다 —
+위 세 명령이 답하지 못하는 "왜 실패했는가"가 거기 있다.
+
 **PC가 계속 켜져 있을 필요는 없다.** 트리거는 로그온 2분 뒤 1회이며
 `StartWhenAvailable`이 켜져 있어 놓친 트리거는 다음 기회에 발화한다. 그것마저
 놓쳐도 Catch-up이 안전장치다 — 검증에서 밀린 6일치가 한 번의 실행으로
@@ -171,6 +175,14 @@ Start-ScheduledTask   -TaskName DOJOONPASS_COMPANY_OPS_AGENT_<ID>   # 지금 1�
 Desktop에 묶여 있을 수 있다. 그때 Agent는 실행을 거부하고 무엇이 어긋났는지
 알려준다. **state 파일을 직접 지우지 말 것** — 아직 수집되지 않은 날짜가
 조용히 건너뛰어질 수 있다.
+
+**`-DesktopId`를 바꿔 다시 설치하면 Task가 둘이 된다.** `-Force`는 *같은
+이름*만 대체하는데 이 Task 이름에는 Desktop ID가 들어 있기 때문이다. 둘 다
+로그온에 발화하고, 이 머신 것이 아닌 쪽은 매 실행 거부된다 — 안전하지만
+아무도 모르는 상태다. 스크립트가 등록 직전에 그것을 **경고하고**(미리보기
+`-WhatIf`에서도 나온다) 지우는 명령을 알려준다. 지우는 것은 사람이 한다.
+이미 그 상태가 된 머신은 `python ops_status.py`의 SCHEDULE 블록이 둘 다
+이름을 대며 보고한다.
 
 ---
 
@@ -375,7 +387,7 @@ python run_agent.py        # 수동 1회 실행
 ```
 
 `ops_status.py`는 아무것도 쓰지 않고 lock도 잡지 않는다. Runner나 Agent가
-도는 중에 실행해도 안전하다. **여섯 블록**을 보여준다.
+도는 중에 실행해도 안전하다. **일곱 블록**을 보여준다.
 
 **COMPANY** — Desktop 4가 수집한 Event 기준으로 각 Desktop의 마지막 소식,
 침묵 일수, 아직 수집되지 않은 backlog. backlog 줄에는 왜 그 숫자가 줄지 않는지도
@@ -480,6 +492,81 @@ COMPANY 블록의 키이기도 해서, 그것은 그 블록이 이미 말하는 
 실패한 단계와 **그 단계의 수치**(예: `queued=47`), 시작조차 못 한 단계,
 Runner Lock 상태. 마지막 실행이 너무 오래됐으면 그것도 여기서 걸린다.
 
+**SCHEDULE** — 이 머신의 Windows Task Scheduler 등록 상태. 나머지 블록이
+전부 **이 시스템이 쓴 파일**에서 나오는 데 반해 이것 하나만 Windows에게 직접
+묻는다. 그 차이가 이 블록의 존재 이유다: 예약된 Task가 프로세스를 **시작조차
+못 하면**(`python`이 PATH에 없다, 작업 디렉터리가 사라졌다, 암호 변경 뒤 Task가
+사용 안 함으로 바뀌었다) `runtime/` 아래에는 로그도 Manifest도 Lock도 남지
+않고, 그 트리는 **주말 동안 PC를 꺼 둔 것과 구별되지 않는다.** 유일한 증인이
+Windows다.
+
+`LAST RUN`의 "Runner가 N일째 실행되지 않았다 — Task Scheduler 등록 상태를
+확인해야 한다"가 사람에게 시키던 그 확인을, 이 블록이 대신 한다. 셋을 본다 —
+Runner(`DOJOONPASS_COMPANY_OPS_DAILY`), Control Tower publish
+(`DOJOONPASS_COMPANY_OPS_PUBLISH`), 이 머신의 Agent
+(`DOJOONPASS_COMPANY_OPS_AGENT_<ID>`). 각각에 대해 등록 여부·사용 안 함
+여부·마지막 실행 결과(`LastTaskResult` = 프로세스 종료 코드)·다음 실행 시각을
+찍는다.
+
+**publish만 "없어도 정상"이다.** Runner와 Agent는 일이 Company History가 되는
+경로이고, publish는 그 결과가 **터미널을 열지 않는 사람들에게** 닿는 경로다.
+브라우저 Dashboard(6d)를 보기로 한 운영자는 잘못 설정한 것이 아니므로, 등록되지
+않은 publish는 **사실로 적고 경보로 올리지 않는다** — 대신 등록하는 명령을 같이
+찍는다. 등록돼 있는데 **고장난** 것은 다른 이야기이고 나머지 둘과 똑같이
+경보다(exit 1 = Notion 자격증명 없음, exit 3 = 페이지는 갱신됐지만 주변 표면이
+빠졌다).
+
+마지막 실행이 실패했거나 중단됐을 때는 그 실행의 **콘솔 출력 끝 몇 줄**을
+같이 보여준다(`runtime\logs\scheduled_runner.log` /
+`scheduled_agent.log`). 이것이 그 실패의 유일한 기록인 경우가 있다 — 설정이
+빠져 exit 1로 끝난 실행은 `runtime/` 어디에도 아무것도 쓰지 않으므로, 어떤
+환경변수가 없었는지를 말해 주는 문장은 여기에만 있다. 파일 내용이므로 화면에
+찍기 전에 `redact()`를 거친다.
+
+다섯째로, 등록된 **Action 자체**도 본다. Task가 등록돼 있고 사용 중이고
+제때 돌면서도 **자기가 찍은 것을 전부 버릴 수** 있다 — C138 이전에 등록된
+Task가 전부 그렇다(Action이 리디렉션 없는 `python.exe <entrypoint>`였다).
+Windows는 저장소가 바뀌었다고 Action을 갱신하지 않으므로, 이것은 installer를
+다시 실행해야 고쳐진다(`-Force`, 멱등). 판단은 **리디렉션이 있는가**로 하지
+로그 파일 이름으로 하지 않는다 — 운영자가 다른 곳으로 보내는 것은 선택이고,
+아무 데도 안 보내는 것만이 문제다.
+
+여섯째로, 등록된 Action이 **어느 저장소를 실행하는지**도 본다. installer는
+절대 경로를 Task에 박아 넣고 Windows는 그것을 그대로 보관하므로, 저장소를
+옮기거나 이름을 바꾸거나 사본을 하나 더 만들면 Task는 **없는 디렉터리**를
+가리킨 채 남는다. 그 실패가 특히 나쁜 이유는 **설명에 닿을 수 없다**는 것이다 —
+로그 파일도 그 사라진 디렉터리 안에 있으므로 `>>`가 열지 못하고, cmd는 exit 1로
+끝나며, "파일을 열 수 없다"는 문장은 아무 데도 쓰이지 않는다. 화면에는
+`exit 1`과 빈 로그만 남는다. 그래서 등록된 경로를 이 저장소와 비교해서 말한다
+(대소문자 무시, `resolve()` 후 — 한 디렉터리의 두 철자를 사본 둘로 보고하면
+그것이야말로 거짓 경보다).
+
+일곱째는 이름으로 묻는 것만으로는 볼 수 없다. Agent Task 이름에는 Desktop
+ID가 들어 있으므로(`..._AGENT_DESKTOP_1`), `-DesktopId`를 바꿔 다시 설치하면
+**새 Task가 생기고 옛 Task가 남는다** — 둘 다 로그온에 발화하고, 이름으로
+하나씩 물어보면 **둘 다 "등록됨, 정상"이라고 답한다.** 그래서 접두사로도
+묻는다(`DOJOONPASS_COMPANY_OPS_AGENT_*`): 실제로 등록된 것이 무엇인지를
+이름을 몰라도 본다. 둘 이상이면 경보이고, 하나인데 이 머신의 Desktop ID와
+다르면 그것도 경보다. `agent_state.json`과 맞지 않는 쪽은 매 실행 거부되며,
+그 거부가 없다면 한 Desktop이 다른 Desktop의 수집 워터마크를 물려받아 그
+사이 날짜를 **조용히 건너뛴다**(`run_agent.py`가 그것을 길게 적어 두었다).
+경보 문구는 **state 파일을 지우라고 하지 않는다** — 그 도구가 거부하는 일을
+화면이 권할 수는 없다.
+
+ATTENTION으로 올라가는 것은 일곱이다 — **등록되지 않음**, **사용 안 함**,
+**마지막 실행이 실패로 끝남**, **Windows가 중단시킴**, **콘솔 출력을 버림**,
+**다른 저장소를 실행함**, **Agent Task가 둘이거나 다른 Desktop의 것임**. 올라가지 **않는** 것도
+그만큼 의도적이다: 갓 등록돼 아직 한 번도 돌지 않은 Task는 정상이고(설치
+직후의 모든 Task가 그 상태다), 지금 실행 중인 것도 정상이며, 조회 자체가
+실패했을 때는 **Task에 대해 아무 말도 하지 않는다**(화면에는 `UNKNOWN`과 그
+이유를 찍는다 — 답이 없다는 사실이 답이 있는 자리에 보여야 한다).
+
+Runner Task는 Desktop 4의 것이므로 Desktop 1~3에서는 "등록되지 않음"이 정상
+상태다. 이 머신이 Runner인지는 Runner만 남기는 흔적(Company History 트리 또는
+Run Manifest)으로 판단하고, **그 판단 근거를 읽지 못했으면 그것을 경보로
+올린다** — 판단할 수 없는 것을 "아니오"로 답하면 Desktop 4에서 이 경보가 조용히
+사라진다. 이 블록은 아무것도 등록·해제·시작하지 않는다(읽기 전용).
+
 **NOTION** — Notion에 아직 닿지 못한 것: Retry Queue에 남은 Event 수, 최대
 재시도 횟수, **가장 오래된 항목이 며칠째 남아 있는지**, 그리고 Operations
 Dashboard의 밀린 기록 수. 마지막 두 가지가 이 블록의 이유다 —
@@ -563,6 +650,7 @@ Get-ChildItem runtime\agent\outbox                    # 비어 있어야 정상
 Get-ChildItem runtime\agent\signals_rejected -Recurse # 사람이 봐야 할 것
 Get-Content runtime\agent\logs\agent.log -Tail 20
 Get-Content runtime\logs\daily_late_update.log        # Desktop 4: 늦게 도착한 Event
+Get-Content runtime\logs\scheduled_agent.log -Tail 30 # 예약 실행이 화면에 찍은 것
 ```
 
 `run_agent.py` 종료 코드: `0` 정상/skip, `1` 설정 오류, `2` 전송 실패(유실
@@ -573,13 +661,33 @@ Get-Content runtime\logs\daily_late_update.log        # Desktop 4: 늦게 도착
 Runner는 실패해도 대부분 **멈추지 않는다** — Notion이 죽어도, Monthly가
 깨져도, Dashboard가 안 되어도 Company History는 계속 기록된다(README RULE 5,
 RULE 9). 그래서 "돌긴 돌았는데 뭔가 안 됐다"를 알아내려면 로그를 봐야 한다.
-Runner가 Task Scheduler 뒤에서 돌면 stdout은 아무도 보지 않으므로, 실패는
-전부 아래 두 파일에 남는다.
+단계별 실패는 전부 아래 두 파일에 남는다.
 
 ```powershell
 Select-String FAILED runtime\logs\daily_late_update.log
 Select-String "DASHBOARD|REASON" runtime\logs\notion_sync.log
 ```
+
+**여기에 세 번째 파일이 생겼다(C138).** 위 둘은 파이프라인이 **자기 손으로 쓴**
+기록이므로, 파이프라인이 시작조차 못 한 실패는 여기에 남지 않는다 —
+`python`이 PATH에 없다, 작업 디렉터리가 사라졌다, `COMPANY_OPS_*`가 설정돼
+있지 않다. 그런 실행은 `runtime/` 어디에도 아무것도 쓰지 않고 끝나고, 그때
+남는 증거는 Task Scheduler의 종료 코드 하나뿐이었다.
+
+예전에는 그 실행의 콘솔 출력이 **버려졌다.** 등록되는 Action이
+`python.exe run_company_ops.py`였고 리디렉션이 없었기 때문이다. 이제
+installer가 `cmd.exe /c "... >> <로그> 2>&1"`로 등록하므로 그 출력이 남는다:
+
+```powershell
+Get-Content runtime\logs\scheduled_runner.log -Tail 30   # Desktop 4 Runner
+Get-Content runtime\logs\scheduled_agent.log  -Tail 30   # 이 머신의 Agent
+```
+
+**이미 등록된 Task는 자동으로 바뀌지 않는다** — installer를 다시 실행해야
+Action이 갱신된다(`-Force`이므로 재실행은 안전하고 멱등이다). 종료 코드는
+`cmd`를 그대로 통과하므로 `LastTaskResult`의 뜻은 달라지지 않는다(docs/14 §4).
+`ops_status.py`의 SCHEDULE 블록이 마지막 실행이 실패했을 때 이 파일의 끝
+몇 줄을 같이 보여준다.
 
 `daily_late_update.log` — Daily / Monthly 계열
 
@@ -899,6 +1007,20 @@ Dashboard와 **같은 모델**(`dashboard_server.gather()`)을 Notion 페이지 
 읽는 값은 `NOTION_API_TOKEN`과 `NOTION_PROJECTS_DATABASE_ID` 둘뿐이다 —
 `init_notion.py`가 읽는 그 둘이고, 이 도구만의 환경변수는 **없다.**
 
+**예약해 두면 사람이 실행하지 않아도 갱신된다.**
+
+```powershell
+.\scripts\install_publish_task.ps1 -WhatIf   # 먼저 미리보기
+.\scripts\install_publish_task.ps1
+```
+
+기본값은 매일 11:30(Runner 기본 11:00 뒤)과 로그온 10분 뒤다. 순서는
+**보장되지 않아도 안전하다** — 이 도구는 지역 증거를 읽고 자기 Notion 페이지만
+다시 쓰므로, Runner보다 먼저 돌면 몇 분 동안 조금 오래된 숫자를 보여주고 다음
+트리거가 바로잡는다. 스크립트는 환경변수를 **하나도** 쓰지 않는다(둘 다
+비밀이다). 자격증명이 없으면 그 Task는 매일 exit 1로 끝나고, 그것은
+`ops_status.py`의 SCHEDULE 블록에 로그 끝 몇 줄과 함께 나타난다.
+
 **어디에 쓰는가 — 세 군데다 (C106).**
 
 | 표면 | 무엇 | 사람이 언제 보는가 |
@@ -1037,6 +1159,21 @@ Blocker가 없는 것이 아니라 **셀 Event가 없다.** 이제 `판정 보�
 실측상 8개 Row 전부 비어 있었다. 그래도 "배정 안 됨"이 "우리 것"은 아니므로
 `[CT]`로 시작하지 않는 값은 **절대 덮어쓰지 않는다** (실측: COO 메모를 넣고 실행 →
 그 Row만 건너뛰고 메모 그대로, 이름 보고).
+
+> **그런데 그 열은 이 저장소가 만들지 않는다 (C139).** `init_notion.py`가 만드는
+> Property는 `bootstrap.TARGET_PROPERTIES`의 **11개**이고 `Notes`는 그 안에 없다.
+> 지금 되는 이유는 이 Workspace의 PROJECTS가 Notion 기본 템플릿으로 만들어졌기
+> 때문이고, docs/13 §5가 그 셋(`Date`/`Notes`/`Tags`)을 **잔재**라고 부른다 —
+> 즉 정리하기 좋아하는 사람이 지울 수 있는 열이다.
+>
+> 없으면 어떻게 되는가: Notion이 400을 돌려주고
+> `publish_control_tower.py`가 `NotionAPIError`를 **비치명적으로** 받아
+> `실행 상태: DEGRADED — … Notes 열`로 매번 끝난다. **보이고, 범위가
+> 한정된다** — 그래서 결함이 아니라 **기록된 의존성**이다. 열을 만드는 것은
+> docs/04 §43의 11개 계약을 바꾸는 일이라 승인이 필요하다.
+>
+> `EveryProjectsColumnAWriterTouchesIsOwnedTests`가 이 관계를 지킨다: publish가
+> 쓰는 열은 bootstrap이 만들거나, 이 명부에 이유와 함께 있어야 한다.
 
 **`Date` / `Tags`는 비워 둔다.** docs/13 §5이 정체를 적어 두었다 — PROJECTS는
 Notion 기본 템플릿으로 만들어졌고 `Date`/`Notes`/`Tags` 셋은 그 잔재다("무해").

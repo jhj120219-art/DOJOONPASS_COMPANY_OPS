@@ -136,6 +136,166 @@ class GitProhibitionGuardTests(unittest.TestCase):
         "rev-list --count @{u}..HEAD": "commits the upstream does not have",
     }
 
+    #: git commands run **outside** `backup/git_ops.py`, and why each is
+    #: admissible. Same rule as `APPROVED_COMMANDS`: a reason per entry.
+    #:
+    #: **This roster exists because the gate above could not see them.**
+    #: `test_git_ops_runs_only_the_approved_command_set` reads exactly one
+    #: file, so its sentence -- "adding any new git command must be a
+    #: deliberate, reviewed act" -- was true of `backup/git_ops.py` and of
+    #: nothing else. Measured: two invocations in `ops_status.py`, neither
+    #: reviewed by anything.
+    #:
+    #: That is the scope question BACKLOG E-0a raises and C135 answered five
+    #: times ("규칙은 옳고 그 규칙이 보는 범위가 좁다") -- `DependencyGuardTests`
+    #: and `ADeeplyNestedStateFileReadsLikeAnyOtherCorruptOneTests` were both
+    #: widened to reach the root entrypoints for exactly this reason.
+    #:
+    #: It matters more here than the file count suggests: both of these run
+    #: with `cwd=` the **Backup Working Copy**, which is a real git
+    #: repository holding Company History. `ops_status.py` is a read-only
+    #: diagnostic and a dozen tests say so, but none of them said anything
+    #: about which git commands it may run.
+    APPROVED_COMMANDS_ELSEWHERE = {
+        "ops_status.py": {
+            "ls-files -c -o --exclude-standard": (
+                "Which of the secret-shaped candidate files git actually "
+                "tracks or would track, so the ATTENTION line names files "
+                "that could reach the remote rather than every match on "
+                "disk. Read-only: lists index and worktree entries, changes "
+                "neither."
+            ),
+            "rev-list --all --objects": (
+                "Whether a secret-shaped name was ever committed -- the "
+                "question `_secrets_ever_committed()` exists to answer, and "
+                "the reason it cannot be answered from the working tree "
+                "alone. Read-only: walks history, touches no ref."
+            ),
+        },
+    }
+
+    @staticmethod
+    def _direct_git_invocations():
+        """`{file: {command}}` for `subprocess.run(["git", ...])` anywhere.
+
+        A second scan rather than a widened regex, because the two shapes
+        are genuinely different: `git_ops.py` funnels everything through
+        `_run_git(["status", ...])` and its argument list is unpacked
+        (`["git", *args]`), so the command words are not literals there. A
+        direct call spells the whole command out, and that is what this
+        reads.
+
+        By AST, so a call split across lines -- which both of the real ones
+        are -- is seen the same as a one-liner.
+        """
+        import ast
+
+        found = {}
+        paths = [p for p in SRC.rglob("*.py") if "__pycache__" not in p.parts]
+        paths += sorted(REPO_ROOT.glob("*.py"))
+        for path in paths:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if getattr(node.func, "attr", None) != "run":
+                    continue
+                if not node.args or not isinstance(node.args[0], ast.List):
+                    continue
+                elements = node.args[0].elts
+                if not elements or not isinstance(elements[0], ast.Constant):
+                    continue
+                if elements[0].value != "git":
+                    continue
+                if any(isinstance(element, ast.Starred) for element in elements):
+                    # `_run_git`'s own `["git", *args]`. The command words
+                    # are not here at all -- they are in each `_run_git()`
+                    # call, which is what the first roster reads. Counting
+                    # this would add an empty command to every scan and say
+                    # nothing about what git_ops.py actually runs.
+                    continue
+                words = [
+                    element.value
+                    for element in elements[1:]
+                    if isinstance(element, ast.Constant)
+                ]
+                found.setdefault(path.name, set()).add(" ".join(words))
+        return found
+
+    def test_the_scan_finds_the_direct_invocations(self):
+        """Guards the guard. The assertion below is an equality against a
+        scan, and a scan that stopped matching would make the roster look
+        complete while reviewing nothing."""
+        found = self._direct_git_invocations()
+
+        self.assertIn("ops_status.py", found)
+        self.assertIn("ls-files -c -o --exclude-standard", found["ops_status.py"])
+
+    def test_the_two_scans_do_not_overlap(self):
+        """`git_ops.py` must keep funnelling through `_run_git()`. If a
+        direct `subprocess.run(["git", ...])` appeared there it would be
+        reviewed by neither roster -- the first reads `_run_git` calls, the
+        second is declared to be about the other files."""
+        self.assertNotIn("git_ops.py", self._direct_git_invocations())
+
+    def test_every_git_command_run_outside_git_ops_is_approved(self):
+        """The property the original gate's sentence claimed and its scope
+        did not deliver."""
+        found = self._direct_git_invocations()
+
+        for name, commands in sorted(found.items()):
+            with self.subTest(file=name):
+                approved = set(self.APPROVED_COMMANDS_ELSEWHERE.get(name, {}))
+                self.assertEqual(
+                    commands - approved,
+                    set(),
+                    f"{name} runs git commands nothing reviews: "
+                    f"{sorted(commands - approved)}",
+                )
+
+    def test_the_elsewhere_roster_names_nothing_that_is_gone(self):
+        """A stale entry is a standing permission for a command nobody
+        runs, and it would silently cover a new one that took its name."""
+        found = self._direct_git_invocations()
+
+        for name, commands in sorted(self.APPROVED_COMMANDS_ELSEWHERE.items()):
+            with self.subTest(file=name):
+                self.assertEqual(set(commands) - found.get(name, set()), set())
+
+    def test_every_command_run_outside_git_ops_is_read_only(self):
+        """The rule docs/08 section 5 states for the Backup, applied where
+        it matters most.
+
+        `backup/git_ops.py` is *allowed* three writing commands because
+        writing the backup is its job. Nothing outside it has that job --
+        and both of these run against the Backup Working Copy, a real
+        repository holding Company History. A write from a diagnostic would
+        be a change made by the one tool an operator trusts to change
+        nothing.
+        """
+        writers = {"add", "commit", "push", "checkout", "reset", "clean",
+                   "gc", "rm", "mv", "merge", "rebase", "fetch", "pull",
+                   "remote", "branch", "tag", "stash", "restore", "switch",
+                   "apply", "cherry-pick", "revert", "prune", "repack"}
+
+        for name, commands in sorted(self._direct_git_invocations().items()):
+            for command in sorted(commands):
+                with self.subTest(file=name, command=command):
+                    self.assertNotIn(
+                        command.split()[0] if command else "",
+                        writers,
+                        f"{name} runs a writing git command",
+                    )
+
+    def test_every_elsewhere_entry_carries_its_reason(self):
+        for name, commands in sorted(self.APPROVED_COMMANDS_ELSEWHERE.items()):
+            for command, reason in sorted(commands.items()):
+                with self.subTest(file=name, command=command):
+                    self.assertGreater(
+                        len(reason.strip()), 60, f"{command} has no stated reason"
+                    )
+                    self.assertIn("ead-only", reason)
+
     def test_git_ops_runs_only_the_approved_command_set(self):
         """A closed inventory. Adding any new git command to git_ops.py must
         be a deliberate, reviewed act — this test is the review gate."""

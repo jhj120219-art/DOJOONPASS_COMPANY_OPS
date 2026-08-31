@@ -11,6 +11,10 @@
                At log on (docs/11 section 20's Startup Catch-up, for the
                mornings the PC was off at 11:00).
     Action:    python run_company_ops.py, once, then the process exits.
+               Its console output is appended to
+               runtime\logs\scheduled_runner.log -- see the block above
+               $commandLine for why a scheduled run with nowhere to
+               print is a run whose failure has no explanation anywhere.
 
     The Runner is the one machine-level job that turns collected Events into
     Company History, backs it up, and syncs Notion. Until this script
@@ -74,7 +78,6 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $entrypoint = Join-Path $repoRoot 'run_company_ops.py'
-$taskName = 'DOJOONPASS_COMPANY_OPS_DAILY'
 
 if (-not (Test-Path -LiteralPath $entrypoint)) {
     throw "run_company_ops.py not found at $entrypoint - run this script from the repository's scripts\ directory."
@@ -84,6 +87,58 @@ $python = (Get-Command python -ErrorAction SilentlyContinue)
 if ($null -eq $python) {
     throw 'python was not found on PATH. Install Python or add it to PATH before registering the task.'
 }
+
+# ------------------------------------------------------------------------
+# The task name and its log file, asked of the one place that defines them.
+#
+# Both used to be literals here as well as in `src/schedtask.py`, kept in
+# step by a test that read the two and compared them. That test could only
+# ever *detect* the drift; it could not stop it, and a repository that keeps
+# removing hand-written rosters should not have added one across two
+# languages.
+#
+# `schedtask` is the source rather than these scripts because it is the side
+# that reasons about the values -- `ops_status.py` has to know the name to
+# query Windows for it, `scheduled_log_name()` maps name to log, and
+# `agent_task_name()` builds the per-Desktop form. PowerShell only writes
+# them down once, at install time.
+#
+# No new dependency: this script already requires python on PATH and already
+# bakes `$python.Source` into the action it registers.
+#
+# **Failing here is the right failure.** If `import schedtask` does not work
+# from this checkout, the task this script would register runs an
+# entrypoint that imports the same tree every morning. Refusing to register
+# is better than registering something that cannot run, and the check costs
+# one interpreter start.
+$srcDir = Join-Path $repoRoot 'src'
+$taskProbe = @"
+import sys
+sys.path.insert(0, r'$srcDir')
+import schedtask
+name = schedtask.RUNNER_TASK_NAME
+print(name)
+print(schedtask.scheduled_log_name(name))
+"@
+$taskFacts = @(& $python.Source -c $taskProbe)
+if ($LASTEXITCODE -ne 0 -or $taskFacts.Count -lt 2 -or
+    [string]::IsNullOrWhiteSpace($taskFacts[0]) -or
+    [string]::IsNullOrWhiteSpace($taskFacts[1])) {
+    throw @"
+Could not read the task name from src\schedtask.py.
+
+  python  : $($python.Source)
+  src     : $srcDir
+  output  : $($taskFacts -join ' | ')
+
+That module is where this project defines the scheduled task names and the
+log each one writes. If it cannot be imported from this checkout, the task
+this script would register would run an entrypoint that imports the same
+tree -- so nothing is registered.
+"@
+}
+$taskName = $taskFacts[0].Trim()
+$logFileName = $taskFacts[1].Trim()
 
 # Refused rather than warned about, unlike the Agent's -SyncFolder. A date
 # the Runner cannot read stops the run at its configuration check every
@@ -106,9 +161,80 @@ if ($PSCmdlet.ShouldProcess('user environment', 'Set COMPANY_OPS_HISTORY_START_D
     [Environment]::SetEnvironmentVariable('COMPANY_OPS_HISTORY_START_DATE', $HistoryStartDate, 'User')
 }
 
+# ------------------------------------------------------------------------
+# Where the scheduled run's console output goes.
+#
+# It went nowhere. The action was `python.exe <entrypoint>` with no
+# redirection, so a scheduled task's stdout and stderr were written to
+# handles nothing was reading and discarded.
+#
+# That is not a cosmetic loss, and the repository already knew it: five
+# entrypoints carry a measured comment about `line_buffering=True` being
+# needed because "under `> log 2>&1`, which is how a scheduled run is
+# captured, the two streams reorder against each other". They were
+# protecting the ordering of output that no installer ever captured.
+#
+# What is lost with it is the whole of the diagnosis for the failures that
+# happen OUTSIDE the application. Everything `ops_status.py` can tell you is
+# derived from files this system wrote; a run that dies before it writes any
+# of them leaves nothing but a `LastTaskResult` number:
+#
+#     python not on PATH             cmd: the system cannot find the path
+#     working directory gone         Python: can't open file '...'
+#     an import failure              a traceback, and nothing else, anywhere
+#     COMPANY_OPS_* unset            [FAILED] <name> is not set  (exit 1)
+#
+# The last one is the likeliest of the four and the worst: it exits 1 every
+# single morning, writes nothing under `runtime/`, and the sentence naming
+# the missing variable is printed to a stream that is thrown away.
+#
+# `cmd.exe /c` rather than a PowerShell wrapper: it is the smallest thing
+# that can redirect, and -- measured, because the whole point is that the
+# exit code stays meaningful -- it returns the child's exit code unchanged:
+#
+#     cmd /c ""python.exe" "prog.py" >> "log" 2>&1"   ->  7   (prog exits 7)
+#     ...with a python.exe that does not exist         ->  1, and the log
+#                                                          says which path
+#
+# So `LastTaskResult` keeps meaning what docs/14 section 4 says it means, and the
+# SCHEDULE block in `ops_status.py` keeps reading it the same way.
+#
+# Appended, not overwritten. The record of a failure is exactly what this
+# exists to stop losing, and `>` would let the next morning's run erase
+# yesterday's traceback. The volume is bounded by how often the task fires
+# (twice a day at most) times a few dozen lines, which is smaller than
+# `collector.log`, whose growth BACKLOG section D measured and found immaterial at
+# this scale.
+$logDir = Join-Path $repoRoot 'runtime\logs'
+$logPath = Join-Path $logDir $logFileName
+
+# `>>` fails if the directory is absent, and `runtime/` is git-ignored -- so
+# on a fresh clone it does not exist until something creates it. Without
+# this line the first scheduled run on a new machine would fail at the
+# redirection itself, which is the opposite of what the redirection is for.
+# `-WhatIf` propagates into `New-Item` from this script's CmdletBinding, so
+# a preview still creates nothing.
+if (-not (Test-Path -LiteralPath $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
+# `$env:ComSpec` rather than the bare name, so the action does not depend on
+# PATH resolution inside a service-started task; the fallback is the one
+# fixed location Windows guarantees.
+$comspec = $env:ComSpec
+if ([string]::IsNullOrWhiteSpace($comspec)) {
+    $comspec = Join-Path $env:SystemRoot 'System32\cmd.exe'
+}
+
+# The entrypoint still receives NO arguments -- every tool here refuses ones
+# it cannot honour (`cli.unexpected_arguments`), so an extra token would
+# make the task exit 1 forever. Everything after the entrypoint is cmd's
+# redirection, which cmd consumes and never passes on.
+$commandLine = '/c ""{0}" "{1}" >> "{2}" 2>&1"' -f $python.Source, $entrypoint, $logPath
+
 $action = New-ScheduledTaskAction `
-    -Execute $python.Source `
-    -Argument "`"$entrypoint`"" `
+    -Execute $comspec `
+    -Argument $commandLine `
     -WorkingDirectory $repoRoot
 
 # docs/07 section 4: the regular run. No delay -- it already names a

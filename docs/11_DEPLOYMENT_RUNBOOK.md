@@ -377,10 +377,62 @@ Installer가 C13에서 치른 대가다), `MultipleInstances=IgnoreNew`(docs/07 
 `StartWhenAvailable`(§20의 목적), logon trigger 지연(docs/07 §54),
 그리고 등록됐다고 보고했지만 실제로 없는 경우의 검출.
 
+**콘솔 출력의 목적지도 함께 등록한다.** Action은
+`python.exe run_company_ops.py`가 아니라
+
+    cmd.exe /c ""<python>" "<entrypoint>" >> "<repo>\runtime\logs\scheduled_runner.log" 2>&1"
+
+이다. 리디렉션이 없으면 예약 실행이 화면에 찍는 것은 아무도 읽지 않는 핸들로
+가서 사라지고, **애플리케이션이 파일을 하나도 쓰기 전에 죽는 실패**는 종료
+코드 말고 아무 흔적도 남기지 않는다 — `python`이 PATH에 없다, 작업 디렉터리가
+사라졌다, `COMPANY_OPS_*`가 없다(매일 아침 exit 1). 종료 코드는 `cmd`를 그대로
+통과하므로 `LastTaskResult`의 뜻은 docs/14 §4 그대로다.
+
+Agent도 같으며 로그 파일만 `scheduled_agent.log`로 다르다.
+
+**이미 등록돼 있는 Task는 저장소를 갱신해도 바뀌지 않는다** — Windows는 받은
+Action을 그대로 보관한다. 설치 스크립트를 다시 실행하면 갱신되고(`-Force`,
+멱등), `ops_status.py`가 갱신되지 않은 Task를 "콘솔 출력을 버린다"로 보고한다.
+
 **Notion 자격증명은 이 스크립트가 다루지 않는다.** `NOTION_API_TOKEN`은 비밀이고
 매개변수로 받으면 명령줄·프로세스 목록·PowerShell 기록에 남는다. 운영자가 직접
 설정하며, 없으면 Notion Sync만 건너뛰고 수집·Company History·Backup은 정상
 동작한다(`python ops_status.py`가 부재를 보고한다).
+
+---
+
+# 19b. D4 — Control Tower publish 설치 (선택)
+
+Notion Control Tower 페이지는 **터미널을 열지 않는 사람들**이 보는 자리다.
+그런데 그 페이지는 사람이 `publish_control_tower.py`를 실행할 때만 갱신된다 —
+예약해 두지 않으면 "워크스페이스가 보는 상태"는 누군가 마지막으로 터미널을 연
+날의 상태다.
+
+Task:
+
+    DOJOONPASS_COMPANY_OPS_PUBLISH
+
+```powershell
+cd scripts
+powershell -ExecutionPolicy Bypass -File .\install_publish_task.ps1 -WhatIf
+```
+
+기본 Trigger는 매일 11:30(§19의 11:00 뒤)과 로그온 10분 뒤다. **Runner와의
+순서는 보장되지 않으며 그래도 안전하다** — 이 도구는 지역 증거를 읽고 자기
+Notion 페이지만 다시 쓴다. Event를 쓰지 않고, Lock을 잡지 않으며, `runtime\`
+아래 아무것도 건드리지 않는다. Runner보다 먼저 돌면 몇 분 동안 조금 오래된
+숫자를 보여주고 다음 트리거가 바로잡는다.
+
+**이 스크립트는 환경변수를 하나도 쓰지 않는다.** `NOTION_API_TOKEN`과
+`NOTION_PROJECTS_DATABASE_ID`는 비밀이고 매개변수로 받으면 명령줄·프로세스
+목록·PowerShell 기록에 남는다. 둘이 없으면 이 Task는 매일 exit 1로 끝나며,
+그것은 조용하지 않다 — `python ops_status.py`의 SCHEDULE 블록이 종료 코드와
+`runtime\logs\scheduled_publish.log`의 끝 몇 줄을 함께 보여준다.
+
+**선택이라고 적은 이유.** §19의 Runner와 Agent는 일이 Company History가 되는
+경로이고 없으면 시스템이 돌지 않는다. 이것은 결과가 보이는 경로이고, 브라우저
+Dashboard(AGENT.md §6d)로 대신할 수 있다. 그래서 `ops_status.py`도 등록되지
+않은 publish를 경보로 올리지 않고 사실로만 적는다.
 
 ---
 
@@ -413,6 +465,27 @@ Installer가 C13에서 치른 대가다), `MultipleInstances=IgnoreNew`(docs/07 
     Duplicate Run
 
     Catch-up
+
+**등록 상태는 손으로 Task Scheduler를 열지 않고 확인한다.**
+
+```powershell
+python ops_status.py        # SCHEDULE 블록
+```
+
+이 블록만이 이 시스템의 **밖**을 본다. 나머지 블록은 전부 파이프라인이 쓴
+파일에서 나오므로, 프로세스를 시작조차 못 한 예약 실행에 대해서는 아무 말도
+할 수 없다. SCHEDULE은 Windows에게 직접 물어 등록 여부·사용 여부·마지막 실행
+결과(`LastTaskResult` = 프로세스 종료 코드)·다음 실행 시각을 보여주고, 마지막
+실행이 실패했으면 그 실행의 콘솔 로그 끝 몇 줄을 같이 띄운다.
+
+등록 직후 정상인 모습(아직 한 번도 돌지 않았다):
+
+    Runner : DOJOONPASS_COMPANY_OPS_DAILY — NEVER_RUN
+             상태 Ready · 아직 실행된 적 없음 · 다음 실행 2026-08-11T11:00:00+09:00
+
+`Start-ScheduledTask`로 한 번 돌린 뒤 다시 보면 `HEALTHY`가 되고,
+`runtime\logs\scheduled_runner.log`에 그 실행의 출력이 남아 있어야 한다.
+남아 있지 않으면 §19의 리디렉션이 등록되지 않은 것이다.
 
 ---
 

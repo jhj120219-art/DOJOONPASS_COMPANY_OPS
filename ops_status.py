@@ -131,6 +131,12 @@ from scheduler.consistency import (  # noqa: E402
 )
 from oplog import bounded, one_line, redact  # noqa: E402
 
+# The only reader in this repository of state that lives outside it.
+# Every other block here is derived from files this system wrote, and
+# that is exactly the evidence a task which never started the process
+# does not produce. A leaf, so it adds no edge that could form a cycle.
+import schedtask  # noqa: E402
+
 # The same compiled rule the Agent refuses a Signal with and `redact()`
 # scrubs a log line with. A second opinion about what a secret looks like is
 # how the door that refuses and the door that reports drift apart (C28).
@@ -5327,6 +5333,519 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
     return attention
 
 
+
+# The Task Scheduler query, behind one name so a test can answer it without a
+# subprocess and without a task existing. The same shape as the `run`
+# parameter `schedtask.query()` already takes, one level up: this block is
+# reached through `_block()`, which passes only `now`.
+SCHEDULE_QUERY = schedtask.query
+
+#: Which installer registers each task SCHEDULE reports on. Two messages in
+#: `_print_schedule()` name a script an operator is told to run, and a
+#: message that names the wrong one sends them to register the wrong job.
+_SCHEDULE_INSTALLERS = {"Runner": "runner", "Agent": "agent", "Publish": "publish"}
+
+
+def _scheduled_desktop_id() -> str | None:
+    """Which Agent task name this machine's Agent would have been given.
+
+    `COMPANY_OPS_PROFILE` first, because that is the variable
+    `install_agent_task.ps1` writes at the same moment it builds the task
+    name out of the same `-DesktopId` — so where a task exists, this is the
+    value it was named after.
+
+    `agent_state.json` second, for the machine where the task is registered
+    but the variable was lost (a new shell, a profile that was never
+    reloaded, an operator running this from an editor). The state file's
+    `desktop_id` is written by the Agent itself and `ensure_desktop()`
+    refuses to let it drift, so it names the same Desktop.
+
+    `None` when neither answers: this block then says it cannot check rather
+    than checking a guessed name and reporting a real task as missing.
+    """
+    from_environment = os.environ.get("COMPANY_OPS_PROFILE", "").strip()
+    if from_environment:
+        return from_environment
+    try:
+        raw = json.loads(
+            (_agent_dir() / "state" / "agent_state.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, RecursionError):
+        # `RecursionError` for BUG-40's reason, the same as every other
+        # `json.loads` in this file: deeply nested JSON raises it rather than
+        # `ValueError`, and this view must answer even when the evidence is
+        # damaged. The state file being unreadable is already reported by the
+        # AGENT block; it must not also take this one down.
+        return None
+    if not isinstance(raw, dict):
+        return None
+    desktop_id = raw.get("desktop_id")
+    if isinstance(desktop_id, str) and desktop_id.strip():
+        return desktop_id.strip()
+    return None
+
+
+def _this_machine_runs_the_runner() -> tuple[bool, tuple[str, ...]]:
+    """Whether Desktop 4's daily task belongs on this machine.
+
+    Desktops 1-3 run only the Agent, so "DOJOONPASS_COMPANY_OPS_DAILY is not
+    registered" is the correct state there, and raising it would be a false
+    alarm on three machines out of four — the kind that gets a whole block
+    ignored.
+
+    Decided from evidence the Runner leaves and nothing else does: the
+    Company History tree it writes, or a Run Manifest from a run that
+    happened. `_print_agent()` makes the mirror-image judgement from
+    `runtime/agent` existing, and this follows it deliberately rather than
+    inventing a second convention.
+
+    The cost of the remaining error is asymmetric and points this way. On a
+    Desktop 4 that has never run, this answers False and the block raises
+    nothing — one quiet morning until the first run, after which it is right
+    forever. Answering True everywhere would put a permanent false ATTENTION
+    on the three Desktops that must never see one.
+
+    **Returns the probes it could not read, and that is not decoration.**
+    Both `is_dir()` and `is_file()` re-raise `EACCES` (only the "not there"
+    family is swallowed by `pathlib`), and the first draft of this function
+    answered a refused probe with `pass` — so a permission change under
+    `runtime/` made Desktop 4 look like Desktop 1, and the "Runner 예약
+    실행이 등록돼 있지 않다" alarm went quiet for the exact machine it exists
+    to protect. `ASilentlyDroppedEntryIsARosterNotAParagraphTests` caught it
+    on the first run, which is what that class is for.
+    """
+    unreadable: list[str] = []
+    for probe, is_present in (
+        (RUNTIME_DIR / "local_master", Path.is_dir),
+        (DEFAULT_RUN_SUMMARY_PATH, Path.is_file),
+    ):
+        try:
+            if is_present(probe):
+                return True, ()
+        except OSError as exc:
+            unreadable.append(f"{probe.name}: {exc.strerror or exc}")
+    return False, tuple(unreadable)
+
+
+
+#: How many trailing lines of a scheduled run's console log SCHEDULE prints.
+#:
+#: Small on purpose. This is a status screen, not a log viewer, and the
+#: useful part of a failed run's output is at the end -- the traceback's last
+#: line, or the `[FAILED] ...` sentence. The file itself is named so an
+#: operator can read the rest.
+_SCHEDULED_LOG_TAIL_LINES = 5
+
+#: How much of the end of that file is read to find those lines.
+#:
+#: **The first draft read the whole file**, and that file is the one thing
+#: this Sprint added with no bound on its size. It is appended to on every
+#: scheduled run and nothing trims it (a retention policy for this system's
+#: growing files is an open decision — BACKLOG E-2). At the daily cadence
+#: the task fires that is a few megabytes a year, which is nothing; the case
+#: that is not nothing is a task failing in a loop, or a run printing a
+#: traceback per Event, which is exactly when an operator opens this screen.
+#:
+#: A diagnostic that reads an unbounded file into memory to print five lines
+#: of it is the shape BUG-40 already cost this project once — one oversized
+#: input taking down the tool people reach for when something else is
+#: already broken. 64 KB holds far more than five lines of anything.
+_SCHEDULED_LOG_TAIL_BYTES = 64 * 1024
+
+
+def _tail_bytes(path: Path) -> str:
+    """The last `_SCHEDULED_LOG_TAIL_BYTES` of `path`, decoded.
+
+    Binary and seeked rather than `read_text()`, so the cost does not grow
+    with a file nothing trims. See `_SCHEDULED_LOG_TAIL_BYTES`.
+
+    The first line of the window is dropped when the window did not start at
+    the beginning of the file: a byte offset lands mid-line, and mid-line is
+    also mid-character in UTF-8 — `errors="replace"` would render the
+    fragment as replacement characters and the report would print a line
+    that was never written. Dropping one line to print four true ones is the
+    right trade for a screen that exists to be believed.
+    """
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        window = min(size, _SCHEDULED_LOG_TAIL_BYTES)
+        handle.seek(size - window)
+        raw = handle.read(window)
+    text = raw.decode("utf-8", errors="replace")
+    if window < size:
+        _, _, text = text.partition("\n")
+    return text
+
+
+def _scheduled_log_tail(
+    task_name: str, status=None
+) -> "tuple[Path | None, tuple[str, ...], str | None]":
+    """The end of the console log this task's scheduled action appends to.
+
+    Returns `(path, lines, problem)`. `path` is `None` for a task neither
+    installer registers — there is no log to name, and naming one would send
+    an operator looking for evidence that was never written.
+
+    **Why this is worth printing at all.** Every other line in this report
+    comes from a file the pipeline wrote. The failures this block exists to
+    catch are the ones where the pipeline never ran: `python` off PATH, a
+    moved working directory, an unset `COMPANY_OPS_*`. Those leave a
+    `LastTaskResult` and nothing else — the number says "exit 1" and this
+    file says *which variable was missing*. The installers redirect the
+    action's output here precisely so that sentence survives (C138).
+
+    `redact()` as well as `one_line()` and `bounded()`, unlike this file's
+    ATTENTION sink: this is a file's **contents**, not a filename or a count,
+    and `run_company_ops.py` prints Notion failure reasons — remote response
+    bodies — straight to the stream that lands in it.
+    """
+    # The path the *registered action* redirects to, when it can be read,
+    # and only then the one this repository's installer would have used.
+    #
+    # The order matters and the reason is the same one `redirect_target()`
+    # gives: an operator may have pointed the output somewhere of their own
+    # choosing, and a report that showed them our path instead would send
+    # them looking for a file that was never written. Falling back to the
+    # installer's name covers the machine whose action this could not read.
+    registered = schedtask.redirect_target(
+        getattr(status, "action_command", None)
+    )
+    if registered:
+        path = Path(registered)
+    else:
+        name = schedtask.scheduled_log_name(task_name)
+        if name is None:
+            return None, (), None
+        path = RUNTIME_DIR / "logs" / name
+    try:
+        text = _tail_bytes(path)
+    except FileNotFoundError:
+        # Not damage. The task has never produced output, or was registered
+        # by an installer older than the redirection. Said as itself, because
+        # "no log" and "an unreadable log" call for different actions.
+        return path, (), "아직 기록이 없다"
+    except OSError as exc:
+        return path, (), bounded(str(exc.strerror or exc))
+    lines = [line for line in text.splitlines() if line.strip()]
+    # `bounded` OUTSIDE `redact`, not inside it. The first draft here read
+    # `redact(one_line(bounded(line)))`, which cuts the line before anything
+    # has looked for a secret — a token straddling the cut is then never
+    # matched and its head is printed. Every pattern in `SECRET_RE` has a
+    # minimum length, so truncating first is exactly how to defeat it.
+    # `test_oplog.py::BoundingBeforeRedactingDefeatsItTests` caught it, which
+    # is the whole reason that gate sweeps production modules rather than
+    # trusting each writer to remember the order.
+    return path, tuple(
+        bounded(redact(one_line(line)))
+        for line in lines[-_SCHEDULED_LOG_TAIL_LINES:]
+    ), None
+
+
+def _entrypoint_is_another_checkout(status) -> str | None:
+    """The action's entrypoint when it is not this checkout's, else `None`.
+
+    `None` also when it cannot be told — an unreadable action, an
+    unparseable path. This produces an ATTENTION line accusing the operator
+    of having two copies, and that accusation must rest on two paths this
+    actually compared.
+
+    Compared case-insensitively and through `resolve()`, because Windows
+    treats `C:/Repo` and `c:/repo` as one directory and because either
+    side can arrive with `..` or a short (8.3) component. Two spellings of
+    one directory reported as two checkouts would be a false alarm about the
+    one thing that stops every scheduled run.
+    """
+    entrypoint = schedtask.action_entrypoint(
+        getattr(status, "action_command", None)
+    )
+    if not entrypoint:
+        return None
+    try:
+        registered_root = Path(entrypoint).resolve().parent
+        here = PROJECT_ROOT.resolve()
+    except OSError:
+        # A path on a disconnected drive cannot be resolved, and "I could not
+        # check" must not be reported as "it points somewhere else".
+        return None
+    if str(registered_root).casefold() == str(here).casefold():
+        return None
+    return entrypoint
+
+
+def _print_schedule(now: datetime) -> list[str]:
+    """SCHEDULE — is anything actually going to start tomorrow morning?
+
+    Every other block in this report is derived from files this system wrote,
+    which makes all of them blind to the same thing: a scheduled task that
+    never starts the process leaves no file to read. `python` off PATH, a
+    working directory that moved, a task disabled after a password change —
+    the process dies before `oplog` opens anything, and `runtime/` is then
+    indistinguishable from a machine that was switched off for the weekend.
+
+    Windows is the only witness to that, and LAST RUN's staleness message has
+    been telling an operator to go and ask it by hand ("Task Scheduler 등록
+    상태를 확인해야 한다") since it was written. This block asks.
+
+    Read-only, and `schedtask` carries a test asserting it stays that way. A
+    diagnostic that repaired the thing it was diagnosing would be the one
+    tool an operator cannot trust to leave the evidence alone.
+
+    `now` is unused and still taken: `_block()` calls every renderer the same
+    way, and a signature that opted out would make this the one block whose
+    failure is not caught the way the others' are.
+    """
+    attention: list[str] = []
+
+    runner_expected, runner_probe_errors = _this_machine_runs_the_runner()
+    agent_expected = _agent_dir().exists()
+    desktop_id = _scheduled_desktop_id()
+
+    names: list[str] = [schedtask.RUNNER_TASK_NAME, schedtask.PUBLISH_TASK_NAME]
+    expected_agent_task = (
+        schedtask.agent_task_name(desktop_id) if desktop_id else None
+    )
+    if expected_agent_task is not None:
+        names.append(expected_agent_task)
+
+    # Asked by prefix as well, because the Agent's task name carries a
+    # Desktop id and asking only for today's can only answer "is the one I
+    # expected there". See `schedtask.build_query`.
+    statuses = SCHEDULE_QUERY(names, prefixes=(schedtask.AGENT_TASK_PREFIX,))
+
+    # What is actually registered, whatever it is called. Sorted so the
+    # report is stable across runs; `present` filters out the by-name row
+    # for a task that is not there, which would otherwise appear here as a
+    # discovered one.
+    registered_agent_tasks = sorted(
+        name
+        for name, status in statuses.items()
+        if name.startswith(schedtask.AGENT_TASK_PREFIX) and status.present
+    )
+    agent_task = (
+        registered_agent_tasks[0] if registered_agent_tasks else expected_agent_task
+    )
+
+    print("SCHEDULE — Windows Task Scheduler 등록 상태")
+    print("-" * 60)
+
+    if len(registered_agent_tasks) > 1:
+        # Both fire at logon, and only one of them matches this machine's
+        # `agent_state.json`. The other reaches `ensure_desktop()`, which
+        # refuses — correctly, because accepting it would let one Desktop
+        # inherit another's watermark and skip every date up to it with no
+        # error anywhere (`run_agent.py` spends twenty lines on this). The
+        # pair is what nothing could see: each task, asked about by name,
+        # answers "registered and healthy".
+        attention.append(
+            "Agent 예약 실행이 둘 이상 등록돼 있다: "
+            + ", ".join(one_line(name) for name in registered_agent_tasks)
+            + " — 둘 다 로그온에 발화하고, 이 머신의 agent_state.json과 맞지 "
+            "않는 쪽은 매번 거부된다. -DesktopId를 바꿔 다시 설치한 흔적이다. "
+            "쓰지 않는 Task를 Unregister-ScheduledTask로 지워야 한다"
+        )
+
+    if (
+        expected_agent_task is not None
+        and registered_agent_tasks
+        and expected_agent_task not in registered_agent_tasks
+    ):
+        # The single-task version of the same accident: the machine's
+        # identity was repointed and the task was not, or the reverse.
+        attention.append(
+            f"등록된 Agent Task가 이 머신의 Desktop ID와 다르다 — 등록: "
+            + ", ".join(one_line(name) for name in registered_agent_tasks)
+            + f" / 이 머신: {one_line(expected_agent_task)}. 둘 중 하나가 "
+            f"틀렸다. COMPANY_OPS_PROFILE을 되돌리거나 올바른 -DesktopId로 "
+            f"scripts/install_agent_task.ps1을 다시 실행한다 — state 파일은 "
+            f"직접 지우지 않는다"
+        )
+
+    for task_name, expected, label in (
+        (schedtask.RUNNER_TASK_NAME, runner_expected, "Runner"),
+        # Never "expected", and that is a judgement rather than an oversight.
+        # The Control Tower publish is how the result reaches people who
+        # never open a terminal — AGENT.md §6c tells an operator to register
+        # it "beside run_company_ops.py", and this tool's exit code 3 exists
+        # for that deployment — but an operator who reads the browser
+        # Dashboard instead is not misconfigured. So its absence is printed
+        # as a fact with the command that would change it, and never raised.
+        #
+        # Everything *else* about it is raised exactly like the other two: a
+        # publish task that is disabled, failing, terminated, or throwing
+        # its output away is a scheduled job that has stopped doing its job,
+        # and that is not a preference.
+        (schedtask.PUBLISH_TASK_NAME, False, "Publish"),
+        (agent_task, agent_expected, "Agent"),
+    ):
+        if task_name is None:
+            # Only reachable for the Agent, and only when neither
+            # COMPANY_OPS_PROFILE nor the state file names a Desktop. Said
+            # out loud: an unchecked task must not look like a checked one.
+            print(
+                "  Agent  : 확인 불가 — 이 머신의 Desktop ID를 알 수 없어 "
+                "Task 이름을 만들 수 없다"
+            )
+            if agent_expected:
+                attention.append(
+                    "Agent 예약 실행을 확인할 수 없다 — COMPANY_OPS_PROFILE이 "
+                    "설정돼 있지 않고 agent_state.json에서도 desktop_id를 읽지 "
+                    "못했다. 이 머신의 Agent가 예약돼 있는지 알 수 없는 상태다"
+                )
+            continue
+
+        status = statuses.get(
+            task_name,
+            schedtask.ScheduledTaskStatus(
+                name=task_name, present=False, query_error="조회 결과 없음"
+            ),
+        )
+        verdict = schedtask.classify(status)
+        # One table rather than two conditionals: this name is interpolated
+        # into two different messages, and two copies is how a third task
+        # ends up named correctly in one of them and wrongly in the other.
+        installer = _SCHEDULE_INSTALLERS[label]
+        print(f"  {label:<7}: {one_line(task_name)} — {verdict}")
+
+        if verdict == schedtask.UNKNOWN:
+            print(f"           {one_line(status.query_error or '')}")
+            continue
+
+        if status.present:
+            detail = f"           상태 {one_line(status.state or '?')}"
+            if status.has_ever_run:
+                detail += (
+                    f" · 마지막 실행 {one_line(status.last_run or '?')} "
+                    f"({schedtask.describe_result(status.last_result)})"
+                )
+            else:
+                detail += " · 아직 실행된 적 없음"
+            if status.next_run:
+                detail += f" · 다음 실행 {one_line(status.next_run)}"
+            print(detail)
+
+        # A task can be registered, enabled and firing on time while
+        # throwing away everything its process prints — which is what every
+        # task this project registered before C138 does, because the action
+        # was `python.exe <entrypoint>` with no redirection.
+        #
+        # It is checked here rather than folded into `classify()` because it
+        # is not about whether the task runs. It is about whether the run
+        # that fails will be able to say why: for the failures that happen
+        # before the application writes anything — python off PATH, a moved
+        # working directory, an unset COMPANY_OPS_* — the discarded stream
+        # was the entire diagnosis.
+        #
+        # Windows keeps the action it was given, so this does not fix itself
+        # when the repository is updated. Re-running the installer is what
+        # changes it, and the message says so.
+        # Where the registered action actually points. A task whose paths
+        # were baked before the repository moved runs nothing and cannot say
+        # so: its log lives in the vanished directory too, so `>>` fails and
+        # the explanation is never written. See `schedtask.action_entrypoint`.
+        elsewhere = _entrypoint_is_another_checkout(status)
+        if elsewhere is not None:
+            print(f"           실행 대상 {one_line(elsewhere)}")
+            attention.append(
+                f"{label} 예약 실행이 이 저장소가 아닌 곳을 실행한다 "
+                f"({one_line(task_name)}): {one_line(elsewhere)} — "
+                f"저장소를 옮겼거나 사본이 둘이다. 그 경로가 없으면 매 실행이 "
+                f"실패하고 로그도 그 경로에 있어 아무 설명도 남지 않는다. "
+                f"scripts/install_{installer}_task.ps1을 여기서 다시 실행하면 "
+                f"이 저장소를 가리키게 된다"
+            )
+
+        discards = schedtask.discards_console_output(status)
+        if discards:
+            print("           콘솔 출력을 남기지 않는다 (Action에 리디렉션 없음)")
+            attention.append(
+                f"{label} 예약 실행이 콘솔 출력을 버린다 "
+                f"({one_line(task_name)}) — 지금 등록된 Action에 리디렉션이 "
+                f"없어서, 프로세스가 시작조차 못 하고 끝난 실행은 종료 코드 "
+                f"말고 아무 설명도 남기지 않는다. "
+                f"scripts/install_{installer}_task.ps1을 다시 실행하면 "
+                f"갱신된다(-Force, 멱등)"
+            )
+
+        if verdict not in schedtask.NEEDS_ATTENTION:
+            continue
+
+        if verdict in (schedtask.LAST_RUN_FAILED, schedtask.LAST_RUN_TERMINATED):
+            # The console output of the run that failed. This is the only place
+            # it exists: a run that died before `oplog` opened a file wrote
+            # nothing under `runtime/` except this.
+            log_path, tail, log_problem = _scheduled_log_tail(task_name, status)
+            if log_path is not None:
+                print(f"           로그 {log_path}")
+                if log_problem is not None:
+                    print(f"             ({log_problem})")
+                for line in tail:
+                    print(f"             | {line}")
+
+        if verdict == schedtask.NOT_REGISTERED:
+            if not expected:
+                if label == "Publish" and runner_expected:
+                    # Said, not raised. On Desktop 4 this is the difference
+                    # between "the workspace sees today's state" and "the
+                    # workspace sees whatever day somebody last opened a
+                    # terminal" — worth putting in front of an operator, and
+                    # not worth an alarm that never clears for the operator
+                    # who deliberately reads the browser Dashboard instead.
+                    print(
+                        "           Notion Control Tower는 예약돼 있지 않다 — "
+                        "사람이 실행할 때만 갱신된다"
+                    )
+                    print(
+                        f"           예약하려면: "
+                        f"scripts/install_{installer}_task.ps1"
+                    )
+                if label == "Runner" and runner_probe_errors:
+                    # Not "this is not a Runner machine" — "this cannot be
+                    # told apart from one". Raised rather than swallowed
+                    # because the two answers differ by exactly the alarm
+                    # Desktop 4 depends on, and a refused probe is why the
+                    # first draft of `_this_machine_runs_the_runner()` was
+                    # wrong.
+                    attention.append(
+                        "이 머신이 Runner(Desktop 4)인지 판단할 근거를 읽지 "
+                        "못했다 (" + "; ".join(runner_probe_errors) + ") — "
+                        "Runner 예약 실행이 등록돼 있지 않은데, 그것이 정상인지 "
+                        "아닌지를 말할 수 없다"
+                    )
+                # Otherwise the normal state on the machines this job does
+                # not belong to. Printed above as NOT_REGISTERED, not raised.
+                continue
+            attention.append(
+                f"{label} 예약 실행이 등록돼 있지 않다 ({one_line(task_name)}) — "
+                f"이 머신은 자동으로 아무것도 실행하지 않는다. "
+                f"scripts/install_{installer}_task.ps1로 등록해야 한다"
+            )
+        elif verdict == schedtask.DISABLED:
+            attention.append(
+                f"{label} 예약 실행이 사용 안 함 상태다 ({one_line(task_name)}) — "
+                f"등록은 돼 있지만 트리거가 발생해도 시작되지 않는다"
+            )
+        elif verdict == schedtask.LAST_RUN_TERMINATED:
+            attention.append(
+                f"{label}의 마지막 예약 실행을 Windows가 중단시켰다 "
+                f"({one_line(task_name)}, 마지막 실행 "
+                f"{one_line(status.last_run or '?')}) — 시간 제한을 넘겼을 수 "
+                f"있다. 실행은 도중에 끊겼고 다음 트리거가 이어받는다"
+            )
+        else:  # LAST_RUN_FAILED
+            attention.append(
+                f"{label}의 마지막 예약 실행이 실패로 끝났다 "
+                f"({one_line(task_name)}, 마지막 실행 "
+                f"{one_line(status.last_run or '?')}): "
+                f"{schedtask.describe_result(status.last_result)} — "
+                f"프로세스가 시작조차 못 했다면 runtime/에는 이 로그 말고 아무 "
+                f"기록도 남지 않는다: "
+                f"{one_line(str(RUNTIME_DIR / 'logs' / (schedtask.scheduled_log_name(task_name) or '?')))}"
+            )
+
+    return attention
+
+
 def _block(label: str, render, now: datetime) -> list[str]:
     """One section of the report, and the guarantee that it produces one.
 
@@ -5430,6 +5949,7 @@ def main(argv: Sequence[str] = ()) -> int:
         ("HISTORY", _print_history),
         ("CONTROL TOWER", _print_control_tower),
         ("LAST RUN", _print_last_run),
+        ("SCHEDULE", _print_schedule),
         ("NOTION", _print_notion),
         ("AGENT", _print_agent),
     ):

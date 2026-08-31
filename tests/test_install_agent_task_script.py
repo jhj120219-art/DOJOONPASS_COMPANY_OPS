@@ -29,6 +29,7 @@ code.
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -36,6 +37,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "install_agent_task.ps1"
 
 sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import schedtask  # noqa: E402
 
 
 def _script_text() -> str:
@@ -480,9 +483,19 @@ class SchedulerPolicyTests(unittest.TestCase):
 
     def test_the_task_name_is_namespaced_per_desktop(self):
         """Four Desktops each register their own task; one shared name would
-        mean the last install silently replaced the others."""
-        text = _script_text()
-        self.assertIn("DOJOONPASS_COMPANY_OPS_AGENT_$DesktopId", text)
+        mean the last install silently replaced the others.
+
+        The name is built by `schedtask.agent_task_name()` now rather than
+        by string interpolation here, so the property is asserted where it
+        lives -- four ids, four distinct names -- plus the one thing this
+        script still owns: that it passes its own `-DesktopId` in.
+        """
+        from reporter.profiles import PROFILES
+
+        names = {schedtask.agent_task_name(d) for d in PROFILES}
+        self.assertEqual(len(names), len(PROFILES), sorted(names))
+
+        self.assertIn("schedtask.agent_task_name('$DesktopId')", _script_code())
 
     def test_the_task_does_not_keep_the_machine_awake(self):
         """docs/07 §58: OFF 허용 + Catch-up. A wake timer would contradict
@@ -652,6 +665,242 @@ class SecretSafetyTests(unittest.TestCase):
         text = _script_code()
         self.assertNotIn("-User SYSTEM", text)
         self.assertNotIn("RunLevel Highest", text)
+
+
+
+class TheScheduledRunHasSomewhereToPrintTests(unittest.TestCase):
+    """The action's output used to go nowhere, and the repository knew it.
+
+    Five entrypoints carry a measured comment about `line_buffering=True`
+    being needed because "under `> log 2>&1`, which is how a scheduled run
+    is captured, the two streams reorder against each other". No installer
+    ever set up that redirection. The action was `python.exe <entrypoint>`,
+    so a scheduled task's stdout and stderr were written to handles nothing
+    read.
+
+    What that loses is the entire diagnosis for failures that happen outside
+    the application. Every other thing `ops_status.py` can tell an operator
+    is derived from a file this system wrote, and a run that dies before it
+    writes one leaves only a `LastTaskResult` number — for the likeliest
+    failure of all, an unset `COMPANY_OPS_*`, that number is `1` every
+    morning while the sentence naming the missing variable is discarded.
+
+    These tests assert the property (the run has somewhere to print, and the
+    exit code still means what docs/14 §4 says) rather than the exact
+    string, except where the string is the thing that can silently be wrong
+    — cmd's quoting.
+    """
+
+    ENTRYPOINT_NAME = 'run_agent.py'
+    LOG_NAME = 'scheduled_agent.log'
+
+    def test_the_action_redirects_the_console_output_to_a_file(self):
+        """The redirection target is `$logPath`, which is
+        `$logDir` + the filename `schedtask.scheduled_log_name()` returned.
+
+        This used to assert the literal filename appeared in the script.
+        It no longer does, and that is the point -- the name lives in
+        `src/schedtask.py` alone now (see
+        `test_schedtask.py::TaskNamesMatchTheInstallersTests`). What is
+        checkable here is that the action redirects at all, and that it
+        redirects to the derived path rather than to one this script made
+        up.
+        """
+        code = _script_code()
+        self.assertIn("2>&1", code)
+        self.assertIn('>> "{2}"', code)
+        self.assertIn("$logPath = Join-Path $logDir $logFileName", code)
+    def test_the_log_lives_under_the_runtime_tree(self):
+        """Beside `collector.log` and the Run Manifest, which is where
+        `ops_status.py` and an operator already look."""
+        self.assertIn("runtime\\logs", _script_code())
+
+    def test_the_log_directory_is_created_before_the_task_is_registered(self):
+        """`runtime/` is git-ignored, so on a fresh clone it does not exist.
+        `>>` fails when the directory is absent — without this the first
+        scheduled run on a new machine would fail at the redirection itself,
+        which is the opposite of what the redirection is for."""
+        code = _script_code()
+        self.assertIn("New-Item -ItemType Directory -Path $logDir", code)
+        self.assertLess(
+            code.index("New-Item -ItemType Directory -Path $logDir"),
+            code.index("Register-ScheduledTask"),
+        )
+
+    def test_the_shell_is_named_by_path_and_not_left_to_path_lookup(self):
+        """A task started by the scheduler service does not necessarily have
+        the PATH an interactive shell has."""
+        code = _script_code()
+        self.assertIn("$comspec = $env:ComSpec", code)
+        self.assertIn("System32\\cmd.exe", code)
+        self.assertIn("-Execute $comspec", code)
+
+    def test_redirection_is_append_not_overwrite(self):
+        """`>` would let the next morning's run erase yesterday's traceback,
+        and the record of a failure is exactly what this exists to keep."""
+        code = _script_code()
+        self.assertNotRegex(code, r"[^>]> \"\{2\}")
+        self.assertIn('>> "{2}"', code)
+
+    # ------------------------------------------------ the string that runs
+
+    #: The **executed** half of this contract lives in
+    #: `test_schedtask.py::TaskNamesMatchTheInstallersTests` and covers all
+    #: three installers from one place.
+    #:
+    #: It was written here first, once per installer: twelve PowerShell
+    #: launches at ~1.2 s each, asserting one identical property three times
+    #: over. Measured with `--durations`, those twelve were the twelve
+    #: slowest tests in these files. Worse than the cost, it was three
+    #: hand-copies of a contract -- the roster shape this Sprint spent its
+    #: time removing, in a test file.
+    #:
+    #: What stays here is the static half, which is per-installer by nature:
+    #: **this** script builds the shape, redirects, appends rather than
+    #: overwrites, names the shell by path, and creates the log directory
+    #: first. The sweep over there asserts all three declare the *same*
+    #: shape and then executes it -- so an installer that declared a
+    #: different one fails there rather than going untested here.
+
+    def test_a_preview_creates_no_log_directory(self):
+        """`-WhatIf` exists to change nothing, and the Agent installer's
+        history in this file is what that rule was written from: its
+        environment writes once ran during a preview.
+
+        `New-Item` inherits `$WhatIfPreference` from this script's
+        `CmdletBinding`, which is a propagation rather than a guard anybody
+        wrote — so it is measured here rather than assumed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "runtime" / "logs"
+            probe = Path(tmp) / "probe.ps1"
+            probe.write_text(
+                "[CmdletBinding(SupportsShouldProcess = $true)]\n"
+                "param([string]$Dir)\n"
+                "if (-not (Test-Path -LiteralPath $Dir)) {\n"
+                "    New-Item -ItemType Directory -Path $Dir -Force | Out-Null\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", str(probe),
+                 "-Dir", str(target), "-WhatIf"],
+                capture_output=True, text=True, timeout=180,
+            )
+            self.assertFalse(target.exists(), "a preview created a directory")
+            # The same lines without -WhatIf must actually create it, or the
+            # assertion above would pass for the wrong reason.
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-File", str(probe),
+                 "-Dir", str(target)],
+                capture_output=True, text=True, timeout=180,
+            )
+            self.assertTrue(target.is_dir())
+
+    def test_the_log_path_is_the_one_python_expects_to_find(self):
+        """`ops_status.py` prints the end of this file when a scheduled run
+        failed, and for the failures that leave nothing under `runtime/` it
+        is the only evidence there is.
+
+        There is nothing to compare any more: the script asks
+        `schedtask.scheduled_log_name()` for the name, so the two cannot
+        disagree. What is asserted is that it asks -- and that the answer,
+        for this installer's task, is a name at all rather than `None`,
+        which is what the script would silently write into its path if the
+        task were one `schedtask` does not know.
+        """
+        code = _script_code()
+        self.assertIn("schedtask.scheduled_log_name(", code)
+        self.assertIsNotNone(schedtask.scheduled_log_name(schedtask.agent_task_name("DESKTOP_1")))
+    def test_the_check_looks_for_agent_tasks_of_any_desktop(self):
+        """By prefix, because the name of the *other* task is exactly what
+        this cannot know -- it is whichever `-DesktopId` was used last time.
+
+        The prefix comes from `schedtask.AGENT_TASK_PREFIX`, the same place
+        `$taskName` came from, rather than being spelled a third time here.
+        """
+        code = _script_code()
+        self.assertIn("schedtask.AGENT_TASK_PREFIX + '*'", code)
+        self.assertIn("-TaskName $agentTaskWildcard", code)
+        self.assertIn("$_.TaskName -ne $taskName", code)
+
+    def test_the_warning_precedes_the_registration(self):
+        """After it, the operator has already been asked to approve the
+        thing the warning is about."""
+        code = _script_code()
+        self.assertLess(
+            code.index("$otherAgentTasks"), code.index("Register-ScheduledTask")
+        )
+
+    def test_it_warns_rather_than_throws(self):
+        """Refusing would block a legitimate migration, and this script
+        cannot tell that case from a mistake."""
+        code = _script_code()
+        window = code[code.index("$otherAgentTasks"):code.index("Register-ScheduledTask")]
+        self.assertIn("Write-Warning", window)
+        self.assertNotIn("throw", window)
+
+    def test_it_removes_nothing(self):
+        """An installer that deleted a scheduled task it did not create
+        would be making a decision that is not its to make -- and the task
+        it deleted might be the one still collecting."""
+        code = _script_code()
+        for destructive in ("Unregister-ScheduledTask -TaskName $",
+                            "Disable-ScheduledTask", "Stop-ScheduledTask"):
+            with self.subTest(command=destructive):
+                self.assertNotIn(destructive, code)
+
+    def test_the_removal_command_is_printed_for_the_operator(self):
+        """Naming a problem without naming the fix is how a warning becomes
+        noise. It appears inside the warning *text*, which is a here-string
+        and therefore not executed."""
+        self.assertIn("Unregister-ScheduledTask -TaskName", _script_text())
+
+    def test_the_check_is_read_only_so_a_preview_performs_it(self):
+        """`Get-ScheduledTask` changes nothing, so this runs under `-WhatIf`
+        too -- which is where an operator previewing an install should learn
+        that they are about to end up with two."""
+        code = _script_code()
+        # Up to the `ShouldProcess` guard, not past it: the guard is the
+        # next statement, and a window that swallowed it would find the word
+        # every time regardless of where the check sat.
+        start = code.index("$otherAgentTasks")
+        # The guard that FOLLOWS the check. `index` from the start would find
+        # the earlier one (the environment write), and the window would come
+        # back empty -- an assertion over nothing, which is the vacuous pass
+        # this file keeps guarding against.
+        window = code[start:code.index("if ($PSCmdlet.ShouldProcess", start)]
+        self.assertTrue(window.strip(), "the window is empty; it proves nothing")
+        self.assertIn("Get-ScheduledTask", window)
+        self.assertNotIn("ShouldProcess", window)
+        self.assertNotIn("-WhatIf", window)
+
+    @unittest.skipUnless(sys.platform == "win32", "Task Scheduler is Windows-only")
+    def test_the_check_runs_and_finds_nothing_on_a_machine_with_no_agent_task(self):
+        """Executed, not read. A `Where-Object` against `$null` or a
+        property that does not exist would throw here under
+        `$ErrorActionPreference = 'Stop'`, and the installer would stop
+        before registering anything -- which is exactly the shape C13 found
+        (`New-ScheduledTaskSettingsSet` threw before `Register-` was
+        reached, so the installer had never worked on any machine).
+        """
+        command = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"& '{SCRIPT.as_posix()}' -DesktopId DESKTOP_1 "
+            "-SyncFolder 'C:\\Temp\\CompanyOpsProbe' -StartDate 2026-08-10 "
+            "-WhatIf; Write-Output \"EXIT:$LASTEXITCODE\""
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True, text=True, timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(
+            "already has an Agent task", result.stderr,
+            "warned about a task this machine does not have",
+        )
 
 
 if __name__ == "__main__":

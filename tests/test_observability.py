@@ -164,6 +164,7 @@ class TheStatusViewAnswersWhenTheDiskRefusesTests(unittest.TestCase):
         "_print_history",
         "_print_control_tower",
         "_print_last_run",
+        "_print_schedule",
         "_print_notion",
         "_print_agent",
     )
@@ -313,6 +314,7 @@ class TheStatusViewAnswersWhenTheDiskRefusesTests(unittest.TestCase):
             "_print_history": "HISTORY",
             "_print_control_tower": "CONTROL TOWER",
             "_print_last_run": "LAST RUN",
+            "_print_schedule": "SCHEDULE",
             "_print_notion": "NOTION",
             "_print_agent": "AGENT",
         }
@@ -4768,11 +4770,55 @@ class AHealthyRuntimeCanActuallyBeQuietTests(unittest.TestCase):
         spec.loader.exec_module(module)
         module.RUNTIME_DIR = runtime
         module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+        module.SCHEDULE_QUERY = self._healthy_schedule()
 
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             code = module.main()
         return buffer.getvalue(), code
+
+    def _healthy_schedule(self):
+        """The one corner of "healthy" that does not live under `runtime/`.
+
+        SCHEDULE reads Windows Task Scheduler, so the fixture cannot put it
+        on disk beside the other nine. Leaving it to the real machine would
+        not make this test stricter, it would make its verdict depend on
+        whose PC it runs on: green on a Desktop 4 with the task registered,
+        red on every developer checkout and every CI container. Measured:
+        exactly that, on this machine, the first time the block was wired in.
+
+        What the *real* query does is asserted where it belongs, against the
+        real Task Scheduler, in
+        `test_schedtask.py::TheRealTaskSchedulerAnswersTests`. The subject
+        here is "can this report ever be quiet".
+        """
+        import schedtask
+
+        self.schedule_queries = []
+
+        def query(names, *, prefixes=()):
+            self.schedule_queries.append(tuple(names))
+            return {
+                name: schedtask.ScheduledTaskStatus(
+                    name=name, present=True, state="Ready", last_result=0,
+                    last_run="2026-08-31T11:00:00+09:00",
+                    next_run="2026-09-01T11:00:00+09:00",
+                )
+                for name in names
+            }
+
+        return query
+
+    def test_the_healthy_schedule_answer_is_the_one_that_was_used(self):
+        """An empty-fixture guard, the shape this file uses elsewhere. If
+        `_print_schedule()` ever stopped going through `SCHEDULE_QUERY`, the
+        two tests below would be asserting quiet about a report that had
+        gone back to asking the real machine -- and they would keep passing
+        on whichever machine happened to answer conveniently."""
+        self._run()
+
+        self.assertEqual(len(self.schedule_queries), 1, self.schedule_queries)
+        self.assertIn("DOJOONPASS_COMPANY_OPS_DAILY", self.schedule_queries[0])
 
     def test_a_healthy_runtime_needs_nobody_and_exits_zero(self):
         output, code = self._run()
@@ -4792,7 +4838,8 @@ class AHealthyRuntimeCanActuallyBeQuietTests(unittest.TestCase):
         from the exit code alone."""
         output, _code = self._run()
 
-        for heading in ("COMPANY", "HISTORY", "LAST RUN", "NOTION", "AGENT"):
+        for heading in ("COMPANY", "HISTORY", "LAST RUN", "SCHEDULE",
+                        "NOTION", "AGENT"):
             with self.subTest(heading=heading):
                 self.assertIn(heading, output)
 
@@ -17150,6 +17197,1437 @@ class AClosedPipeIsNotDamagedEvidenceTests(unittest.TestCase):
         self.assertIn("run_entrypoint(main, sys.argv)", tail)
         self.assertNotIn("SystemExit(main(", tail)
 
+
+
+class TheScheduleBlockAsksWindowsWhatNoFileCanAnswerTests(unittest.TestCase):
+    """`ops_status.py::_print_schedule()` -- the one block not derived from
+    this system's own files.
+
+    Every other block reads something the pipeline wrote, and that is
+    exactly the evidence a scheduled task which never starts the process
+    does not produce: `python` off PATH, a moved working directory, a task
+    disabled after a password change. The run dies before `oplog` opens
+    anything and `runtime/` becomes indistinguishable from a machine
+    switched off for the weekend.
+
+    `LAST RUN` has been ending its staleness message with "Task Scheduler
+    등록 상태를 확인해야 한다" -- an instruction to go and use a different
+    tool -- since it was written. Measured on this repository before the
+    block existed: ATTENTION carried that line for a 13.9-day-old Runner and
+    said nothing about the cause, which was that no task was registered at
+    all.
+
+    `SCHEDULE_QUERY` is answered here rather than run, so every state
+    Windows can report is covered -- including the ones that cannot be
+    produced on demand without registering a real scheduled task on the
+    machine running the tests.
+    """
+
+    def _module(self, runtime: Path):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_schedule", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.RUNTIME_DIR = runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+        return module
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.runtime = Path(tmp.name) / "runtime"
+        self.runtime.mkdir(parents=True)
+        # No `COMPANY_OPS_PROFILE` unless a test sets one: the developer
+        # machine this suite runs on may export it, and a test that silently
+        # took the real value would be asserting about a different Desktop.
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("COMPANY_OPS_PROFILE", None)
+
+    def _run(self, module, answers, discovered=None):
+        """Drive the block with a fixed set of task statuses.
+
+        `discovered` is what a by-prefix query would have found: tasks whose
+        names production could not have constructed. It is separate from
+        `answers` so a test can say "this is registered under a name nobody
+        asked for", which is the whole subject of the discovery tests.
+        """
+        import schedtask
+
+        def query(names, *, prefixes=()):
+            # `prefixes` is accepted and ignored: a fake that could not be
+            # called the way production calls it would fail every test in
+            # this class for a reason that has nothing to do with any of
+            # them. Discovery's own behaviour is driven by `discovered`
+            # below, which is what a prefix query would have returned.
+            # Discovered rows first, then the by-name defaults for whatever
+            # is left. That is the order the real query produces: one task
+            # answers once, and the "absent" row exists only for a name
+            # nothing came back for. Filling the names first and then
+            # `setdefault`-ing discovery would let a by-name `present=False`
+            # placeholder shadow the row saying that same task IS registered.
+            found = dict(discovered or {})
+            for name in names:
+                found.setdefault(
+                    name,
+                    answers.get(
+                        name, schedtask.ScheduledTaskStatus(name=name, present=False)
+                    ),
+                )
+            for name, status in answers.items():
+                found[name] = status
+            return found
+
+        module.SCHEDULE_QUERY = query
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_schedule(NOW)
+        return buffer.getvalue(), attention
+
+    def _make_runner_machine(self):
+        (self.runtime / "local_master").mkdir(parents=True, exist_ok=True)
+
+    def _make_agent_machine(self, desktop_id="DESKTOP_2"):
+        state = self.runtime / "agent" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "agent_state.json").write_text(
+            json.dumps({"desktop_id": desktop_id}), encoding="utf-8"
+        )
+
+    # -------------------------------------------------- who this task is for
+
+    def test_a_desktop_without_the_runner_is_not_told_its_runner_is_missing(self):
+        """Desktops 1-3 run only the Agent. `DOJOONPASS_COMPANY_OPS_DAILY`
+        being absent is the correct state there, and raising it would put a
+        permanent false alarm on three machines out of four -- which is how
+        a whole block stops being read."""
+        module = self._module(self.runtime)
+        printed, attention = self._run(module, {})
+        self.assertIn("NOT_REGISTERED", printed)
+        self.assertEqual(attention, [])
+
+    def test_a_runner_machine_with_no_runner_task_is_told(self):
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(module, {})
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("Runner 예약 실행이 등록돼 있지 않다", attention[0])
+        self.assertIn("install_runner_task.ps1", attention[0])
+
+    def test_a_run_manifest_alone_identifies_a_runner_machine(self):
+        """The other half of the evidence: a Desktop 4 whose Company History
+        tree was moved or restored elsewhere still has a Run Manifest, and it
+        is still the machine the daily task belongs on."""
+        runs = self.runtime / "runs"
+        runs.mkdir(parents=True)
+        (runs / "last_run.json").write_text("{}", encoding="utf-8")
+        module = self._module(self.runtime)
+        _printed, attention = self._run(module, {})
+        self.assertTrue(any("Runner 예약" in item for item in attention), attention)
+
+    def test_an_agent_machine_with_no_agent_task_is_told(self):
+        self._make_agent_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(module, {})
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("Agent 예약 실행이 등록돼 있지 않다", attention[0])
+        self.assertIn("DOJOONPASS_COMPANY_OPS_AGENT_DESKTOP_2", attention[0])
+
+    def test_a_machine_with_no_agent_at_all_is_not_told(self):
+        """`_print_agent()` uses exactly this test (`runtime/agent` exists)
+        to decide whether this machine has an Agent. Following it rather
+        than inventing a second convention is the point."""
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_2"
+        module = self._module(self.runtime)
+        _printed, attention = self._run(module, {})
+        self.assertEqual(attention, [])
+
+    def test_the_environment_names_the_agent_task_before_the_state_file(self):
+        """`install_agent_task.ps1` writes `COMPANY_OPS_PROFILE` and builds
+        the task name from the same `-DesktopId` in the same breath, so
+        where a task exists this is the value it was named after."""
+        self._make_agent_machine(desktop_id="DESKTOP_3")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1"
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, {})
+        self.assertIn("DOJOONPASS_COMPANY_OPS_AGENT_DESKTOP_1", printed)
+        self.assertNotIn("DOJOONPASS_COMPANY_OPS_AGENT_DESKTOP_3", printed)
+
+    def test_the_state_file_names_it_when_the_environment_does_not(self):
+        """The machine where the task is registered but the variable was
+        lost -- a new shell, a profile never reloaded, an editor's
+        terminal."""
+        self._make_agent_machine(desktop_id="DESKTOP_3")
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, {})
+        self.assertIn("DOJOONPASS_COMPANY_OPS_AGENT_DESKTOP_3", printed)
+
+    def test_an_unreadable_state_file_does_not_take_the_block_down(self):
+        """The AGENT block already reports a damaged state file. This one
+        must not also die of it -- `_block()`'s contract is that a section
+        answers even when part of the evidence is gone."""
+        state = self.runtime / "agent" / "state"
+        state.mkdir(parents=True)
+        (state / "agent_state.json").write_text("{ not json", encoding="utf-8")
+        module = self._module(self.runtime)
+        printed, attention = self._run(module, {})
+        self.assertIn("확인 불가", printed)
+        self.assertTrue(any("알 수 없는 상태" in item for item in attention), attention)
+
+    def test_deeply_nested_state_json_does_not_take_the_block_down(self):
+        """BUG-40's shape, in the file this block reads. `json.loads` raises
+        `RecursionError`, and a handler catching only `ValueError` turns one
+        damaged file into a crash of the tool an operator picks up when the
+        Runner is already broken."""
+        state = self.runtime / "agent" / "state"
+        state.mkdir(parents=True)
+        (state / "agent_state.json").write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, {})
+        self.assertIn("확인 불가", printed)
+
+    def test_a_desktop_id_that_cannot_be_a_task_name_is_reported_not_obeyed(self):
+        """`COMPANY_OPS_PROFILE` is an environment variable and its value is
+        interpolated into a PowerShell string literal. `build_query()`
+        refuses anything outside its pattern, and the refusal has to arrive
+        as UNKNOWN rather than as an exception out of a diagnostic."""
+        import schedtask
+
+        self._make_agent_machine()
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1'; Remove-Item C:\\ -Recurse; '"
+        module = self._module(self.runtime)
+        module.SCHEDULE_QUERY = schedtask.query
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_schedule(NOW)
+        self.assertIn("UNKNOWN", buffer.getvalue())
+        self.assertFalse(
+            any("등록돼 있지 않다" in item for item in attention),
+            "a name that could not be asked about must not be reported absent",
+        )
+
+    # ------------------------------------------------------- the verdicts
+
+    def test_a_disabled_task_is_raised_even_though_it_last_succeeded(self):
+        """The state that reads healthiest and is worst: registered, last
+        result 0, and it will never fire again."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Disabled",
+                    last_result=0, last_run="2026-08-09T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("사용 안 함", attention[0])
+
+    def test_a_failed_last_run_names_the_exit_code_and_the_missing_evidence(self):
+        """`LastTaskResult` is the process exit code, and `1` is this
+        project's own 설정 오류 (AGENT.md section 6) -- the likeliest thing a
+        half-configured deployment produces, every morning, while leaving
+        nothing at all in `runtime/`."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=1, last_run="2026-08-10T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("실패로 끝났다", attention[0])
+        self.assertIn("exit 1", attention[0])
+
+    def test_a_terminated_run_is_reported_as_its_own_thing(self):
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=schedtask.RESULT_TERMINATED,
+                    last_run="2026-08-10T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("중단시켰다", attention[0])
+
+    def test_a_healthy_task_raises_nothing_and_still_says_when_it_next_runs(self):
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    next_run="2026-08-11T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+        self.assertIn("2026-08-11T11:00:00+09:00", printed)
+
+    def test_a_freshly_installed_task_is_not_reported_as_broken(self):
+        """Every correctly installed task is in this state until its first
+        trigger fires. An installer whose success looked like a failure for
+        one morning would teach an operator to ignore the block."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=schedtask.RESULT_HAS_NOT_RUN,
+                    last_run="1999-11-30T00:00:00.0000000+09:00",
+                    next_run="2026-08-11T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+        self.assertIn("아직 실행된 적 없음", printed)
+        self.assertNotIn(
+            "1999", printed, "the never-run sentinel must not be printed as a run"
+        )
+
+    def test_a_query_that_could_not_run_is_shown_and_not_raised(self):
+        """An unanswerable query says nothing about the task. Printing it
+        keeps the absence of an answer visible where the answer would have
+        been; raising it would put a daily ATTENTION line on every machine
+        where PowerShell is unavailable."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=False,
+                    query_error="powershell을 실행할 수 없습니다",
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+        self.assertIn("UNKNOWN", printed)
+        self.assertIn("powershell", printed)
+
+    def test_an_unreadable_runner_probe_is_raised_rather_than_answered_no(self):
+        """The defect the first draft of `_this_machine_runs_the_runner()`
+        had. `is_dir()` re-raises `EACCES`, and answering it with `pass` made
+        a permission change under `runtime/` turn Desktop 4 into Desktop 1 --
+        silencing the one alarm that machine depends on."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+
+        real_is_dir = Path.is_dir
+
+        def refusing(path, *args, **kwargs):
+            if path.name == "local_master":
+                raise PermissionError(13, "Permission denied")
+            return real_is_dir(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "is_dir", refusing):
+            _printed, attention = self._run(module, {})
+
+        self.assertTrue(
+            any("판단할 근거를 읽지 못했다" in item for item in attention), attention
+        )
+
+    def test_a_task_that_throws_its_output_away_is_raised(self):
+        """Registered, enabled, succeeding -- and unable to explain itself
+        the day it stops. Every task this project registered before C138 is
+        in this state, and Windows does not update an action because the
+        repository changed."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    # This checkout's own entrypoint. The path matters:
+                    # `_entrypoint_is_another_checkout()` raises a separate
+                    # alarm for an action pointing elsewhere, and a fixture
+                    # naming an invented `C:\repo` would trip that one too
+                    # and make this test about two things.
+                    action_command=(
+                        'C:\\Python\\python.exe "'
+                        + str(Path(__file__).resolve().parents[1] / "run_company_ops.py")
+                        + '"'
+                    ),
+                )
+            },
+        )
+        self.assertEqual(len(attention), 1, attention)
+        self.assertIn("콘솔 출력을 버린다", attention[0])
+        self.assertIn("install_runner_task.ps1", attention[0])
+
+    def test_a_task_that_redirects_is_not_raised(self):
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    action_command=(
+                        'cmd.exe /c ""py.exe" "run.py" >> "C:\\x\\y.log" 2>&1"'
+                    ),
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+
+    def test_an_action_that_could_not_be_read_raises_nothing(self):
+        """"We could not check" is not "it is broken". A daily ATTENTION
+        line for an unanswerable question is the noise that gets a block
+        skipped."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+
+    def test_the_log_shown_is_the_one_the_action_actually_writes(self):
+        """An operator who redirected somewhere of their own choosing must
+        be shown their file, not ours. Naming the wrong log is the failure
+        mode of every "see the log for details"."""
+        import schedtask
+
+        self._make_runner_machine()
+        elsewhere = self.runtime / "elsewhere.log"
+        elsewhere.write_text("their own file\n", encoding="utf-8")
+        module = self._module(self.runtime)
+        printed, _attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=1, last_run="2026-08-10T11:00:00+09:00",
+                    action_command=(
+                        'cmd.exe /c ""py.exe" "run.py" >> "%s" 2>&1"' % elsewhere
+                    ),
+                )
+            },
+        )
+        self.assertIn("their own file", printed)
+
+    def test_a_task_pointing_at_another_checkout_is_raised(self):
+        """The failure whose explanation is unreachable: the log lives in
+        the same vanished directory, so `>>` fails and nothing is written.
+        The report would otherwise show `exit 1` and an empty log."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    action_command=(
+                        'cmd.exe /c ""py.exe" "D:\\old-copy\\run_company_ops.py"'
+                        ' >> "D:\\old-copy\\runtime\\logs\\x.log" 2>&1"'
+                    ),
+                )
+            },
+        )
+        self.assertTrue(
+            any("이 저장소가 아닌 곳" in item for item in attention), attention
+        )
+        self.assertTrue(
+            any("old-copy" in item for item in attention),
+            "the message must name the path it found",
+        )
+
+    def test_a_task_pointing_here_is_not_raised(self):
+        import schedtask
+
+        self._make_runner_machine()
+        here = Path(__file__).resolve().parents[1]
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    action_command=(
+                        'cmd.exe /c ""py.exe" "'
+                        + str(here / "run_company_ops.py")
+                        + '" >> "'
+                        + str(here / "runtime" / "logs" / "scheduled_runner.log")
+                        + '" 2>&1"'
+                    ),
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+
+    def test_the_same_directory_spelled_differently_is_not_two_checkouts(self):
+        """Windows treats `C:/Repo` and `c:/repo` as one directory, and
+        either side can arrive with `..` in it. Reporting two spellings of
+        one path as two copies would be a false alarm about the one thing
+        that stops every scheduled run."""
+        import schedtask
+
+        self._make_runner_machine()
+        here = Path(__file__).resolve().parents[1]
+        awkward = str(here / "src" / ".." / "run_company_ops.py").upper()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    action_command='cmd.exe /c ""py.exe" "' + awkward + '" 2>&1"',
+                )
+            },
+        )
+        self.assertFalse(
+            any("이 저장소가 아닌 곳" in item for item in attention), attention
+        )
+
+    def test_an_action_that_could_not_be_read_accuses_nobody(self):
+        """This line tells an operator they have two copies of the
+        repository. That accusation has to rest on two paths this actually
+        compared."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(attention, [])
+
+    def test_the_message_names_the_installer_that_would_repoint_it(self):
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    action_command='cmd.exe /c ""py.exe" "D:\\x\\run_company_ops.py" 2>&1"',
+                )
+            },
+        )
+        self.assertTrue(
+            any("install_runner_task.ps1" in item for item in attention), attention
+        )
+
+    def test_the_whole_block_still_answers_where_task_scheduler_does_not_exist(self):
+        """The OS boundary, end to end rather than at `query()`.
+
+        `_block()`'s contract is that a section answers; a block that raised
+        on a machine with no Task Scheduler would take the whole report down
+        on exactly the platform where nothing can be verified by hand
+        either. Nothing is raised, because "this question does not apply
+        here" is not a fault of the deployment.
+        """
+        import schedtask
+
+        self._make_runner_machine()
+        self._make_agent_machine()
+        module = self._module(self.runtime)
+        module.SCHEDULE_QUERY = lambda names, *, prefixes=(): schedtask.query(
+            names, prefixes=prefixes, run=None, is_windows=False
+        )
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            attention = module._print_schedule(NOW)
+
+        printed = buffer.getvalue()
+        self.assertIn("UNKNOWN", printed)
+        self.assertIn("Windows", printed)
+        self.assertEqual(attention, [], "an unanswerable question raised an alarm")
+
+    # ------------------------------------------- every line it can produce
+
+    def _every_alarm_this_block_can_raise(self):
+        """Drive the block through each alarming state and collect the real
+        lines.
+
+        Derived from the block rather than transcribed. `test_dashboard_
+        server.py::test_every_shape_ops_status_can_raise_is_classified_and
+        _actionable` keeps a hand-written roster of assembled shapes, for a
+        reason its docstring states well -- these lines are built by
+        f-string concatenation across several source lines, so grepping for
+        a phrase does not prove the phrase reaches the classifier. That
+        roster is also, being hand-written, a list that a new alarm does not
+        join. C138 added ten and joined none of them.
+
+        This gets both properties: the strings are the assembled ones,
+        **and** they come from running the code, so an alarm added later is
+        collected here the day it exists.
+        """
+        import schedtask
+
+        raised = []
+        for build in (
+            # not registered, on a machine that runs the Runner
+            lambda: ({}, True, None),
+            # disabled
+            lambda: (
+                {
+                    schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                        name=schedtask.RUNNER_TASK_NAME, present=True,
+                        state="Disabled", last_result=0,
+                        last_run="2026-08-09T11:00:00+09:00",
+                    )
+                },
+                True,
+                None,
+            ),
+            # last run failed
+            lambda: (
+                {
+                    schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                        name=schedtask.RUNNER_TASK_NAME, present=True,
+                        state="Ready", last_result=1,
+                        last_run="2026-08-10T11:00:00+09:00",
+                    )
+                },
+                True,
+                None,
+            ),
+            # Windows terminated it
+            lambda: (
+                {
+                    schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                        name=schedtask.RUNNER_TASK_NAME, present=True,
+                        state="Ready", last_result=schedtask.RESULT_TERMINATED,
+                        last_run="2026-08-10T11:00:00+09:00",
+                    )
+                },
+                True,
+                None,
+            ),
+            # throws its console output away
+            lambda: (
+                {
+                    schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                        name=schedtask.RUNNER_TASK_NAME, present=True,
+                        state="Ready", last_result=0,
+                        last_run="2026-08-10T11:00:00+09:00",
+                        action_command=(
+                            'py.exe "'
+                            + str(Path(__file__).resolve().parents[1] / "run_company_ops.py")
+                            + '"'
+                        ),
+                    )
+                },
+                True,
+                None,
+            ),
+            # points at another checkout
+            lambda: (
+                {
+                    schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                        name=schedtask.RUNNER_TASK_NAME, present=True,
+                        state="Ready", last_result=0,
+                        last_run="2026-08-10T11:00:00+09:00",
+                        action_command=(
+                            'cmd /c ""py" "D:\\elsewhere\\run_company_ops.py"'
+                            ' >> "D:\\elsewhere\\x.log" 2>&1"'
+                        ),
+                    )
+                },
+                True,
+                None,
+            ),
+            # two Agent tasks / a task for another Desktop
+            lambda: ({}, False, "two"),
+            lambda: ({}, False, "other"),
+            # the Desktop id cannot be determined
+            lambda: ({}, False, "unknown"),
+        ):
+            answers, runner_machine, agent_case = build()
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Path(tmp) / "runtime"
+                runtime.mkdir(parents=True)
+                if runner_machine:
+                    (runtime / "local_master").mkdir()
+                state = runtime / "agent" / "state"
+                state.mkdir(parents=True)
+                if agent_case == "unknown":
+                    (state / "agent_state.json").write_text("{ nope", encoding="utf-8")
+                else:
+                    (state / "agent_state.json").write_text(
+                        json.dumps({"desktop_id": "DESKTOP_1"}), encoding="utf-8"
+                    )
+                    os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1"
+
+                discovered = {}
+                if agent_case == "two":
+                    for desktop in ("DESKTOP_1", "DESKTOP_3"):
+                        name = schedtask.agent_task_name(desktop)
+                        discovered[name] = schedtask.ScheduledTaskStatus(
+                            name=name, present=True, state="Ready", last_result=0,
+                            last_run="2026-08-10T09:00:00+09:00",
+                        )
+                elif agent_case == "other":
+                    name = schedtask.agent_task_name("DESKTOP_3")
+                    discovered[name] = schedtask.ScheduledTaskStatus(
+                        name=name, present=True, state="Ready", last_result=0,
+                        last_run="2026-08-10T09:00:00+09:00",
+                    )
+
+                module = self._module(runtime)
+                if agent_case == "unreadable-probe":
+                    pass
+                _printed, attention = self._run(module, answers, discovered=discovered)
+                raised.extend(attention)
+
+        # The probe-error alarm needs a refused `is_dir()`, which the loop
+        # above cannot express; taken here so the collection is complete.
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        real_is_dir = Path.is_dir
+
+        def refusing(path, *args, **kwargs):
+            if path.name == "local_master":
+                raise PermissionError(13, "Permission denied")
+            return real_is_dir(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "is_dir", refusing):
+            _printed, attention = self._run(module, {})
+        raised.extend(attention)
+
+        return raised
+
+    def test_every_alarm_this_block_raises_is_classified_and_actionable(self):
+        """C138's own lesson, applied to itself.
+
+        Measured by loading the rendered Dashboard rather than by reading
+        code: both SCHEDULE alarms came out with a `?` badge and "이 화면이
+        분류하지 못한 줄 — 내용을 직접 읽어야 한다", no severity and no next
+        action — directly beneath an older alarm whose prescribed remedy is
+        "예약 작업(Windows 작업 스케줄러)이 꺼져 있는지 확인한다", which is
+        the manual check this block exists to perform.
+
+        `controltower/attention.py` is the one classifier all three surfaces
+        share, so the same lines were unclassified on the Notion page the
+        workspace reads.
+        """
+        from controltower.attention import UNCLASSIFIED, next_action, severity
+
+        raised = self._every_alarm_this_block_can_raise()
+
+        self.assertGreaterEqual(
+            len(raised), 10, f"the sweep collected almost nothing: {raised}"
+        )
+        for line in raised:
+            with self.subTest(line=line[:48]):
+                level, why = severity(line)
+                self.assertNotEqual(level, UNCLASSIFIED, line)
+                self.assertTrue(why, "classified with no stated reason")
+                self.assertTrue(next_action(line), "classified with no remedy")
+
+    def test_the_sweep_would_notice_an_unclassified_alarm(self):
+        """Guards the guard. The assertion above is a negative over a
+        collected list, and a list built from states that raise nothing
+        would pass it for free."""
+        from controltower.attention import UNCLASSIFIED, severity
+
+        raised = self._every_alarm_this_block_can_raise()
+        distinct = {severity(line)[1] for line in raised}
+
+        self.assertGreaterEqual(len(distinct), 6, sorted(map(str, distinct)))
+        self.assertEqual(severity("이 줄은 어떤 규칙에도 맞지 않는다")[0], UNCLASSIFIED)
+
+    # ------------------------------------------ what the machine really has
+
+    def _registered_agent(self, desktop_id, **over):
+        import schedtask
+
+        fields = dict(
+            present=True, state="Ready", last_result=0,
+            last_run="2026-08-10T09:00:00+09:00",
+        )
+        fields.update(over)
+        name = schedtask.agent_task_name(desktop_id)
+        return {name: schedtask.ScheduledTaskStatus(name=name, **fields)}
+
+    def test_two_agent_tasks_on_one_machine_are_raised(self):
+        """The accident nothing could see. The Agent's task name carries a
+        Desktop id, so re-installing with a different `-DesktopId` registers
+        a *new* task and leaves the old one — two tasks, both firing at
+        logon. Asked about by name, each answers "registered and healthy".
+
+        Only one of them matches this machine's `agent_state.json`; the
+        other reaches `ensure_desktop()` and is refused, correctly, because
+        accepting it would let one Desktop inherit another's watermark and
+        skip every date up to it with no error anywhere (`run_agent.py`
+        spends twenty lines on that).
+        """
+        self._make_agent_machine(desktop_id="DESKTOP_1")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1"
+        module = self._module(self.runtime)
+        discovered = {
+            **self._registered_agent("DESKTOP_1"),
+            **self._registered_agent("DESKTOP_3"),
+        }
+        _printed, attention = self._run(module, {}, discovered=discovered)
+
+        raised = [item for item in attention if "둘 이상 등록돼 있다" in item]
+        self.assertEqual(len(raised), 1, attention)
+        self.assertIn("DESKTOP_1", raised[0])
+        self.assertIn("DESKTOP_3", raised[0])
+
+    def test_one_agent_task_is_not_raised_as_two(self):
+        self._make_agent_machine(desktop_id="DESKTOP_1")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1"
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module, {}, discovered=self._registered_agent("DESKTOP_1")
+        )
+        self.assertEqual(attention, [])
+
+    def test_a_task_registered_for_another_desktop_is_raised(self):
+        """The single-task version of the same accident: the machine's
+        identity was repointed and the task was not, or the reverse. By name
+        alone this reads as "the Agent task is not registered", which sends
+        an operator to install a *second* one."""
+        self._make_agent_machine(desktop_id="DESKTOP_2")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_2"
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module, {}, discovered=self._registered_agent("DESKTOP_3")
+        )
+
+        raised = [item for item in attention if "Desktop ID와 다르다" in item]
+        self.assertEqual(len(raised), 1, attention)
+        self.assertIn("DESKTOP_3", raised[0])
+        self.assertIn("DESKTOP_2", raised[0])
+
+    def test_the_mismatch_message_does_not_tell_anyone_to_delete_state(self):
+        """`run_agent.py` refuses to delete or rewrite `agent_state.json`
+        for a reason it states at length: the file holds
+        `last_successful_collection_date`, and losing it skips every
+        uncollected date silently. A status screen must not advise what the
+        tool refuses to do."""
+        self._make_agent_machine(desktop_id="DESKTOP_2")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_2"
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module, {}, discovered=self._registered_agent("DESKTOP_3")
+        )
+        raised = next(item for item in attention if "Desktop ID와 다르다" in item)
+        self.assertIn("직접 지우지 않는다", raised)
+
+    def test_a_discovered_task_is_reported_even_when_the_profile_is_unknown(self):
+        """The machine where `COMPANY_OPS_PROFILE` is not in this shell and
+        the state file is unreadable. By name there is nothing to ask about;
+        by prefix the registered task answers for itself."""
+        state = self.runtime / "agent" / "state"
+        state.mkdir(parents=True)
+        (state / "agent_state.json").write_text("{ not json", encoding="utf-8")
+        module = self._module(self.runtime)
+        printed, _attention = self._run(
+            module, {}, discovered=self._registered_agent("DESKTOP_2")
+        )
+        self.assertIn("DOJOONPASS_COMPANY_OPS_AGENT_DESKTOP_2", printed)
+
+    def test_a_broken_discovered_task_is_raised_like_any_other(self):
+        """Found by prefix rather than by name changes how it was located,
+        not what it means. A task that fails every morning is the same
+        problem however this came to hear about it."""
+        self._make_agent_machine(desktop_id="DESKTOP_1")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1"
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module, {},
+            discovered=self._registered_agent("DESKTOP_1", last_result=1),
+        )
+        self.assertTrue(
+            any("Agent" in item and "실패로 끝났다" in item for item in attention),
+            attention,
+        )
+
+    def test_a_discovered_name_cannot_forge_a_report_line(self):
+        """Discovered names come back from Windows, not from this project,
+        so `_TASK_NAME_RE` never sees them — a task somebody created by hand
+        can be called anything at all."""
+        import schedtask
+
+        self._make_agent_machine(desktop_id="DESKTOP_1")
+        os.environ["COMPANY_OPS_PROFILE"] = "DESKTOP_1"
+        forged = (
+            schedtask.AGENT_TASK_PREFIX
+            + "DESKTOP_1\n  ! 모든 검사 통과 — 할 일 없음"
+        )
+        module = self._module(self.runtime)
+        printed, attention = self._run(
+            module,
+            {},
+            discovered={
+                forged: schedtask.ScheduledTaskStatus(
+                    name=forged, present=True, state="Ready", last_result=1,
+                    last_run="2026-08-10T09:00:00+09:00",
+                )
+            },
+        )
+        self.assertNotIn("\n  ! 모든 검사 통과", printed)
+        for item in attention:
+            with self.subTest(item=item[:40]):
+                self.assertEqual(len(item.splitlines()), 1)
+
+    def test_the_block_asks_by_prefix_as_well_as_by_name(self):
+        """Structural: every assertion above drives an injected `discovered`
+        set, and none of them would notice production having stopped asking
+        for it."""
+        import schedtask
+
+        asked = []
+
+        def query(names, *, prefixes=()):
+            asked.append(tuple(prefixes))
+            return {
+                name: schedtask.ScheduledTaskStatus(name=name, present=False)
+                for name in names
+            }
+
+        module = self._module(self.runtime)
+        module.SCHEDULE_QUERY = query
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            module._print_schedule(NOW)
+
+        self.assertEqual(asked, [(schedtask.AGENT_TASK_PREFIX,)])
+
+    # ------------------------------------------------ the optional third job
+
+    def test_the_publish_task_is_reported_but_never_raised_when_absent(self):
+        """The one task of the three whose absence is a choice.
+
+        `publish_control_tower.py` is how the result reaches people who
+        never open a terminal, and AGENT.md section 6c tells an operator to
+        register it beside the Runner -- but an operator who reads the
+        browser Dashboard instead is not misconfigured. Raising it would put
+        an alarm that never clears on a correctly-run machine, which is how
+        a whole block stops being read.
+        """
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, attention = self._run(module, {})
+
+        self.assertIn(schedtask.PUBLISH_TASK_NAME, printed)
+        self.assertIn("사람이 실행할 때만 갱신된다", printed)
+        self.assertFalse(
+            any("Publish" in item for item in attention),
+            f"the optional task was raised: {attention}",
+        )
+
+    def test_the_hint_names_the_installer_that_would_register_it(self):
+        """Saying "it is not scheduled" and not saying how to schedule it is
+        the shape this repository keeps removing."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, {})
+        self.assertIn("scripts/install_publish_task.ps1", printed)
+
+    def test_a_machine_that_is_not_the_runner_is_not_offered_the_hint(self):
+        """Desktops 1-3 do not publish. Telling them to schedule it would be
+        advice to register a job that has nothing to read."""
+        module = self._module(self.runtime)
+        printed, attention = self._run(module, {})
+        self.assertNotIn("사람이 실행할 때만 갱신된다", printed)
+        self.assertEqual(attention, [])
+
+    def test_a_registered_publish_task_that_is_failing_is_raised(self):
+        """Optional to *have*. Not optional to be broken: a publish task
+        that exits non-zero every morning is a scheduled job that has
+        stopped doing its job, and exit 1 here means the Notion credentials
+        are not set -- so the workspace's page is frozen and nothing else
+        says why."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.PUBLISH_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.PUBLISH_TASK_NAME, present=True, state="Ready",
+                    last_result=1, last_run="2026-08-10T11:30:00+09:00",
+                )
+            },
+        )
+        self.assertEqual(len(attention), 2, attention)
+        self.assertTrue(
+            any("Publish" in item and "실패로 끝났다" in item for item in attention),
+            attention,
+        )
+
+    def test_a_degraded_publish_is_raised_as_a_failure(self):
+        """`3` is `publish_control_tower.py`'s own DEGRADED: the page was
+        written and a surface around it was not. From Task Scheduler's side
+        it is simply a non-zero exit, and that is the right reading -- the
+        surfaces that failed are named in the log this block prints."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.PUBLISH_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.PUBLISH_TASK_NAME, present=True, state="Ready",
+                    last_result=3, last_run="2026-08-10T11:30:00+09:00",
+                )
+            },
+        )
+        self.assertTrue(
+            any("Publish" in item and "exit 3" in item for item in attention), attention
+        )
+
+    def test_a_disabled_publish_task_is_raised(self):
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.PUBLISH_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.PUBLISH_TASK_NAME, present=True, state="Disabled",
+                    last_result=0, last_run="2026-08-10T11:30:00+09:00",
+                )
+            },
+        )
+        self.assertTrue(
+            any("Publish" in item and "사용 안 함" in item for item in attention),
+            attention,
+        )
+
+    def test_the_publish_message_names_its_own_installer(self):
+        """Three tasks, two messages that name a script to run. A single
+        mapping rather than a conditional, because the failure mode of two
+        copies is a message that tells an operator to re-register the wrong
+        job."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.PUBLISH_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.PUBLISH_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:30:00+09:00",
+                    action_command=(
+                        'C:\\Python\\python.exe "'
+                        + str(
+                            Path(__file__).resolve().parents[1]
+                            / "publish_control_tower.py"
+                        )
+                        + '"'
+                    ),
+                )
+            },
+        )
+        self.assertTrue(
+            any("install_publish_task.ps1" in item for item in attention), attention
+        )
+
+    def test_every_label_the_block_prints_has_an_installer(self):
+        """`_SCHEDULE_INSTALLERS` is indexed by label with no fallback, so a
+        fourth task added to the loop without a row would raise `KeyError`
+        inside a diagnostic. Cheap to hold in step."""
+        module = self._module(self.runtime)
+        source = inspect.getsource(module._print_schedule)
+        labels = set(re.findall(r'"(Runner|Agent|Publish)"\),', source))
+        self.assertTrue(labels, "the scan found no labels -- it has gone blind")
+        for label in sorted(labels):
+            with self.subTest(label=label):
+                self.assertIn(label, module._SCHEDULE_INSTALLERS)
+
+    # ------------------------------------------- the only surviving evidence
+
+    def _failed_runner(self):
+        import schedtask
+
+        return {
+            schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                last_result=1, last_run="2026-08-10T11:00:00+09:00",
+            )
+        }
+
+    def _write_scheduled_log(self, text: str) -> Path:
+        import schedtask
+
+        logs = self.runtime / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        path = logs / schedtask.SCHEDULED_LOG_NAMES[schedtask.RUNNER_TASK_NAME]
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_a_failed_run_shows_the_end_of_what_it_printed(self):
+        """The whole point of the redirection the installers gained in C138.
+        `LastTaskResult` says `exit 1`; only this file says which variable
+        was missing, and nothing else under `runtime/` was written at all."""
+        self._make_runner_machine()
+        self._write_scheduled_log(
+            "starting\n[FAILED] COMPANY_OPS_HISTORY_START_DATE 환경변수가 없습니다\n"
+        )
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, self._failed_runner())
+        self.assertIn("COMPANY_OPS_HISTORY_START_DATE", printed)
+
+    def test_only_the_tail_is_shown(self):
+        """A status screen, not a log viewer. The useful part of a failed
+        run is its last lines, and the file is named so the rest is one
+        command away."""
+        self._make_runner_machine()
+        self._write_scheduled_log("".join(f"line-{n}\n" for n in range(200)))
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, self._failed_runner())
+        self.assertIn("line-199", printed)
+        self.assertNotIn("line-100", printed)
+
+    def test_a_log_that_was_never_written_is_said_rather_than_shown_empty(self):
+        """"No log" and "an unreadable log" call for different actions, and
+        a task registered by an installer older than the redirection has the
+        first. Printing nothing would look like a third thing: a run that
+        printed nothing."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, self._failed_runner())
+        self.assertIn("아직 기록이 없다", printed)
+
+    def test_an_unreadable_log_does_not_take_the_block_down(self):
+        """A refused log is reported, not raised. `_block()`'s contract is
+        that a section answers even when part of its evidence is gone, and
+        a permission change under `runtime/` is the ordinary way this
+        happens (a restore, a sync client, antivirus).
+
+        **The fault is injected at `open()`, which is the primitive the code
+        actually uses.** It used to be injected at `Path.read_text` — true
+        when this test was written and stale the moment the tail became a
+        windowed binary read. It kept passing for a while and then failed
+        without the subject having changed at all, which is what an
+        injection aimed at an implementation detail rather than at a
+        boundary does.
+        """
+        self._make_runner_machine()
+        path = self._write_scheduled_log("whatever\n")
+        module = self._module(self.runtime)
+
+        real_open = open
+
+        def refusing(file, *args, **kwargs):
+            if str(file) == str(path):
+                raise PermissionError(13, "Permission denied")
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch("builtins.open", refusing):
+            printed, attention = self._run(module, self._failed_runner())
+
+        self.assertIn("Permission denied", printed)
+        self.assertEqual(len(attention), 1, attention)
+
+    def test_the_refusal_injection_would_notice_a_readable_log(self):
+        """Guards the guard. The test above asserts a message appears under
+        an injected fault; if the injection stopped reaching the code, the
+        block would read the file happily and that assertion would be the
+        only thing standing between a silent no-op and a green suite."""
+        self._make_runner_machine()
+        self._write_scheduled_log("whatever\n")
+        module = self._module(self.runtime)
+
+        printed, _attention = self._run(module, self._failed_runner())
+
+        self.assertIn("whatever", printed)
+        self.assertNotIn("Permission denied", printed)
+
+    def test_a_secret_printed_by_the_run_is_redacted_before_the_screen(self):
+        """This is a file's *contents*, unlike the filenames and counts the
+        ATTENTION sink handles -- and `run_company_ops.py` prints Notion
+        failure reasons, which are remote response bodies, straight to the
+        stream that lands in it. A status screen must not be the second copy
+        of a leak."""
+        self._make_runner_machine()
+        secret = "NOTION_API_TOKEN" + "=" + "ntn_" + "A" * 40
+        self._write_scheduled_log("[FAILED] rejected: " + secret + "\n")
+        module = self._module(self.runtime)
+        printed, _attention = self._run(module, self._failed_runner())
+        self.assertNotIn(secret, printed)
+        self.assertIn("REDACTED", printed)
+
+    def test_no_log_content_can_print_more_lines_than_the_cap(self):
+        """Console output is the least constrained input this file reads --
+        anything any entrypoint printed, including text another Desktop
+        authored.
+
+        **The first version of this test asserted the wrong property, and
+        passing it would have proved nothing.** It wrote one line holding a
+        `\r` and a ` ` and expected one line out; three came out, and
+        three is correct -- `str.splitlines()` treats both as line breaks, so
+        the file simply had three lines. `one_line()` at that point is
+        belt-and-braces, not the guarantee.
+
+        The guarantee that does NOT follow from `splitlines()` is the cap:
+        however many separators the content carries, the block prints at most
+        `_SCHEDULED_LOG_TAIL_LINES` of them. Without it, one "line" holding a
+        thousand ` `s becomes a thousand lines in the middle of a status
+        screen -- which is the same denial-of-attention BUG-6 was about,
+        reached through a file rather than through an Event id.
+        """
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        cap = module._SCHEDULED_LOG_TAIL_LINES
+        self._write_scheduled_log("x " * (cap * 20) + "\n")
+        printed, _attention = self._run(module, self._failed_runner())
+        body = [line for line in printed.splitlines() if line.lstrip().startswith("|")]
+        self.assertEqual(len(body), cap, printed)
+
+    def test_no_control_character_reaches_the_screen(self):
+        """The separator that matters on a terminal is `\r`: mid-line it
+        returns the cursor to column 0, and what follows overwrites the `| `
+        prefix and anything before it -- so a log line could paint itself as
+        a different part of the report.
+
+        `splitlines()` happens to split on `\r` too, so today this is closed
+        twice over. Asserted anyway, on the printed output rather than on the
+        reasoning, because the reasoning is what was wrong the first time.
+        """
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        self._write_scheduled_log("before\rafter\n")
+        printed, _attention = self._run(module, self._failed_runner())
+        for forbidden in ("\r", "\x0b", "\x0c", " ", " "):
+            with self.subTest(char=repr(forbidden)):
+                self.assertNotIn(forbidden, printed)
+
+    def test_a_healthy_task_is_not_given_a_log_dump(self):
+        """The tail answers "why did it fail". A run that did not fail has
+        no question to answer, and a status screen that printed five lines
+        of console output every morning is one nobody reads."""
+        import schedtask
+
+        self._make_runner_machine()
+        self._write_scheduled_log("all fine\n")
+        module = self._module(self.runtime)
+        printed, _attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                )
+            },
+        )
+        self.assertNotIn("all fine", printed)
+
+    def test_the_attention_line_names_the_file_to_open(self):
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(module, self._failed_runner())
+        self.assertIn("scheduled_runner.log", attention[0])
+
+    def test_a_huge_log_is_not_read_whole_to_print_five_lines(self):
+        """The one file this Sprint added with no bound on its size.
+
+        It is appended to on every scheduled run and nothing trims it (a
+        retention policy is an open decision — BACKLOG E-2). At the daily
+        cadence the task fires that is immaterial; the case that is not is a
+        task failing in a loop, or a run printing a traceback per Event —
+        which is exactly when an operator opens this screen.
+
+        A diagnostic that reads an unbounded file into memory to print five
+        lines of it is the shape BUG-40 already cost this project once.
+        Asserted by counting the bytes actually read, not by timing.
+        """
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        path = self._write_scheduled_log(
+            "".join(f"filler line {n}\n" for n in range(200000))
+        )
+        self.assertGreater(
+            path.stat().st_size, module._SCHEDULED_LOG_TAIL_BYTES * 4,
+            "the fixture is not big enough to tell a windowed read from a whole one",
+        )
+
+        real_open = open
+        read = []
+
+        def counting_open(file, mode="r", *args, **kwargs):
+            handle = real_open(file, mode, *args, **kwargs)
+            if str(file) == str(path):
+                real_read = handle.read
+
+                def measured(*a, **k):
+                    data = real_read(*a, **k)
+                    read.append(len(data))
+                    return data
+
+                handle.read = measured
+            return handle
+
+        with mock.patch("builtins.open", counting_open):
+            printed, _attention = self._run(module, self._failed_runner())
+
+        self.assertTrue(read, "the log was not read through open() at all")
+        self.assertLessEqual(
+            sum(read), module._SCHEDULED_LOG_TAIL_BYTES,
+            f"read {sum(read)} bytes from a {path.stat().st_size}-byte log",
+        )
+        self.assertIn("filler line 199999", printed)
+
+    def test_the_window_does_not_print_a_line_that_was_never_written(self):
+        """A byte offset lands mid-line, and in UTF-8 mid-line is also
+        mid-character: `errors="replace"` would render the fragment as
+        replacement characters and the screen would show a line nobody
+        wrote. One line is dropped so the four above it are true."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        # Korean, so a mid-window cut is guaranteed to land inside a
+        # multi-byte character rather than only between two ASCII ones.
+        self._write_scheduled_log(
+            "".join(f"{n}번째 줄 — 한글이 들어 있다\n" for n in range(20000))
+        )
+        printed, _attention = self._run(module, self._failed_runner())
+
+        body = [line for line in printed.splitlines() if line.lstrip().startswith("|")]
+        self.assertEqual(len(body), module._SCHEDULED_LOG_TAIL_LINES)
+        for line in body:
+            with self.subTest(line=line):
+                self.assertNotIn("�", line)
+                self.assertIn("번째 줄", line)
+
+    def test_a_small_log_is_still_read_from_its_first_line(self):
+        """The window is the whole file below the threshold, and then
+        nothing may be dropped — the first line of a two-line log is half of
+        what the operator has."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        self._write_scheduled_log("first line\nsecond line\n")
+        printed, _attention = self._run(module, self._failed_runner())
+
+        self.assertIn("first line", printed)
+        self.assertIn("second line", printed)
+
+    # ------------------------------------------------------- output hygiene
+
+    def test_every_attention_line_this_block_produces_is_one_line(self):
+        """`main()` flattens at its sink, and this is the producer half. The
+        strings interpolated here include a task name built from an
+        environment variable and a `last_run` string that came out of a
+        subprocess."""
+        import schedtask
+
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        _printed, attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=2,
+                    last_run="2026-08-10\n  ! 모든 검사 통과 -- 할 일 없음",
+                )
+            },
+        )
+        self.assertEqual(len(attention), 1, attention)
+        self.assertEqual(len(attention[0].splitlines()), 1, attention[0])
+
+    def test_the_block_never_writes_anything(self):
+        """Read-only, like every other block here. Checked against the tree
+        rather than by reading the source, so a write through any route is
+        caught."""
+        self._make_runner_machine()
+        self._make_agent_machine()
+        module = self._module(self.runtime)
+        before = sorted(
+            (p.relative_to(self.runtime).as_posix(), p.stat().st_size)
+            for p in self.runtime.rglob("*")
+            if p.is_file()
+        )
+        self.assertTrue(before, "the comparison would prove nothing on an empty tree")
+        self._run(module, {})
+        after = sorted(
+            (p.relative_to(self.runtime).as_posix(), p.stat().st_size)
+            for p in self.runtime.rglob("*")
+            if p.is_file()
+        )
+        self.assertEqual(before, after)
+
+    def test_the_block_is_reached_through_main(self):
+        """Structural: the block could be perfect and never called. `main()`
+        drives it through `_block()` like every other section."""
+        module = self._module(self.runtime)
+        source = inspect.getsource(module.main)
+        self.assertIn('("SCHEDULE", _print_schedule)', source)
+
+    def test_the_block_answers_the_question_last_run_tells_the_operator_to_ask(self):
+        """The two messages are a pair: LAST RUN says "Task Scheduler 등록
+        상태를 확인해야 한다", and this block is what checks it. If that
+        sentence is ever rewritten away from Task Scheduler, this block's
+        placement stops being an answer to anything."""
+        source = (Path(__file__).resolve().parents[1] / "ops_status.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Task Scheduler 등록 상태를 확인해야 한다", source)
+        self.assertLess(
+            source.index("Task Scheduler 등록 상태를 확인해야 한다"),
+            source.index('("SCHEDULE", _print_schedule)'),
+        )
 
 
 if __name__ == "__main__":

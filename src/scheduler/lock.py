@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -87,15 +88,70 @@ def _read_lock(lock_path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _is_process_running(pid: object) -> bool:
+#: What a recorded `image_name` may look like before it is passed to
+#: `tasklist`. A bare filename, because that is what `os.path.basename()`
+#: produces and what the `IMAGENAME` filter matches.
+#:
+#: The lock file is written by this module, but it is a file on disk: a
+#: hand-edited, restored, or truncated one can hold anything. A value this
+#: rejects is dropped and the probe falls back to asking about the pid
+#: alone -- the behaviour every lock written before this field existed
+#: already gets. It is passed as one element of an argv list, never through
+#: a shell, so this is about keeping the filter *meaningful* rather than
+#: about injection.
+_IMAGE_NAME_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,120}\Z")
+
+
+def _is_process_running(pid: object, image_name: object = None) -> bool:
     """docs/07_SCHEDULER_CATCHUP_SPEC.md §27: Lock에 기록된 Process가
-    실제로 실행 중인지 확인한다."""
+    실제로 실행 중인지 확인한다.
+
+    `image_name` is the executable the lock's holder was running, recorded
+    beside its pid at acquisition. It exists to answer **pid reuse**, which
+    this function could not see and which wedges the Runner permanently.
+
+    Measured on this machine before the field existed. A lock left by a
+    killed Runner, holding a pid Windows had since handed to an unrelated
+    process:
+
+        lock:  {"process_id": 1336, "created_at": "2020-01-01T00:00:00+09:00"}
+        1336 now belongs to svchost.exe
+        _is_process_running(1336)  ->  True
+        try_acquire_lock(...)      ->  False
+
+    False, from then on, every run. The lock is never judged stale, the
+    Runner skips every trigger, and only a person deleting the file undoes
+    it. The `created_at` is five years old and nothing looks at it, by
+    design -- §27 forbids deciding staleness from elapsed time.
+
+    This is reachable without anything exotic: `ExecutionTimeLimit` expiring
+    (docs/07 §55 registers one), a power cut, a machine reset. Each leaves
+    the lock behind; a reboot then reassigns low pids immediately.
+
+    **The direction of the change is one-way, which is why it is safe.**
+    Adding a filter can only turn a "running" answer into "not running", and
+    only when the pid belongs to a process running a *different executable*
+    -- which by construction cannot be the holder that wrote this lock. A
+    genuinely live holder still matches its own image name and is still
+    reported running, so the BUG-18/BUG-20 condition (two Runners at once)
+    is not reachable through this. What remains unfixed is a pid reused by
+    another process with the same image name; that is narrower than "any
+    process at all", and `ops_status.py`'s LOCK_STUCK_AFTER_HOURS line still
+    reports it.
+
+    A lock without the field -- written before it existed, or by a Python
+    with no `sys.executable` -- falls back to asking about the pid alone,
+    exactly as before.
+    """
     if not isinstance(pid, int) or pid <= 0:
         return False
     if sys.platform == "win32":
+        filters = ["/FI", f"PID eq {pid}"]
+        if isinstance(image_name, str) and _IMAGE_NAME_RE.match(image_name):
+            filters += ["/FI", f"IMAGENAME eq {image_name}"]
         try:
             result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                ["tasklist", *filters, "/NH"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -196,6 +252,18 @@ def try_acquire_lock(lock_path: Path, *, now: datetime) -> bool:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"process_id": os.getpid(), "created_at": now.isoformat(timespec="seconds")}
 
+    # The executable this process is running, so a later run can tell "my
+    # pid is still alive" from "something else now has my old pid". See
+    # `_is_process_running()` for the measurement and for why adding this
+    # can only make the probe more accurate, never less safe.
+    #
+    # Omitted rather than guessed at when `sys.executable` is empty (an
+    # embedded interpreter): the probe then behaves exactly as it did before
+    # this field existed.
+    image = os.path.basename(sys.executable or "")
+    if image:
+        payload["image_name"] = image
+
     # At most two passes: the second exists only to retry once after a stale
     # lock was cleared. A further collision means another run got there first.
     for _ in range(2):
@@ -204,7 +272,8 @@ def try_acquire_lock(lock_path: Path, *, now: datetime) -> bool:
         except FileExistsError:
             observed = _read_lock(lock_path)
             pid = observed.get("process_id") if observed is not None else None
-            if _is_process_running(pid):
+            image = observed.get("image_name") if observed is not None else None
+            if _is_process_running(pid, image):
                 return False
             # Unparseable lock, or recorded process not running -> stale (§27).
             if not _take_over_stale(lock_path, observed):
@@ -261,22 +330,33 @@ def is_locked(lock_path: Path) -> bool:
 def lock_held_since(lock_path: Path) -> datetime | None:
     """When the live holder acquired this lock, or None if nobody holds it.
 
-    Reads the `created_at` field the lock file has always carried — no new
-    field, so `LockFileContractTests`' pinned on-disk shape is untouched.
-    None also covers a lock whose `created_at` is missing or unparseable: a
-    time this cannot read is not a time to report.
+    Reads `created_at`, and `process_id`/`image_name` only to ask whether
+    anybody still holds the lock. None also covers a lock whose `created_at`
+    is missing or unparseable: a time this cannot read is not a time to
+    report.
 
-    What this is for: `_is_process_running()` checks that *a* process has
-    that pid, not that it is the same process that wrote the lock. After a
-    power cut the dead Runner's pid stays in the file, and once Windows
-    reassigns that number to something unrelated the lock looks held
-    forever — every run then skips, silently, until a human deletes the
-    file. Making the identity check exact means widening the lock file's
-    contract, which is a decision (BACKLOG). Noticing that a lock has been
-    held implausibly long needs neither.
+    **What this used to be for, and what changed under it (C138).** This
+    docstring described the pid-reuse hole — "once Windows reassigns that
+    number to something unrelated the lock looks held forever" — and
+    deferred closing it: *"Making the identity check exact means widening
+    the lock file's contract, which is a decision."*
+
+    That premise was wrong, in the way BACKLOG E-11 keeps describing.
+    docs/07 §26 says "Lock에는 **최소한** 다음 정보를 기록할 수 있다" and then
+    lists two fields. It states a minimum, not a schema, so recording the
+    holder's executable beside its pid is implementing §27's own question —
+    "해당 Process가 실제 실행 중인가?" — rather than changing the contract.
+    `_is_process_running()` carries the measurement.
+
+    So this reports "held" for a narrower and truer set of locks than it
+    used to, and the pid-reuse case it was written to *mitigate* is now
+    mostly gone. It keeps its job for what remains: a lock held implausibly
+    long by a process that really is alive.
     """
     observed = _read_lock(lock_path)
-    if observed is None or not _is_process_running(observed.get("process_id")):
+    if observed is None or not _is_process_running(
+        observed.get("process_id"), observed.get("image_name")
+    ):
         return None
     created_at = observed.get("created_at")
     if not isinstance(created_at, str):
@@ -327,7 +407,14 @@ def stale_lock_cannot_be_cleared(lock_path: Path) -> bool:
     observed = _read_lock(lock_path)
     if observed is None and not path.exists():
         return False
-    if observed is not None and _is_process_running(observed.get("process_id")):
+    # The same view of "running" the acquirer uses, `image_name` included.
+    # These two must agree: this function's whole subject is "a lock
+    # `try_acquire_lock()` would judge stale and then fail to remove", and
+    # a narrower probe there than here would make it silently miss exactly
+    # the locks that had become reclaimable.
+    if observed is not None and _is_process_running(
+        observed.get("process_id"), observed.get("image_name")
+    ):
         return False
     return not os.access(path, os.W_OK)
 

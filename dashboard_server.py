@@ -273,7 +273,7 @@ _STALE_AFTER_S = 300
 # single-operator tool is the cheap side.
 _CAPTURE_LOCK = threading.Lock()
 
-# The six blocks of `ops_status.py::main()`, in its order. CONTROL TOWER is
+# The blocks of `ops_status.py::main()`, in its order. CONTROL TOWER is
 # marked because this page renders its panels itself and keeps the text only
 # as the parity check described in the module docstring.
 _BLOCKS: tuple[tuple[str, str, bool], ...] = (
@@ -281,15 +281,29 @@ _BLOCKS: tuple[tuple[str, str, bool], ...] = (
     ("HISTORY", "HISTORY — Company Repository", False),
     ("CONTROL TOWER", "CONTROL TOWER — 터미널 출력 (패널 대조용)", True),
     ("LAST RUN", "LAST RUN — Run Manifest", False),
+    # The only block on this page whose evidence is not a file this system
+    # wrote. It is here because the page and the Notion Control Tower it
+    # feeds are read by the people who never open a terminal, and "nothing
+    # is scheduled" is the one condition that makes every other block on
+    # the page stop changing without any of them saying so.
+    ("SCHEDULE", "SCHEDULE — Windows Task Scheduler 등록 상태", False),
     ("NOTION", "NOTION — Sync / Retry Queue", False),
     ("AGENT", "AGENT — 이 머신의 Agent", False),
 )
 
+#: `_BLOCKS`'s key -> the `ops_status.py` renderer that produces it.
+#:
+#: `SCHEDULE` is the one entry that costs a subprocess (measured: 0.6 s for
+#: a `powershell -NoProfile` query of three task names). That is affordable
+#: precisely because of the decision recorded at the top of this file —
+#: "the page does not refresh itself" — so the cost is paid once per page an
+#: operator deliberately opened, not on a timer.
 _RENDERERS = {
     "COMPANY": ops_status._print_company,
     "HISTORY": ops_status._print_history,
     "CONTROL TOWER": ops_status._print_control_tower,
     "LAST RUN": ops_status._print_last_run,
+    "SCHEDULE": ops_status._print_schedule,
     "NOTION": ops_status._print_notion,
     "AGENT": ops_status._print_agent,
 }
@@ -528,7 +542,7 @@ def gather(
     started = time.perf_counter()
     blocks: list[dict[str, Any]] = []
     attention: list[str] = []
-    # Held across all six blocks rather than re-taken per block: the gap
+    # Held across every block rather than re-taken per block: the gap
     # between two blocks is a gap in which another thread can install its own
     # buffer, and the restore-what-I-saved defect needs only that.
     with _CAPTURE_LOCK:
@@ -2319,7 +2333,7 @@ def _evidence_html(
         데이터 Coverage   how much of the evidence these numbers cover
         기간 필터          the control, not the content
         나머지 패널        TEAMS / DESKTOPS, and the layers with no source
-        터미널 출력        `ops_status.py`'s six blocks, verbatim
+        터미널 출력        `ops_status.py`'s blocks, verbatim
 
     The last is the largest change. Six `<pre>` blocks of terminal text were
     the bottom third of the page, and three of them said what ① and ④ now
@@ -2399,7 +2413,7 @@ def _strip_block_heading(text: str, key: str) -> str:
     On this page the card's `<h3>` says the same thing two lines above, so
     every block opened with its title twice and a row of sixty dashes —
     **twelve lines of the operational area saying nothing** (measured on the
-    rendered page, six blocks).
+    rendered page, every block).
 
     Removed only when both lines are actually there and the second really is
     a rule: a block whose shape changes keeps its text untouched rather than
