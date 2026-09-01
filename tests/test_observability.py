@@ -2613,11 +2613,13 @@ class LastRunViewTests(unittest.TestCase):
 class LastRunLockStuckTests(unittest.TestCase):
     """A Runner lock held far longer than any real run.
 
-    `_is_process_running()` asks whether *a* process has the recorded pid,
-    not whether it is the one that took the lock. A Runner killed by a power
-    cut leaves its pid in the file; once the OS reassigns that number, every
-    later run is denied the lock and skips — silently and permanently, since
-    §27 forbids judging staleness by elapsed time alone.
+    A Runner killed by a power cut leaves its pid in the file; once the OS
+    reassigns that number, the lock can look held forever, and §27 forbids
+    judging staleness by elapsed time alone. C138 closed most of that by
+    recording the holder's executable beside its pid, so
+    `_is_process_running()` now asks about both. What it does not close is a
+    pid reused by a process running the *same* executable — which is what
+    this line is still here for.
 
     Nothing here judges staleness or touches the lock. It reports the one
     fact that is certain: this lock has been held for an implausible time,
@@ -17626,6 +17628,75 @@ class TheScheduleBlockAsksWindowsWhatNoFileCanAnswerTests(unittest.TestCase):
             },
         )
         self.assertEqual(attention, [])
+
+    def _two_action_runner(self, action_command):
+        import schedtask
+
+        return {
+            schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                action_command=action_command,
+                action_count=2,
+            )
+        }
+
+    def test_a_hand_edited_task_is_not_told_its_output_is_safe(self):
+        """The query reads the first action only. Saying nothing here is
+        right -- a second action is the operator's own choice, and the
+        redirection this block can see covers only part of the task.
+
+        What must not happen is the reverse of both: a silent pass that
+        reads as "checked, fine"."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, attention = self._run(
+            module,
+            self._two_action_runner(
+                'cmd.exe /c ""py.exe" "run.py" >> "C:\\x\\y.log" 2>&1"'
+            ),
+        )
+
+        self.assertEqual(attention, [])
+        self.assertNotIn("콘솔 출력을 남기지 않는다", printed)
+        self.assertIn("Action이 2개다", printed)
+        self.assertIn("판정하지 않는다", printed)
+
+    def test_the_missing_redirection_is_also_withheld_not_raised(self):
+        """The other half, and the one that shows this is a refusal to
+        answer rather than a decision that everything is fine: an
+        un-redirected first action on a two-action task raises nothing
+        either, because one of two actions is not the task."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        printed, attention = self._run(
+            module, self._two_action_runner("C:\\Python\\python.exe run.py")
+        )
+
+        self.assertEqual(attention, [])
+        self.assertIn("Action이 2개다", printed)
+
+    def test_the_single_action_task_says_nothing_extra(self):
+        """The guard against this line becoming background noise: the
+        shape all three installers register must not grow a caveat."""
+        self._make_runner_machine()
+        module = self._module(self.runtime)
+        import schedtask
+
+        printed, _attention = self._run(
+            module,
+            {
+                schedtask.RUNNER_TASK_NAME: schedtask.ScheduledTaskStatus(
+                    name=schedtask.RUNNER_TASK_NAME, present=True, state="Ready",
+                    last_result=0, last_run="2026-08-10T11:00:00+09:00",
+                    action_command=(
+                        'cmd.exe /c ""py.exe" "run.py" >> "C:\\x\\y.log" 2>&1"'
+                    ),
+                    action_count=1,
+                )
+            },
+        )
+        self.assertNotIn("Action이", printed)
 
     def test_the_log_shown_is_the_one_the_action_actually_writes(self):
         """An operator who redirected somewhere of their own choosing must

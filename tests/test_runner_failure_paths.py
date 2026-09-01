@@ -4772,19 +4772,74 @@ class BackupFailurePresentationTests(unittest.TestCase):
 
     def test_the_classification_matches_what_backup_recorded(self):
         """The message must agree with the persisted state, or the operator
-        is told one thing while backup_state.json says another."""
+        is told one thing while backup_state.json says another.
+
+        Asked of the exception, because that is what production passes and
+        because the answer is no longer decided by the text alone: a typed
+        `WorkingCopyNotAGitRepositoryError` is permanent whatever it says.
+        """
+        from backup.git_ops import (
+            WorkingCopyNotAGitRepositoryError,
+            is_permanent_failure,
+        )
+
         module = self._entrypoint()
 
-        for message, expected_permanent in (
-            ("git push failed: Authentication failed", True),
-            ("git push failed: could not read Username", True),
-            ("git push failed: Could not resolve host", False),
-            ("git push timed out after 300s", False),
+        for exc, expected_permanent in (
+            (GitOperationError("git push failed: Authentication failed"), True),
+            (GitOperationError("git push failed: could not read Username"), True),
+            (GitOperationError("git push failed: Could not resolve host"), False),
+            (GitOperationError("git push timed out after 300s"), False),
+            (WorkingCopyNotAGitRepositoryError("not a git repository: X"), True),
         ):
-            with self.subTest(message=message):
-                self.assertEqual(
-                    module.is_authentication_failure(message), expected_permanent
+            with self.subTest(exc=type(exc).__name__ + ": " + str(exc)[:40]):
+                self.assertEqual(is_permanent_failure(exc), expected_permanent)
+                # The entrypoint applies that same rule rather than one of
+                # its own -- the property this test has always been about.
+                self.assertIs(module.is_permanent_failure, is_permanent_failure)
+
+    def test_an_unconfigured_backup_is_not_called_transient(self):
+        """The defect this closes, at the surface the operator reads.
+
+        A checkout carries no `runtime/`, so `runtime/backup_working_copy`
+        is absent on every fresh deployment and `check_working_copy_is_a_git
+        _repository()` raises before any git command. Measured before the
+        fix, on every run forever: BACKUP_PENDING / DEGRADED / RETRYABLE and
+        "따로 할 일은 없습니다" -- printed directly beneath a diagnosis
+        naming the command the operator had to run. That is the infinite
+        retry loop docs/08 §62 forbids, reached on the most ordinary
+        starting state there is.
+        """
+        import contextlib
+        import io
+
+        from backup.git_ops import WorkingCopyNotAGitRepositoryError
+
+        module = self._entrypoint()
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            code = module._report_backup_failure(
+                WorkingCopyNotAGitRepositoryError(
+                    "Backup Working Copy is not a git repository: C:\\x "
+                    "(no .git of its own found there - create it with "
+                    "`git clone <backup remote URL> runtime/backup_working_copy`)"
                 )
+            )
+        output = buffer.getvalue()
+
+        self.assertIn("BACKUP_FAILED", output)
+        self.assertNotIn("따로 할 일은 없습니다", output)
+        self.assertNotIn("BACKUP_PENDING", output)
+        # Not a credential problem, and saying so sends the operator to the
+        # one thing that is not broken.
+        self.assertNotIn("자격증명", output)
+        # docs/11 §26's procedure, not `git init`: push needs an upstream
+        # tracking branch and only `clone` configures one. Measured end to
+        # end -- clone reaches BACKUP_SUCCESS on the first run, `init` plus
+        # `remote add` lands in BUG-52's transient-forever loop.
+        self.assertIn("clone", output)
+        self.assertNotIn("git init`을 실행", output)
+        self.assertEqual(code, 2)
 
     def test_the_original_git_error_is_still_shown(self):
         """Explaining the situation must not hide what git actually said."""

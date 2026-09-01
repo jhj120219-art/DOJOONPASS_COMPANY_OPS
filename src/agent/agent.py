@@ -456,7 +456,36 @@ def _collect_one_date(
     Returns the date's result and the DrainSummary produced while
     delivering it (None when the date had nothing to deliver).
     """
-    signals, invalid = load_signals(signals_dir, target_date)
+    try:
+        signals, invalid = load_signals(signals_dir, target_date)
+    except OSError as exc:
+        # The date's Signal directory is there and cannot be listed
+        # (measured: a denied ACL, `PermissionError` winerror 5; also a
+        # disconnected network path or a locked OneDrive folder). Before
+        # `load_signals()` surfaced this, `Path.glob()` swallowed it and
+        # the date came back empty — NO_ACTIVITY, watermark advanced past
+        # it, and the Signals inside became unreachable because dates
+        # close in order and never reopen.
+        #
+        # FAILED is the existing answer for "this date did not succeed":
+        # the caller stops here rather than skipping ahead, leaves
+        # `last_successful_collection_date` where it is, and the next run
+        # retries this same date. Nothing is rejected or moved — the
+        # files were never read, and quarantining what we could not look
+        # at would destroy the evidence.
+        return (
+            DateResult(
+                date=target_date,
+                outcome=DateOutcome.FAILED,
+                errors=(
+                    f"Signal 디렉터리를 읽을 수 없습니다: "
+                    f"{redact(str(exc))} — 이 날짜의 Signal이 있는지 알 수 "
+                    f"없으므로 수집을 여기서 멈춥니다. 권한을 확인한 뒤 "
+                    f"다시 실행하면 같은 날짜부터 이어집니다",
+                ),
+            ),
+            None,
+        )
 
     rejected: list[str] = []
     errors: list[str] = []

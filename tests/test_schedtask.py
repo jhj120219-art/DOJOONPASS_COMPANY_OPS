@@ -27,6 +27,7 @@ than as an error — so they need no fixture and change nothing.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import subprocess
@@ -1017,6 +1018,75 @@ class ATaskCanRunPerfectlyAndSayNothingTests(unittest.TestCase):
         status = schedtask.parse_query_output(row, ["T"])["T"]
         self.assertIsNone(status.action_command)
         self.assertIsNone(schedtask.discards_console_output(status))
+
+    # ------------------------------------------- the count that must travel
+
+    @staticmethod
+    def _row(action, count):
+        return json.dumps(
+            {
+                "name": "T",
+                "present": True,
+                "state": "Ready",
+                "last_result": 0,
+                "last_run": "2026-08-28T08:02:07+09:00",
+                "action": action,
+                "action_count": count,
+            }
+        )
+
+    #: A registered action of each shape, as the installers write them.
+    _REDIRECTED = 'cmd.exe /c ""C:\\py.exe" "C:\\r\\run_company_ops.py" >> "C:\\r\\l.log" 2>&1"'
+    _DISCARDING = 'C:\\py.exe C:\\r\\run_company_ops.py'
+
+    def test_the_action_count_reaches_the_status(self):
+        """`_ROW` has always emitted this field and the parser used to drop
+        it, so the comment promising the caller "can see that this is a
+        partial view" described something that did not happen."""
+        status = schedtask.parse_query_output(self._row(self._DISCARDING, 2), ["T"])["T"]
+        self.assertEqual(status.action_count, 2)
+
+    def test_a_task_with_a_second_action_gets_no_verdict_on_its_output(self):
+        """The defect this closes. The query reads action one; a `False`
+        here says "this task keeps its output" about a task whose other
+        action may not, and `ops_status` prints that as settled."""
+        for action in (self._REDIRECTED, self._DISCARDING):
+            with self.subTest(action=action):
+                status = schedtask.parse_query_output(self._row(action, 2), ["T"])["T"]
+                self.assertIsNone(schedtask.discards_console_output(status))
+
+    def test_the_single_action_answers_are_untouched(self):
+        """The counterpart, and what keeps the fix from being a mute button:
+        one action is what all three installers register, and both verdicts
+        must still be given there."""
+        self.assertIs(
+            schedtask.discards_console_output(
+                schedtask.parse_query_output(self._row(self._DISCARDING, 1), ["T"])["T"]
+            ),
+            True,
+        )
+        self.assertIs(
+            schedtask.discards_console_output(
+                schedtask.parse_query_output(self._row(self._REDIRECTED, 1), ["T"])["T"]
+            ),
+            False,
+        )
+
+    def test_an_unreadable_count_keeps_the_previous_behaviour(self):
+        """Direction of the change, asserted rather than described: only a
+        count *known* to exceed one withholds the answer. A row from a query
+        that never sent the field must not become a new silence."""
+        row = json.dumps(
+            {
+                "name": "T",
+                "present": True,
+                "state": "Ready",
+                "action": self._DISCARDING,
+            }
+        )
+        status = schedtask.parse_query_output(row, ["T"])["T"]
+        self.assertIsNone(status.action_count)
+        self.assertIs(schedtask.discards_console_output(status), True)
 
 
 class WhatTheRegisteredActionActuallyRunsTests(unittest.TestCase):

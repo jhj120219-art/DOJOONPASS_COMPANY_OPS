@@ -313,10 +313,41 @@ def is_locked(lock_path: Path) -> bool:
     `ops_status.py` while a Runner works must not be able to disturb it, and
     the docstring of that script promises exactly that.
 
-    So this only reads: the lock file exists, it parses, and the process id
-    inside belongs to something currently running. Anything else is False,
-    including a lock left behind by a dead process — which is the same
-    judgement `try_acquire_lock()` makes (§27), reached without acting on it.
+    So this only reads: the lock file exists, it parses, and the process it
+    records is still running. Anything else is False, including a lock left
+    behind by a dead process — which is the same judgement
+    `try_acquire_lock()` makes (§27), reached without acting on it.
+
+    **`image_name` is part of that judgement, and this function was left out
+    of the change that made it so.** BUG-54's fix passed the recorded
+    executable name to `_is_process_running()` from `try_acquire_lock()`,
+    `lock_held_since()` and `stale_lock_cannot_be_cleared()` — the last of
+    those carries the reason in a comment ("a narrower probe there than here
+    would make it silently miss exactly the locks that had become
+    reclaimable"). This one kept asking about the pid alone, so the sentence
+    above claiming it reaches the same judgement was false for precisely the
+    case that fix exists for. Measured on this machine, one lock file:
+
+        {"process_id": 1336, "image_name": "python.exe"}   1336 is svchost.exe now
+
+        lock_held_since    -> None      nobody holds it
+        try_acquire_lock   -> True      took it over: the holder is dead
+        is_locked          -> True      **a live process is holding it**
+
+    What that costs is not cosmetic. `ops_status.py` calls this in two
+    places, both to soften an ATTENTION line about work that may have been
+    lost — unrendered KEEP candidates, orphaned Events — with "(Runner 실행
+    중 — 완료 후 재확인 권장)". The comment at the second one states the
+    stake outright: "a real loss hidden behind 'probably just running' is
+    far worse than a false alarm". A reused pid attaches that reassurance
+    permanently, because the stale lock never goes away on its own.
+
+    Adding the filter can only move an answer from True to False, and only
+    when that pid is running a *different* executable — which cannot be the
+    holder that wrote the lock. A live Runner keeps matching its own name,
+    so this cannot begin reporting False about a run that is really going.
+    A lock with no `image_name` (written before the field existed, and
+    present on deployed machines) is judged on the pid alone, as before.
 
     Nothing here decides staleness or timing. `lock_held_since()` answers
     the "for how long" question separately.
@@ -324,7 +355,9 @@ def is_locked(lock_path: Path) -> bool:
     observed = _read_lock(lock_path)
     if observed is None:
         return False
-    return _is_process_running(observed.get("process_id"))
+    return _is_process_running(
+        observed.get("process_id"), observed.get("image_name")
+    )
 
 
 def lock_held_since(lock_path: Path) -> datetime | None:

@@ -42,6 +42,7 @@ to fix — never partially sent, never silently scrubbed.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import date as date_type
@@ -274,10 +275,38 @@ def load_signals(
     A missing date directory is not an error — it is a NO_ACTIVITY day.
     Files are returned in sorted filename order so a re-run produces the
     same Events in the same order.
+
+    **Raises `OSError` when the date directory exists but cannot be
+    listed**, rather than reporting it as an empty day. `Path.glob()`
+    swallows the failure, and measured on Windows that made a day of real
+    work disappear without a word:
+
+        directory denied to this user, one valid Signal inside
+        Path.glob("*.json")  ->  []          (no error)
+        os.listdir()         ->  PermissionError, winerror 5
+
+    `((), ())` means "this day has no Signals", and `agent.py` closes the
+    date on it and advances `last_successful_collection_date` past it.
+    Dates close in order and never reopen, so the Signals sitting in that
+    directory would never become Company History — silently, at exit 0.
+    The Agent already has the right answer for "this date did not
+    succeed" (`DateOutcome.FAILED`: stop, hold the watermark, retry next
+    run); it just could not be told. This is the same distinction the
+    per-file `except OSError` below already draws — an unreadable Signal
+    is quarantined, not counted as absent — applied to the directory.
     """
     date_dir = Path(signals_dir) / target_date.isoformat()
     if not date_dir.is_dir():
         return (), ()
+
+    # Listed explicitly so the failure surfaces. The result is discarded
+    # and `glob()` still does the matching below: its case-folding is what
+    # decides whether `WORK.JSON` is a Signal on Windows, and re-deriving
+    # that here would be a second, quietly different answer to the same
+    # question. One extra listing of a directory holding a handful of
+    # files, once per collected date.
+
+    os.listdir(date_dir)
 
     valid: list[Signal] = []
     invalid: list[tuple[Path, SignalError]] = []

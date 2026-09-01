@@ -1,14 +1,17 @@
 """Windows Task Scheduler, read back — the half of the deployment nothing looked at.
 
-Everything this system does unattended is started by two Windows scheduled
-tasks that `scripts/install_agent_task.ps1` and `scripts/install_runner_task.ps1`
-register:
+Everything this system does unattended is started by the Windows scheduled
+tasks that `scripts/install_*_task.ps1` register:
 
     DOJOONPASS_COMPANY_OPS_DAILY            Desktop 4, the Runner
     DOJOONPASS_COMPANY_OPS_AGENT_<ID>       each Desktop's Agent
+    DOJOONPASS_COMPANY_OPS_PUBLISH          the Control Tower page
+
+The third is optional and the other two are not; `PUBLISH_TASK_NAME` says
+why, and `ops_status._print_schedule()` is where that distinction is spent.
 
 Until this module existed, **no Python in this repository had ever asked
-Windows whether either of them was there.** The installers write the task and
+Windows whether any of them was there.** The installers write the task and
 verify their own write (`Get-ScheduledTask` immediately after
 `Register-ScheduledTask`, because "reporting success on a task that is not
 there would send the operator away believing Company History is scheduled
@@ -85,15 +88,28 @@ from typing import Callable, NamedTuple, Sequence
 
 #: The Runner's task, from `scripts/install_runner_task.ps1`.
 #:
-#: Duplicated from the installer rather than parsed out of it: the installer
-#: is PowerShell and this is Python, and a regex over a `$taskName = "..."`
-#: line would be a second parser to keep correct. `EveryDuplicatedConstantIs
-#: HeldInStepTests`-style drift is closed by a test that greps both installers
-#: for these exact strings, so the copy cannot silently diverge.
+#: **Not duplicated in the installer — the installer asks for it.** This is
+#: the sole spelling of the name. Right after it finds python on PATH,
+#: `scripts/install_runner_task.ps1` runs a two-line probe through it —
+#: `import schedtask`, then print `RUNNER_TASK_NAME` and the
+#: `scheduled_log_name()` for it — and refuses to register at all if that
+#: comes back empty or non-zero. All three installers use the same shape.
+#: The direction is this way because Python is the side that *reasons* about
+#: these names (`scheduled_log_name()` maps name to log, `agent_task_name()`
+#: builds the per-Desktop form, and `ops_status.py` must know the name to ask
+#: Windows anything); PowerShell only writes it down once, at install time.
+#:
+#: Until C138 §15 there really were two copies held in step by a test that
+#: grepped both sides. Comparing copies detects drift; it does not prevent
+#: it. The copies are gone, and what stands in their place is the opposite
+#: assertion — `test_no_installer_hard_codes_a_task_name` fails if a literal
+#: comes back, and `test_every_installer_asks_this_module_for_both` fails if
+#: an installer stops asking.
 RUNNER_TASK_NAME = "DOJOONPASS_COMPANY_OPS_DAILY"
 
-#: The Agent's task prefix, from `scripts/install_agent_task.ps1`
-#: (`$taskName = "DOJOONPASS_COMPANY_OPS_AGENT_$DesktopId"`).
+#: The Agent's task prefix. `agent_task_name()` appends the Desktop id, and
+#: `scripts/install_agent_task.ps1` asks this module for the finished name
+#: rather than building one of its own — see `RUNNER_TASK_NAME`.
 AGENT_TASK_PREFIX = "DOJOONPASS_COMPANY_OPS_AGENT_"
 
 #: The Control Tower publish, from `scripts/install_publish_task.ps1`.
@@ -123,10 +139,12 @@ PUBLISH_TASK_NAME = "DOJOONPASS_COMPANY_OPS_PUBLISH"
 #: `LastTaskResult`. That number says "exit 1"; this file says which
 #: variable was missing.
 #:
-#: Duplicated from the installers for the same reason the task names above
-#: are, and held in step by the same kind of test: the installers are
-#: PowerShell, this is Python, and a second parser would be a second thing
-#: to keep correct.
+#: Not duplicated in the installers either, for `RUNNER_TASK_NAME`'s reason:
+#: each one calls `schedtask.scheduled_log_name()` for the filename it will
+#: append to, and `test_no_installer_hard_codes_a_log_filename` fails if a
+#: second spelling appears. A second spelling would send an operator — and
+#: `ops_status._scheduled_log_tail()`, which reads this file when a
+#: scheduled run fails — to a path nothing writes.
 SCHEDULED_LOG_NAMES = {
     RUNNER_TASK_NAME: "scheduled_runner.log",
     AGENT_TASK_PREFIX: "scheduled_agent.log",
@@ -241,6 +259,21 @@ class ScheduledTaskStatus(NamedTuple):
     #: only thing that changes it -- Windows keeps the action it was given.
     #: `None` when the task is absent or the query could not read it.
     action_command: str | None = None
+
+    #: How many actions the task has, of which `action_command` is the first.
+    #:
+    #: The query has always asked for this -- `_ROW` emits it, and says why:
+    #: "reporting on its first action as though it were the whole thing would
+    #: be a guess, so `action_count` travels with it and the caller can see
+    #: that this is a partial view". **It did not travel.** The parser
+    #: dropped the field, so `discards_console_output()` answered a flat
+    #: `False` ("this task keeps its output") for a two-action task after
+    #: reading one of them -- the exact confusion between "we could not
+    #: check" and "it is fine" that this class refuses everywhere else.
+    #:
+    #: `None` for an absent task, a failed query, or output from a query
+    #: that predates the field.
+    action_count: int | None = None
 
     @property
     def has_ever_run(self) -> bool:
@@ -373,11 +406,12 @@ _ROW = (
     "    next_run = if ($null -eq $i -or $null -eq $i.NextRunTime) { $null }"
     " else { $i.NextRunTime.ToString('o') }\n"
     "    missed = if ($null -eq $i) { $null } else { [int]$i.NumberOfMissedRuns }\n"
-    # The first action only. Both installers register exactly one, and a
-    # task with several is one a person built by hand -- reporting on its
+    # The first action only. All three installers register exactly one, and
+    # a task with several is one a person built by hand -- reporting on its
     # first action as though it were the whole thing would be a guess, so
     # `action_count` travels with it and the caller can see that this is a
-    # partial view.
+    # partial view. It reaches `ScheduledTaskStatus.action_count`, and
+    # `discards_console_output()` declines to answer when it exceeds one.
     "    action = $(if (@($t.Actions).Count -gt 0) {"
     " $a = @($t.Actions)[0];"
     " (([string]$a.Execute) + ' ' + ([string]$a.Arguments)).Trim() } else { $null })\n"
@@ -496,6 +530,7 @@ def parse_query_output(text: str, names: Sequence[str]) -> dict[str, ScheduledTa
             next_run=_as_str(row.get("next_run")),
             missed_runs=_as_int(row.get("missed")),
             action_command=_as_str(row.get("action")),
+            action_count=_as_int(row.get("action_count")),
         )
 
     result = {
@@ -522,10 +557,19 @@ def parse_query_output(text: str, names: Sequence[str]) -> dict[str, ScheduledTa
 def discards_console_output(status: ScheduledTaskStatus) -> bool | None:
     """Whether this task throws away everything its process prints.
 
-    `None` when it cannot be told -- an absent task, a failed query, or an
-    action this could not read. Three-valued rather than defaulting to
-    False, because "we could not check" and "it is fine" are the two answers
-    this module refuses to confuse everywhere else.
+    `None` when it cannot be told -- an absent task, a failed query, an
+    action this could not read, or **a task with more than one action**.
+    Three-valued rather than defaulting to False, because "we could not
+    check" and "it is fine" are the two answers this module refuses to
+    confuse everywhere else.
+
+    The multi-action case is the one that used to be answered wrongly rather
+    than not at all. `_ROW` reads the first action only -- all three
+    installers register exactly one, so a task with several was built by
+    hand -- and the count travels alongside it precisely so this function
+    can decline. Answering `False` off one of two actions says "this task
+    keeps its output" about a task half of which may not, and the caller
+    (`ops_status._print_schedule()`) prints that as settled.
 
     **The question is real and its answer used to be yes for every task this
     project registers.** The action both installers built was
@@ -544,6 +588,13 @@ def discards_console_output(status: ScheduledTaskStatus) -> bool | None:
     if status.query_error is not None or not status.present:
         return None
     if status.action_command is None:
+        return None
+    # `is not None` rather than a truth test: a count this module could not
+    # read stays on the pre-existing behaviour (answer from the one action
+    # it has), and only a count that is *known* to exceed one withholds the
+    # answer. The change can therefore only turn a definite answer into
+    # "unknown" -- it can never invent a fault on a correctly installed task.
+    if status.action_count is not None and status.action_count > 1:
         return None
     return "2>&1" not in status.action_command
 

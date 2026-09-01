@@ -58,7 +58,7 @@ DEFAULT_LATE_UPDATE_LOG_PATH = PROJECT_ROOT / "runtime" / "logs" / "daily_late_u
 
 import businessdate  # noqa: E402
 from businessdate import business_date  # noqa: E402
-from backup.git_ops import GitOperationError, is_authentication_failure  # noqa: E402
+from backup.git_ops import GitOperationError, is_permanent_failure  # noqa: E402
 from backup.result import BackupStatus  # noqa: E402
 from backup.runner import run_once as backup_run_once  # noqa: E402  (backup/__init__.py 없음 — 서브모듈 직접 import)
 from collector import (  # noqa: E402
@@ -1392,16 +1392,25 @@ def run_once(
             # `ops_status.py` reads.
             #
             # That mattered concretely: ATTENTION only surfaces PERMANENT
-            # failures, so a genuinely permanent credential failure arriving
-            # by this path would have been filed as UNKNOWN and never
-            # surfaced. `is_authentication_failure()` is docs/08 §21's own
-            # rule and is what `run_company_ops.py` already uses — reused
-            # here rather than restated, so the two cannot disagree.
+            # failures, so a genuinely permanent failure arriving by this
+            # path would have been filed as UNKNOWN and never surfaced.
+            # `is_permanent_failure()` answers docs/08 §21/§62's question —
+            # can a retry fix this — and is what `run_company_ops.py` and
+            # `backup/runner.py` already use, reused here rather than
+            # restated, so the three cannot disagree.
+            #
+            # It used to read `is_authentication_failure(str(exc))`, the
+            # same rule asked of the message text alone. That could not see
+            # `WorkingCopyNotAGitRepositoryError`, which `backup/git_ops.py`
+            # raises before any git command runs — so an unconfigured Backup
+            # was recorded RETRYABLE/DEGRADED next to a `reason` telling the
+            # operator to go and create the repository, and ATTENTION stayed
+            # silent about it. That is the state of every fresh deployment.
             #
             # Re-raised because whether run_once() should absorb a Backup
             # failure is BUG-4, a contract decision (BACKLOG A-18). This
             # changes what the run *records*, not what it does.
-            permanent = is_authentication_failure(str(exc))
+            permanent = is_permanent_failure(exc)
             recorder.failed(
                 C_BACKUP,
                 classification="BACKUP_FAILED" if permanent else "BACKUP_PENDING",

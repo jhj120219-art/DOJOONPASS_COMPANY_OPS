@@ -1124,7 +1124,86 @@ class APidComesBackAsSomebodyElseTests(LockTestCase):
             os.getpid(),
         )
 
+    # ------------------------------------- every probe of "held" must agree
+
+    def test_no_reader_disagrees_with_the_acquirer_about_one_lock_file(self):
+        """The half of BUG-54 that was missed, stated as the property.
+
+        `try_acquire_lock()`, `lock_held_since()` and
+        `stale_lock_cannot_be_cleared()` were all given the image name;
+        `is_locked()` was not, and it kept asking about the pid alone.
+        Measured on one lock file before this was closed:
+
+            lock_held_since  -> None    nobody holds it
+            try_acquire_lock -> True    took it over: the holder is dead
+            is_locked        -> True    **a live process is holding it**
+
+        Asserted as agreement rather than as `is_locked() is False`, because
+        a fourth reader added later has the same way of going wrong.
+        """
+        from scheduler.lock import is_locked, lock_held_since
+
+        pid = self._a_live_pid_running_something_else()
+        self._write_lock(
+            {
+                "process_id": pid,
+                "created_at": "2020-01-01T00:00:00+09:00",
+                "image_name": "python.exe",
+            }
+        )
+
+        self.assertFalse(is_locked(self.lock_path))
+        self.assertIsNone(lock_held_since(self.lock_path))
+        # Last: it takes the lock over, which changes the file.
+        self.assertTrue(try_acquire_lock(self.lock_path, now=NOW))
+
+    def test_a_reused_pid_no_longer_excuses_an_alarm_about_lost_work(self):
+        """What the disagreement actually cost. `ops_status.py` calls
+        `is_locked()` only to append "(Runner 실행 중 — 완료 후 재확인 권장)"
+        to two ATTENTION lines about work that may be gone, and the comment
+        at one of them says the stake: "a real loss hidden behind 'probably
+        just running' is far worse than a false alarm". A stale lock holding
+        a reused pid attached that reassurance permanently, because nothing
+        clears such a lock on its own."""
+        from scheduler.lock import is_locked
+
+        pid = self._a_live_pid_running_something_else()
+        self._write_lock(
+            {
+                "process_id": pid,
+                "created_at": "2020-01-01T00:00:00+09:00",
+                "image_name": "python.exe",
+            }
+        )
+        self.assertFalse(is_locked(self.lock_path))
+
     # --------------------------------------------- and nothing else changed
+
+    def test_a_live_holders_lock_still_reads_as_held(self):
+        """The direction guarantee for the reader, matching
+        `test_a_live_holders_lock_is_still_refused` for the acquirer: this
+        change may only turn True into False, and never for a real holder.
+        An `is_locked()` that went False on a running Runner would tell an
+        operator the lock is free while the Runner works."""
+        from scheduler.lock import is_locked
+
+        self._write_lock(
+            {
+                "process_id": os.getpid(),
+                "created_at": "2026-08-05T10:00:00+09:00",
+                "image_name": os.path.basename(sys.executable),
+            }
+        )
+        self.assertTrue(is_locked(self.lock_path))
+
+    def test_a_reader_of_a_lock_without_an_image_behaves_as_before(self):
+        """Deployed machines hold such locks right now."""
+        from scheduler.lock import is_locked
+
+        self._write_lock(
+            {"process_id": os.getpid(), "created_at": "2026-08-05T10:00:00+09:00"}
+        )
+        self.assertTrue(is_locked(self.lock_path))
 
     def test_a_live_holder_is_still_a_live_holder(self):
         """The property the whole module exists for. A narrower probe that

@@ -2702,7 +2702,12 @@ class ExitCodeContractTests(unittest.TestCase):
         reporter = ast.unparse(self._function("_report_backup_failure"))
 
         # It still exits nonzero and still explains itself...
-        self.assertIn("is_authentication_failure", reporter)
+        #
+        # `is_permanent_failure()` is what the classification now asks; it
+        # was `is_authentication_failure(str(exc))`, the same rule read off
+        # the message text alone. The property here is unchanged — this
+        # function classifies the failure rather than merely exiting on it.
+        self.assertIn("is_permanent_failure", reporter)
         # ...and 2 is only the FALLBACK. The code the process actually
         # returns comes from the Run Manifest, which `run_once()` writes in
         # its `finally` and which has already classified this failure.
@@ -5311,7 +5316,16 @@ class BackupLogIsNeverPersistedTests(unittest.TestCase):
                     for part in node.values
                     if isinstance(part, ast.Constant) and isinstance(part.value, str)
                 ).replace("\\", "/")
-                if "/backup" in literal or literal.startswith("backup/"):
+                # Matched on a whole path component, not on the substring
+                # `/backup`. The looser form flagged
+                # `runtime/backup_working_copy` — the Backup Working Copy,
+                # which `git_ops.py` legitimately names in the message that
+                # tells an operator how to create it. The directory §69
+                # forbids is a component called exactly `backup`, and every
+                # spelling `test_the_detector_sees_the_spellings_the_old_one
+                # _missed` shoots at is still one (`{logs}/backup/{run}.json`
+                # splits to a bare `backup`).
+                if "backup" in literal.split("/"):
                     hits.append(f"line {node.lineno}: f-string component")
         return hits
 
@@ -5362,6 +5376,26 @@ class BackupLogIsNeverPersistedTests(unittest.TestCase):
                     self._backup_path_expressions(path.read_text(encoding="utf-8")),
                     [],
                 )
+
+    def test_a_path_that_merely_starts_with_backup_is_not_the_forbidden_one(self):
+        """Precision at the boundary the tree scan cannot pin on its own.
+
+        `test_the_detector_is_silent_on_the_tree_it_guards` only proves
+        today's tree is clean. This names the distinction: §69 forbids a
+        directory *called* `backup`, and `backup_working_copy` is a
+        different directory this project creates on purpose — `git_ops.py`
+        names it in the message telling an operator how to clone it.
+        """
+        self.assertEqual(
+            self._backup_path_expressions(
+                'p = f"{root}/runtime/backup_working_copy is not a repository"'
+            ),
+            [],
+        )
+        # ...while the real thing is still caught in the same shape.
+        self.assertTrue(
+            self._backup_path_expressions('p = f"{root}/runtime/logs/backup"')
+        )
 
     def test_the_one_spelling_that_still_evades_is_named(self):
         """The residual, pinned as a fact rather than left in prose.
@@ -6618,6 +6652,329 @@ class EveryDuplicatedConstantIsHeldInStepTests(unittest.TestCase):
             body.format(heading="## Late Arrivals"), target_date=target
         )
         self.assertEqual(drifted.items, ())
+
+
+class EveryDuplicatedFunctionBodyIsHeldInStepTests(unittest.TestCase):
+    """The other half of `EveryDuplicatedConstantIsHeldInStepTests`.
+
+    That class exists because `DuplicatedRulesStayInStepTests` "names three
+    duplicated rules; the tree has more, and one of them was drifting with
+    nothing watching it". It then asked the counting question for
+    **constants** and found five.
+
+    Nobody asked it for **functions**, and the same three-name roster is
+    still what stands behind them. Counted here the way that class counts
+    constants, the tree holds nine duplicated function bodies, and two of
+    the shared rules among them had nothing comparing their copies:
+
+        safe_event_filename          2 modules   gated by DuplicatedRules...
+        _is_sole_identifier          2 modules   gated by DuplicatedRules...
+        is_incomplete_write          4 modules   gated by IncompleteWrite...
+        _has_reserved_windows_head   3 modules   **nothing compared them**
+        _candidate_date              2 modules   **nothing compared them**
+
+    Both uncovered ones carry a written claim that they correspond, which is
+    E-11's shape and the same shape that class was created to fix -- there
+    the false claim was "tests assert the two copies agree", here it is:
+
+        history/file_repository.py   "kept in step with the other two
+                                      storage boundaries" -- and it names
+                                      two others while the gate that exists
+                                      compares only the *other* pair
+        daily/role_summary.py        "Deliberately identical to
+                                      daily.generator._candidate_date(),
+                                      KST normalisation included ... the
+                                      summary and the rendered file must
+                                      never describe different sets of work"
+
+    The second is the expensive one. `_candidate_date` decides **which day**
+    a piece of work is filed under, and its KST normalisation is C135's fix
+    for the defect that used to put the same instant on two different days
+    (`...T01:00+09:00` and `...T16:00+00:00`). If one copy converted and the
+    other did not, the role summary and the rendered Daily History would
+    describe different sets of work, with no error anywhere.
+
+    **Grouped by body, not by name** -- the opposite of the constants scan,
+    and for a reason that reverses with the subject. Two constants sharing a
+    name are two copies of one contract. Two *functions* sharing a name are
+    usually a protocol: `send`, `run_once`, `to_dict` and `save` each mean
+    "this class's own version", and grouping functions by name yields 43
+    entries of which almost none is a duplication. An identical body is what
+    actually says "one rule, written twice".
+
+    That choice has the weakness the constants class named for its own: a
+    pair that has **already** drifted leaves the scan and looks like two
+    unrelated functions. It is covered from the other side -- every shared
+    rule below is also compared by behaviour in a named test, so drift fails
+    there rather than here, and this scan's job is to make a *new*
+    duplication announce itself.
+    """
+
+    #: Identical bodies that are not a shared rule of this project's, with
+    #: what makes each one a coincidence rather than a contract. A new
+    #: duplication that is not listed here fails
+    #: `test_every_duplicated_body_is_accounted_for`.
+    NOT_A_SHARED_RULE = {
+        "_select": (
+            "notion/dashboard.py and notion/properties.py each spell the "
+            "Notion API's own `{'select': {'name': ...}}` shape. The shape "
+            "is Notion's, not a decision this project makes, and C138 §18 "
+            "measured that forcing the Notion property surface into one "
+            "derivation joins namespaces that only look alike."
+        ),
+        "_date": (
+            "Same as `_select`: the API's `{'date': {'start': ...}}` shape, "
+            "held by whoever builds a payload."
+        ),
+        "_log": (
+            "agent/agent.py and collector/runtime.py are both one-line "
+            "call-throughs to `oplog.append_line()`. The rule they would "
+            "have duplicated already has a single owner -- these are the "
+            "shims that reach it, and `oplog` is where redact/flatten/bound "
+            "is decided for both."
+        ),
+        "to_json": (
+            "backup/log.py, events/schema.py and runsummary.py each render "
+            "their own `to_dict()` with the same json.dumps arguments. The "
+            "convention is checked by SerialisationFidelityTests; the "
+            "*content* of the three is entirely different, which is why "
+            "equality of these bodies is not a property worth holding."
+        ),
+    }
+
+    #: Duplicated bodies that ARE one rule, and the test that compares the
+    #: copies by behaviour. Named rather than derived: what makes a shared
+    #: rule shared is a judgement, and the point of this roster is that the
+    #: judgement was made.
+    SHARED_RULES = {
+        "safe_event_filename": (
+            "DuplicatedRulesStayInStepTests::"
+            "test_both_safe_event_filename_copies_return_the_same_name"
+        ),
+        "_is_sole_identifier": (
+            "DuplicatedRulesStayInStepTests::"
+            "test_both_is_sole_identifier_copies_agree"
+        ),
+        "is_incomplete_write": (
+            "IncompleteWriteInvariantTests::"
+            "test_every_copy_of_the_predicate_behaves_the_same"
+        ),
+        "_has_reserved_windows_head": (
+            "EveryDuplicatedFunctionBodyIsHeldInStepTests::"
+            "test_all_three_device_name_copies_agree"
+        ),
+        "_candidate_date": (
+            "EveryDuplicatedFunctionBodyIsHeldInStepTests::"
+            "test_both_business_date_copies_file_work_on_one_day"
+        ),
+    }
+
+    @staticmethod
+    def _duplicated_function_bodies():
+        """`{name: {module: body_source}}` for identical bodies in 2+ modules.
+
+        The docstring is stripped before comparing: two copies of one rule
+        legitimately explain themselves differently (one is the origin, the
+        other says "identical to the origin"), and a scan that read the
+        prose as part of the body would see every real duplication as a
+        disagreement and none of them at all.
+        """
+        import ast
+        from collections import defaultdict
+
+        found = defaultdict(dict)
+        paths = [p for p in sorted(SRC.rglob("*.py")) if "__pycache__" not in p.parts]
+        for path in paths:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                body = list(node.body)
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                ):
+                    body = body[1:]
+                if not body:
+                    continue
+                rendered = ast.unparse(ast.Module(body=body, type_ignores=[]))
+                found[node.name][path.relative_to(REPO_ROOT).as_posix()] = rendered
+        return {
+            name: modules
+            for name, modules in found.items()
+            if len(modules) > 1 and len(set(modules.values())) == 1
+        }
+
+    def test_the_scan_finds_the_duplications_we_know_about(self):
+        """Guards the guard, the way its constant sibling does: every
+        assertion here is a negative over this scan, and an empty or
+        narrowed scan would satisfy all of them for free."""
+        duplicated = self._duplicated_function_bodies()
+
+        self.assertGreaterEqual(len(duplicated), 9, sorted(duplicated))
+        for name in (*self.SHARED_RULES, *self.NOT_A_SHARED_RULE):
+            with self.subTest(function=name):
+                self.assertIn(name, duplicated)
+
+    def test_every_duplicated_body_is_accounted_for(self):
+        """The property. One rule written twice is either held in step by a
+        named test or explained as a coincidence -- a new copy that is
+        neither is what this fails on."""
+        unaccounted = sorted(
+            f"{name} in {sorted(modules)}"
+            for name, modules in self._duplicated_function_bodies().items()
+            if name not in self.SHARED_RULES and name not in self.NOT_A_SHARED_RULE
+        )
+        self.assertEqual(unaccounted, [], unaccounted)
+
+    def test_every_named_comparison_test_exists(self):
+        """`SHARED_RULES` promises that something compares each pair. A
+        promise pointing at a test nobody wrote is what this class exists to
+        stop, so the names are resolved against the suite -- against
+        `def`/`class` definitions, never as a bare substring, because this
+        roster is itself inside the tree being searched and would otherwise
+        match itself (C138 §17 paid for that once)."""
+        suite = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(Path(__file__).resolve().parent.glob("test_*.py"))
+        )
+        for name, reference in sorted(self.SHARED_RULES.items()):
+            with self.subTest(function=name):
+                for part in reference.split("::"):
+                    self.assertTrue(
+                        f"class {part}" in suite or f"def {part}(" in suite,
+                        f"{name} names {part}, which is not defined anywhere",
+                    )
+
+    def test_nothing_on_the_coincidence_roster_became_a_shared_rule(self):
+        """The other direction, matching `test_nothing_on_the_different_
+        roster_secretly_agrees`. An entry here that stopped being duplicated
+        is an explanation describing nothing, and it should be retired
+        rather than left standing as cover for a future copy."""
+        duplicated = self._duplicated_function_bodies()
+        for name in self.NOT_A_SHARED_RULE:
+            with self.subTest(function=name):
+                self.assertIn(name, duplicated)
+
+    # -------------------------------- the two pairs nothing was comparing
+
+    #: Names that have actually mattered. `NUL.json` is the NUL device on the
+    #: deployment machine, so a copy that had not learned this rule writes to
+    #: a device while the others write a file -- a silent loss rather than a
+    #: mismatch.
+    DEVICE_NAMES = (
+        "NUL", "nul", "NUL.json", "com1", "COM1.x.json", "LPT9",
+        "CON.txt", "AUX", "PRN", "NULx", "CONSOLE", "a.NUL", "", ".",
+    )
+
+    def test_all_three_device_name_copies_agree(self):
+        """`history/file_repository.py` says it is "kept in step with the
+        other two storage boundaries". The gate that existed compared the
+        two `safe_event_filename` copies, which reach only the other two --
+        this copy was named by the claim and covered by nothing.
+
+        The three `_RESERVED_WINDOWS_STEMS` constants are already held equal
+        by test_untrusted_event_input.py; this is the predicate that reads
+        them, which could split on the `.upper()` or the `split(".", 1)`
+        while the sets stayed identical.
+        """
+        from history import file_repository
+        from reporter import local_output
+        from transport import onedrive
+
+        for name in self.DEVICE_NAMES:
+            with self.subTest(name=name):
+                verdicts = {
+                    "history": file_repository._has_reserved_windows_head(name),
+                    "reporter": local_output._has_reserved_windows_head(name),
+                    "transport": onedrive._has_reserved_windows_head(name),
+                }
+                self.assertEqual(len(set(verdicts.values())), 1, verdicts)
+
+    def test_the_device_name_rule_still_does_its_job(self):
+        """Not a tautology: three identical-but-wrong copies would pass the
+        comparison above. `NUL.json` must be recognised through its
+        extension, and `NULx` must not be swept up with it."""
+        from reporter.local_output import _has_reserved_windows_head as reserved
+
+        for reserved_name in ("NUL", "nul", "NUL.json", "COM1.x.json", "AUX"):
+            with self.subTest(name=reserved_name):
+                self.assertTrue(reserved(reserved_name))
+        for ordinary in ("NULx", "CONSOLE", "a.NUL", "", "."):
+            with self.subTest(name=ordinary):
+                self.assertFalse(reserved(ordinary))
+
+    #: One instant per row, written the ways Desktops actually write it.
+    #: The first two are the same moment in two offsets -- the pair C135
+    #: measured landing on two different days before KST normalisation.
+    TIMESTAMPS = (
+        "2026-08-28T01:00:00+09:00",
+        "2026-08-27T16:00:00+00:00",
+        "2026-08-28T00:30:00+00:00",
+        "2026-08-28T23:59:59+09:00",
+        "2026-08-28T09:00:00-05:00",
+        "2026-08-28T12:00:00Z",
+    )
+
+    @staticmethod
+    def _candidate(timestamp):
+        from history.result import HistoryCandidate, HistoryDecision
+
+        return HistoryCandidate(
+            history_id="HIST-1", event_id="EVT-1", timestamp=timestamp,
+            category=None, project_id="P", role="CTO_BACKEND", summary="s",
+            evidence=(), filter_result=HistoryDecision.KEEP,
+        )
+
+    def test_both_business_date_copies_file_work_on_one_day(self):
+        """`role_summary._candidate_date` says it is "deliberately identical"
+        to the generator's, "KST normalisation included ... the summary and
+        the rendered file must never describe different sets of work". That
+        sentence was the whole of what held them together.
+
+        Compared by behaviour rather than source, for the reason
+        `DuplicatedRulesStayInStepTests` gives: a reindentation is not a
+        defect, and a test that fails on one is a test people edit.
+        """
+        from daily.generator import _candidate_date as rendered_file
+        from daily.role_summary import _candidate_date as summary
+
+        for timestamp in self.TIMESTAMPS:
+            with self.subTest(timestamp=timestamp):
+                self.assertEqual(
+                    rendered_file(self._candidate(timestamp)),
+                    summary(self._candidate(timestamp)),
+                )
+
+    def test_the_business_date_rule_is_still_kst(self):
+        """The property the duplication exists to provide, not just that the
+        copies match. The same instant in two offsets must land on one day
+        -- measured before C135, `...T01:00+09:00` and `...T16:00+00:00`
+        landed on two."""
+        from daily.generator import _candidate_date
+
+        self.assertEqual(
+            _candidate_date(self._candidate("2026-08-28T01:00:00+09:00")),
+            _candidate_date(self._candidate("2026-08-27T16:00:00+00:00")),
+        )
+        self.assertEqual(
+            _candidate_date(self._candidate("2026-08-28T01:00:00+09:00")).isoformat(),
+            "2026-08-28",
+        )
+
+    def test_both_copies_refuse_a_timestamp_with_no_offset(self):
+        """The refusal is part of the shared rule. A naive timestamp cannot
+        be placed on a KST day without inventing an offset, and both copies
+        must decline rather than one of them guessing -- E-0c's REFUSE
+        answer, at the boundary that files work under a date."""
+        from daily.generator import _candidate_date as rendered_file
+        from daily.role_summary import _candidate_date as summary
+
+        for side in (rendered_file, summary):
+            with self.subTest(side=side.__module__):
+                with self.assertRaises(ValueError):
+                    side(self._candidate("2026-08-28T12:00:00"))
 
 
 class CompanyHistoryWritersCleanUpTooTests(unittest.TestCase):

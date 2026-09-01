@@ -517,8 +517,9 @@ Runner(`DOJOONPASS_COMPANY_OPS_DAILY`), Control Tower publish
 빠졌다).
 
 마지막 실행이 실패했거나 중단됐을 때는 그 실행의 **콘솔 출력 끝 몇 줄**을
-같이 보여준다(`runtime\logs\scheduled_runner.log` /
-`scheduled_agent.log`). 이것이 그 실패의 유일한 기록인 경우가 있다 — 설정이
+같이 보여준다(`runtime\logs\scheduled_runner.log` / `scheduled_agent.log` /
+`scheduled_publish.log` — 세 예약 작업이 각자 하나씩 쓴다). 이것이 그 실패의
+유일한 기록인 경우가 있다 — 설정이
 빠져 exit 1로 끝난 실행은 `runtime/` 어디에도 아무것도 쓰지 않으므로, 어떤
 환경변수가 없었는지를 말해 주는 문장은 여기에만 있다. 파일 내용이므로 화면에
 찍기 전에 `redact()`를 거친다.
@@ -679,8 +680,9 @@ Select-String "DASHBOARD|REASON" runtime\logs\notion_sync.log
 installer가 `cmd.exe /c "... >> <로그> 2>&1"`로 등록하므로 그 출력이 남는다:
 
 ```powershell
-Get-Content runtime\logs\scheduled_runner.log -Tail 30   # Desktop 4 Runner
-Get-Content runtime\logs\scheduled_agent.log  -Tail 30   # 이 머신의 Agent
+Get-Content runtime\logs\scheduled_runner.log  -Tail 30  # Desktop 4 Runner
+Get-Content runtime\logs\scheduled_agent.log   -Tail 30  # 이 머신의 Agent
+Get-Content runtime\logs\scheduled_publish.log -Tail 30  # Control Tower publish
 ```
 
 **이미 등록된 Task는 자동으로 바뀌지 않는다** — installer를 다시 실행해야

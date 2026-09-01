@@ -45,6 +45,7 @@ from history import (  # noqa: E402
 )
 from notion.properties import build_create_properties  # noqa: E402
 from reporter.local_output import safe_event_filename, write_event_json  # noqa: E402
+from transport import TransportError  # noqa: E402
 from transport.onedrive import OneDriveTransport  # noqa: E402
 
 
@@ -1636,6 +1637,21 @@ class OneDriveExistenceShortCircuitTests(unittest.TestCase):
     characterized, because narrowing that skip is a decision about a real
     race (Phase 5.15), not a cleanup.
 
+    **The directory facet is now FIXED too (C142).** The skip asks
+    `is_file()`, so the three sync-folder facets are no longer one group:
+
+        sync/<id>.json is a directory    FIXED  — refused, nothing written
+        sync/<id>.json is 0 bytes        open   — still skipped
+        sync/<id>.json has other content open   — still skipped
+
+    The split is the race, not the shape. Narrowing the skip for the two
+    file facets means rewriting a file the OneDrive client may be
+    mid-upload, which is the Phase 5.15 decision. A directory is not that:
+    `os.replace()` onto one raises (measured, `PermissionError` WinError 5,
+    directory intact), so refusing overwrites nothing and enters no race —
+    and `agent.outbox.stage()` had already made exactly this `exists()` ->
+    `is_file()` correction for the identical question one layer up.
+
     CHARACTERIZATION for everything still marked open below: asserts today's
     behaviour.
 
@@ -1704,12 +1720,36 @@ class OneDriveExistenceShortCircuitTests(unittest.TestCase):
         delivered = (self.sync / "OD-PROBE.json").read_text(encoding="utf-8")
         self.assertIn("the real payload", delivered)
 
-    def test_a_directory_at_the_destination_is_treated_as_delivered(self):
+    def test_a_directory_at_the_destination_is_not_treated_as_delivered(self):
+        """FIXED (was a characterization of the opposite).
+
+        The skip now asks `is_file()`, the same correction
+        `agent.outbox.stage()` already carries for the same question. A
+        directory is the one facet of BUG-47's sync-folder half that is not
+        the Phase 5.15 decision: nothing is overwritten and no race is
+        entered, because `os.replace()` onto a directory raises (measured,
+        `PermissionError` WinError 5, directory intact). The other two
+        facets below are files, so they still short-circuit and remain
+        characterized.
+
+        Measured end to end through the real Agent before and after:
+
+            before  COMPLETED   watermark advanced   sent/ 1   sync empty
+            after   FAILED      watermark held       outbox 1  sent/ 0
+            then, directory removed:
+                    COMPLETED   watermark advanced   the Event delivered
+        """
         (self.sync / "OD-PROBE.json").mkdir()
 
-        self._send()  # reports success
+        with self.assertRaises(TransportError):
+            self._send()
 
+        # Refused, not overwritten: the obstruction is left exactly as found
+        # for the operator, and no staging residue is left behind.
         self.assertTrue((self.sync / "OD-PROBE.json").is_dir())
+        self.assertEqual(
+            [p.name for p in self.sync.iterdir() if p.name.startswith(".tmp-")], []
+        )
 
     def test_an_empty_placeholder_at_the_destination_is_treated_as_delivered(self):
         """The OneDrive Files On-Demand shape."""

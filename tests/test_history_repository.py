@@ -276,5 +276,170 @@ class RepositoryBoundaryTests(unittest.TestCase):
                 )
 
 
+class AnUnreadableCandidateDirectoryIsNotAnEmptyOneTests(RepositoryTestCase):
+    """BUG: a `keep/` that could not be listed rendered days of Company
+    History as empty, and the run reported COMPLETED.
+
+    `list()` matched with `Path.glob("*.json")`, and `glob()` swallows the
+    `OSError` it hits while scanning. Measured, one stored KEEP Candidate in
+    a directory denied to this user:
+
+        repository.list(KEEP)  ->  []            no error
+        os.listdir()           ->  PermissionError (5)
+
+    An empty list is not "no Company History for this day" -- it is what
+    `scheduler.run_once()` renders as an empty day before advancing its
+    watermark past it. Measured end to end through the real scheduler:
+
+        status COMPLETED   generated ['2026-08-29', '2026-08-30']
+        2026-08-29.md      "No material company history recorded."
+
+    `list()` takes no date, so one unreadable directory does that to
+    **every** pending date in the batch.
+
+    The repair is only to let the failure out. `scheduler.run_once()`
+    already wraps this call and returns FAILED without generating anything,
+    and its own comment states the rule the call could not honour:
+    "repository.list()도 다른 단계와 동일하게 실패를 감춰서는 안 된다".
+    """
+
+    def _deny_listing(self, directory):
+        """Deny *list directory* only, and restore afterwards.
+
+        `(RD)` rather than `(F)`: a full deny also removes the right to read
+        the ACL, so the restore then fails (measured -- icacls rc=5) and the
+        fixture leaves an unreadable directory behind.
+        """
+        import os
+        import subprocess
+        import sys
+
+        user = os.environ.get("USERNAME")
+        if sys.platform != "win32" or not user:
+            self.skipTest("directory-listing denial is applied with icacls")
+        denied = subprocess.run(
+            ["icacls", str(directory), "/deny", f"{user}:(RD)"],
+            capture_output=True, text=True,
+        )
+        if denied.returncode != 0:
+            self.skipTest(f"could not deny listing: {denied.stdout.strip()[:80]}")
+        self.addCleanup(
+            subprocess.run,
+            ["icacls", str(directory), "/remove:d", user],
+            capture_output=True,
+        )
+        try:
+            os.listdir(directory)
+        except OSError:
+            return
+        self.skipTest("the deny did not take effect; the test would prove nothing")
+
+    def _stored_candidate(self):
+        result = self.filter.evaluate(sample_event(event_id="TEST-UNREADABLE-001"))
+        self.repo.save(result.candidate)
+        return result.candidate
+
+    def test_listing_a_denied_directory_raises_instead_of_returning_nothing(self):
+        self._stored_candidate()
+        self.assertEqual(len(self.repo.list(HistoryDecision.KEEP)), 1)
+
+        self._deny_listing(self.keep_dir)
+
+        with self.assertRaises(OSError):
+            self.repo.list(HistoryDecision.KEEP)
+
+    def test_a_directory_that_is_simply_absent_is_still_not_an_error(self):
+        """The other direction, and what stops this being a mute button. A
+        `review/` nothing has ever written to does not exist, and asking for
+        REVIEW Candidates there is an ordinary empty answer -- if that
+        raised, every clean run would fail."""
+        self.assertFalse(self.review_dir.exists())
+
+        self.assertEqual(self.repo.list(HistoryDecision.REVIEW), [])
+
+    def test_an_empty_directory_is_still_an_empty_answer(self):
+        """A directory that exists and holds nothing is a real empty day."""
+        self.keep_dir.mkdir(parents=True, exist_ok=True)
+
+        self.assertEqual(self.repo.list(HistoryDecision.KEEP), [])
+
+    def test_the_scheduler_writes_no_empty_day_and_holds_its_watermark(self):
+        """The consequence, driven through the real scheduler rather than
+        argued: the failure this surfaces has to reach the contract that was
+        already written for it."""
+        import json
+        from datetime import date, datetime, timedelta, timezone
+
+        from scheduler.scheduler import run_once
+
+        candidate = self._stored_candidate()
+        target = datetime.fromisoformat(candidate.timestamp).date()
+        root = self.keep_dir.parent
+        daily = root / "daily"; daily.mkdir()
+        state = root / "scheduler_state.json"
+        self._deny_listing(self.keep_dir)
+
+        result = run_once(
+            self.repo,
+            history_start_date=target,
+            now=datetime.combine(
+                target + timedelta(days=2), datetime.min.time(),
+                tzinfo=timezone(timedelta(hours=9)),
+            ).replace(hour=11),
+            state_path=state,
+            lock_path=root / "scheduler.lock",
+            daily_output_dir=daily,
+        )
+
+        self.assertEqual(result.status.name, "FAILED")
+        self.assertEqual(result.generated_dates, ())
+        self.assertFalse(
+            (daily / f"{target.isoformat()}.md").exists(),
+            "an empty day was written for a date whose Candidates were unreadable",
+        )
+        if state.exists():
+            self.assertIsNone(
+                json.loads(state.read_text(encoding="utf-8")).get("last_generated_date")
+            )
+
+    def test_the_work_arrives_once_the_directory_is_readable_again(self):
+        """Failing loudly is only right if the Company History still gets
+        written afterwards."""
+        import os
+        import subprocess
+        from datetime import date, datetime, timedelta, timezone
+
+        from scheduler.scheduler import run_once
+
+        candidate = self._stored_candidate()
+        target = datetime.fromisoformat(candidate.timestamp).date()
+        root = self.keep_dir.parent
+        daily = root / "daily"; daily.mkdir()
+        now = datetime.combine(
+            target + timedelta(days=2), datetime.min.time(),
+            tzinfo=timezone(timedelta(hours=9)),
+        ).replace(hour=11)
+        kwargs = dict(
+            history_start_date=target, now=now,
+            state_path=root / "scheduler_state.json",
+            lock_path=root / "scheduler.lock", daily_output_dir=daily,
+        )
+        self._deny_listing(self.keep_dir)
+        self.assertEqual(run_once(self.repo, **kwargs).status.name, "FAILED")
+
+        subprocess.run(
+            ["icacls", str(self.keep_dir), "/remove:d", os.environ["USERNAME"]],
+            capture_output=True,
+        )
+        second = run_once(self.repo, **kwargs)
+
+        self.assertEqual(second.status.name, "COMPLETED")
+        self.assertIn(target, second.generated_dates)
+        self.assertIn(
+            candidate.summary,
+            (daily / f"{target.isoformat()}.md").read_text(encoding="utf-8"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,15 @@ What this module never does, in any code path:
 Repository URL and branch name are never inferred or hardcoded here —
 `git push` relies entirely on whatever upstream tracking branch the
 Working Copy's remote was already configured with (section 30).
+
+**What configures it is `git clone`, and docs/11 §26 is where that is
+decided.** This line used to cite section 30 alone for the tracking branch;
+section 30 makes the Working Copy operator setup but does not say how, and
+the difference decides whether Backup ever succeeds. `clone` sets an
+upstream, `init` + `remote add` does not, and without one the first push
+fails "has no upstream branch" — classified transient and retried on every
+run forever (BACKLOG F-2b / BUG-52). Measured on a fresh deployment: cloned,
+BACKUP_SUCCESS on the first run.
 """
 
 from __future__ import annotations
@@ -58,10 +67,23 @@ def check_working_copy_is_a_git_repository(working_copy_dir: Path) -> None:
     """Raise WorkingCopyNotAGitRepositoryError unless `working_copy_dir`
     itself (not some parent directory) is a git repository."""
     if not (working_copy_dir / ".git").exists():
+        # The remedy names `clone`, not `init`, because docs/11 §26 makes
+        # that the setup procedure and says why: `git push` depends on an
+        # upstream tracking branch, `clone` configures one and
+        # `init` + `remote add` does not. This message used to say "run
+        # `git init` and configure `origin` there first" -- the procedure
+        # that section explicitly warns against, because the first Backup
+        # then fails with "has no upstream branch", which is classified
+        # transient and retried on every run forever (BACKLOG F-2b /
+        # BUG-52). Measured end to end on a fresh deployment: following
+        # `clone` reaches BACKUP_SUCCESS on the first run; following the old
+        # text reached that loop instead. An error message is an execution
+        # path, and this one pointed away from the one the spec chose.
         raise WorkingCopyNotAGitRepositoryError(
             f"Backup Working Copy is not a git repository: {working_copy_dir} "
-            "(no .git found directly inside it - run `git init` and configure "
-            "`origin` there first; docs/08 sections 12, 30)"
+            "(no .git of its own found there - create it with "
+            "`git clone <backup remote URL> runtime/backup_working_copy`; "
+            "docs/08 sections 12, 30 and docs/11 section 26)"
         )
 
 
@@ -97,6 +119,51 @@ def is_authentication_failure(message: str) -> bool:
     """
     lowered = message.lower()
     return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
+
+
+def is_permanent_failure(exc: BaseException) -> bool:
+    """True when retrying this Backup failure on a schedule cannot fix it.
+
+    The question every caller actually asks. Four of them asked it as
+    `is_authentication_failure(str(exc))`, and `app/runner.py` says why they
+    all reach for one rule: *"reused here rather than restated, so the two
+    cannot disagree."* That was right, and the rule was **incomplete** — it
+    could only recognise a permanent failure by the words git printed, so
+    the one permanent failure this module diagnoses *itself* was invisible
+    to it.
+
+    `WorkingCopyNotAGitRepositoryError` is raised by
+    `check_working_copy_is_a_git_repository()` before any git command runs,
+    from a precondition this module tests directly. Nothing in this system
+    ever creates that repository — docs/08 §30 makes `git init` operator
+    setup — so no number of retries can change the answer. It is permanent
+    by construction, not by interpretation.
+
+    Measured on a fresh deployment (a clone has no `runtime/`, so this is
+    the state of **every first run**), the same failure on every run:
+
+        classification  BACKUP_PENDING
+        severity        DEGRADED
+        retryability    RETRYABLE
+        reason          "... run `git init` and configure `origin` there first"
+
+    The manifest contradicted itself inside one object, and the operator was
+    told "따로 할 일은 없습니다" directly beneath the sentence naming the
+    command they had to run. Because ATTENTION only surfaces PERMANENT
+    failures, the status screen never raised it either.
+
+    **This is deliberately not BUG-52.** That one is about what git's own
+    *stderr* means — "no upstream", "not a repository" as git reports it, a
+    non-fast-forward rejection — and where to draw the line between an
+    ambiguous permanent failure and a transient one. Drawing that line is a
+    judgement and stays open (BACKLOG F-2b); no marker was added here, and
+    the characterisation test that pins those three cases as transient still
+    passes unchanged. This asks a different question, of a typed exception
+    rather than of a string, and needs no line drawn.
+    """
+    if isinstance(exc, WorkingCopyNotAGitRepositoryError):
+        return True
+    return is_authentication_failure(str(exc))
 
 
 @dataclass(frozen=True)

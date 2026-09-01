@@ -2173,32 +2173,36 @@ class DashboardDatabasesWithNoWriterTests(unittest.TestCase):
 
 
 class StrayShellArtifactsInTheRepositoryRootTests(unittest.TestCase):
-    """CHARACTERIZATION (C51): five empty, extension-less files are committed
-    at the repository root, and every one of them is the name of a command.
+    """No extension-less stray file is committed at the repository root.
+
+    **This was a characterization until C140, and it named the day it would
+    end.** Five empty, extension-less files were committed at the root, every
+    one of them the name of a command:
 
         FETCH_HEAD  cd  claude  git  main
 
-    All five are zero bytes and all five entered in one commit (43771a9).
-    That is the signature of a shell redirection that went to a file instead
-    of to a program — `git ... > main`, `> FETCH_HEAD` — on a project whose
-    own AGENT.md says it is driven from several Windows Desktops.
+    All five were zero bytes and all five entered in one commit (43771a9) --
+    the signature of a shell redirection that went to a file instead of to a
+    program (`git ... > main`, `> FETCH_HEAD`) on a project driven from
+    several Windows Desktops.
 
-    Nothing breaks. They carry no content, no guard here reads them (none has
-    a text suffix), and `PATHEXT` means an extension-less `git` in the
-    working directory is not executable on Windows. What they cost is
-    legibility: `git`, `cd` and `main` sitting beside `src/` and `docs/` read
-    as though they mean something.
+    Nothing broke: they carried no content, no guard read them (none has a
+    text suffix), and `PATHEXT` means an extension-less `git` in the working
+    directory is not executable on Windows. What they cost was legibility --
+    `git`, `cd` and `main` sitting beside `src/` and `docs/` read as though
+    they mean something, and they shipped to every clone.
 
-    **Not deleted, and the reason is the session's Git policy rather than a
-    judgement about the files** — removing tracked files is outside what this
-    Sprint may do. So this pins the set instead, and it is deliberately
-    exact-match in both directions: a sixth artifact fails immediately, and
-    the day someone does delete these the test fails too and this record has
-    to go with them. A characterization that could quietly outlive its
-    subject is the drift `DeadCapabilityInventoryTests` exists to stop.
+    The old docstring recorded why they survived: *"Not deleted, and the
+    reason is the session's Git policy rather than a judgement about the
+    files ... the day someone does delete these the test fails too and this
+    record has to go with them."* C140 deleted them, this test failed
+    exactly as promised, and the record goes with them.
+
+    What replaces it is the guarantee rather than nothing, because the
+    failure mode is still live: a mistyped redirection in this repository's
+    root is one keystroke away, and it is invisible in review precisely
+    because an empty extension-less file looks like nothing.
     """
-
-    KNOWN = {"FETCH_HEAD", "cd", "claude", "git", "main"}
 
     def _stray_root_files(self):
         return {
@@ -2210,30 +2214,37 @@ class StrayShellArtifactsInTheRepositoryRootTests(unittest.TestCase):
             and not path.name.startswith(".")
         }
 
-    def test_the_stray_set_is_exactly_what_is_recorded(self):
+    def test_no_stray_artifact_is_committed_at_the_root(self):
         self.assertEqual(
             self._stray_root_files(),
-            self.KNOWN,
-            "extension-less files at the repository root changed — a new one "
-            "is a shell redirection that missed, and a missing one means "
-            "these were cleaned up and this record should go",
+            set(),
+            "an extension-less file is tracked at the repository root -- "
+            "almost always a shell redirection that missed its program "
+            "(`git ... > main`). If one is genuinely intended, it needs a "
+            "name that says so and an entry here saying why.",
         )
 
-    def test_every_one_of_them_is_empty(self):
-        """If one ever gains content it stops being an artifact and starts
-        being a file somebody meant, which is a different conversation."""
-        for name in sorted(self.KNOWN):
+    def test_the_scan_would_see_one(self):
+        """Guards the guard: the assertion above is a negative over a scan,
+        and a scan that stopped matching would satisfy it for free. The five
+        this class was written for are the fixture -- they are gone from the
+        tree, so the check is made against the predicate directly."""
+        for name in ("FETCH_HEAD", "cd", "claude", "git", "main", "notes"):
             with self.subTest(name=name):
-                self.assertEqual((REPO_ROOT / name).stat().st_size, 0)
-
-    def test_none_of_them_shadows_a_python_module(self):
-        """The one way an empty file here could actually do something: a name
-        that `import` would find before the real module. None of these is a
-        `.py`, so none can — asserted rather than assumed."""
-        for name in sorted(self.KNOWN):
+                candidate = REPO_ROOT / name
+                self.assertFalse(candidate.suffix)
+                self.assertFalse(candidate.name.startswith("."))
+        # ...and the things that legitimately live there are not swept up.
+        for name in ("README.md", "run_company_ops.py", "ops_status.py"):
             with self.subTest(name=name):
-                self.assertFalse((REPO_ROOT / f"{name}.py").exists())
+                self.assertTrue((REPO_ROOT / name).suffix)
 
+    def test_the_deleted_artifacts_are_really_gone(self):
+        """The other direction, so this class cannot pass while the files it
+        describes are still on disk under a name the scan misses."""
+        for name in ("FETCH_HEAD", "cd", "claude", "git", "main"):
+            with self.subTest(name=name):
+                self.assertFalse((REPO_ROOT / name).exists())
 
 
 class NoTestTakesADefaultThatPointsAtTheLiveTreeTests(unittest.TestCase):

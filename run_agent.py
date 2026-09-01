@@ -254,10 +254,19 @@ def main(argv: Sequence[str] = ()) -> int:
         # line twenty above guards item by item: half a fix, and the half
         # that lands inside the `[FAILED]` block an operator reads to decide
         # whether Events were lost.
+        # "outbox에 남아 있으며" was true of the only failure this could
+        # once report — a drain that could not deliver. It is false for the
+        # other one: when a date's Signal directory cannot be listed, no
+        # Event was ever built, and the work is still sitting in `signals/`.
+        # Sending an operator to an empty `outbox/` to look for work the
+        # line above just said was not lost is how a report stops being
+        # read. Both modes share the guarantee that actually matters, so
+        # that is what this says, and `result.error` above names which one
+        # happened.
         print(
             f"[FAILED] {one_line(result.error)}\n"
-            f"        Event는 유실되지 않았습니다 — outbox에 남아 있으며 다음 "
-            f"실행에서 같은 날짜부터 다시 시도합니다.",
+            f"        버려진 것은 없습니다 — 다음 실행이 같은 날짜부터 "
+            f"이어서 시도합니다.",
             file=sys.stderr,
         )
         return 2

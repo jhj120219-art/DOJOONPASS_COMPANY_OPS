@@ -439,16 +439,33 @@ class FailureClassificationTests(RunContractTestCase):
         self.assertEqual(manifest.exit_code, EXIT_FAILED)
 
     def test_the_backup_classification_uses_the_spec_rule_not_a_copy(self):
-        """`is_authentication_failure()` is docs/08 §21's own rule and is
-        what `run_company_ops.py` already applies. The Runner reuses it
-        rather than restating it, so the two cannot drift into disagreeing
-        about whether a given failure is worth waking someone for."""
+        """`is_permanent_failure()` answers docs/08 §21/§62's question --
+        can a retry fix this -- and is what `run_company_ops.py` and
+        `backup/runner.py` also apply. The Runner reuses it rather than
+        restating it, so they cannot drift into disagreeing about whether a
+        given failure is worth waking someone for.
+
+        It used to be `is_authentication_failure(str(exc))` here, which was
+        the same rule asked of the message text alone. That could not see
+        `WorkingCopyNotAGitRepositoryError`, so an unconfigured Backup --
+        the state of every fresh deployment -- was recorded RETRYABLE beside
+        a `reason` telling the operator to go and create the repository."""
         import inspect
 
         import app.runner as runner_module
 
         source = inspect.getsource(runner_module.run_once)
-        self.assertIn("is_authentication_failure(str(exc))", source)
+        self.assertIn("is_permanent_failure(exc)", source)
+        # Comments stripped before the negative, the way
+        # `test_schedtask.py::_code()` does for the installers and for the
+        # same reason: the prose above the call explains what it replaced,
+        # and a raw scan would read that explanation as the violation.
+        code = "\n".join(
+            line
+            for line in source.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("is_authentication_failure", code)
 
 
 class EventContractPreservationTests(RunContractTestCase):

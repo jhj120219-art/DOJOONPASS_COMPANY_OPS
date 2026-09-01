@@ -330,8 +330,24 @@ class PendingRetryClassifiesTheSameWayTests(BackupRunnerTestCase):
 
         source = inspect.getsource(backup_runner.run_once)
 
-        self.assertEqual(source.count("is_authentication_failure(str(exc))"), 2)
+        self.assertEqual(source.count("is_permanent_failure(exc)"), 2)
         self.assertEqual(source.count("else BackupStatus.PENDING"), 2)
+        # The rule these two share must be the shared one, not a local
+        # re-spelling of it. Both sites once read
+        # `is_authentication_failure(str(exc))`, which was the same rule and
+        # an incomplete one: it could only see a permanent failure in the
+        # words git printed, so `WorkingCopyNotAGitRepositoryError` -- raised
+        # by this module before any git command -- was classified transient
+        # and retried forever.
+        #
+        # Comments stripped first, as `test_schedtask.py::_code()` does: the
+        # prose explaining the change names the thing it forbids.
+        code = "\n".join(
+            line
+            for line in source.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("is_authentication_failure", code)
 
 
 

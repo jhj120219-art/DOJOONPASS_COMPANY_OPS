@@ -29,7 +29,7 @@ from .git_ops import (
     git_head_commit,
     git_push,
     git_status,
-    is_authentication_failure,
+    is_permanent_failure,
 )
 from .log import BackupLogEntry
 from .result import BackupStatus
@@ -193,7 +193,7 @@ def run_once(
                 # 7번 단계와 동일한 분류 규칙(docs/08 §19 vs §21/§62).
                 state.backup_status = (
                     BackupStatus.FAILED
-                    if is_authentication_failure(str(exc))
+                    if is_permanent_failure(exc)
                     else BackupStatus.PENDING
                 )
                 save_state(resolved_state_path, state)
@@ -363,7 +363,7 @@ def run_once(
         # 재개").
         state.backup_status = (
             BackupStatus.FAILED
-            if is_authentication_failure(str(exc))
+            if is_permanent_failure(exc)
             else BackupStatus.PENDING
         )
         save_state(resolved_state_path, state)

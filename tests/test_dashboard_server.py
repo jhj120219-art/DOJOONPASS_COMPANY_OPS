@@ -2600,6 +2600,54 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
                 "Collector가 거부한 Event 2건 — 사람이 확인해야 한다"),
             "E17": ("P1",
                 "KEEP Candidate 1건이 저장돼 있는데 그 날짜의 Daily History에 없다: E1"),
+            # C143. The damaged-evidence family — seven shapes, every one of
+            # them `?` until now, and the ones an operator sees exactly when
+            # the evidence itself is broken. Found by rendering
+            # `dashboard_server.py` against a runtime with corrupted state
+            # files: the clean tree produced zero unclassified badges, the
+            # damaged one produced six, and they were the only six.
+            #
+            # The two P1s are P1 by measurement rather than by reading —
+            # each stops a pipeline outright (`SchedulerStateError` /
+            # `AgentStateError`, verified by calling both `run_once()`s
+            # against a corrupt state file).
+            "DAILY_STATE_UNREADABLE": ("P1",
+                "Daily State를 읽을 수 없다: state file could not be read: "
+                "scheduler state file is corrupted: daily_history_state.json"),
+            "AGENT_STATE_UNREADABLE": ("P1",
+                "이 머신의 Agent state를 읽을 수 없다: agent state file is "
+                "corrupted: agent_state.json"),
+            "AGENT_NEVER_COMPLETED": ("P1",
+                "이 머신의 Agent가 한 번도 실행을 완료한 적이 없다"),
+            # None of these stops anything, which is why filing them beside
+            # the two above would be wrong.
+            "MANIFEST_UNREADABLE": ("P2",
+                "Run Manifest를 읽을 수 없다: runtime/runs/last_run.json"),
+            "PROCESSED_UNREADABLE": ("P2",
+                "읽을 수 없는 processed Event 1건: NOTAFILE.json"),
+            "PROCESSED_UNREADABLE_ATTRIBUTION": ("P2",
+                "processed에 읽을 수 없는 Event 1건: X.json — History 반영 "
+                "여부를 판단할 수 없다"),
+            "AGENT_LAST_RUN_NOT_A_TIMESTAMP": ("P2",
+                "이 머신의 Agent state의 last_run이 timestamp가 아니다 — 마지막 "
+                "실행 시각을 알 수 없어 지연 여부를 검사하지 못한다"),
+            # C144. The Backup/durability family, found the same way — a
+            # fixture with a real working copy, Company History missing from
+            # Local Master and a failed backup state, rendered through
+            # `ops_status.py`. Four came out `?`; these three fit the
+            # existing P1/P2 definitions without stretching them.
+            "NEVER_BACKED_UP": ("P1",
+                "원격 백업에 도달하지 않은 Company History 1건: daily/2026-08-03.md — "
+                "이 머신에서 한 번도 백업이 성공한 적이 없다. Backup이 SUCCESS/"
+                "NOT_REQUIRED를 보고하고 있어도 이 파일들은 이 머신에만 있다"),
+            "HISTORY_GONE_FROM_MASTER": ("P1",
+                "Backup Working Copy에는 있고 Local Master에는 없는 Company History "
+                "2건: daily/2026-08-01.md — 그 파일들은 백업에 도달했었고 지금 이 "
+                "머신에 없다"),
+            "WORKING_COPY_WRITE_RESIDUE": ("P2",
+                "Backup Working Copy에 완료되지 않은 쓰기 잔여물 1건: "
+                "daily/.tmp-abc.json — 중단된 실행이 남긴 것으로 Company History가 "
+                "아니다"),
         }
         for name, (expected, line) in cases.items():
             with self.subTest(shape=name):

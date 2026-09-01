@@ -1410,7 +1410,13 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
         from agent.agent import AgentRunResult, AgentStatus
 
         module = self._entrypoint()
-        forged = "        Event는 유실되지 않았습니다 — 확인할 것 없음"
+        # Shaped like the real reassurance line so the forgery is a
+        # plausible one. Its wording changed when the Agent gained a second
+        # failure mode -- an unreadable Signal directory builds no Event at
+        # all, so "outbox에 남아 있으며" was false there -- and this fixture
+        # follows it, because a forgery of a line nobody prints proves
+        # nothing.
+        forged = "        버려진 것은 없습니다 — 확인할 것 없음"
         result = AgentRunResult(
             status=AgentStatus.FAILED,
             desktop_id="DESKTOP_1",
@@ -1436,7 +1442,11 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
         self.assertIn("\\n", printed)
         # The real reassurance still appears, exactly once.
         self.assertEqual(
-            sum(1 for ln in printed.splitlines() if "outbox에 남아 있으며" in ln),
+            sum(
+                1
+                for ln in printed.splitlines()
+                if "다음 실행이 같은 날짜부터" in ln
+            ),
             1,
             printed,
         )
@@ -1993,6 +2003,159 @@ class ANonStringSignalFieldIsRefusedOnTheSendingSideTests(AgentTestCase):
             any("identity fields" in error for error in result.dates[0].errors),
             result.dates[0].errors,
         )
+
+
+class ADateWhoseSignalsCannotBeListedIsNotAnEmptyDayTests(AgentTestCase):
+    """BUG: a day of real work disappeared because a directory could not be
+    read, and the run reported COMPLETED.
+
+    `load_signals()` asked `Path.glob("*.json")` for the date's Signals, and
+    `glob()` swallows the `OSError` it hits while scanning. Measured on this
+    machine, one valid Signal inside a directory denied to this user:
+
+        Path.glob("*.json")  ->  []                     no error
+        os.listdir()         ->  PermissionError (5)
+
+    `((), ())` is how this module says "this day has no Signals", so the
+    Agent closed the date as NO_ACTIVITY and advanced
+    `last_successful_collection_date` past it. **Dates close in order and
+    never reopen** (`pending_dates()` starts after the watermark), so the
+    Signals sitting in that directory could never become Company History.
+    Exit 0, no error, nothing in the log.
+
+    Reachable without anything exotic: an ACL applied by Group Policy on a
+    managed machine, a folder restored from backup with different
+    permissions, an antivirus or OneDrive lock. The directory is created
+    and owned by the operator, not by this code.
+
+    The Agent already had the right answer -- `DateOutcome.FAILED` stops at
+    that date, holds the watermark, and the next run retries it. It simply
+    could not be told, because "I could not look" and "there is nothing
+    here" arrived as the same value.
+    """
+
+    DAY = date(2026, 8, 8)
+
+    def _deny_listing(self, directory):
+        """Deny only *list directory* to this user, and restore afterwards.
+
+        `(RD)` rather than `(F)` or `(RX)` deliberately: a full deny also
+        removes the right to read the ACL, so `icacls /remove:d` then fails
+        and the fixture cannot clean up after itself (measured -- rc=5,
+        "0 files processed, 1 failed", leaving an unreadable directory
+        behind in the temp tree).
+        """
+        user = os.environ.get("USERNAME")
+        if sys.platform != "win32" or not user:
+            self.skipTest("directory-listing denial is applied with icacls")
+        import subprocess
+
+        deny = subprocess.run(
+            ["icacls", str(directory), "/deny", f"{user}:(RD)"],
+            capture_output=True, text=True,
+        )
+        if deny.returncode != 0:
+            self.skipTest(f"could not deny listing: {deny.stdout.strip()[:80]}")
+        self.addCleanup(
+            subprocess.run,
+            ["icacls", str(directory), "/remove:d", user],
+            capture_output=True,
+        )
+        try:
+            os.listdir(directory)
+        except OSError:
+            return
+        self.skipTest("the deny did not take effect; the test would prove nothing")
+
+    def test_the_date_fails_instead_of_closing_empty(self):
+        self.write_signal(self.DAY, "work")
+        self._deny_listing(self.signals_dir / self.DAY.isoformat())
+
+        result = self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY
+        )
+
+        self.assertIs(result.status, AgentStatus.FAILED)
+        self.assertEqual(result.failed_date, self.DAY)
+        self.assertEqual(result.dates[0].outcome, DateOutcome.FAILED)
+
+    def test_the_watermark_does_not_move_past_it(self):
+        """The half that made this permanent. A date closed here is a date
+        no later run will ever collect."""
+        self.write_signal(self.DAY, "work")
+        self._deny_listing(self.signals_dir / self.DAY.isoformat())
+
+        self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY
+        )
+
+        self.assertNotEqual(self.state().last_successful_collection_date, self.DAY)
+
+    def test_nothing_is_delivered_and_nothing_is_quarantined(self):
+        """It must not guess in either direction. The Signals were never
+        read, so rejecting them would destroy the evidence, and delivering
+        anything would be inventing it."""
+        self.write_signal(self.DAY, "work")
+        self._deny_listing(self.signals_dir / self.DAY.isoformat())
+        transport = RecordingTransport()
+
+        self.run_agent(transport, now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY)
+
+        self.assertEqual(transport.delivered, [])
+        self.assertEqual(list(self.rejected_dir.rglob("*.json")), [])
+
+    def test_the_error_names_the_cause(self):
+        """An operator has to know it is a permission problem, not a day
+        with no work. The two look identical from every other surface."""
+        self.write_signal(self.DAY, "work")
+        self._deny_listing(self.signals_dir / self.DAY.isoformat())
+
+        result = self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY
+        )
+
+        self.assertIn("Signal 디렉터리를 읽을 수 없습니다", result.error)
+
+    def test_the_next_run_collects_the_date_once_it_is_readable_again(self):
+        """The recovery this is worth having. Failing loudly is only right
+        if the work still arrives afterwards -- measured end to end."""
+        signal_dir = self.signals_dir / self.DAY.isoformat()
+        self.write_signal(self.DAY, "work")
+        self._deny_listing(signal_dir)
+
+        first = self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY
+        )
+        self.assertIs(first.status, AgentStatus.FAILED)
+
+        import subprocess
+
+        subprocess.run(
+            ["icacls", str(signal_dir), "/remove:d", os.environ["USERNAME"]],
+            capture_output=True,
+        )
+        transport = RecordingTransport()
+        second = self.run_agent(
+            transport, now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY
+        )
+
+        self.assertIs(second.status, AgentStatus.COMPLETED)
+        self.assertEqual(second.dates[0].outcome, DateOutcome.COLLECTED)
+        self.assertEqual(len(transport.delivered), 1)
+        self.assertEqual(self.state().last_successful_collection_date, self.DAY)
+
+    def test_an_ordinary_empty_day_is_still_no_activity(self):
+        """The other direction, and what keeps this from being a mute
+        button: a date with no directory at all is a real NO_ACTIVITY day
+        and must still close, or every Agent would stop on its first quiet
+        weekend."""
+        result = self.run_agent(
+            RecordingTransport(), now=datetime(2026, 8, 9, 11, 0), start_date=self.DAY
+        )
+
+        self.assertIs(result.status, AgentStatus.COMPLETED)
+        self.assertEqual(result.dates[0].outcome, DateOutcome.NO_ACTIVITY)
+        self.assertEqual(self.state().last_successful_collection_date, self.DAY)
 
 
 class StalenessThresholdIsAKnobNobodyTurnsTests(unittest.TestCase):

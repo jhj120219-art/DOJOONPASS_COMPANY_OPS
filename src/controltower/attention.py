@@ -61,6 +61,48 @@ RULES: tuple[tuple[str, str, str], ...] = (
     # never leave the machine. "Work is not reaching Company History" by
     # the letter of the definition above.
     ("Desktop ID와 다르다", "P1", "등록된 Task가 다른 Desktop의 것 — 매번 거부된다"),
+    # C143. The **damaged-evidence family** — seven lines, every one of them
+    # `?`. Measured by running `dashboard_server.py` against a runtime with
+    # corrupted state files: the clean tree renders zero unclassified
+    # badges, the damaged one rendered six, and they were the only six.
+    #
+    # That is the worst possible place for this gap. These are the lines an
+    # operator sees *when the evidence itself is broken* — the moment they
+    # most need "how bad is this" and "what do I do" — and they arrived with
+    # no severity and no remedy, sorted in beside the genuine faults.
+    #
+    # The two below are P1 by measurement, not by reading. Each one stops a
+    # pipeline outright:
+    #
+    #     scheduler.run_once()  -> SchedulerStateError, no Daily History is
+    #                              generated for **any** date until a human
+    #                              fixes the file
+    #     agent.run_once()      -> AgentStateError, this Desktop's work never
+    #                              leaves the machine (the same consequence
+    #                              `Desktop ID와 다르다` above is P1 for)
+    ("Daily State를 읽을 수 없다", "P1", "Scheduler가 멈춤 — 어떤 날짜도 생성되지 않는다"),
+    ("Agent state를 읽을 수 없다", "P1", "Agent가 멈춤 — 이 Desktop의 일이 나가지 않는다"),
+    # The zero-case of `실행되지 않았다`, which is already P1 four lines up.
+    # `agent/status.py` raises them from one `if/elif/elif` on the same
+    # question, so they cannot honestly carry different severities.
+    ("한 번도 실행을 완료한 적이 없다", "P1", "파이프라인이 돌지 않음 — 한 번도 완료된 적이 없다"),
+    # C144. The **Backup/durability family**, measured the same way: a
+    # fixture with a real working copy, history missing from Local Master,
+    # and a failed backup state, rendered through `ops_status.py`. Four
+    # backup alarms came out `?`; these two are the ones that fit this
+    # module's existing P1 definition without stretching it.
+    #
+    # docs/08 exists so Company History survives this machine. A tree where
+    # backup has *never* succeeded has no off-machine copy of anything, and
+    # the line itself says the green signal is wrong ("Backup이 SUCCESS/
+    # NOT_REQUIRED를 보고하고 있어도 이 파일들은 이 머신에만 있다") — the
+    # C137 shape. That is the backup pipeline not running, not a warning.
+    ("원격 백업에 도달하지 않은", "P1", "이 머신에만 있는 Company History — 백업이 도달하지 않았다"),
+    # Company History that reached the backup and is **now gone from this
+    # machine**. "Work is not reaching Company History" by the letter — it
+    # got there and left. `_history_gone_from_local_master()` exists because
+    # every other hole check structurally cannot see a missing prefix.
+    ("Local Master에는 없는", "P1", "Company History가 이 머신에서 사라졌다"),
     # C133. An open Blocker is the most actionable line this list carries
     # and it was **unclassified** -- measured on a probe tree, it rendered
     # with a `?` badge and "이 화면이 분류하지 못한 줄".
@@ -112,6 +154,29 @@ RULES: tuple[tuple[str, str, str], ...] = (
     # and P2 ("사람 확인 필요") is exactly that tier. Listed before the
     # broader `사람이 확인해야 한다` because that phrase is appended to
     # several fault lines too and would otherwise claim this one first.
+    # C143, the other half of the damaged-evidence family. None of these
+    # stops anything — which is exactly why filing them beside the two P1s
+    # above would be wrong.
+    #
+    # The Run Manifest is the *account* of a run, not the run:
+    # `_exit_code_from_manifest()` already falls back to 2 without it, so
+    # what is lost is the explanation, not the pipeline.
+    ("Run Manifest를 읽을 수 없다", "P2", "마지막 실행의 기록을 읽을 수 없음 — 실행 자체는 멈추지 않는다"),
+    # One file whose attribution cannot be judged. Per-file isolation is the
+    # design (docs/03 §53), so the rest of the run is unaffected — the two
+    # spellings come from two different producers on the same subject.
+    ("읽을 수 없는 processed Event", "P2", "이 Event의 귀속을 판단할 수 없음"),
+    ("processed에 읽을 수 없는 Event", "P2", "이 Event의 History 반영 여부를 판단할 수 없음"),
+    # `agent/status.py` states this one's severity itself: `last_run` is
+    # informational, and it deliberately does **not** validate it on load
+    # because "rejecting it there would turn a cosmetic corruption into a
+    # stopped Agent, which is the wrong direction". The Agent keeps running;
+    # only the staleness check is blind.
+    ("last_run이 timestamp가 아니다", "P2", "마지막 실행 시각을 읽을 수 없어 지연 검사만 못 한다"),
+    # C144. Residue an interrupted run left in the Backup Working Copy.
+    # Nothing is lost and nothing is stopped — `git add -A` would carry it
+    # to the remote, so it is something to clear, which is what P2 is.
+    ("완료되지 않은 쓰기 잔여물", "P2", "중단된 실행의 잔여물 — Company History가 아니다"),
     ("검토를 기다리", "P2", "사람 검토 대기"),
     ("사람이 확인해야 한다", "P2", "사람 확인 필요"),
 )
@@ -181,6 +246,62 @@ ACTIONS: dict[str, str] = {
     ),
     "시작조차 되지 못한": (
         "앞 단계의 실패를 먼저 고친다 — 이 단계는 그 결과일 뿐이다."
+    ),
+    # C143. docs/10 §46 forbids the obvious remedy: "프로그램이 임의로 모든
+    # History를 삭제하거나 다시 생성하면 안 된다", and §49 says "History가
+    # State보다 우선". So the action names no command that rewrites state —
+    # it points at the History already on disk, which is the authority.
+    "Daily State를 읽을 수 없다": (
+        "Scheduler는 이 파일을 읽지 못하면 어떤 날짜도 생성하지 않는다. "
+        "`runtime/local_master/daily/` 에 이미 있는 파일이 무엇까지 닫혔는지의 "
+        "정본이다(docs/10 §49) — 그것을 보고 State를 사람이 되살린다. "
+        "History를 지우거나 다시 만들지 않는다(docs/10 §46)."
+    ),
+    "Agent state를 읽을 수 없다": (
+        "이 Desktop의 Agent는 이 파일을 읽지 못하면 실행되지 않는다. "
+        "`runtime/agent/sent/` 에 무엇이 전달됐는지가 남아 있으므로 "
+        "그것을 보고 `desktop_id` 와 마지막 수집 날짜를 사람이 되살린다."
+    ),
+    "한 번도 실행을 완료한 적이 없다": (
+        "`python run_agent.py` 를 한 번 돌린다. 설치 직후라면 정상이고, "
+        "그 실행이 끝나면 이 줄은 사라진다 — 사라지지 않으면 그 실행이 "
+        "찍은 오류가 원인이다."
+    ),
+    "Run Manifest를 읽을 수 없다": (
+        "실행 자체는 멈추지 않는다 — 잃은 것은 마지막 실행의 설명이다. "
+        "`python run_company_ops.py` 를 한 번 돌리면 새 Manifest가 쓰이고, "
+        "그때까지 `runtime/logs/` 의 로그가 그 실행의 유일한 기록이다."
+    ),
+    "읽을 수 없는 processed Event": (
+        "줄이 지목한 파일을 `runtime/events/processed/` 에서 열어 본다 — "
+        "다른 Event는 영향받지 않는다(docs/03 §53)."
+    ),
+    "processed에 읽을 수 없는 Event": (
+        "줄이 지목한 파일을 `runtime/events/processed/` 에서 열어 본다 — "
+        "그 Event가 History에 들어갔는지는 그 파일을 읽어야만 알 수 있다."
+    ),
+    "last_run이 timestamp가 아니다": (
+        "Agent는 계속 돈다 — 못 하는 것은 지연 여부 검사뿐이다. "
+        "다음 실행이 `last_run` 을 다시 쓰므로, 한 번 돌려 이 줄이 "
+        "사라지는지 확인한다."
+    ),
+    # C144. docs/08 §30 makes the Working Copy operator setup, so the remedy
+    # names the one command that fixes the usual cause and stops.
+    "원격 백업에 도달하지 않은": (
+        "`python run_company_ops.py` 를 한 번 돌리고 Backup 결과를 본다. "
+        "실패한다면 그 메시지가 원인이다 — `runtime/backup_working_copy/` 가 "
+        "clone으로 만들어졌고 `origin` 이 설정돼 있는지 먼저 확인한다"
+        "(docs/11 §26)."
+    ),
+    "Local Master에는 없는": (
+        "그 파일들은 백업 원격에 아직 있다. "
+        "`runtime/backup_working_copy/daily/` 에서 `runtime/local_master/daily/` "
+        "로 사람이 되돌린다 — 이 시스템은 지워진 Company History를 스스로 "
+        "복원하지 않는다(docs/10 §46)."
+    ),
+    "완료되지 않은 쓰기 잔여물": (
+        "Company History가 아니므로 `runtime/backup_working_copy/` 에서 "
+        "그 파일을 지운다 — 지우지 않으면 다음 Backup이 원격으로 가져간다."
     ),
     "같은 event_id를 두고 내용이 다른": (
         "두 파일을 열어 보고, 그 Event가 아닌 쪽을 "

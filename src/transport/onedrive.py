@@ -114,14 +114,18 @@ def _write_atomic(
     `overwrite` distinguishes the two directories this transport writes to,
     which differ in exactly one respect that matters — who else touches them.
 
-    `overwrite=False` (the OneDrive sync folder): an existing entry is left
-    alone. The sync folder is managed by the OneDrive client, so rewriting a
-    file it may be mid-upload is the race the staging buffer exists to avoid
-    (Phase 5.15). Skipping is the conservative choice there, and its known
-    costs are characterized in
+    `overwrite=False` (the OneDrive sync folder): an existing **file** is
+    left alone. The sync folder is managed by the OneDrive client, so
+    rewriting a file it may be mid-upload is the race the staging buffer
+    exists to avoid (Phase 5.15). Skipping is the conservative choice there,
+    and its remaining costs — a 0-byte Files On-Demand entry, an entry
+    holding something else — are characterized in
     `test_untrusted_event_input.OneDriveExistenceShortCircuitTests`
-    (BUG-47's sync-folder half — still open, because narrowing the skip is a
-    decision about that race, not a cleanup).
+    (BUG-47's sync-folder half, still open for those two, because narrowing
+    the skip for a *file* is a decision about that race, not a cleanup).
+
+    A directory wearing the name is no longer part of that group — see the
+    comment on the check below.
 
     `overwrite=True` (this transport's own `outgoing/` staging directory):
     an existing entry is residue from an earlier failed send, and the caller
@@ -134,7 +138,29 @@ def _write_atomic(
     """
     directory.mkdir(parents=True, exist_ok=True)
     final_path = directory / filename
-    if final_path.exists() and not overwrite:
+    # `is_file()`, not `exists()` — the same correction, for the same
+    # question, that `agent.outbox.stage()` already carries: "is this Event
+    # already there" is not "is this name taken", and a *directory* wearing
+    # the Event's name is not a delivered Event.
+    #
+    # This narrows the skip by exactly one facet, and deliberately only
+    # that one. BUG-47's sync-folder half stays open for the other two
+    # (a 0-byte entry, an entry holding something else) because those are
+    # **files**, and choosing to rewrite a file the OneDrive client may be
+    # mid-upload is the Phase 5.15 race — a decision, not a cleanup. Both
+    # are still files, so both still short-circuit here, unchanged.
+    #
+    # A directory is not that decision. Nothing is overwritten and no race
+    # is entered: `os.replace()` onto a directory raises (measured on this
+    # machine, `PermissionError` WinError 5, the directory left intact),
+    # which `send()` turns into `TransportError`. That is the honest
+    # answer, and it is the one the rest of the Agent already knows how to
+    # act on — the Event stays in the outbox, `DrainSummary.is_clear` goes
+    # False, the collection date does not advance, and `ops_status.py`
+    # raises it. Measured before this: `send()` returned success, `drain()`
+    # filed the Event in `sent/`, the watermark moved past its date, and
+    # nothing had been written to the sync folder at all.
+    if final_path.is_file() and not overwrite:
         return final_path
 
     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")

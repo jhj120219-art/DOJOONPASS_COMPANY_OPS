@@ -5047,17 +5047,19 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
 
     # A lock still held long after any real run could have finished.
     #
-    # `_is_process_running()` asks whether *a* process has the recorded pid,
-    # not whether it is the one that wrote the lock. After a power cut the
-    # dead Runner's pid stays in the file; once Windows reassigns that
-    # number, every subsequent run is denied the lock and skips — silently,
-    # forever, until someone deletes the file by hand. Making the identity
-    # check exact means widening the lock file's pinned on-disk contract,
-    # which is a decision and stays in BACKLOG.
+    # This used to record the pid-reuse defect as open and deferred: "making
+    # the identity check exact means widening the lock file's pinned on-disk
+    # contract, which is a decision and stays in BACKLOG." **C138 §3 made
+    # that decision and implemented it** — docs/07 §26 lists what a lock may
+    # record as a minimum, not as a schema, so writing the holder's image
+    # name beside its pid implements §27's question rather than widening
+    # anything. `_is_process_running()` now asks about both.
     #
-    # This decides nothing and takes nothing: it reports that a lock has
-    # been held longer than plausible. A genuinely long run and a
-    # pid-reuse ghost both deserve the same sentence — go and look.
+    # What is left is narrower: a pid reused by a process running the *same*
+    # executable, which this line still covers. It decides nothing and takes
+    # nothing — it reports that a lock has been held longer than plausible,
+    # and a genuinely long run and a ghost both deserve the same sentence:
+    # go and look.
     # A stale lock nothing can remove. `lock_held_since()` below only sees a
     # lock a LIVE process holds, so this condition — dead process, file not
     # writable — is invisible to it, and `try_acquire_lock()` reports it as
@@ -5753,6 +5755,19 @@ def _print_schedule(now: datetime) -> list[str]:
                 f"실패하고 로그도 그 경로에 있어 아무 설명도 남지 않는다. "
                 f"scripts/install_{installer}_task.ps1을 여기서 다시 실행하면 "
                 f"이 저장소를 가리키게 된다"
+            )
+
+        # A task nobody here registered: all three installers write exactly
+        # one action, so more than one means a person edited it. The query
+        # reads the first action only, so the redirection check below
+        # declines to answer (`schedtask.discards_console_output`). Said as
+        # a fact and not raised — a second action is the operator's choice,
+        # and the thing worth printing is that this check no longer covers
+        # the whole task, rather than letting the line simply disappear.
+        if status.present and (status.action_count or 0) > 1:
+            print(
+                f"           Action이 {status.action_count}개다 — 이 화면은 "
+                f"첫 번째만 읽으므로 리디렉션 여부를 판정하지 않는다"
             )
 
         discards = schedtask.discards_console_output(status)

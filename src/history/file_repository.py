@@ -235,6 +235,26 @@ class FileHistoryRepository(HistoryRepository):
         for directory in directories:
             if not directory.exists():
                 continue
+            # Listed explicitly so a directory that exists but cannot be
+            # read raises instead of coming back empty. `Path.glob()`
+            # swallows the `OSError` it meets while scanning, and an empty
+            # result here does not mean "no Company History for this day" —
+            # it is what `scheduler.py` turns into a rendered *empty day*
+            # before advancing its watermark past it. Measured, one KEEP
+            # Candidate in a `keep/` denied to this user:
+            #
+            #     status COMPLETED   generated ['2026-08-29', '2026-08-30']
+            #     2026-08-29.md      "No material company history recorded."
+            #
+            # `list()` takes no date, so a single unreadable directory does
+            # that to **every** pending date in the batch.
+            #
+            # Raising is the whole fix: `scheduler.run_once()` already wraps
+            # this call in a `try/except` that returns FAILED without
+            # generating anything, and its comment says why ("repository.
+            # list()도 다른 단계와 동일하게 실패를 감춰서는 안 된다"). The
+            # contract was already right; the failure never reached it.
+            os.listdir(directory)
             for path in sorted(directory.glob("*.json")):
                 if is_incomplete_write(path.name):
                     # `save()` stages into this same directory, so a run

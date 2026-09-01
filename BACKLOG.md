@@ -7,7 +7,45 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-08-31 (C138 — **무인 운영의 절반이 관측 밖에 있었다.**
+마지막 갱신: 2026-09-01 (C145 — **감사 넷, 결함 없음.** 한 번도 구동해
+보지 않은 경로 넷을 실제로 돌렸다: Notion Retry Queue(미분 3,000 trial + 실
+장애/복구/배치 중간 예외), `review_cli.py`(읽기 전용 파일에서도 저장물 무손상),
+Desktop 4에서 Agent와 Runner 동시 실행 3회(Event 40건 유실 0·중복 0), 성능 측정.
+**production 변경 없음** — 넷 다 옳게 동작했다.)
+이전 갱신: 2026-09-01 (C144 — **같은 방법을 Backup에 겨눴다.**
+Company History가 이 머신에만 있다·이 머신에서 사라졌다고 말하는 줄들이
+severity도 다음 행동도 없이 나오고 있었다. 셋은 기존 정의로 분류했고, 보안 줄은
+어휘에 자리가 없어 SKIP했다. 그리고 AST로 재 보니 `ops_status.py`의 attention
+shape 76개 중 40개가 아직 분류되지 않았다 — 손으로 쓴 표의 한계에 숫자가 붙었다.)
+이전 갱신: 2026-09-01 (C143 — **증거가 망가졌을 때 나오는 줄들만
+분류되지 않고 있었다.** Dashboard를 손상된 런타임에 대고 실제로 띄우니 분류 불가
+배지가 6개 — 깨끗한 트리에서는 0이었고, 그 6개가 전부였다. 전부 "증거 자체를
+읽을 수 없다" 한 부류이고, 사람이 severity와 다음 행동을 가장 필요로 하는
+순간에 둘 다 없이 나온다. 실행해서 재 보니 둘은 파이프라인을 실제로 멈춘다.)
+이전 갱신: 2026-09-01 (C142 — **E-9b의 세 갈래 중 하나는 결정이
+아니었다.** sync 폴더 목적지가 *디렉터리*일 때 `send()`가 아무것도 쓰지 않고
+성공을 반환했고, watermark가 그 날짜를 넘어갔다. 셋을 묶어 두던 이유는
+"OneDrive가 업로드 중인 파일을 다시 쓰는 race"인데, 디렉터리에는 다시 쓸
+파일이 없다. `exists()` -> `is_file()` 한 단어. 파일인 두 갈래는 그대로 열려
+있다.)
+이전 갱신: 2026-09-01 (C141 — **읽을 수 없는 디렉터리가 빈 디렉터리로
+보고되고 있었다.** `Path.glob()`이 목록 조회 실패를 삼켜서, 권한이 막힌 Signal
+디렉터리는 "일이 없는 날"로, 읽히지 않는 `keep/`은 "Company History가 없는 날"로
+돌아왔다. 둘 다 그 날짜를 닫고 watermark를 넘겨 버렸고 — 날짜는 다시 열리지
+않는다. 두 곳 다 FAILED 계약은 이미 쓰여 있었고 실패가 거기 도달한 적이 없었다.)
+이전 갱신: 2026-09-01 (C140 — **모든 새 배포의 첫 실행이 docs/08 §62가
+금지하는 무한 재시도 루프였다.** 갓 clone한 트리에서 Runner를 돌려 봤더니,
+설정되지 않은 Backup이 매 실행 "일시적 — 따로 할 일은 없습니다"로 보고됐다.
+Manifest는 한 객체 안에서 RETRYABLE과 "사람이 만들어야 한다"를 동시에 적었다.
+그리고 그 실패 메시지는 docs/11 §26이 **하지 말라고** 적어 둔 절차(`git init`)를
+가르치고 있었다 — 그대로 따라 하면 BUG-52 루프에 도착한다.)
+이전 갱신: 2026-09-01 (C139 — **C138이 고친 결함의 나머지 절반.**
+`is_locked()`가 BUG-54의 수정에서 빠져 있어 한 Lock 파일에 대해 세 probe가
+서로 다른 답을 냈고, 그 어긋남이 **일이 사라졌을지 모른다**는 경보 둘에
+"아마 그냥 실행 중"을 영구히 붙이고 있었다. 그리고 그 수정을 설명하던 주석
+다섯이 이미 거짓이 돼 있었다 — 없앤 사본을 설명하거나, 내려진 결정을
+"BACKLOG 대기"라고 말하거나.)
+이전 갱신: 2026-08-31 (C138 — **무인 운영의 절반이 관측 밖에 있었다.**
 Task Scheduler에 물어보는 코드가 한 줄도 없었고, 예약 실행의 콘솔 출력은
 버려지고 있었으며(entrypoint 다섯이 그 리디렉션을 전제한 주석을 달고 있는
 채로), 재사용된 PID 하나가 Runner를 영구히 멈출 수 있었다.)
@@ -3176,6 +3214,19 @@ docs/14 §2에 명시돼 있다.
 
 ### E-9b. BUG-47 sync facet — C15 운영 수준 재측정 (여전히 SKIP)
 
+> **C142 갱신 — 세 갈래 중 디렉터리 하나는 닫혔고, 이 항목은 파일 둘로
+> 좁아졌다.** 셋을 묶고 있던 이유는 *"OneDrive 클라이언트가 업로드 중일 수
+> 있는 파일을 다시 쓰는 race"* 인데, 목적지가 **디렉터리**면 다시 쓸 파일이
+> 없다(실측: `os.replace()`가 `PermissionError` WinError 5, 디렉터리 그대로).
+> `exists()` -> `is_file()`로 그 하나만 좁혔고, `TransportError` -> outbox
+> 유지 -> watermark 정지 -> ATTENTION이라는 **이미 있던** 실패 경로로 들어간다.
+> 아래 표의 0바이트 시나리오는 **그대로 유효하다** — 이 저장소 자신의 측정이
+> Files On-Demand placeholder가 0바이트라고 적어 두었으므로, 거기서 거부하면
+> *실제로 배달된* Event를 영구 실패로 만든다. 그것과 "다른 내용"은 여전히
+> 결정 대기다. 탐지·보고는 C142에서 실행 경로 끝까지 확인했다(ATTENTION +
+> exit 3). C142 참조.
+
+
 기존 특성화는 `OneDriveTransport.send()` 단위였다. C15는 **실제 Agent로**
 끝까지 돌려 운영자에게 무엇이 보이는지 측정했다. 목적지에 0바이트 placeholder
 (OneDrive Files On-Demand의 형태)를 미리 심고 Agent 실행:
@@ -4458,6 +4509,19 @@ CEO 승인 A안)가 실제로 동작한다. **이것이 F-2b를 더 정확하게
 
 ### F-2b. BUG-52는 기록된 것보다 넓다 — 설정 오류가 영구 재시도된다 (C136 실측)
 
+> **C140 갱신 — 이 항목의 범위 밖에 있던 넷째 경우를 닫았다.** 아래 셋은 전부
+> git이 **stderr로 말하는** 실패이고, 그것을 어떻게 분류할지는 여전히 결정
+> 대기다(아래 그대로 유효하다). 넷째는 `git push`가 돌기도 전에
+> `check_working_copy_is_a_git_repository()`가 올리는 **타입** —
+> `WorkingCopyNotAGitRepositoryError` — 이고, 이 시스템이 그 저장소를 절대
+> 만들지 않으므로(docs/08 §30) 해석의 여지 없이 영구다. 네 분류기가 전부
+> `is_authentication_failure(str(exc))`로 물어 그 타입을 문자열로 지워
+> 버리고 있었다. `is_permanent_failure(exc)`로 모았다. **marker는 하나도
+> 추가하지 않았고**, 아래 셋을 고정하는 특성화 테스트
+> (`APermanentMisconfigurationIsClassifiedTransientTests`)는 고치지 않은 채
+> 그대로 통과한다. C140 참조.
+
+
 **실 git, 실 remote로 `git push` 실패 네 가지를 만들어 분류기에 넣었다:**
 
     case                        exit  분류              재시도로 고쳐지는가
@@ -4526,7 +4590,7 @@ APermanentMisconfigurationIsClassifiedTransientTests` — 실 git으로 세 경�
 | ID | 무엇인가 | 왜 미수정인가 |
 |---|---|---|
 | **BUG-30** | Desktop 간 시계 오차로 mtime이 미래면 `_is_stable()`이 그 파일을 **시계가 따라잡을 때까지** 무기한 보류(1년이면 1년) | mtime을 얼마나 신뢰할지의 결정 |
-| **BUG-53** | intake의 중복 검사가 존재 기반이라 **이름만 맞으면** 무엇이든 배달을 억제(디렉터리, 0바이트 포함) | BUG-47과 같은 race 정책 결정(E-9) |
+| **BUG-53** | intake의 중복 검사가 존재 기반이라 **이름만 맞으면** 무엇이든 배달을 억제(디렉터리, 0바이트 포함) | BUG-47과 같은 race 정책 결정(E-9). **C142 재확인 — 여기서는 거짓 성공이 없다**: 파일은 `transport/`에 그대로 남고, `desktop_activity._count_transport()`가 twin의 `event_id`를 열어 비교해 정상 중복(`already_collected`)과 **억제(`suppressed`)**를 가른다. 실측: 디렉터리·0바이트 -> `suppressed=1`(ATTENTION 유지), 진짜 중복 -> `already_collected=1`. `is_file()`로 좁히는 것보다 넓게 덮으므로 intake는 바꾸지 않았다 |
 | **BUG-32** | Notion 초당 ~3요청 제한에 대해 pacing이 전혀 없음 | pacing 정책은 결정 |
 | **BUG-11 / BUG-27** | `summary`와 `evidence`가 Daily Markdown에 escape 없이 렌더링 → Markdown 구조 위조 가능 | 무엇을 escape할지는 docs/06 렌더링 계약 변경. **로그 쪽은 C10이 이미 닫았다**(`oplog`) — 남은 것은 Markdown |
 | ~~**BUG-26**~~ | 서로 다른 UTC offset의 Event가 offset-local 날짜로 그룹핑되어 "잘못된 날"에 들어갈 수 있음 | **C135에서 수정.** 여기 적힌 이유가 틀렸다 — "정규화는 docs/06 §12 변경"이 아니다. §12는 *"timestamp가 속하는 날"* 만 말하고, **어느 시간대에서 재는지는 §9가 이미 정해 두었다**(`Asia/Seoul`). KST 정규화는 §12를 바꾸는 것이 아니라 §9 아래에서 §12를 구현하는 것이고, 디스크의 Event를 하나도 건드리지 않는다. 결정이 필요한 것은 고르지 않은 두 갈래(스키마를 `+09:00`으로 좁히기 / 생성 시점 정규화)였다. `src/businessdate.py` 신설, 특성화 테스트를 보증으로 재작성 |
@@ -4588,6 +4652,926 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C145. 감사 넷 — 결함 없음 (숫자만 남긴다)
+
+C144가 분류 표를 두 번 연속 손댔다. 이번에는 **실행**으로 돌아가, 아직 한 번도
+구동해 보지 않은 경로 넷을 실제로 돌렸다. **코드는 한 줄도 바꾸지 않았다** —
+넷 다 옳게 동작한다.
+
+### 1. Notion Retry Queue — 네 방향으로 확인
+
+**(a) indexed 경로의 미분 테스트.** `remove_entry(index=...)`는 swap-with-last로
+O(1) 제거를 하고 `upsert_entry`는 append하며 index를 갱신한다. 두 연산이 섞이면
+position이 낡을 수 있다 — 낡으면 Event가 큐에서 사라지거나(= Notion에 영원히
+반영 안 됨) 영원히 남는다. 무작위 연산열로 index 경로와 비-index 참조 구현을
+대조했다:
+
+    3,000 trial · 연산열 길이 1~11 · event_id 6종
+    결과 불일치 0 · index 정합성 위반 0
+
+**(b) 실제 Notion 장애 → (c) 복구.** 실 runner(`app.runner.run_once`)에
+모든 호출이 `NotionAPIError`를 던지는 transport를 물렸다:
+
+    run 1 (장애)   queue 6건  OUT-0..OUT-5 전부
+    run 2 (복구)   queue 0건  · Notion page 6건 (중복 0)
+
+**(d) 배치 중간의 예상 밖 예외.** `app/runner.py`의 주석이 이 경우를 적어 두었다
+— *"Notion 장애 6건 중 4번째에서 예외가 나면 6건 전부가 큐에서 사라졌다"*,
+그래서 델타 기록을 `finally`로 옮겼다는 것. 그 보장을 실제로 쏴 봤다(4번째
+호출에서 `RuntimeError`):
+
+    큐에 남은 것 6건 (MID-0..MID-5) — 유실 0
+
+`finally` 보장은 살아 있다.
+
+### 2. `review_cli.py` — 사람이 Company History를 고치는 유일한 도구
+
+이 저장소에서 사람이 저장된 Candidate를 **변경**하는 유일한 entrypoint이고,
+이 사이클들에서 한 번도 구동해 본 적이 없었다. 실 repository·실 reviewer로
+비대화식 구동:
+
+    정상    updated=1 · decision_context/expected_outcome 반영
+            summary·category·decision 그대로
+
+    읽기 전용 파일(복원 후 흔한 상태)
+            updated=0 · failed=('HIST-R1',)
+            운영자에게 사유까지 출력   `[실패] … WinError 5 …`
+            **저장된 Candidate는 byte 단위로 동일**, 여전히 유효한 JSON
+            staging 잔여물 0건 · `repository.list()`에 그대로 보인다
+
+부분 쓰기도, 손상도, 잔여물도 없다.
+
+### 3. Desktop 4에서 Agent와 Runner **동시 실행** — 같은 디렉터리를 두고
+
+AGENT.md §4는 두 lock이 다른 파일이며 Desktop 4에서 동시 실행이 정상이라고
+적는다. 그런데 Desktop 4의 Agent는 **자기 자신의 `runtime/events/transport/`**
+에 쓰고(§1), intake는 바로 그 디렉터리를 스캔한다. 실제로 겹쳐 본 적이 없었다.
+
+Signal 40건(4일 × 10건), Agent와 Runner를 **같이 띄워서 3회 반복**:
+
+    agent exit 0 / runner exit 0 (3회 모두)
+
+최종 상태:
+
+    agent sent            40
+    processed 파일        40   distinct event_id 40   중복 0
+    sent인데 미처리       0
+    처리됐는데 sent 아님  0
+    transport/incoming/outbox 잔여   0 / 0 / 0
+    Company History의 `- Event ID:` 줄   **40**
+
+`.tmp-` staging + 5초 안정화 창 + 결정론적 `event_id` + 계층별 dedup이 실제
+동시성에서 함께 버틴다. 유실 0, 중복 0.
+
+### 4. 성능 — 측정만 하고 최적화하지 않았다
+
+    ops_status.py (실 트리, 5회)   min 1.59s · med 1.61s · max 1.66s
+    트리 크기: processed 17 · daily 6 · rejected 4
+
+C103이 기록한 med 288ms에서 올라온 것이고 **원인은 이미 기록돼 있다** —
+C138 §21c가 SCHEDULE 블록의 PowerShell 조회를 1.30~1.36s로 실측했다. 즉
+1.6s ≈ 0.3s(파일) + 1.3s(Task Scheduler 조회)로 설명된다. 회귀가 아니라 알려진
+비용이고, 그 비용을 지불하기로 한 근거도 C138에 있다(사람이 명령을 칠 때 한 번).
+**최적화하지 않았다.**
+
+---
+
+**이번 사이클의 production 변경: 없음.** 넷 다 실제로 옳게 동작했고, 지침대로
+문제가 없는 곳에 코드를 넣지 않았다.
+
+## C144. 같은 방법을 Backup에 겨눴다 — 그리고 이 표가 **손으로 따라갈 수 없다**는 것을 재 봤다
+
+C143이 손상된 런타임을 실제로 렌더해서 "증거를 읽을 수 없다" 부류 일곱을
+찾았다. 같은 방법을 다른 손상 조합에 겨눴다.
+
+### 1. Backup/durability 부류 — 실제 렌더로 넷
+
+실 git working copy, Local Master에서 사라진 Company History, 실패한 backup
+state, working copy 안의 secret, 중단된 쓰기 잔여물로 트리를 만들고
+`ops_status.py`를 돌렸다. ATTENTION 10줄 중 **넷이 `?`** 였다:
+
+    원격 백업에 도달하지 않은 Company History N건 … 한 번도 백업이 성공한 적이 없다
+    Backup Working Copy에는 있고 Local Master에는 없는 Company History N건 …
+    Backup Working Copy에 Secret 형태의 파일 N건: id_rsa …
+    Backup Working Copy에 완료되지 않은 쓰기 잔여물 N건 …
+
+**docs/08의 존재 이유가 "Company History가 이 머신보다 오래 산다"인데, 그것이
+깨졌다고 말하는 줄 전부가 severity도 다음 행동도 없이 나오고 있었다.**
+
+### 2. 셋은 기존 정의로 분류했다 — 정의를 늘리지 않고
+
+이 모듈의 정의는 *"P1은 일이 Company History에 닿지 않거나 파이프라인이 멈춘 것"*
+이다.
+
+* **`원격 백업에 도달하지 않은` → P1.** 한 번도 성공한 적이 없다는 것은 off-machine
+  사본이 하나도 없다는 뜻이고, 그 줄 자체가 초록 신호가 거짓임을 적고 있다
+  (*"Backup이 SUCCESS/NOT_REQUIRED를 보고하고 있어도 이 파일들은 이 머신에만
+  있다"* — C137의 모양). Backup 파이프라인이 돌지 않는 것이다.
+* **`Local Master에는 없는` → P1.** 백업에 **도달했었고 지금 이 머신에 없는**
+  Company History. 정의의 문자 그대로다 — 닿았다가 떠났다.
+* **`완료되지 않은 쓰기 잔여물` → P2.** 잃은 것도 멈춘 것도 없다. `git add -A`가
+  원격으로 가져가므로 치울 것이고, 그것이 P2다.
+
+다음 행동은 명세를 따랐다 — `Local Master에는 없는` 항목은 백업 원격에서
+사람이 되돌리라고 하고 **자동 복원을 권하지 않는다**(docs/10 §46).
+
+    수정 전   ATTENTION 10줄 중 `?` 4
+    수정 후   `?` 1 (아래 §3), P1 6 · P2 3, 전부 다음 행동 있음
+
+### 3. 넷째는 **분류하지 않았다** — 그것이 결정이기 때문
+
+`Backup Working Copy에 Secret 형태의 파일`은 보안 경보다. 이 표의 어휘에는
+보안 등급이 없고, P1의 정의("일이 History에 닿지 않거나 파이프라인이 멈춤")는
+**유출을 포함하지 않는다.**
+
+C133이 같은 긴장을 이미 겪고 답을 정해 두었다 — 막힌 Project를 P1로 올리지
+않으면서 *"Promoting it would redefine P1 for the ten lines that already use
+it"* 라고 적었다. 그 선례를 따랐다.
+
+확인해 보니 **보안 줄은 하나도 분류돼 있지 않다** — `Event 내용에 Secret 형태의
+문자열`, `Decision Context에 Secret 형태의 문자열`, `Backup 원격 history에 이미
+들어간 Secret 형태 경로`까지 전부 `?`다. 즉 누락이 아니라 **어휘에 자리가
+없다.** "비밀이 머신을 떠나려 한다"를 P1/P2 중 무엇으로 볼지, 아니면 세 번째
+등급을 둘지는 **정책 결정**이므로 SKIP한다. 근거를 남긴다.
+
+### 4. 그리고 이 표의 진짜 한계를 측정했다
+
+AST로 `ops_status.py`의 `attention.append/extend` 인자를 전부 뽑아 분류기에
+넣었다:
+
+    attention shape  76건
+    분류되지 않음     40건   (상한 — 문자열이 placeholder를 가로지르면
+                            substring 매칭이 끊기므로 실제보다 크게 나온다)
+
+C143이 7건, C144가 3건을 넣었지만 **손으로 쓴 표가 76개 shape을 따라가지
+못한다**는 것이 숫자로 나왔다. 그 테스트의 docstring이 이미 *"What it cannot
+be is complete"* 라고 적어 두었고, 이 측정이 그 문장에 크기를 붙인다.
+
+**여기서 40개를 한 번에 채우지 않았다.** 각 줄의 severity는 실제 결과를 재서
+정해야 하고(C143의 둘은 실제로 raise를 확인해 P1이 됐다), 근거 없이 40개를
+채우는 것은 이 표를 신뢰할 수 없게 만든다. 다음 작업으로 남긴다 — 방법은
+이미 서 있다(AST sweep + 손상 fixture 렌더).
+
+### 5. 이번에 결함 없음으로 확인한 것
+
+* **Notion 페이지(세 번째 표면)** — C143의 일곱 줄이 공유 분류기를 통해 그대로
+  도달한다. 실제 블록을 만들어 확인: `🔴 즉시 조치 (3건)` / `🟡 확인 필요 (4건)`,
+  `🟣 분류하지 못함` 그룹 없음, 헤드라인 `조치 필요 — 7건, 그중 P1 3건`.
+  **표면별 작업이 필요 없었다** — source of truth가 하나인 덕분이다.
+* **보안 경계(P0)** — ATTENTION 줄에 토큰 모양 문자열을 넣어 Notion 블록까지
+  추적: `ntn_…`가 `[REDACTED]`로 바뀌어 나가고 원문은 직렬화된 블록 어디에도
+  없다. 그 줄은 P1으로 분류되고 다음 행동도 붙는다.
+* **`publish_control_tower.py`** — 자격증명 없이 실행: exit 1, 두 변수 이름과
+  `.env`가 자동으로 읽히지 않는다는 정책까지 정확히 말하고, Notion에 닿지
+  않는다. docs/14 §4의 exit 1(설정 오류) 그대로.
+
+### 6. 승인이 필요해 하지 않은 것
+
+보안 줄의 severity 정책(§3), 실제 Notion/OneDrive/Task Scheduler 왕복,
+E-9의 남은 두 갈래(0바이트·다른 내용).
+
+---
+
+## C143. 증거가 망가졌을 때 나오는 줄들만 **분류되지 않고 있었다** — 사람이 가장 필요한 순간에
+
+C142가 E-9b를 끝내고 다음 미탐색 영역을 찾았다. **브라우저 Dashboard는 이
+사이클들에서 한 번도 실제로 띄워 본 적이 없었다.** C138 §13이 남긴 교훈이
+정확히 그것이었다 — 페이로드와 명부는 테스트가 확인했고, 렌더된 페이지는
+아무도 보지 않았다.
+
+### 1. 실제로 띄웠다 — 깨끗한 트리에서는 결함 없음
+
+실 서버 기동, 실 HTTP:
+
+    GET /            200, 73KB      7개 블록 전부 존재(SCHEDULE 포함)
+    GET /healthz     200
+    GET /?since=x    400 (이유 포함)
+    GET /nope        404
+    분류 불가 배지    0
+    raw ** 마크업     0
+    escaped 태그 누출  0
+    동시 요청 5개      전부 200
+
+### 2. 그리고 증거를 망가뜨렸다 — 여기서 나왔다
+
+`collector_state.json` 깨진 JSON, `last_run.json` 빈 파일,
+`daily_history_state.json` 디코드 불가 바이트, `agent_state.json` 잘린 JSON,
+`processed/NOTAFILE.json` 이 디렉터리.
+
+    GET /   200, 50KB      <- 화면은 살아 있다(이 도구의 계약)
+    traceback 누출 없음
+    분류 불가 배지  **6**   <- 깨끗한 트리에서는 0이었다
+
+**그리고 그 6개가 전부였다.** 페이지의 다른 어떤 줄도 `?`가 아니었다.
+
+전수 확인하니 일곱이다(하나는 이 fixture가 만들지 않은 형제):
+
+    읽을 수 없는 processed Event N건: …
+    Daily State를 읽을 수 없다: …
+    processed에 읽을 수 없는 Event N건: … — History 반영 여부를 판단할 수 없다
+    Run Manifest를 읽을 수 없다: …
+    이 머신의 Agent state를 읽을 수 없다: …
+    이 머신의 Agent가 한 번도 실행을 완료한 적이 없다
+    이 머신의 Agent state의 last_run이 timestamp가 아니다 — …
+
+**한 부류다: "증거 자체가 망가졌다".** 그리고 그것이 이 공백의 최악인 점이다 —
+운영자가 *무엇이 얼마나 나쁜지*와 *무엇을 해야 하는지*를 가장 필요로 하는 순간에
+나오는 줄들이, severity도 다음 행동도 없이 진짜 결함들 옆에 섞여 나온다.
+
+C133(막힌 Project)·C138 §13(SCHEDULE 10줄)과 같은 모양이고, 두 번 다 이
+저장소가 실제 결함으로 판정하고 고친 것이다.
+
+### 3. severity는 **읽어서가 아니라 재서** 정했다
+
+이 모듈 자신의 정의는 *"P1은 일이 Company History에 닿지 않거나 파이프라인이
+멈춘 것"* 이다. 그래서 각 줄이 실제로 무엇을 멈추는지 실행해 봤다.
+
+    scheduler.run_once(손상된 state)  ->  SchedulerStateError raise
+                                          **어떤 날짜의 Daily History도 생성되지 않는다**
+    agent.run_once(손상된 state)      ->  AgentStateError raise
+                                          이 Desktop의 일이 머신을 떠나지 못한다
+
+둘 다 파이프라인이 멈춘다 → **P1**. 후자는 이미 P1인 `Desktop ID와 다르다`와
+결과가 같다(매 실행 거부 → Event가 나가지 않는다).
+
+`한 번도 실행을 완료한 적이 없다`도 P1이다 — `agent/status.py`가 이미 P1인
+`실행되지 않았다`와 **같은 `if/elif/elif` 한 줄기**에서 올리는 0회 케이스다.
+같은 질문에 다른 severity를 붙일 수 없다.
+
+나머지 넷은 P2이고, **아무것도 멈추지 않는다는 것이 P1 둘과 나란히 두면 안 되는
+이유다**:
+
+* `Run Manifest를 읽을 수 없다` — 잃은 것은 실행의 *설명*이지 실행이 아니다.
+  `_exit_code_from_manifest()`가 이미 2로 폴백한다.
+* `읽을 수 없는 processed Event` / `processed에 읽을 수 없는 Event` — 파일 하나의
+  귀속을 판단할 수 없을 뿐이고, 파일 단위 격리가 설계다(docs/03 §53).
+* `last_run이 timestamp가 아니다` — **`agent/status.py`가 답을 이미 적어 두었다**:
+  이 값은 informational이며 load에서 검증하지 않는 이유가 *"cosmetic corruption을
+  stopped Agent로 바꾸는 것은 잘못된 방향"* 이다. Agent는 계속 돈다.
+
+### 4. 수정 — 기존 표 두 개에 합류시켰다
+
+`controltower/attention.py`의 `RULES`(severity)와 `ACTIONS`(다음 행동)는 이미
+있는 분류기이고, 모듈 자신이 *"one match, two answers: severity() and
+next_action() walk the same tuple"* 라고 적어 둔 구조다. **같은 phrase로 양쪽에
+7개씩 넣었다.** 새 분류기도, 새 표면도, 새 severity 체계도 만들지 않았다.
+
+다음 행동은 명세를 따랐다 — docs/10 §46이 *"프로그램이 임의로 모든 History를
+삭제하거나 다시 생성하면 안 된다"*, §49가 *"History가 State보다 우선"* 이라고
+못박으므로, Daily State 항목은 state를 다시 쓰는 명령을 대지 않고 **디스크에 이미
+있는 History가 정본**임을 가리킨다.
+
+실측(같은 손상된 런타임, 실 서버):
+
+    수정 전   분류 불가 6
+    수정 후   분류 불가 **0**,  P1 5건 · P2 6건, 전부 다음 행동 있음
+
+### 5. 게이트는 만들지 않고 **기존 명부에 넣었다**
+
+`test_every_shape_ops_status_can_raise_is_classified_and_actionable`이 이미
+그 성질을 지키는 명부다. 그 docstring이 자기 한계를 이미 적어 두었다 —
+*"What it cannot be is complete"*, C138이 SCHEDULE 10줄을 넣지 않아 조용히
+거짓이 됐던 그 명부. 일곱을 거기에 넣었다. 돌연변이로 확인했다(규칙 하나를
+빼면 해당 shape이 즉시 실패).
+
+### 6. 이번에 결함 없음으로 확인하고 바꾸지 않은 것
+
+* **Monthly 전 구간** — 불완전한 달(PENDING), 완전한 달(GENERATED 31건),
+  재실행 멱등(중복 0), **닫힌 달에 도착한 Late Event**(MONTHLY_UPDATED 31→32,
+  EVT-LATE 도달), 그리고 `mark_month_dirty()` docstring이 적어 둔
+  **state가 파일보다 뒤처진 crash 창** — 실측으로 재현: `monthly_dir` 없이는
+  False(옛 판단, 조용한 유실), production이 넘기는 `monthly_dir`로는 True →
+  catch-up이 MONTHLY_UPDATED. 부분 실패 4형태(깨진 파일 → 월은 닫히고
+  `unconsolidated_days`가 그 날을 지목, 디코드 불가 → MONTHLY_FAILED,
+  디렉터리 → MONTHLY_PENDING "missing day"). **결함 없음.**
+* **intake 5초 안정화 창** — 잘린 JSON·0바이트가 `stable`로 보이도록 mtime을
+  1시간 과거로 밀어도 전부 `invalid`로 걸러지고 `transport/`에 남는다. JSON
+  파싱이 안정화 창의 backstop이다. 비-Event JSON은 승격되지만 그것이 계약이고
+  (docs/03 §7) Collector가 `rejected/`로 보낸다(실측: accepted=0 rejected=2).
+  **결함 없음.**
+
+### 7. 승인이 필요해 하지 않은 것
+
+실제 OneDrive 왕복 / Notion 변경 / Task Scheduler 등록 / GitHub push.
+E-9의 남은 두 갈래(0바이트·다른 내용)는 C142가 좁힌 그대로 결정 대기.
+
+---
+
+## C142. E-9b의 세 갈래 중 하나는 **결정이 아니었다** — 디렉터리가 배달 완료로 기록되고 있었다
+
+C141이 Agent crash/recovery를 실제 프로세스 종료로 검증하면서 E-9b도 함께
+재현했다. 이번에는 그 **근본 원인**을 따라갔다.
+
+### 1. detection은 실제로 발화한다 — 먼저 이것부터 확인했다
+
+*"Detection은 있는데 production 경로에서는 아무 효과가 없는 것 아닌가"* 를
+끝까지 추적했다. 0바이트 placeholder를 목적지에 두고 실제 Agent를 돌린 뒤:
+
+    find_undelivered_events()  ->  [('bc40ce13', 'EMPTY')]
+    AGENT 블록                 ->  전달 정합성 : UNDELIVERED (확인 1건)
+    ATTENTION                  ->  ! 전송 완료로 기록됐지만 sync 폴더에
+                                     도착하지 않은 Event 1건 … 사람이 확인해야 한다
+    exit code                  ->  3
+
+**형식적 detection이 아니다.** 운영자 화면과 종료 코드까지 도달한다.
+
+### 2. 근본 원인 — `exists()`가 "배달됐다"로 읽히고 있었다
+
+    transport/onedrive._write_atomic()
+        if final_path.exists() and not overwrite:
+            return final_path        # -> send() 성공, drain()이 sent/에 기록
+
+`Path.exists()`는 **그 경로에 무엇이 있든** True다. 그래서 `send()`는 아무것도
+쓰지 않고 성공을 반환하고, `drain()`이 `sent/`로 옮기고, watermark가 그 날짜를
+넘어간다.
+
+### 3. 세 갈래를 하나로 묶고 있던 것이 틀렸다
+
+BUG-47의 sync 폴더 절반은 세 경우를 **한 덩어리로** 미뤄 두고 있었다. 미룬
+이유는 하나다 — *"OneDrive 클라이언트가 업로드 중일 수 있는 파일을 다시 쓰는
+것은 Phase 5.15의 race"*.
+
+    sync/<id>.json 이 0바이트          파일이다  -> 다시 쓰는 것 = race    **결정**
+    sync/<id>.json 이 다른 내용        파일이다  -> 다시 쓰는 것 = race    **결정**
+    sync/<id>.json 이 디렉터리         파일이 아니다 -> 다시 쓸 것이 없다   **결정 아님**
+
+**디렉터리에는 그 race가 존재하지 않는다.** 덮어쓸 파일이 없기 때문이다.
+실측으로 확인했다:
+
+    os.replace(tmp, <디렉터리>)  ->  PermissionError (WinError 5)
+                                     디렉터리는 그대로, 아무것도 덮이지 않음
+
+C137(BUG-41)·C138 §3(BUG-54)·C140이 세 번 찾아낸 그 모양이다 — **미룬 이유가
+전체를 덮지 못한다.**
+
+**그리고 이 저장소는 같은 질문에 이미 답해 두었다.** `agent.outbox.stage()`가
+한 계층 위에서 정확히 같은 교정을 실측 근거와 함께 갖고 있다:
+
+> *"`is_file()`, not `exists()`. The question is "is this Event already
+> persisted", and a **directory** wearing the Event's name is not a persisted
+> Event — but it does exist."*
+
+sync 쪽 사본만 `exists()`로 남아 있었다.
+
+### 4. 수정 — 한 단어, 그리고 세 갈래가 분리됐다
+
+`exists()` → `is_file()`. 실측으로 다섯 모양 전부 확인했다:
+
+    목적지 없음(정상 배달)      SUCCESS         Event가 쓰인다
+    디렉터리                     TransportError  디렉터리 그대로   <- 고침
+    0바이트 (E-9 미결)          SUCCESS         변화 없음
+    다른 내용 (E-9 미결)        SUCCESS         내용 보존, 변화 없음
+    우리 Event(crash 재시도)    SUCCESS         멱등 재전송 유지
+
+**결정 대기 두 갈래는 손대지 않았다** — 둘 다 *파일*이므로 여전히
+short-circuit한다. 멱등 재전송(C141이 crash 복구로 검증한 경로)도 그대로다.
+
+### 5. 실제 실행 경로 검증 — Agent 전체로
+
+    수정 전   status=COMPLETED  watermark 전진  sent/ 1건  sync 폴더 비어 있음
+    수정 후   status=FAILED     watermark 유지  outbox 1건  sent/ 0건
+    운영자가 디렉터리 제거 후
+              status=COMPLETED  watermark 전진  Event 실제 배달됨
+
+새 실패 경로를 만들지 않았다 — `TransportError`는 `drain()`이 이미
+`failed`로 받아 `is_clear`를 False로 만들고, `agent.py`가 이미 "수집 날짜를
+전진시키지 않는다"로 해석하며, `ops_status.py`가 이미 보고한다.
+
+### 6. 같은 질문을 나머지 write 경로 전부에 던졌다
+
+`exists()`가 "이미 있다"로 쓰이는 자리를 전수 확인했다. **거짓 성공은
+transport 하나뿐이었다:**
+
+    daily/generator.py     이미 `exists() and not is_file()` 전용 가드 있음
+    monthly/generator.py   같음
+    history/file_repository  exists() -> **raise**  (실패 방향, 안전)
+    reporter/local_output    exists() -> **raise**  (실패 방향, 안전)
+    collector/runtime.py     디렉터리 -> FAILED + rollback + 로그 (시끄러움)
+    agent/_reject_signal     원본 유지, 다음 실행 재판정 (유실 없음)
+
+억지로 바꾸지 않았다.
+
+### 7. 남은 E-9 / E-9b
+
+여전히 열려 있고, 이번 수정이 그 경계를 **좁혔지 옮기지 않았다**:
+
+* **0바이트 목적지** — 이 저장소 자신의 측정이 *"Files On-Demand
+  placeholder는 0바이트"* 라고 적어 두었다. 즉 **실제로 배달된** Event도 그
+  모양일 수 있으므로, 여기서 거부하면 정상 배달을 영구 실패로 만든다. 무엇이
+  0바이트를 의미하는지는 실제 OneDrive 동작을 봐야 하는 결정이다.
+* **다른 내용** — 다시 쓰는 것이 Phase 5.15의 race 그 자체다.
+
+둘 다 탐지·보고는 완전하다(§1).
+
+---
+
+## C141. 읽을 수 없는 디렉터리가 **빈 디렉터리로 보고**되고 있었다 — 하루치 일이 조용히 사라지는 경로 둘
+
+C140이 갓 clone한 배포를 실제로 돌려 결함을 찾았다. 같은 방법을 **Agent 쪽**으로
+옮겨 Signal → Agent → OneDrive → transport → Runner → Company History를 실제
+파일로 끝까지 흘려 봤다. 그 경로 자체는 결함이 없었다(§4). 결함은 그 옆에 있었다.
+
+### 1. `Path.glob()`은 읽기 실패를 삼킨다 — 실측
+
+    한 개의 유효한 Signal이 든 디렉터리, 이 사용자에게 목록 조회 거부
+
+    Path.glob("*.json")  ->  []                    오류 없음
+    os.listdir()         ->  PermissionError (5)
+
+`load_signals()`가 glob으로 매칭하므로, **읽을 수 없는 날짜 디렉터리가
+"Signal이 없는 날"과 완전히 같은 값**(`((), ())`)으로 돌아왔다.
+
+### 2. Agent — 하루가 NO_ACTIVITY로 닫히고 다시는 열리지 않는다 (P0)
+
+실측(실제 `run_once`, 실제 ACL):
+
+    수정 전   status=COMPLETED  2026-08-29 NO_ACTIVITY  watermark -> 2026-08-31
+              Signal은 디스크에 그대로, Event는 만들어진 적 없음, exit 0
+
+`pending_dates()`는 watermark **다음** 날짜부터 시작한다. 날짜는 순서대로 닫히고
+**다시 열리지 않으므로**, 그 디렉터리의 Signal은 영원히 Company History에 닿지
+못한다. 로그에도 아무 줄이 없다.
+
+이국적인 상황이 아니다 — 관리 정책이 적용한 ACL, 다른 권한으로 복원된 폴더,
+백신·OneDrive 잠금. 그 디렉터리는 **운영자가 만들고 소유**하는 것이지 이 코드가
+만드는 것이 아니다.
+
+**Agent에는 이미 옳은 답이 있었다.** `DateOutcome.FAILED`는 그 날짜에서 멈추고,
+watermark를 그대로 두고, 다음 실행이 같은 날짜를 다시 시도한다. 다만 그 사실을
+**전달받을 방법이 없었다** — "볼 수 없었다"와 "아무것도 없다"가 같은 값으로
+도착했기 때문이다.
+
+    수정 후   run 1 (거부)  status=FAILED  failed_date=2026-08-29  watermark=2026-08-28
+                            거부/이동된 파일 0건 (읽지도 못한 것을 격리하지 않는다)
+              run 2 (복구)  status=COMPLETED  2026-08-29 COLLECTED  Event 1건 전달
+                            watermark -> 2026-08-31
+
+### 3. Company History — 같은 결함, 더 넓은 반경 (P0)
+
+같은 질문을 데이터 경로 전체에 던졌다(`glob`/`iterdir`/`scandir` 전수).
+`history/file_repository.list()`가 같은 모양이었고, **이쪽이 더 나쁘다**:
+`list()`는 날짜 인자를 받지 않으므로 `keep/` 하나가 안 읽히면 그 배치의
+**모든 날짜**가 영향을 받는다.
+
+실측(실제 `scheduler.run_once`):
+
+    수정 전   status=COMPLETED  generated=['2026-08-29','2026-08-30']
+              2026-08-29.md  ->  "No material company history recorded."
+              KEEP Candidate는 keep/ 에 그대로
+
+**여기서도 계약은 이미 옳게 쓰여 있었다.** `scheduler.run_once()`는 이 호출을
+`try/except`로 감싸 FAILED를 돌려주고, 그 주석이 규칙을 직접 적어 두었다 —
+*"repository.list()도 다른 단계와 동일하게 실패를 감춰서는 안 된다"*. 실패가
+그 계약에 **도달한 적이 없었을 뿐이다.**
+
+    수정 후   run 1 (거부)  status=FAILED  generated=[]  빈 날짜 파일 쓰이지 않음
+              run 2 (복구)  status=COMPLETED  generated=['2026-08-29','2026-08-30']
+                            그 날의 일이 Company History에 들어갔다
+
+### 4. 수정 — 새 계층 없이, 이미 있는 실패 경로로 연결했다
+
+두 곳 다 한 줄이다: glob 앞에서 `os.listdir(directory)`로 **목록 조회를 명시적으로
+한 번** 한다. 실패하면 거기서 OSError가 나오고, 그것이 각자 이미 존재하던 FAILED
+경로로 들어간다.
+
+* **새 source of truth 없음** — 매칭은 여전히 `glob("*.json")`이 한다. 목록 결과는
+  버린다. 이유: Windows에서 `WORK.JSON`이 Signal인지를 정하는 것은 glob의
+  대소문자 접기이고, 여기서 그 규칙을 다시 유도하면 같은 질문에 조용히 다른
+  답을 하는 두 번째 구현이 생긴다.
+* **새 실행 경로 없음** — Agent는 `DateOutcome.FAILED`, Scheduler는 자기
+  `except`. 둘 다 이미 있었다.
+* **감시 코드 아님** — 분류·watermark·exit code·운영자 안내가 실제로 바뀐다.
+* 비용: 수집하는 날짜당 디렉터리 목록 조회 한 번(파일 몇 개짜리 디렉터리).
+
+`run_agent.py`의 실패 안내도 한 줄 고쳤다. *"Event는 유실되지 않았습니다 —
+**outbox에 남아 있으며**"* 는 새 실패 모드에서 거짓이다(Event가 만들어진 적이
+없고 일은 `signals/`에 있다). 빈 `outbox/`를 뒤지게 만드는 안내는 다음부터
+읽히지 않는 안내다. 두 모드가 공유하는 참인 보증만 남겼다 —
+*"버려진 것은 없습니다 — 다음 실행이 같은 날짜부터 이어서 시도합니다."*
+
+### 5. 같은 질문을 나머지 목록 조회 지점에 — 고치지 않은 것과 그 이유
+
+판별 기준은 하나다: **빈 목록이 되돌릴 수 없는 닫힘을 만드는가.**
+
+    transport/intake.py     파일이 transport/ 에 남고 매 실행 다시 스캔  자가 치유
+    collector/runtime.py    파일이 incoming/ 에 남는다                    자가 치유
+    agent/delivery.py       sent/ 는 중복 방지용 — 못 읽으면 재전송,
+                            하위 계층이 event_id로 다시 걸러낸다          무해
+    agent/outbox.py         **실측함** — outbox는 매 실행 맨 앞에서
+                            drain된다. 거부 상태에서 watermark가 하루
+                            나아가지만, 복구 후 다음 실행이 밀린 Event를
+                            그대로 전달한다(실측: LEFTOVER-1 전달됨)      자가 치유
+
+마지막 것은 그 함수의 주석이 *"advancing past a date whose Events are still
+sitting locally is the one thing that would break invariant 1"* 이라고 적은
+상태를 한 사이클 동안 만든다. 다만 **유실이 아니고**(다음 실행이 배달한다) 늦게
+도착한 Event는 Late Event 병합이 이미 처리한다. 억지로 바꾸지 않고 적어 둔다.
+
+### 6. 결함 없음으로 확인한 것 — 전체 경로를 실제로 흘려 봤다
+
+Signal 작성 → Agent 수집 → outbox → sync 폴더 → transport → intake →
+Collector → History Filter → Daily → **Late Event 병합** → Backup(실 git)
+까지 실제 파일로 한 번 통과시켰다. 결함 없음.
+
+특히 확인한 것: transport의 5초 안정화 창 때문에 첫 실행에서 `moved=0`이 되고
+그 날짜가 **빈 채로 닫힌 뒤**, 다음 실행이 그 Event를 집어 **Late Events 절로
+그 날짜에 정확히 병합**했다(실측, `Late Events Added: 1`). 닫힌 날짜에 대한
+보호가 실제로 동작한다.
+
+`COMPANY_OPS_AGENT_SYNC_FOLDER`(Agent가 쓰는 곳)와 `runtime/events/transport`
+(Runner가 읽는 곳)를 무엇이 잇는가는 **docs/12 §16이 "V1에서 의도적으로 결정하지 않은 것"으로 적어
+둔 항목**이다. 메커니즘을 지어내지 않았다.
+
+### 7. 승인이 필요해 하지 않은 것
+
+* 실제 OneDrive 왕복 — 로컬 공유 폴더로 대체
+* 실제 GitHub Private remote — 로컬 bare remote로 검증
+* Transport 구체 기술 결정(docs/12 §16)
+* BUG-52 / F-2b의 stderr 분류 결정 — C140 그대로
+
+---
+
+## C140. 모든 새 배포의 **첫 실행**이 docs/08 §62가 금지하는 무한 재시도 루프였다 — 그리고 프로그램이 스스로 그 길을 가리키고 있었다
+
+이번에는 Audit이 아니라 **실행**에서 시작했다. BACKLOG §B가 적어 둔 방법 넷 중
+첫째("실제로 돌리고 결과를 읽는다")를 이 저장소가 아직 한 번도 해 보지 않은
+상태에 적용했다: **갓 clone한 배포.**
+
+`git ls-files`가 주는 것만 복사하면 `runtime/`이 없다(git-ignore). 그것이
+모든 새 머신의 상태이고, 거기서 Runner를 한 번 돌렸다.
+
+### 1. 실측 — 첫 실행, 그리고 그 뒤 모든 실행
+
+    [FAILED] Backup: Backup Working Copy is not a git repository: …
+             (no .git found directly inside it - run `git init` and
+              configure `origin` there first)
+
+    이 실패는 **일시적인 것**으로 분류되어 BACKUP_PENDING으로 기록됐습니다.
+    다음 Runner 실행이 같은 commit을 자동으로 다시 push합니다(docs/08 §19).
+    **따로 할 일은 없습니다.**
+
+바로 윗줄이 *"`git init`을 실행하라"* 고 말하는데 아랫줄이 *"할 일이 없다"* 고
+말한다. **한 화면 안에서 서로를 부정한다.**
+
+Run Manifest — 기계가 읽는 계약(docs/14) — 는 한 객체 안에서 같은 모순을 적었다:
+
+    classification  BACKUP_PENDING
+    severity        DEGRADED
+    retryability    RETRYABLE          <- "다음 실행이 고친다"
+    reason          "… run `git init` … first"   <- "사람이 만들어야 한다"
+
+세 번 돌렸다. 세 번 다 같았다. 이 시스템은 그 저장소를 **스스로 만들지
+않으므로**(docs/08 §30이 운영자 설정으로 둔다) 재시도는 답을 바꿀 수 없다.
+docs/08 §62가 금지하는 바로 그 무한 루프이고, 도달 조건은 이국적인 것이 아니라
+**갓 설치한 상태**다.
+
+그리고 `ops_status.py`의 ATTENTION은 **PERMANENT만 올린다.** 그래서 이 상태는
+상태 화면에서도 조용했다.
+
+### 2. 원인 — 규칙이 하나인 것은 옳았고, 그 규칙이 불완전했다
+
+`permanent`를 정하는 자리가 넷이고 넷 다 이렇게 물었다:
+
+    is_authentication_failure(str(exc))
+
+`app/runner.py`가 그 이유를 적어 두었다 — *"reused here rather than restated,
+so the two cannot disagree."* **의도는 옳다.** 문제는 그 규칙이 **git이 찍은
+문자열로만** 영구 실패를 알아본다는 것이다.
+
+그런데 이 모듈은 자기가 진단하는 영구 실패를 **타입으로** 갖고 있다:
+
+    class WorkingCopyNotAGitRepositoryError(GitOperationError)
+
+`check_working_copy_is_a_git_repository()`가 **어떤 git 명령도 돌기 전에**
+올리고, 이 모듈이 직접 검사한 전제다. 그런데 **아무도 그 타입으로 분기하지
+않았다** — 올리고 테스트하기만 할 뿐, 네 분류기 전부가 그것을 문자열로
+바꿔 버렸다.
+
+### 3. 수정 — 네 사본을 하나의 완전한 규칙으로 모았다
+
+`git_ops.is_permanent_failure(exc)`. 네 자리가 실제로 묻던 질문 그대로이고,
+이 모듈이 **이미 가진 두 사실**을 합칠 뿐이다:
+
+    isinstance(exc, WorkingCopyNotAGitRepositoryError)   타입 — 이 모듈이 소유
+    is_authentication_failure(str(exc))                  문자열 — 그대로 소유
+
+**새 source of truth가 아니다.** 문자열 규칙은 여전히
+`is_authentication_failure`의 것이고, 타입 규칙은 여전히 예외 클래스의 것이다.
+줄어든 것은 네 곳에 흩어져 있던 **같은 boolean 식의 사본 넷**이다. Notion 쪽에
+이미 같은 모양이 있고(`SyncResult.is_permanently_refused`), F-2b가 그것을
+선례로 지목해 두었다.
+
+실측(같은 fresh 배포):
+
+    before   BACKUP_PENDING  DEGRADED  RETRYABLE   exit 3   "따로 할 일은 없습니다"
+    after    BACKUP_FAILED   CRITICAL  PERMANENT   exit 2   할 일을 이름으로 말한다
+
+ATTENTION에도 올라온다: `! backup: BACKUP_FAILED — 재시도로 해결되지 않는다`.
+
+### 4. **BUG-52는 건드리지 않았다** — 그리고 그것을 증명했다
+
+F-2b가 연 결정은 *"git의 stderr 중 무엇을 영구로 볼 것인가"* (`no upstream`,
+git이 말하는 `not a repository`, non-fast-forward)이고, 그것은 **선을 어디에
+그을지의 판단**이라 여전히 승인 대기다.
+
+이번 건은 그 질문이 아니다 — 문자열이 아니라 **타입**이고, 어떤 marker도
+추가하지 않았다. 증거: 그 결정을 고정하는 특성화 테스트
+`APermanentMisconfigurationIsClassifiedTransientTests` 5건이 **한 줄도 고치지
+않고 그대로 통과한다.** 세 경우는 지금도 transient다.
+
+### 5. 그 수정이 드러낸 두 번째 결함 — 프로그램이 **금지된 절차**를 가르치고 있었다
+
+분류를 고치자 메시지가 "인증/권한 문제 — 자격증명을 갱신하라"가 됐다.
+`git init`이 안 된 것을 자격증명 탓으로 돌리는 것이므로, **틀린 문장 하나를
+다른 틀린 문장으로 바꾼 것**이었다. 그래서 원인별로 갈랐다.
+
+그 문장을 쓰려고 docs를 확인하다 더 나쁜 것을 찾았다. **docs/11 §26은 이미
+답을 갖고 있고, 코드가 그 반대를 가르치고 있었다:**
+
+> Working Copy는 **clone으로 만든다** … `clone`은 upstream tracking branch를
+> 자동으로 잡고, `git init` + `git remote add`는 잡지 않는다 — 후자로 만들면
+> 첫 Backup이 `fatal: … has no upstream branch`로 실패한다 …
+> **매 실행 재시도되지만 사람이 upstream을 설정할 때까지 성공하지 않는다**
+> (BACKLOG F-2b / BUG-52).
+
+그런데 `check_working_copy_is_a_git_repository()`의 메시지는
+*"run `git init` and configure `origin` there first"* 였다. **명세가 하지 말라고
+적어 둔 절차를, 그것을 하면 무슨 일이 나는지까지 적힌 채로, 코드가 시키고
+있었다.**
+
+실측으로 양쪽을 다 밟았다:
+
+    안내대로 git init + git remote add   -> 다음 실행 BACKUP_PENDING / exit 3
+                                            "따로 할 일은 없습니다" (= BUG-52 루프)
+    docs/11 §26대로 git clone            -> **첫 실행 BACKUP_SUCCESS / exit 0**
+
+메시지와 운영자 안내 양쪽을 `clone`으로 맞췄다. `git_ops.py` 머리말의
+*"(section 30)"* 인용도 고쳤다 — §30은 Working Copy를 운영자 설정으로 두기만
+하고 **어떻게** 만드는지는 말하지 않는다. upstream을 정하는 것은 docs/11 §26이고,
+그 차이가 Backup이 성공하는지를 정한다.
+
+**오류 메시지는 실행 경로다.** 이것은 잘못된 경로를 가리키고 있었다.
+
+### 6. 최종 검증 — 화면에 찍힌 것만 따라 한 배포
+
+새 clone, 아무 설정 없음:
+
+    RUN 1   exit 2   BACKUP_FAILED / CRITICAL / PERMANENT
+                     화면이 명령 하나를 찍는다
+    운영자  git clone <URL> runtime/backup_working_copy      (찍힌 것 그대로)
+    RUN 2   exit 0   Backup: BACKUP_SUCCESS
+
+**수정 전에는 화면에 찍힌 것을 그대로 따라 하면 영구 루프에 도착했다.**
+
+### 7. 테스트를 다섯 곳 고쳤고, 하나도 약화하지 않았다
+
+넷은 **구현 철자**를 고정하고 있었다(`is_authentication_failure(str(exc))`를
+source에서 substring으로 찾는 형태). 지키던 성질 — *"분류기는 공유 규칙을
+재사용하고 자기 사본을 만들지 않는다"* — 은 그대로이므로 철자만 새 이름으로
+옮기고, **반대 방향 단언을 새로 붙여 강화했다**(`is_authentication_failure`가
+코드에서 사라졌는가). 그 단언은 주석을 제거한 뒤 검사한다 —
+`test_schedtask.py::_code()`가 installer에 대해 쓰는 그 방법이고, 이유도 같다:
+바꾼 이유를 설명하는 산문이 자기가 금지하는 이름을 적는다.
+
+다섯째는 **내가 만든 거짓 양성**이다. `BackupLogIsNeverPersistedTests`가
+docs/08 §69의 `logs/backup` 생성을 막는데, f-string 검사가 `"/backup" in literal`
+이라 새 메시지의 `runtime/backup_working_copy`에 발화했다. 게이트가 옳고
+코드가 틀린 것이 아니라 **패턴이 과했다** — §69가 금지하는 것은 `backup`이라는
+**경로 구성요소**다. 구성요소 단위 비교로 좁혔고, 그 클래스가 스스로에게 쏘는
+8가지 철자는 전부 그대로 잡힌다(`{logs}/backup/{run}.json`도 포함). 경계를
+고정하는 단언을 하나 붙였다.
+
+### 8. 커밋된 빈 파일 다섯 개를 지웠다
+
+저장소 루트에 `cd`, `claude`, `git`, `main`, `FETCH_HEAD` — **전부 0바이트**이고
+전부 한 커밋(43771a9)에서 들어왔다. 셸 사고의 잔해이며 모든 clone에 실려 간다.
+확장자가 없어 어떤 게이트도 보지 않는다(루트 스캔은 전부 `*.py`다). 지우기 전에
+비어 있음을 확인하고 지웠다.
+
+### 9. 승인이 필요해 하지 않은 것
+
+* **BUG-52 / F-2b의 결정** — git stderr 중 무엇을 영구로 볼 것인가. §4 참조.
+  이번 수정은 그 경계를 넘지 않았고, 특성화 테스트가 그것을 증명한다.
+* **실제 GitHub Private remote로의 Backup** — 로컬 bare remote로만 검증했다.
+* **E-1의 나머지** 그대로.
+
+---
+
+## C139. C138이 고친 결함의 **나머지 절반** — 그리고 그 수정을 설명하던 주석 다섯이 거짓이 돼 있었다
+
+C138은 큰 Sprint였고, 큰 Sprint가 남기는 것을 남겼다: **고쳐진 결함을
+"아직 열려 있다"고 설명하는 주석**과, **넷 중 셋에만 적용된 수정** 하나.
+
+이번 Cycle이 쓴 방법은 새로울 것이 없다 — BACKLOG §B가 적어 둔 넷 중
+"**방금 한 수정에 같은 질문을 던진다**"(C82) 하나다. C138의 수정 지점마다
+"이 수정은 이 함수에만 적용됐는가"와 "이 수정을 설명하는 문장은 아직 참인가"를
+물었다.
+
+### 1. `is_locked()`가 BUG-54의 수정에서 빠져 있었다 (BUG, 실측 재현)
+
+C138 §3이 PID 재사용을 닫으면서 `_is_process_running()`에 `image_name`을
+넘기도록 고친 곳은 셋이다 — `try_acquire_lock()`, `lock_held_since()`,
+`stale_lock_cannot_be_cleared()`. **`is_locked()`는 넷째였고 고쳐지지
+않았다.** 그 함수의 docstring은 자기가 *"the same judgement
+`try_acquire_lock()` makes (§27), reached without acting on it"* 이라고
+적고 있었다.
+
+실측(이 머신, 실제 `tasklist`, C138이 쓴 것과 **같은 PID 1336**):
+
+    lock:  {"process_id": 1336, "image_name": "python.exe"}
+    1336은 지금 svchost.exe의 것이다
+
+    lock_held_since    -> None    아무도 안 쥐고 있다
+    try_acquire_lock   -> True    인수했다 — 홀더는 죽었다
+    is_locked          -> True    **살아 있는 프로세스가 쥐고 있다**
+
+한 Lock 파일에 대해 세 probe가 서로 다른 답을 냈다.
+
+**무엇을 잃는가.** `ops_status.py`가 `is_locked()`를 부르는 곳은 정확히
+둘이고, 둘 다 **일이 사라졌을지 모른다**는 ATTENTION 줄에
+`(Runner 실행 중 — 완료 후 재확인 권장)`을 덧붙이는 용도다. 그중 한 곳의
+주석이 대가를 직접 적어 두었다: *"a real loss hidden behind 'probably just
+running' is far worse than a false alarm."* 재사용된 PID를 든 stale lock은
+스스로 사라지지 않으므로, 그 위안이 **영구히** 붙는다.
+
+인자 하나를 넘긴다. **방향이 한쪽뿐이라 안전하다**는 C138 §3의 논증이
+그대로 적용된다 — 필터를 더하면 True가 False로만 바뀔 수 있고, 그것도 그
+PID가 **다른 실행 파일**을 돌릴 때만이며, 그것은 이 Lock을 쓴 홀더일 수
+없다. `image_name`이 없는 Lock(배포된 머신에 지금 있다)은 예전 그대로다.
+
+**단언은 "is_locked가 False다"가 아니라 "넷이 서로 어긋나지 않는다"로
+적었다** — 다섯 번째 reader가 생기면 같은 방식으로 틀릴 수 있다.
+`test_a_live_holders_lock_still_reads_as_held`가 반대 방향을 고정한다
+(실행 중인 Runner를 "안 쥐고 있다"로 읽으면 그것이 BUG-18이다).
+
+**Evidence:** `APidComesBackAsSomebodyElseTests` +4건. 돌연변이로 확인했다
+(인자를 빼면 둘이 즉시 발화).
+
+### 2. 같은 결함의 **미룸 기록**이 `ops_status.py`에 그대로 남아 있었다
+
+C138 §3은 `lock_held_since()`의 docstring에서 *"Making the identity check
+exact means widening the lock file's contract, which is a decision
+(BACKLOG)"* 를 찾아 **그 전제가 틀렸다**고 적고 고쳤다(docs/07 §26은 스키마가
+아니라 하한이다).
+
+**그 문장의 두 번째 사본이 `ops_status.py`에 있었고, 아무도 보지 않았다.**
+거의 같은 문구로, 이미 내려진 결정을 "BACKLOG에 남아 있다"고 말한다. 다음
+사람은 고쳐진 결함을 열린 것으로 읽거나, 이미 한 일을 다시 한다. 무엇이
+**실제로** 남았는지로 바꿨다 — 같은 실행 파일 이름으로 재사용된 PID이며,
+그 줄(`LOCK_STUCK_AFTER_HOURS`)이 계속 보고한다. `tests/test_observability.py`의
+같은 주장도 함께 고쳤다.
+
+### 3. `schedtask.py`의 상수 주석 셋이 §15가 없앤 사본을 설명하고 있었다
+
+C138 §15는 Task 이름·로그 이름의 PowerShell 사본을 **없앴다** — installer가
+`schedtask`에게 묻는다. 그런데 그 값들 옆의 주석은 그대로였다:
+
+    "Duplicated from the installer rather than parsed out of it …
+     drift is closed by a test that greps both installers for these
+     exact strings, so the copy cannot silently diverge."
+
+**사본은 없고, 그런 테스트도 없다.** 지금 있는 것은 정반대의 단언이다
+(`test_no_installer_hard_codes_a_task_name`). 이 주석을 믿는 사람은
+`.ps1`에 literal을 "복원"하려 하거나, 더 나쁘게는 **의존 방향**을 모른다 —
+설치 시점에 installer가 이 모듈을 import한다는 것이 그 값들의 실제 계약이다.
+
+셋 다 고쳤다. 모듈 머리말도 함께 고쳤다 — 예약 작업을 **둘**로 적고 있었는데
+`PUBLISH_TASK_NAME`은 그 아래 정의돼 있고 SCHEDULE 블록이 그것을 조회한다
+(C138 §5가 셋째를 만들었다).
+
+`-WhatIf`로 세 installer를 전부 실제로 돌려 확인했다 — 셋 다 Python에서 이름을
+받아온다(`..._DAILY`, `..._AGENT_DESKTOP_1`, `..._PUBLISH`), 아무것도 등록되지
+않았고 환경변수도 그대로다.
+
+### 4. `action_count`는 보내지고 있었고 도착하지 않았다 (BUG)
+
+`_ROW`가 Task마다 `action_count`를 실어 보내고, 그 이유를 자기 주석에
+적어 두었다: *"reporting on its first action as though it were the whole
+thing would be a guess, so `action_count` travels with it and the caller
+can see that this is a partial view."*
+
+**파서가 그 필드를 버렸다.** `ScheduledTaskStatus`에 자리가 없었다. 그래서
+`discards_console_output()`은 Action이 둘인 Task에 대해 하나만 읽고 **`False`**
+— "이 Task는 출력을 남긴다" — 를 단정했고, `ops_status`가 그것을 확정된
+사실로 찍었다. 그 함수의 docstring이 바로 위에서 금지하는 혼동이다:
+*"'we could not check' and 'it is fine' are the two answers this module
+refuses to confuse everywhere else."*
+
+필드를 통과시키고, 셋을 넘으면 `None`으로 답한다. **알려진 개수가 1을 넘을
+때만** 답을 보류하므로(필드가 없는 옛 출력은 예전 그대로), 변화는 확정된
+답을 "모른다"로 바꾸는 방향뿐이고 정상 Task에 결함을 만들어내지 않는다.
+화면에는 사실 한 줄을 찍는다(경보 아님 — Action을 더한 것은 운영자의 선택이고,
+값이 있는 것은 **이 검사가 더 이상 Task 전체를 덮지 않는다**는 사실이다).
+
+**실측으로 확인했다 — 합성 fixture가 아니라 이 머신의 진짜 Task로.** 이
+저장소의 세 Task는 등록돼 있지 않아 `query()`가 `present=$false` 분기만
+지나므로, *present* Task의 row 모양은 지금까지 합성 NDJSON으로만 검증돼
+있었다. `_ROW`를 이 머신의 루트 Task 4개에 대고 실제로 돌렸다:
+
+    rows=4  parsed=4
+    action_count=1  discards=True  state=Ready  result=0        -> HEALTHY
+    action_count=1  discards=True  state=Ready  result=267011   -> NEVER_RUN
+
+`action_count`가 실제 PowerShell 출력에서 파싱되고, 1999 sentinel과
+`SCHED_S_TASK_HAS_NOT_RUN`이 의도대로 NEVER_RUN이 된다.
+
+### 5. 그리고 §1~§4에 같은 질문을 던졌다 — 명부가 손으로 쓰였다
+
+§3이 "사본이 사라졌는데 주석이 남았다"였다. 그래서 **이 저장소가 일부러
+남긴 사본들**은 무엇이 지키고 있는지 물었다.
+
+`DuplicatedRulesStayInStepTests`가 셋을 이름으로 적고 있다. 그리고 그
+바로 옆에 `EveryDuplicatedConstantIsHeldInStepTests`가 있는데, 그 클래스의
+첫 줄이 이렇다: *"`DuplicatedRulesStayInStepTests` names three duplicated
+rules. The tree has more, and one of them was drifting with nothing
+watching it."* 그 클래스는 그 질문을 **상수**에 대해 던져 다섯을 찾았다.
+
+**함수에 대해서는 아무도 던지지 않았고, 그 셋짜리 명부가 여전히 전부였다.**
+디스크에서 파생했다(AST, docstring 제외, 동일 body):
+
+    safe_event_filename          2 모듈   DuplicatedRules...가 비교
+    _is_sole_identifier          2 모듈   DuplicatedRules...가 비교
+    is_incomplete_write          4 모듈   IncompleteWrite...가 비교
+    _has_reserved_windows_head   3 모듈   **아무것도 비교하지 않음**
+    _candidate_date              2 모듈   **아무것도 비교하지 않음**
+    _select / _date / _log / to_json     우연 — 공유 규칙이 아니다
+
+**빠진 둘 다 "대응한다"는 문장을 달고 있었다** — E-11의 모양이고, 저 클래스가
+만들어진 계기와 같은 모양이다(그때 거짓이던 문장은 *"tests assert the two
+copies agree"* 였다):
+
+    history/file_repository.py  "kept in step with the other two storage
+                                 boundaries" — 둘을 이름으로 부르는데,
+                                 존재하는 게이트는 **다른 쌍**만 비교한다
+    daily/role_summary.py       "Deliberately identical to
+                                 daily.generator._candidate_date(), KST
+                                 normalisation included … the summary and
+                                 the rendered file must never describe
+                                 different sets of work"
+
+**둘째가 비싸다.** `_candidate_date`는 일이 **어느 날에 기록되는가**를 정하고,
+그 KST 정규화가 바로 C135가 BUG-26에 대해 한 수정이다. 한쪽만 변환하면 역할별
+요약과 렌더된 Daily History가 **서로 다른 집합의 일**을 서술하고, 아무 오류도
+나지 않는다.
+
+**이름이 아니라 body로 묶는다** — 상수 sweep과 반대이고, 대상이 바뀌면 이유도
+뒤집히기 때문이다. 이름이 같은 상수 둘은 한 계약의 사본이지만, 이름이 같은
+**함수** 둘은 대개 프로토콜이다(`send`·`run_once`·`to_dict`·`save`는 각
+클래스의 자기 버전이다 — 이름으로 묶으면 43개가 나오고 그중 거의 전부가
+중복이 아니다). "한 규칙을 두 번 썼다"고 실제로 말하는 것은 동일한 body다.
+
+그 선택의 약점은 상수 클래스가 자기 것에 대해 적어 둔 것과 같다 — **이미**
+드리프트한 쌍은 스캔에서 빠져 무관한 둘로 보인다. 반대편에서 덮는다: 명부의
+모든 공유 규칙은 **행동으로** 비교되므로, 드리프트는 여기가 아니라 그 비교에서
+실패한다. 스캔의 일은 **새** 중복이 스스로 드러나게 하는 것이다.
+
+돌연변이 둘로 확인했다:
+
+    두 모듈에 같은 body의 함수 주입   -> 이름을 대며 즉시 실패
+    role_summary에서 KST 제거         -> 셋이 발화. 그중 행동 비교는
+                                        C135가 측정한 바로 그 쌍
+                                        (…T01:00+09:00 / …T16:00+00:00)
+                                        에서 터졌다
+
+**Evidence:** `EveryDuplicatedFunctionBodyIsHeldInStepTests` 9건.
+`SHARED_RULES`가 가리키는 테스트 이름은 **정의**로 확인한다(부분 문자열이
+아니라 — 명부가 자기가 검색하는 트리 안에 있으므로 C138 §17이 그 값을 한 번
+치렀다).
+
+### 6. 결함 없음으로 확인하고 바꾸지 않은 것
+
+같은 눈으로 보고 **실제로 문제가 없어서 손대지 않은** 것들이다. 억지로
+바꾸지 않았다.
+
+* **"identical"을 주장하는 함수 쌍 셋** — `safe_event_filename`,
+  `_has_reserved_windows_head`, `_candidate_date` 전부 실제로 동일하다
+  (AST 비교 + 행동 비교). 주장은 참이었고, 없던 것은 **그것을 지키는 것**
+  뿐이었다(§5).
+* **`redact()` 둘** — `agent/signals.py`와 `oplog.py`. 두 패턴이 같은
+  객체다(`assertIs`로 이미 고정돼 있다). 사본이 아니다.
+* **`_RESERVED_WINDOWS_STEMS` 셋** — 이미 3방향으로 비교되고 있다
+  (`tests/test_untrusted_event_input.py`). 빠져 있던 것은 그것을 읽는 **술어**였다.
+* **`scheduler_status`/`backup_status`의 두 파생** — 의도된 중복이고 OR로
+  묶여 있어 어긋나도 해로운 방향이 없다.
+* **docs/14 §4 ↔ `schedtask.describe_result`** — exit 1/2/3의 뜻이 정확히
+  일치한다.
+* **`Notes` 열(C138 §18)** — 게이트가 제대로 서 있다.
+* **`Get-ScheduledTask -TaskPath '\'`** — 조회가 0건을 낸다고 의심해 실측했다.
+  루트 4건이 정상적으로 나온다. 0을 본 것은 **내 probe의 escaping**이었고
+  모듈의 literal은 온전하다(`build_query`에서 직접 확인).
+
+### 7. 승인이 필요해 하지 않은 것
+
+* **실제 Task 등록** — 이번에도 하지 않았다. `-WhatIf`로 세 installer를
+  실제 실행해 이름·환경변수·미등록을 확인하는 데 그쳤다.
+* **E-1의 1~5**(실제 OneDrive 왕복, 실제 GitHub push, 실제 Notion 연결,
+  Developer Mode symlink) 그대로.
+* **Action이 여럿인 Task를 어떻게 다룰 것인가** — §4는 "판정하지 않는다"로
+  좁게 답했다. 모든 Action을 읽어 종합하는 것은 `_ROW`의 계약 변경이고, 그
+  판정 규칙(하나만 리디렉션하면?)은 결정이다. **SKIP.**
 
 ---
 

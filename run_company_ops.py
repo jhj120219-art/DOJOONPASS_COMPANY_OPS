@@ -65,7 +65,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from app.runner import PROJECT_ROOT as runner_project_root  # noqa: E402
 from app.runner import run_once  # noqa: E402
-from backup.git_ops import GitOperationError, is_authentication_failure  # noqa: E402
+from backup.git_ops import (  # noqa: E402
+    GitOperationError,
+    WorkingCopyNotAGitRepositoryError,
+    is_permanent_failure,
+)
 from notion import (  # noqa: E402
     ExecutionPlanSync,
     NotionClient,
@@ -440,11 +444,18 @@ def _report_backup_failure(
     failure. The one thing this function exists to report, decided by an
     unrelated file.
     """
-    # Classified on the RAW message, printed guarded. The order matters:
-    # `is_authentication_failure()` matches git's own wording, and running it
-    # on a redacted string would let a substitution eat the phrase the
-    # classification depends on.
-    permanent = is_authentication_failure(str(exc))
+    # Classified on the RAW exception, printed guarded. The order matters:
+    # the string half of `is_permanent_failure()` matches git's own wording,
+    # and running it on a redacted string would let a substitution eat the
+    # phrase the classification depends on.
+    permanent = is_permanent_failure(exc)
+    # Permanent has two causes and they need opposite actions: renew a
+    # credential, or create the repository. Saying "자격증명을 갱신하라" to
+    # someone whose Working Copy was never `git init`-ed sends them to the
+    # one place that is not broken — and this is the state of every first
+    # run, because a clone carries no `runtime/`. The exception's own text,
+    # printed directly above, already names the command.
+    setup = isinstance(exc, WorkingCopyNotAGitRepositoryError)
 
     # `GitOperationError` embeds `result.stderr.strip()` verbatim
     # (`backup/git_ops._run_git`), so this is multi-line output from another
@@ -460,7 +471,34 @@ def _report_backup_failure(
         "끝났고 이미 디스크에 저장되어 있습니다. 유실된 데이터는 없습니다.",
         file=sys.stderr,
     )
-    if permanent:
+    if setup:
+        # `clone`, not `init` — docs/11 §26's procedure and its reason:
+        # `git push` needs an upstream tracking branch, which `clone`
+        # configures and `init` + `remote add` does not. Measured on a fresh
+        # deployment: clone reaches BACKUP_SUCCESS on the first run, while
+        # init leaves every run failing "has no upstream branch", classified
+        # transient and retried forever (BACKLOG F-2b / BUG-52).
+        #
+        # The directory is normally absent rather than empty: a checkout has
+        # no `runtime/`, and the Runner creates `local_master`/`locks`/
+        # `logs`/`runs`/`state` but never this one (docs/08 §30 makes it
+        # operator setup). `clone` creates it, so the remedy is one command.
+        print(
+            "\n이 실패는 Backup 설정이 끝나지 않은 것으로 분류되어 "
+            "BACKUP_FAILED로\n기록됐습니다. 일정에 맡겨 재시도해도 해결되지 "
+            "않습니다 — 이 시스템은\nBackup Working Copy 저장소를 스스로 "
+            "만들지 않습니다(docs/08 §30이 그것을\n운영자 설정으로 둡니다).\n"
+            "\n  저장소 루트에서:\n"
+            "    git clone <백업 Private Repository URL> "
+            "runtime/backup_working_copy\n"
+            "\n`git init`이 아니라 `clone`입니다 — push는 upstream tracking "
+            "branch를\n필요로 하고 clone만 그것을 설정합니다. init으로 만들면 "
+            "첫 Backup이\n`no upstream branch`로 실패하고 매 실행 재시도됩니다"
+            "(docs/11 §26).\n"
+            "\n설정한 뒤 다시 실행하세요(docs/08 §12, §30, §62).",
+            file=sys.stderr,
+        )
+    elif permanent:
         print(
             "\n이 실패는 인증/권한 문제로 분류되어 BACKUP_FAILED로 기록됐습니다.\n"
             "일정에 맡겨 재시도해도 해결되지 않습니다 — 자격증명을 갱신한 뒤\n"
