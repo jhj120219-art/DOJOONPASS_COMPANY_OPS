@@ -428,6 +428,30 @@ class CorruptStateFilePathTests(RunnerFailurePathTestCase):
         Note the remaining scope: A안 unified the *loaders*, not their callers,
         so app/runner.py still lets this abort the run before History Filter.
         Making the Runner absorb it was 병목 #3 B안, which was not approved.
+
+        **What that costs, measured (C146).** This test named the open
+        decision and not its price, so the price is asserted here now — the
+        behaviour is unchanged and the decision is still not this test's to
+        make. Run end to end with one collectable Event, a Notion double that
+        never fails, and this file holding `{not json`:
+
+                               healthy queue        this test's tree
+            run_once()         SUCCESS, exit 0      raises RetryQueueError
+            daily history      written              **not written**
+            backup             ran                  **never started**
+            components         9                    3
+
+        So the two CRITICAL steps — the one that writes Company History and
+        the one that gets it off this machine — are stopped by the local
+        cache file of an integration README RULE 5 puts *off* the History
+        critical path, and no run repairs the file, so every following run
+        stops in the same place. `drain_pending()` makes the opposite choice
+        for the Dashboard's identical queue, in as many words: "a Dashboard
+        problem must never interrupt the Runtime… the file is left untouched
+        for an operator to inspect".
+
+        The assertions below pin that cost rather than argue it. When B안 (or
+        another answer) is approved, they are the ones that change.
         """
         self.notion_retry_queue_path.parent.mkdir(parents=True, exist_ok=True)
         self.notion_retry_queue_path.write_text("{not json", encoding="utf-8")
@@ -442,6 +466,19 @@ class CorruptStateFilePathTests(RunnerFailurePathTestCase):
 
         self.assertEqual(
             self.notion_retry_queue_path.read_text(encoding="utf-8"), "{not json"
+        )
+
+        # The price of that abort, at the two places it is actually paid.
+        daily_dir = self.local_master_dir / "daily"
+        self.assertEqual(
+            sorted(p.name for p in daily_dir.glob("*.md")) if daily_dir.is_dir() else [],
+            [],
+            "Company History was written despite the abort — the cost this "
+            "docstring records has changed and the text above is now wrong",
+        )
+        self.assertFalse(
+            self.backup_state_path.exists(),
+            "the Backup step ran despite the abort — same",
         )
 
     def test_corrupt_dashboard_pending_no_longer_stops_the_runtime(self):

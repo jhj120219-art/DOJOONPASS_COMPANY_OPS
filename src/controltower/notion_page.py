@@ -65,6 +65,10 @@ from typing import Any, Iterable, Mapping, Sequence
 from oplog import one_line, redact
 
 from . import verdict as _verdict
+from .attention import DOMAIN_LABELS as _DOMAIN_LABELS
+from .attention import SYSTEM as _SYSTEM
+from .attention import COMPANY as _COMPANY
+from .attention import domain as _attention_domain
 from .attention import next_action as _attention_action
 from .attention import rank as _attention_rank
 from .attention import severity as _attention_severity
@@ -587,7 +591,22 @@ def build_control_tower_blocks(
             "열려 있는 Blocker: "
             + ("확인 불가 — 이 값을 읽지 못했다" if open_blockers is None
                else f"{open_blockers}건"),
-            f"즉시 조치(P1): {counts.get('P1', 0)}건 · 확인 필요(P2): "
+            # Who the work is for, before how urgent it is (C147).
+            #
+            # The severity line below counts across both audiences, and on a
+            # real tree that reads badly: "즉시 조치(P1): 6건" where all six
+            # were Company Ops maintenance and the two things needing a
+            # person were in the P2 half. This section is the one a reader
+            # takes in at a glance, so it says the split ② is now grouped by
+            # — otherwise ① keeps the confusion ② no longer has.
+            #
+            # Stated as a plain count, not a verdict: "회사 0건" is a real
+            # and good answer, and it must not read as "nothing is known".
+            "지금 봐야 할 것: 회사 "
+            + f"{sum(1 for line in attention if _attention_domain(line) == _COMPANY)}건"
+            + " · 시스템(Company Ops 자체) "
+            + f"{sum(1 for line in attention if _attention_domain(line) == _SYSTEM)}건",
+            f"그중 즉시 조치(P1): {counts.get('P1', 0)}건 · 확인 필요(P2): "
             f"{counts.get('P2', 0)}건"
             + (f" · 미분류: {counts['?']}건" if counts.get("?") else ""),
             f"{SILENT_AFTER_DAYS}일 이상 조용한 Desktop: {len(silent_rows)}/{fleet}",
@@ -628,37 +647,77 @@ def build_control_tower_blocks(
                 "Event Schema에도 Run Manifest에도 심각도 필드는 없다."
             )
         )
+        # **Audience first, severity within it.**
+        #
+        # Severity alone was the whole order until C147, and severity answers
+        # "how broken is the pipeline" — correctly, and `attention.RULES`
+        # defends it: a blocked Project is P2 because the pipeline is working
+        # perfectly on work a person has stopped. For `ops_status.py`, read
+        # by an operator, that is the right ordering.
+        #
+        # This page is the one a CEO opens, and its own callout says to read
+        # this section from the top. Measured on a tree with two real
+        # blockers and a stopped pipeline at once:
+        #
+        #     🔴 즉시 조치 (6건)   6/6 about Company Ops itself
+        #     🟡 확인 필요 (6건)   ...3rd and 4th: the two blocked Projects,
+        #                          one of them the CEO's own pending approval
+        #
+        # Six tool-maintenance items before the thing that needed them. No
+        # line was wrong; the page had one axis and two jobs for it.
+        #
+        # So the company's list comes first and keeps its own severity order
+        # inside. Nothing about severity changed, `ops_status.py` and the
+        # browser page are untouched, and the `attention` module stays the
+        # single place that reads a line.
         shown = sorted(attention, key=_attention_rank)[:MAX_TABLE_ROWS]
-        for group, emoji, title in (
-            ("P1", "🔴", "즉시 조치"),
-            ("?", "🟣", "분류하지 못함 — 직접 읽어야 한다"),
-            ("P2", "🟡", "확인 필요"),
-        ):
-            items = [i for i in shown if _attention_severity(i)[0] == group]
-            if not items:
+        for audience in (_COMPANY, _SYSTEM):
+            in_audience = [i for i in shown if _attention_domain(i) == audience]
+            if not in_audience:
                 continue
-            blocks.append(_paragraph(f"{emoji} {title} ({len(items)}건)"))
-            for item in items:
-                level, why = _attention_severity(item)
-                prefix = f"[{level}] " + (f"({why}) " if why else "(분류 불가) ")
-                action = _attention_action(item)
-                suffix = (
-                    f" → 다음 행동: {_safe(action)}"
-                    if action
-                    else " → 다음 행동: 이 페이지가 정해 두지 않았다 — 줄 전문을 "
-                    "읽고 사람이 판단한다."
+            # The heading earns its place only when both groups are present:
+            # with one group it is a title over the whole section, which is
+            # what `②` already is.
+            if any(
+                _attention_domain(i) != audience for i in shown
+            ):
+                blocks.append(
+                    _paragraph(
+                        f"{_DOMAIN_LABELS[audience]} — {len(in_audience)}건"
+                    )
                 )
-                # **The remedy is what survives the 2,000-character cut, not
-                # what falls off it.** `_text()` trims from the right and the
-                # remedy is on the right, so a long line would have lost
-                # exactly the sentence saying what to do — on exactly the
-                # item where a reader most needs it. Nothing bounds `blocker`
-                # or `summary` upstream, so the long case is reachable.
-                room = RICH_TEXT_LIMIT - len(prefix) - len(suffix)
-                text = _safe(item)
-                if room > 0 and len(text) > room:
-                    text = text[: max(0, room - 1)] + "…"
-                blocks.append(_bullet(prefix + text + suffix, markup=True))
+            for group, emoji, title in (
+                ("P1", "🔴", "즉시 조치"),
+                ("?", "🟣", "분류하지 못함 — 직접 읽어야 한다"),
+                ("P2", "🟡", "확인 필요"),
+            ):
+                items = [
+                    i for i in in_audience if _attention_severity(i)[0] == group
+                ]
+                if not items:
+                    continue
+                blocks.append(_paragraph(f"{emoji} {title} ({len(items)}건)"))
+                for item in items:
+                    level, why = _attention_severity(item)
+                    prefix = f"[{level}] " + (f"({why}) " if why else "(분류 불가) ")
+                    action = _attention_action(item)
+                    suffix = (
+                        f" → 다음 행동: {_safe(action)}"
+                        if action
+                        else " → 다음 행동: 이 페이지가 정해 두지 않았다 — 줄 전문을 "
+                        "읽고 사람이 판단한다."
+                    )
+                    # **The remedy is what survives the 2,000-character cut, not
+                    # what falls off it.** `_text()` trims from the right and the
+                    # remedy is on the right, so a long line would have lost
+                    # exactly the sentence saying what to do — on exactly the
+                    # item where a reader most needs it. Nothing bounds `blocker`
+                    # or `summary` upstream, so the long case is reachable.
+                    room = RICH_TEXT_LIMIT - len(prefix) - len(suffix)
+                    text = _safe(item)
+                    if room > 0 and len(text) > room:
+                        text = text[: max(0, room - 1)] + "…"
+                    blocks.append(_bullet(prefix + text + suffix, markup=True))
         if len(attention) > MAX_TABLE_ROWS:
             blocks.append(
                 _paragraph(
@@ -747,7 +806,25 @@ def build_control_tower_blocks(
             _paragraph(
                 "Owner / Next Action 열은 없다 — 이 시스템에 Project 담당자와 "
                 "다음 작업의 원천이 없다. Team은 그 Event를 보고한 Desktop이지 "
-                "책임자가 아니다. 막힌 Project의 다음 행동은 ②에 있다."
+                "책임자가 아니다. 막힌 Project의 다음 행동은 ②에 있다. "
+                # C148. The same species of gap as the two named above, in
+                # the one place a reader is most likely to fill it in
+                # themselves: a table read top to bottom looks ranked.
+                #
+                # It is not. `_projects_panel()` orders blocked-first, then
+                # longest-idle, then id — chosen so the table does not
+                # reshuffle between runs, and its docstring says so. An
+                # Event carries thirteen fields and none of them is a
+                # priority, an owner, or a due date, so **importance has no
+                # source here at all** — the same reason Owner does not.
+                #
+                # Said rather than fixed: inventing a rank from elapsed days
+                # would be this page's first made-up fact, which is the line
+                # `승인 병목 · 다음 Sprint` already refuses to cross.
+                "**이 표의 순서는 중요도가 아니다** — 막힌 Project 먼저, 그다음 "
+                "오래 조용한 순이다(실행마다 순서가 바뀌지 않게 한 것이다). "
+                "Event에는 우선순위 필드가 없어 이 시스템은 무엇이 더 중요한지 "
+                "알지 못한다. 중요도는 사람이 정한다."
             )
         )
 

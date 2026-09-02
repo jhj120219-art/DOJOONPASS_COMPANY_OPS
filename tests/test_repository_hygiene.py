@@ -1090,6 +1090,73 @@ class NothingNewIsSpelledOutOnBothSidesOfTheBoundaryTests(unittest.TestCase):
                 for forbidden in ("$Token", "$ApiToken", "$NotionToken", "$Secret"):
                     self.assertNotIn(forbidden, code)
 
+    def test_an_installer_that_needs_a_secret_says_where_it_has_to_live(self):
+        """The gap between "the tool works" and "the deployment works" (C147).
+
+        These two installers deliberately refuse the Notion credentials —
+        `test_no_installer_stores_a_secret` above is that decision — so a
+        person sets them, and *where* they set them decides whether the
+        scheduled run ever sees them. A scheduled task inherits no
+        interactive shell.
+
+        The scripts knew this and used it: each persists its own non-secret
+        variable with `SetEnvironmentVariable(..., 'User')` and says why.
+        Then they printed the three variables they do not set with no scope
+        at all, and `.env.example` said "export these in the shell".
+
+        Measured on this repository, which followed that advice: `.env` holds
+        the credentials, `ops_status.py` reports *"자격증명: .env에 있으나 이
+        프로세스에 전달되지 않았다"*, and `runtime/logs/notion_sync.log`
+        **does not exist** — Notion has never been reached once. A shell
+        export would make an interactive run work and change nothing about
+        the scheduled one, and because Notion sits off the History critical
+        path (README RULE 5) that run still exits 0. Success-shaped failure.
+
+        Asserted as a property, not as wording: the installer must name the
+        USER scope, say a scheduled task inherits nothing, and point at the
+        one document that carries the command.
+        """
+        needs_a_secret = ("install_runner_task.ps1", "install_publish_task.ps1")
+        for path in self._scripts():
+            if path.name not in needs_a_secret:
+                continue
+            with self.subTest(installer=path.name):
+                code = self._code(path)
+                self.assertIn("USER environment", code)
+                self.assertIn("inherits no interactive shell", code)
+                self.assertIn("13_NOTION_ENVIRONMENT_SETUP.md", code)
+
+    def test_the_document_those_installers_point_at_carries_the_command(self):
+        """The pointer is only worth having if the target answers.
+
+        The command lives in exactly one place on purpose: an installer is
+        scanned by `test_no_installer_stores_a_secret`, which forbids the
+        literal `SetEnvironmentVariable("NOTION` anywhere in it — a guard
+        about *storing* a secret that cannot tell a call from printed help.
+        Keeping that guard at full strength and putting the command in the
+        document is the trade this makes.
+        """
+        doc = (REPO_ROOT / "docs" / "13_NOTION_ENVIRONMENT_SETUP.md").read_text(
+            encoding="utf-8"
+        )
+        section = doc[doc.index("### 2.1"):doc.index("## 3.")]
+
+        for name in ("NOTION_API_TOKEN", "NOTION_PROJECTS_DATABASE_ID"):
+            with self.subTest(variable=name):
+                self.assertIn(f"SetEnvironmentVariable('{name}'", section)
+        self.assertIn("'User'", section)
+        # And the reason, so the command is not a rite performed blindly.
+        self.assertIn("exit 0", section)
+
+    def test_the_env_template_sends_the_reader_to_the_same_place(self):
+        """`.env.example` is the file an operator has open while doing this,
+        and its own advice ("export these in the shell") is the one that
+        produces the silent failure for a scheduled run."""
+        template = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("USER environment", template)
+        self.assertIn("13_NOTION_ENVIRONMENT_SETUP.md", template)
+
     def test_the_publish_runs_after_the_runner_it_reports_on(self):
         """The one relationship between two installers' defaults.
 

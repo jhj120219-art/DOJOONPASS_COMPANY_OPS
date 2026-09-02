@@ -2872,12 +2872,42 @@ def _print_history(now: datetime) -> list[str]:
                 f"한다(BACKLOG BUG-55)"
             )
 
+    # `state = None` rather than `return attention` (C146).
+    #
+    # This handler used to leave the whole block. `_print_history()` runs
+    # from here to line ~3580, so one unreadable file skipped **every
+    # remaining question the report asks about Company History** — and said
+    # nothing about having skipped them. That is the shape `_block()`'s own
+    # docstring is written against: *"a partial report presented as
+    # complete, which is the silent-loss shape this project keeps
+    # removing."*
+    #
+    # Measured on one tree, corrupting only this file and changing nothing
+    # else — 13 ATTENTION lines became 10, and these four went silent:
+    #
+    #     Daily State와 실제 History가 어긋난다        (state claims a day that is gone)
+    #     Daily History 시퀀스에 구멍 2일              (Company History no run rebuilds)
+    #     Daily State가 미래 날짜를 …                  (Daily generation stopped entirely)
+    #     History Candidate의 Decision Context에       (a credential on its way to the
+    #     Secret 형태의 문자열 1건                      backup remote)
+    #
+    # None of the four has anything to do with Monthly. The last one is the
+    # worst: the report stops looking for leaked credentials because a
+    # different state file will not parse — and a damaged
+    # `monthly_history_state.json` also stops the Monthly pipeline, so it can
+    # sit there for a long time while it does that.
+    #
+    # `None`, not an empty `MonthlyState()`: an invented "nothing has been
+    # consolidated" would make this view *report* things it does not know
+    # ("monthly 파일은 있는데 state에는 통합 기록이 없다"), which is the
+    # guessing docs/10 §46 forbids. The three places below that need the file
+    # say so instead.
+    state = None
     try:
         state = load_monthly_state(RUNTIME_DIR / "state" / "monthly_history_state.json")
     except MonthlyStateError as exc:
         print("  monthly state       : 읽을 수 없음")
         attention.append(f"monthly state 파일이 손상됨: {exc}")
-        return attention
 
     # docs/10 §48: "Runner 시작 시 최소 확인 가능: State Last Success ->
     # Corresponding Local History 존재?". `scheduler/consistency.py`
@@ -3028,7 +3058,9 @@ def _print_history(now: datetime) -> list[str]:
     # below it. An earlier month lost while the pointer moved on is the same
     # limitation the Daily check has, and widening it here would be
     # inventing scope rather than applying the spec's.
-    closed = state.last_successful_monthly_close
+    # `None` when the state file above could not be read — every check under
+    # this pointer is then skipped, and only those.
+    closed = state.last_successful_monthly_close if state is not None else None
     if closed is not None:
         expected_monthly = monthly_history_path(monthly_dir, closed)
         if not expected_monthly.is_file():
@@ -3431,9 +3463,22 @@ def _print_history(now: datetime) -> list[str]:
     # A Monthly that has fallen behind the Daily files it is derived from —
     # the link the two checks around it cannot see, because both compare a
     # document with itself.
-    lagging, lagging_skipped = _monthly_lags_its_daily_source(
-        daily_dir, monthly_dir, dirty_months=tuple(state.dirty_months)
-    )
+    # Skipped, and said out loud, when the state file is unreadable.
+    # `dirty_months` is what tells this check which months are *known* to be
+    # awaiting a rebuild; passing `()` for "I could not read it" would report
+    # every such month as a divergence — a false alarm invented out of a
+    # missing input, which is the opposite of the mistake this whole
+    # correction is about.
+    if state is None:
+        print(
+            "  Monthly 원본 대조   : 확인 못 함 — monthly state를 읽지 못해 "
+            "재생성 대기 중인 달을 가려낼 수 없다"
+        )
+        lagging, lagging_skipped = [], 0
+    else:
+        lagging, lagging_skipped = _monthly_lags_its_daily_source(
+            daily_dir, monthly_dir, dirty_months=tuple(state.dirty_months)
+        )
     if lagging_skipped:
         print(
             f"  Monthly 원본 대조   : {lagging_skipped}건 확인 못 함 — "
@@ -3497,8 +3542,9 @@ def _print_history(now: datetime) -> list[str]:
             "말할 수 없다"
         )
 
-    print(f"  마지막 통합한 달    : {state.last_successful_monthly_close}")
-    if state.dirty_months:
+    if state is not None:
+        print(f"  마지막 통합한 달    : {state.last_successful_monthly_close}")
+    if state is not None and state.dirty_months:
         print(f"  재생성 대기         : {', '.join(state.dirty_months)}")
 
         # "자동 처리된다" is true of every dirty month except one kind, and
@@ -3566,7 +3612,10 @@ def _print_history(now: datetime) -> list[str]:
     # flagging: it means Daily Coverage never became COMPLETE for it.
     last_closed = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
     last_closed_key = f"{last_closed[0]:04d}-{last_closed[1]:02d}"
-    if state.last_successful_monthly_close is None:
+    if state is None:
+        # Both branches below read the pointer; neither can be answered.
+        pass
+    elif state.last_successful_monthly_close is None:
         if monthly_files:
             attention.append(
                 "monthly 파일은 있는데 state에는 통합 기록이 없다 — state 파일 확인 필요"
@@ -4268,6 +4317,39 @@ def _print_agent(now: datetime) -> list[str]:
             )
     else:
         print("  전달 정합성         : 확인 불가 (COMPANY_OPS_AGENT_SYNC_FOLDER 미설정)")
+        # Printed and, until C146, raised nothing — while this file raises
+        # ATTENTION for the two other "확인 못 함" cases it has (the Local
+        # Master listing, the backup remote's secret history), on the stated
+        # ground that *"이것은 '없음'이 아니라 '확인 못 함'이다"*.
+        #
+        # It matters more here than in either of those. This check exists
+        # because BACKLOG E-9b measured the failure it is the only detector
+        # for, end to end on a real Agent run:
+        #
+        #     sync folder file                  still 0 bytes -- never delivered
+        #     agent/sent/                       contains the event_id
+        #     last_successful_collection_date   advanced past that date
+        #     Agent exit code / log             0 / COLLECTED
+        #     any warning anywhere              none
+        #
+        # An unset environment variable turns that detector off, and the one
+        # line saying so sat in the body of the report rather than in the
+        # section an operator reads for what needs doing.
+        #
+        # Guarded on `sent_count`, not raised unconditionally: a Desktop that
+        # has never delivered an Event has nothing for this check to verify,
+        # and a standing alarm there is the alert-that-cannot-clear this file
+        # keeps removing (C26). With deliveries on disk the sentence is
+        # exact — these are records of Events this machine reported as
+        # delivered, and nothing here can say whether any of them arrived.
+        if snapshot.sent_count:
+            delivery_attention.append(
+                f"전달 정합성을 확인할 수 없다 — 이 머신은 Event "
+                f"{snapshot.sent_count}건을 전송 완료로 기록했지만 "
+                f"COMPANY_OPS_AGENT_SYNC_FOLDER가 없어 그중 무엇이 실제로 "
+                f"도착했는지 검사하지 못한다(BACKLOG E-9/E-9b). 이것은 "
+                f"'문제 없음'이 아니라 '확인 못 함'이다"
+            )
     # Unconditional on the count, because the count is exactly what is
     # meaningless without it — and the previous condition made this line
     # unreachable.
@@ -5097,7 +5179,26 @@ def _print_last_run(now: datetime | None = None) -> list[str]:
         summary = read_summary(DEFAULT_RUN_SUMMARY_PATH)
     except RunSummaryError as exc:
         print(f"  손상된 Run Manifest: {exc}")
-        return [f"Run Manifest를 읽을 수 없다: {DEFAULT_RUN_SUMMARY_PATH}"]
+        # `attention + [...]`, not `[...]` (C146). A fresh list here threw
+        # away everything this function had already found, and what it had
+        # already found is the two Runner Lock alarms above — including the
+        # one whose own comment says it is the only thing that can see the
+        # condition: *"`try_acquire_lock()` reports it as ordinary
+        # contention. The Runner then skips on schedule forever while every
+        # automatic signal reads healthy (BUG-42 / BACKLOG F-1)."*
+        #
+        # The two co-occur by construction. A run killed mid-write leaves a
+        # held lock **and** a truncated manifest, so the manifest damage was
+        # silencing the alarm about the lock the same accident left behind.
+        # Measured, a 48-hour-old lock held by a live process:
+        #
+        #     healthy manifest   Runner Lock이 48.0시간째 잡혀 있다  + 1 more
+        #     corrupt manifest   (only) Run Manifest를 읽을 수 없다
+        #
+        # Same correction, same reason, as the monthly-state handler in
+        # `_print_history()`: a check that cannot run must not take the
+        # answered ones down with it.
+        return attention + [f"Run Manifest를 읽을 수 없다: {DEFAULT_RUN_SUMMARY_PATH}"]
 
     if summary is None:
         print("  아직 기록된 실행이 없다.")

@@ -3116,8 +3116,44 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         now = businessdate.now()
+        # **Reading the data and building the body are one try (C146).**
+        #
+        # They were two, and only the first one was guarded. `gather()`
+        # answered a failure with 500 and the traceback — the posture this
+        # file states in as many words one screen up, *"reported on the page,
+        # never swallowed"* — while `render_html()` and `json.dumps()` were
+        # called outside it. An exception in either escaped `do_GET()`,
+        # `BaseHTTPRequestHandler` wrote nothing, and the socket closed.
+        #
+        # Measured against the running server, `render_html` made to raise:
+        #
+        #     gather() raises        HTTP/1.0 500, 1,007 bytes, names the error
+        #     render_html() raises   **no status line, 0 bytes**
+        #     (same request, /api/dashboard.json)   HTTP/1.0 200
+        #
+        # So the browser got "this site can't be reached" for a *running*
+        # server holding readable data, and the one artefact that could have
+        # said otherwise went to stderr. `render_html()` formats untrusted
+        # Event content — `_authored()`, folding, the KPI tiles, the
+        # attention grouping — which is exactly where this project keeps
+        # finding the unexpected type.
+        #
+        # `_send()` stays outside: a write that fails because the client
+        # disconnected is not a rendering failure, and answering it with a
+        # second `_send()` on a dead socket would be the worse error.
         try:
             data = gather(now, since=since, until=until)
+            if path == "/api/dashboard.json":
+                body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+                content_type = "application/json; charset=utf-8"
+            elif path == "/":
+                body = render_html(data).encode("utf-8")
+                content_type = "text/html; charset=utf-8"
+            else:
+                # Unchanged: an unknown path still pays for `gather()` before
+                # it is refused, because the refusal is decided here and not
+                # before — moving it would be a different change.
+                body = None
         except Exception:  # noqa: BLE001
             detail = traceback.format_exc()
             self._send(
@@ -3126,14 +3162,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "text/html; charset=utf-8",
             )
             return
-        if path == "/api/dashboard.json":
-            body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
-            self._send(200, body, "application/json; charset=utf-8")
-            return
-        if path != "/":
+        if body is None:
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
-        self._send(200, render_html(data).encode("utf-8"), "text/html; charset=utf-8")
+        self._send(200, body, content_type)
 
     def do_POST(self) -> None:  # noqa: N802
         # The host check is not repeated here on purpose: these methods

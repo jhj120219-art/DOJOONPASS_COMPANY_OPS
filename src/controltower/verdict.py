@@ -63,12 +63,45 @@ METRIC_LOWER_IS_BETTER = frozenset(
 #: puts three to five headline numbers above the fold, and the full nine
 #: stay one toggle away rather than being cut. Ordered by what a person
 #: acts on — a Blocker is a decision, an Event count is context.
+#:
+#: **`events` was one of the five and is not any more (C148).** That comment
+#: already called it context, and it is narrower than context: it counts the
+#: *files this run read*, which is the definition of machine data. The brief
+#: this page is written for is explicit that an executive summary carries
+#: Status / Blocker / Decision / Recent Change / Risk, not the reader's own
+#: instrumentation.
+#:
+#: Measured on a simulated month of real company work — five projects, three
+#: blockers, one completion, one approved decision:
+#:
+#:     ③ (above the fold)   열려 있는 Blocker 2 · 움직인 Project 5 ·
+#:                          완료된 Milestone 2 · 조용한 Team 0 ·
+#:                          **기록된 Event 9**
+#:     ⑥ (collapsed)        **완료된 Project 1** · **승인된 Decision 1** ·
+#:                          해결된 Issue 1
+#:
+#: So the month's largest business outcome was one toggle away while "we read
+#: nine files" was not. `projects_completed` takes the slot: it is the
+#: counterpart to `open_blockers` — what finished against what is stuck.
+#:
+#: **Nothing is lost by dropping it.** The number stays in the full nine one
+#: toggle down, and `데이터 Coverage` reports the same count again as "읽은
+#: Event". Nor was it carrying the empty-corpus signal, which is the reason
+#: worth checking before touching this list: measured on an empty tree, ③
+#: prints its own banner ("아래 0은 '일이 없었다'가 아니라 '셀 Event가
+#: 없다'는 뜻이다") and every metric reads 판정 보류 — neither depends on this
+#: entry.
+#:
+#: No direction is claimed for it (`METRIC_LOWER_IS_BETTER` is unchanged).
+#: More completions is not automatically better — a quarter can legitimately
+#: finish nothing — and inventing a verdict here is the "정상을 보고하는 채로"
+#: failure this file exists to avoid.
 HEADLINE_METRICS: tuple[tuple[str, str], ...] = (
     ("open_blockers", "🚧"),
     ("projects_active", "📁"),
+    ("projects_completed", "✅"),
     ("milestones_completed", "🎯"),
     ("teams_silent", "🔕"),
-    ("events", "📨"),
 )
 
 

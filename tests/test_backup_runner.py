@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -579,6 +580,166 @@ class CountUnpushedCommitsTests(BackupRunnerTestCase):
         plain.mkdir()
 
         self.assertIsNone(count_unpushed_commits(plain))
+
+
+class AnUnpushedCommitIsReportedWhateverTheStateFileSaysTests(BackupRunnerTestCase):
+    """The same lie, one state over (C146).
+
+    `AFailedBackupIsNotQuietlyDowngradedToNotRequiredTests` closed this for
+    `BACKUP_FAILED` and wrote the reason down in one sentence: *"the question
+    is put to git rather than to the state file."* The code then asked the
+    state file whether to ask git — `if state.backup_status is FAILED` — so
+    every other way of holding an unpushed commit was untouched.
+
+    The one that matters is a state file with **no** `backup_status` at all.
+    `load_state()` returns `None` for that field, and three ordinary things
+    produce it:
+
+        the state file is gone          `runtime/` is .gitignore'd, so a
+                                        restore that brings the Working Copy
+                                        back need not bring the state
+        a person repaired it            docs/10 §46 expects hand-edited
+                                        state, and `controltower/attention`'s
+                                        own remedy for a corrupt
+                                        `backup_state.json` tells them to
+        a partial restore               the same file, half of it
+
+    Measured with real git and a real (local, bare) remote, before the fix:
+
+        run                                   reported              unpushed
+        healthy                               BACKUP_SUCCESS               0
+        new Daily, remote broken              raises, PENDING              1
+        nothing new, no `backup_status`       **BACKUP_NOT_REQUIRED**      1
+
+    The third row is the defect, and it is worse than the FAILED one it
+    mirrors: there is no prior FAILED in the file for `ops_status.py` to
+    notice, so the green verdict is the only verdict anywhere. `save_state`
+    then writes NOT_REQUIRED and the tree settles into "backed up".
+
+    What the fix does **not** do is invent an alarm out of "unknown".
+    `count_unpushed_commits()` answers `None` for a repository with no
+    upstream, and a Working Copy in that shape has never pushed anything —
+    a brand-new one included. Reporting FAILED there on every quiet run is
+    the standing alert C26 warns trains people to skim the section, so
+    `None` stays confined to the FAILED arm, where a real failure is already
+    on record. A count greater than zero is unambiguous in every state, and
+    widening it to every state is the whole of the change.
+    """
+
+    def _clean_tree_holding_an_unpushed_commit(self):
+        """A commit the remote does not have, a clean tree — built by
+        actually failing a push, so the premise cannot drift from what the
+        code produces."""
+        remote = self._init_working_copy_with_remote()
+        (self.master_dir / "daily" / "2026-08-19.md").write_text("# 19\n", encoding="utf-8")
+        run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        broken = self.root / "not_a_repository_either"
+        broken.mkdir()
+        _run_git(["remote", "set-url", "origin", str(broken)], cwd=self.working_copy_dir)
+
+        (self.master_dir / "daily" / "2026-08-20.md").write_text("# 20\n", encoding="utf-8")
+        with self.assertRaises(GitOperationError):
+            run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+        return remote
+
+    def _drop_backup_status(self):
+        """What a lost, hand-repaired or partially restored state file looks
+        like. Written as JSON rather than through `save_state()` because
+        `save_state()` cannot produce it — which is the point: this shape
+        comes from outside the program."""
+        raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        raw.pop("backup_status", None)
+        self.state_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    def _unpushed(self):
+        out = _run_git(
+            ["log", "--oneline", "origin/main..HEAD"], cwd=self.working_copy_dir
+        )
+        return [line for line in out.strip().splitlines() if line]
+
+    def test_the_premise_is_real(self):
+        """Vacuous otherwise: no commit, or a state that still says FAILED,
+        and every assertion below would be about the arm already fixed."""
+        self._clean_tree_holding_an_unpushed_commit()
+        self._drop_backup_status()
+
+        from backup.git_ops import git_status
+
+        self.assertFalse(git_status(self.working_copy_dir).has_changes)
+        self.assertEqual(len(self._unpushed()), 1)
+        self.assertIsNone(load_state(self.state_path).backup_status)
+
+    def test_a_run_with_nothing_new_reports_the_unpushed_commit(self):
+        self._clean_tree_holding_an_unpushed_commit()
+        self._drop_backup_status()
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.FAILED)
+        self.assertIsNotNone(entry.push_result)
+        self.assertIn("1", entry.push_result)
+        self.assertIn("21", entry.push_result)
+        self.assertIsNotNone(entry.commit_hash)
+
+    def test_the_state_is_not_overwritten_with_green(self):
+        """The half that made it silent. `save_state` writing NOT_REQUIRED
+        is what left no trace anywhere that a backup had not reached the
+        remote."""
+        self._clean_tree_holding_an_unpushed_commit()
+        self._drop_backup_status()
+
+        run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIsNot(
+            load_state(self.state_path).backup_status, BackupStatus.NOT_REQUIRED
+        )
+
+    def test_it_does_not_push_again(self):
+        """docs/08 §62, same as the FAILED arm: the fix is to stop lying,
+        not to start retrying."""
+        self._clean_tree_holding_an_unpushed_commit()
+        self._drop_backup_status()
+
+        run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertEqual(len(self._unpushed()), 1)
+
+    def test_a_hand_pushed_remote_is_still_allowed_to_be_current(self):
+        """The other direction, and the reason this asks git. Without it the
+        fix would be satisfied by never saying NOT_REQUIRED again."""
+        remote = self._clean_tree_holding_an_unpushed_commit()
+        self._drop_backup_status()
+        _run_git(["remote", "set-url", "origin", str(remote)], cwd=self.working_copy_dir)
+        _run_git(["push", "origin", "main"], cwd=self.working_copy_dir)
+        self.assertEqual(self._unpushed(), [])
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.NOT_REQUIRED)
+
+    def test_a_working_copy_with_no_upstream_is_not_turned_into_an_alarm(self):
+        """The boundary the fix deliberately does not cross. `None` means
+        "git cannot tell me", and a Working Copy that has never pushed —
+        including a brand-new one — answers `None` forever. Raising FAILED
+        on every quiet run for that is a standing alert, not a finding, so
+        `None` stays confined to the arm where a failure is already on
+        record."""
+        from backup.git_ops import count_unpushed_commits
+
+        self.working_copy_dir.mkdir(parents=True, exist_ok=True)
+        _run_git(["init", "-b", "main"], cwd=self.working_copy_dir)
+        _run_git(["config", "user.email", "test@example.invalid"], cwd=self.working_copy_dir)
+        _run_git(["config", "user.name", "Backup Runner Test"], cwd=self.working_copy_dir)
+        (self.working_copy_dir / ".gitkeep").write_text("", encoding="utf-8")
+        _run_git(["add", "-A"], cwd=self.working_copy_dir)
+        _run_git(["commit", "-m", "init"], cwd=self.working_copy_dir)
+
+        self.assertIsNone(count_unpushed_commits(self.working_copy_dir))
+
+        entry = run_once(self.master_dir, self.working_copy_dir, state_path=self.state_path)
+
+        self.assertIs(entry.final_status, BackupStatus.NOT_REQUIRED)
 
 
 if __name__ == "__main__":

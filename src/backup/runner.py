@@ -245,30 +245,61 @@ def run_once(
         # 사람이 손으로 push해 놓았다면 remote는 최신이고 NOT_REQUIRED가 참이다.
         # None(upstream 없음 등)은 0으로 읽지 않는다: "알 수 없다"는 "도달했다"가
         # 아니고, 그 경우 초록을 보고하는 것이 정확히 이 결함이다.
-        if state.backup_status is BackupStatus.FAILED:
-            unpushed = count_unpushed_commits(working_copy_dir)
-            if unpushed != 0:
-                entry = BackupLogEntry(
-                    run_id=resolved_run_id,
-                    backup_start=backup_start,
-                    source=resolved_source,
-                    changed_files=(),
-                    deleted_files=(),
-                    commit_hash=git_head_commit(working_copy_dir),
-                    push_result=(
-                        "이전 실행의 BACKUP_FAILED가 아직 해소되지 않았다: "
-                        + (
-                            f"remote에 도달하지 않은 commit {unpushed}건"
-                            if unpushed is not None
-                            else "remote와 비교할 수 없다 (upstream 미설정)"
-                        )
-                        + ". docs/08 §21 — 사람이 개입해야 한다"
-                    ),
-                    backup_end=businessdate.now(),
-                    final_status=BackupStatus.FAILED,
-                )
-                # 상태는 건드리지 않는다. 이 분기의 요점이 그것이다.
-                return entry
+        # …그리고 그 질문은 **어떤 state에서든** 같은 질문이다. 위 문단이
+        # "state 파일이 아니라 저장소에 묻는다"고 적어 놓고도 묻기 **전에**
+        # state 파일에게 물을지 말지를 물었다 — `state.backup_status is
+        # FAILED`. 그래서 push가 실패해 commit이 남았는데 state가 FAILED가
+        # **아닌** 모든 경우가 그대로 남아 있었다. 특히 `backup_status`가
+        # 없는 state: 파일이 유실됐거나(runtime/은 .gitignore된다), 손상된
+        # 파일을 사람이 고쳤거나(docs/10 §46이 예상하는 경우이고,
+        # `controltower/attention.py`의 복구 안내가 정확히 그것을 시킨다),
+        # 부분 복원된 경우다.
+        #
+        # 실측(실제 git, 실제 remote):
+        #
+        #   1) 정상                              BACKUP_SUCCESS,       unpushed 0
+        #   2) remote 파손 + 새 Daily            raises, PENDING,      unpushed 1
+        #   3) 변경 없음 + backup_status 없음    **BACKUP_NOT_REQUIRED**, unpushed 1
+        #
+        # 3번이 이 결함이다. remote에는 없는 Company History를 들고 초록을
+        # 보고하고, `save_state`가 NOT_REQUIRED를 써서 그 상태로 굳힌다 —
+        # FAILED 팔에서 이미 고친 것과 같은 거짓말이다.
+        #
+        # None은 여전히 FAILED에서만 보고한다. "알 수 없다"는 "도달했다"가
+        # 아니지만, 앞선 실패 기록이 없는 상태에서 그것만으로 FAILED를 새로
+        # 만들어내면 upstream이 아직 없는 갓 만든 Working Copy가 매 실행
+        # 경보를 울린다 — C26이 경계하는, 사람이 ATTENTION을 건너뛰게 만드는
+        # 상시 경보다. 숫자가 0보다 크다는 것은 어떤 state에서도 모호하지
+        # 않고, 그것이 이 분기가 넓어진 전부다.
+        unpushed = count_unpushed_commits(working_copy_dir)
+        unresolved = (
+            unpushed != 0
+            if state.backup_status is BackupStatus.FAILED
+            else bool(unpushed)
+        )
+        if unresolved:
+            entry = BackupLogEntry(
+                run_id=resolved_run_id,
+                backup_start=backup_start,
+                source=resolved_source,
+                changed_files=(),
+                deleted_files=(),
+                commit_hash=git_head_commit(working_copy_dir),
+                push_result=(
+                    "Working Copy의 commit이 remote에 도달하지 않았다: "
+                    + (
+                        f"remote에 도달하지 않은 commit {unpushed}건"
+                        if unpushed is not None
+                        else "remote와 비교할 수 없다 (upstream 미설정)"
+                    )
+                    + ". docs/08 §21 — 사람이 개입해야 한다"
+                ),
+                backup_end=businessdate.now(),
+                final_status=BackupStatus.FAILED,
+            )
+            # 상태는 건드리지 않는다. 이 분기의 요점이 그것이다 — 앞선 실행이
+            # 무엇을 적었든(FAILED든, 아무것도 아니든) 그대로 서 있게 둔다.
+            return entry
 
         final_status = BackupStatus.NOT_REQUIRED
         entry = BackupLogEntry(

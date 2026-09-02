@@ -4348,18 +4348,38 @@ class DeliveryConsistencyIsRenderedTests(unittest.TestCase):
         line = self._line(output)
         self.assertIn("OK", line)
         self.assertIn("이미 수거됨 1건", line)
-        self.assertEqual([a for a in attention if "전송 완료로" in a], [])
+        # Matched on the undelivered sentence itself rather than on
+        # "전송 완료로", which is a fragment two different statements share —
+        # see the `else` arm's test below, where that looseness had a
+        # consequence.
+        self.assertEqual([a for a in attention if "도착하지 않은 Event" in a], [])
 
     def test_an_unset_sync_folder_says_it_cannot_check(self):
         """The `else` arm. "확인 불가" and "OK" must not be the same line —
-        a Desktop whose folder is unconfigured has had nothing verified."""
+        a Desktop whose folder is unconfigured has had nothing verified.
+
+        The negative below was `"전송 완료로" not in a` until C146, which is a
+        fragment of the undelivered sentence rather than the sentence, and it
+        caught the *"cannot check"* line this arm now raises — a different
+        statement, and the one this test's own name asks for. Narrowed to the
+        claim that must not appear, with the claim that must now appear
+        asserted beside it (see
+        `ADisabledDeliveryCheckIsNotSilenceTests` for why it exists).
+        """
         self._sent("EVT-1")
 
         output, attention = self._run(sync_folder=False)
 
         self.assertIn("확인 불가", self._line(output))
         self.assertNotIn("OK", self._line(output))
-        self.assertEqual([a for a in attention if "전송 완료로" in a], [])
+        # No delivery verdict may be claimed — nothing was checked.
+        self.assertEqual([a for a in attention if "도착하지 않은 Event" in a], [])
+        # And the fact that nothing was checked reaches ATTENTION.
+        self.assertEqual(
+            len([a for a in attention if "전달 정합성을 확인할 수 없다" in a]),
+            1,
+            attention,
+        )
 
     def test_the_undelivered_list_is_bounded_and_the_count_is_not(self):
         """Six losses, five names. The printed list is capped; the number in
@@ -18698,6 +18718,712 @@ class TheScheduleBlockAsksWindowsWhatNoFileCanAnswerTests(unittest.TestCase):
         self.assertLess(
             source.index("Task Scheduler 등록 상태를 확인해야 한다"),
             source.index('("SCHEDULE", _print_schedule)'),
+        )
+
+
+class OneDamagedStateFileDoesNotSilenceTheRestOfTheViewTests(unittest.TestCase):
+    """The check that stops the other checks (C146).
+
+    `_print_history()` answers roughly a dozen independent questions about
+    Company History, and it loads `monthly_history_state.json` in the middle
+    of them. That load's failure handler was `return attention` — out of the
+    *whole function*, not out of the monthly section — so an unreadable
+    monthly state skipped every question after it and the report said nothing
+    about having skipped them.
+
+    Measured on one tree, corrupting only that one file and changing nothing
+    else: 13 ATTENTION lines became 10, and these went silent —
+
+        Daily State와 실제 History가 어긋난다   state names a day whose file is gone
+        Daily History 시퀀스에 구멍 2일         Company History no run rebuilds
+        Daily State가 미래 날짜를 …             Daily generation stopped entirely
+        Decision Context에 Secret 형태의 …      a credential on its way to the
+                                               backup remote
+
+    None of the four is about Monthly. The fourth is the reason this is not
+    a cosmetic ordering issue: the view stops looking for leaked credentials
+    because a different file will not parse — and a damaged
+    `monthly_history_state.json` also stops the Monthly pipeline, so it is
+    exactly the file most likely to still be damaged tomorrow.
+
+    `_block()`'s own docstring is the rule this broke: *"Making each
+    predicate return `False` on a refusal would turn 'I could not read this'
+    into 'there is nothing here' — a partial report presented as complete,
+    which is the silent-loss shape this project keeps removing."*
+    """
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_monthly_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _tree(self, *, corrupt_monthly):
+        """One runtime holding four unrelated problems, and a monthly state
+        file that either parses or does not."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        for sub in (
+            "events/processed", "events/transport", "events/incoming",
+            "events/rejected", "local_master/daily", "local_master/monthly",
+            "history_candidates/keep", "history_candidates/review", "state",
+            "logs", "runs", "locks",
+        ):
+            (runtime / sub).mkdir(parents=True, exist_ok=True)
+
+        # A Daily pointer in the future, and a hole behind it.
+        (runtime / "state" / "daily_history_state.json").write_text(
+            json.dumps({"last_successful_daily_close": "2027-01-01"}), encoding="utf-8"
+        )
+        for day in ("2026-08-01", "2026-08-02", "2026-08-05"):
+            (runtime / "local_master" / "daily" / f"{day}.md").write_text(
+                "# x\n- Event Count: 0\n", encoding="utf-8"
+            )
+
+        # A credential typed into a Candidate's Decision Context.
+        (runtime / "history_candidates" / "keep" / "C1.json").write_text(
+            json.dumps(
+                {
+                    "history_id": "C1", "event_id": "E1", "source": "DESKTOP_1",
+                    "role": "CTO_BACKEND", "project_id": "P", "category": "DECISION",
+                    "summary": "s", "timestamp": "2026-08-01T10:00:00+09:00",
+                    "filter_result": "KEEP",
+                    "decision_context": (
+                        "token secret_key=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        (runtime / "state" / "monthly_history_state.json").write_text(
+            "{not json"
+            if corrupt_monthly
+            else json.dumps(
+                {"last_successful_monthly_close": None, "dirty_months": []}
+            ),
+            encoding="utf-8",
+        )
+        return runtime
+
+    def _attention(self, *, corrupt_monthly):
+        module = self._load_entrypoint()
+        module.RUNTIME_DIR = self._tree(corrupt_monthly=corrupt_monthly)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return module._print_history(NOW)
+
+    #: The four questions the corrupt file used to skip, by a phrase each.
+    UNRELATED_TO_MONTHLY = (
+        "Daily State와 실제 History가 어긋난다",
+        "Daily History 시퀀스에 구멍",
+        "미래 날짜를 마지막 Daily Close로 기록하고 있다",
+        "Decision Context에 Secret 형태의 문자열",
+    )
+
+    def test_the_premise_is_real_the_healthy_tree_raises_all_four(self):
+        """Vacuous otherwise: a tree that raises none of these would let the
+        assertion below pass no matter what the handler does."""
+        raised = self._attention(corrupt_monthly=False)
+
+        for phrase in self.UNRELATED_TO_MONTHLY:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(
+                    any(phrase in line for line in raised),
+                    f"the fixture stopped producing this alarm: {raised}",
+                )
+
+    def test_a_corrupt_monthly_state_silences_none_of_them(self):
+        raised = self._attention(corrupt_monthly=True)
+
+        missing = [
+            phrase
+            for phrase in self.UNRELATED_TO_MONTHLY
+            if not any(phrase in line for line in raised)
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "an unreadable monthly_history_state.json stopped the view from "
+            "asking these — none of which is about Monthly:\n  "
+            + "\n  ".join(missing),
+        )
+
+    def test_it_still_reports_the_damaged_file_itself(self):
+        """The fix must not trade one silence for another."""
+        raised = self._attention(corrupt_monthly=True)
+
+        self.assertTrue(any("monthly state 파일이 손상됨" in line for line in raised))
+
+    def test_the_monthly_answers_it_cannot_give_are_not_invented(self):
+        """`state = None`, not an empty `MonthlyState()`. A fabricated
+        "nothing consolidated yet" would make this view *assert* things it
+        does not know — and one of them, `monthly 파일은 있는데 state에는
+        통합 기록이 없다`, would send an operator to look at a file the view
+        has already said it cannot read."""
+        module = self._load_entrypoint()
+        runtime = self._tree(corrupt_monthly=True)
+        (runtime / "local_master" / "monthly" / "2026-07.md").write_text(
+            "# 7\n", encoding="utf-8"
+        )
+        module.RUNTIME_DIR = runtime
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            raised = module._print_history(NOW)
+
+        self.assertFalse(
+            any("state에는 통합 기록이 없다" in line for line in raised),
+            "invented a monthly verdict from a file it could not read",
+        )
+        self.assertFalse(
+            any("Monthly가 아직 없다" in line for line in raised),
+            "same, the other branch of the same pointer",
+        )
+        # And the one derived check that genuinely needs `dirty_months` says
+        # it could not run, rather than running on a guessed empty list.
+        self.assertIn("Monthly 원본 대조", printed.getvalue())
+
+    def test_a_healthy_tree_is_unchanged(self):
+        """The correction must be invisible when nothing is damaged."""
+        module = self._load_entrypoint()
+        module.RUNTIME_DIR = self._tree(corrupt_monthly=False)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            module._print_history(NOW)
+
+        self.assertNotIn("Monthly 원본 대조   : 확인 못 함", printed.getvalue())
+        self.assertIn("마지막 통합한 달", printed.getvalue())
+
+
+class ADamagedManifestDoesNotTakeTheLockAlarmsWithItTests(unittest.TestCase):
+    """The same correction as
+    `OneDamagedStateFileDoesNotSilenceTheRestOfTheViewTests`, one block over
+    and found by the same scan (C146): a `return` on an unreadable-evidence
+    path that discards what the function had already found.
+
+    `_print_last_run()` raises the two Runner Lock alarms *before* it opens
+    the Run Manifest, and the manifest's failure handler returned a fresh
+    list. So a damaged manifest deleted them.
+
+    That pairing is not a coincidence — it is the ordinary way both happen.
+    A Runner killed mid-write leaves a lock nobody released **and** a
+    half-written manifest, so the damaged manifest was silencing the alarm
+    about the lock the same accident had just left behind. And the alarm it
+    silenced is the one the code says nothing else can raise:
+
+        "`try_acquire_lock()` reports it as ordinary contention. The Runner
+         then skips on schedule forever while every automatic signal reads
+         healthy (BUG-42 / BACKLOG F-1)."
+
+    Measured, a 48-hour-old lock held by a process that really is running:
+
+        healthy manifest   Runner Lock이 48.0시간째 잡혀 있다   (+ 1 more)
+        corrupt manifest   (only) Run Manifest를 읽을 수 없다
+    """
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_manifest_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _run(self, *, corrupt_manifest):
+        """A lock this process really holds, held long enough to alarm, and a
+        manifest that either parses or does not.
+
+        The lock names *this* interpreter on purpose: `lock_held_since()`
+        reports only a lock whose recorded holder is alive, so a made-up pid
+        would make the premise vacuous in the quietest possible way.
+        """
+        module = self._load_entrypoint()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        (runtime / "locks").mkdir(parents=True)
+        (runtime / "runs").mkdir(parents=True)
+
+        now = NOW
+        (runtime / "locks" / "company_ops.lock").write_text(
+            json.dumps(
+                {
+                    "process_id": os.getpid(),
+                    "image_name": Path(sys.executable).name,
+                    "created_at": (now - timedelta(hours=48)).isoformat(
+                        timespec="seconds"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (runtime / "runs" / "last_run.json").write_text(
+            "{not json"
+            if corrupt_manifest
+            else json.dumps(
+                {
+                    "run_id": "R",
+                    "started_at": now.isoformat(),
+                    "finished_at": now.isoformat(),
+                    "components": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        module.RUNTIME_DIR = runtime
+        module.DEFAULT_RUN_SUMMARY_PATH = runtime / "runs" / "last_run.json"
+        with contextlib.redirect_stdout(io.StringIO()):
+            return module._print_last_run(now)
+
+    LOCK_ALARM = "시간째 잡혀 있다"
+
+    def test_the_premise_is_real_the_lock_alarm_fires_at_all(self):
+        """Vacuous otherwise. `lock_held_since()` answers None for a lock
+        whose holder is not running, and a fixture that tripped over that
+        would pass the assertion below without testing anything."""
+        raised = self._run(corrupt_manifest=False)
+
+        self.assertTrue(
+            any(self.LOCK_ALARM in line for line in raised),
+            f"the fixture no longer raises the lock alarm: {raised}",
+        )
+
+    def test_a_corrupt_manifest_keeps_the_lock_alarm(self):
+        raised = self._run(corrupt_manifest=True)
+
+        self.assertTrue(
+            any(self.LOCK_ALARM in line for line in raised),
+            "a damaged Run Manifest deleted the Runner Lock alarm that was "
+            "already found — and a run killed mid-write produces both at "
+            f"once: {raised}",
+        )
+
+    def test_it_still_reports_the_damaged_manifest(self):
+        raised = self._run(corrupt_manifest=True)
+
+        self.assertTrue(
+            any("Run Manifest를 읽을 수 없다" in line for line in raised), raised
+        )
+
+    def test_a_healthy_manifest_is_unchanged(self):
+        raised = self._run(corrupt_manifest=False)
+
+        self.assertFalse(
+            any("Run Manifest를 읽을 수 없다" in line for line in raised), raised
+        )
+
+
+class ADisabledDeliveryCheckIsNotSilenceTests(unittest.TestCase):
+    """"확인 못 함" is not "문제 없음" — for the one detector that answers a
+    measured silent loss (C146).
+
+    `agent/delivery.py` exists because BACKLOG E-9b measured this, end to
+    end, on a real Agent run:
+
+        sync folder file                  still 0 bytes -- never delivered
+        agent/sent/                       contains the event_id
+        last_successful_collection_date   advanced past that date
+        Agent exit code / log             0 / COLLECTED
+        any warning anywhere              none
+
+    `ops_status.py` runs that check only when `COMPANY_OPS_AGENT_SYNC_FOLDER`
+    is set, and when it is not it printed one line in the body of the report
+    and raised nothing. So an unset environment variable turned the detector
+    off silently — on the very screen an operator opens to find out whether
+    anything needs them.
+
+    This file already treats the same shape as reportable twice, in its own
+    words: *"이것은 '없음'이 아니라 '확인 못 함'이다"* (the Local Master
+    listing, and the backup remote's secret history). This is the third.
+
+    Guarded on `sent_count` rather than raised unconditionally: a Desktop
+    that has never delivered an Event has nothing to verify, and a standing
+    alarm there is the alert-that-cannot-clear C26 warns about. Both
+    directions are asserted below, because a fix that simply always alarms
+    would pass the first test alone.
+    """
+
+    def _load_entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "ops_status.py"
+        spec = importlib.util.spec_from_file_location("ops_status_delivery_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _agent_tree(self, *, sent):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        agent = runtime / "agent"
+        for sub in ("outbox", "sent", "state", "signals", "signals_rejected", "locks"):
+            (agent / sub).mkdir(parents=True, exist_ok=True)
+        save_state(
+            agent / "state" / "agent_state.json",
+            AgentState(
+                desktop_id="DESKTOP_1",
+                last_successful_collection_date=date(2026, 8, 9),
+                last_run=NOW.isoformat(timespec="seconds"),
+            ),
+        )
+        for index in range(sent):
+            (agent / "sent" / f"EVT-{index}.json").write_text(
+                json.dumps({"event_id": f"EVT-{index}"}), encoding="utf-8"
+            )
+        return runtime
+
+    def _attention(self, *, sent):
+        module = self._load_entrypoint()
+        module.RUNTIME_DIR = self._agent_tree(sent=sent)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMPANY_OPS_AGENT_SYNC_FOLDER", None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return module._print_agent(NOW)
+
+    PHRASE = "전달 정합성을 확인할 수 없다"
+
+    def test_a_machine_that_has_delivered_events_says_it_cannot_verify_them(self):
+        raised = self._attention(sent=3)
+
+        matching = [line for line in raised if self.PHRASE in line]
+        self.assertEqual(len(matching), 1, raised)
+        self.assertIn("3", matching[0])
+        self.assertIn("COMPANY_OPS_AGENT_SYNC_FOLDER", matching[0])
+
+    def test_a_machine_that_has_delivered_nothing_stays_quiet(self):
+        """The half that keeps this from becoming a standing alert. There is
+        no delivery to verify, so there is nothing to report."""
+        raised = self._attention(sent=0)
+
+        self.assertEqual([line for line in raised if self.PHRASE in line], [], raised)
+
+    def test_the_line_is_classified_and_actionable(self):
+        """It reaches the terminal, the Dashboard and the Notion page through
+        one classifier; an unclassified line arrives there with a `?` badge
+        and no remedy."""
+        from controltower.attention import UNCLASSIFIED, next_action, severity
+
+        line = next(l for l in self._attention(sent=3) if self.PHRASE in l)
+
+        level, why = severity(line)
+        self.assertNotEqual(level, UNCLASSIFIED)
+        self.assertTrue(why)
+        self.assertIn("COMPANY_OPS_AGENT_SYNC_FOLDER", next_action(line) or "")
+
+
+class EveryAttentionSiteIsClassifiedTests(unittest.TestCase):
+    """The whole question, asked once (C146).
+
+    `controltower/attention.py` grew one block at a time — SCHEDULE (C138),
+    the damaged-evidence family (C143), Backup (C144) — and each of those
+    found its lines by *rendering that block* and looking for `?` badges.
+    Nobody had asked the question that covers all of them: **of every place
+    that puts a line into the ATTENTION list, how many produce a line the
+    table can read?**
+
+    Measured before this class existed: **90 emission sites, 43 of them
+    unclassified.** Reproduced live for two of them — a corrupt
+    `backup_state.json` and a corrupt `monthly_history_state.json`, both
+    printed under ATTENTION with `severity() == "?"` and `next_action() is
+    None`, on the terminal, the Dashboard, and the Notion page the workspace
+    reads.
+
+    Why a source scan rather than a fixture sweep. The fixture sweep is what
+    the three earlier passes did, and it is the reason each of them saw one
+    block: reaching a line means building the exact runtime that raises it,
+    and there is no tree that raises all ninety at once. The **emitters**, on
+    the other hand, are all in two files and can be enumerated exactly. So
+    this reads the sites, and
+    `TheScheduleBlockAsksWindowsWhatNoFileCanAnswerTests` keeps the
+    complementary fixture-driven check for the block where it is affordable.
+
+    What "the site's text" means here: the literal skeleton of the appended
+    expression, with every interpolation replaced by a hole. A phrase in
+    `RULES` is a fixed string, so a phrase that matches the skeleton always
+    matches the rendered line. The converse is not true — a phrase can arrive
+    *through* an interpolation — which is why `THROUGH_INTERPOLATION` below
+    exists and carries the rendered string it is satisfied by.
+    """
+
+    #: Where a line can enter the ATTENTION list.
+    SINKS = {
+        "ops_status.py": {
+            "attention",
+            "signal_attention",
+            "delivery_attention",
+            "lock_attention",
+        },
+        "src/agent/status.py": {"reasons"},
+    }
+
+    #: Stands in for an interpolated value in a reconstructed line.
+    HOLE = "\x00"
+
+    #: A conditional inside a line yields two whole lines, and a line with
+    #: several would yield their product. Bounded so a future rewrite cannot
+    #: turn this scan combinatorial; measured, the widest site today is 2.
+    MAX_VARIANTS = 32
+
+    #: The one site whose classifying phrase arrives through an
+    #: interpolation, with the string that proves it classifies.
+    #: `_risk_totals`'s overflow line renders the RISK kind verbatim, and
+    #: EVENT_ID_CONFLICT is the only kind that reaches that branch —
+    #: OPEN_BLOCKER and ROLE_MISMATCH have their own sentences, matched by
+    #: their own phrases.
+    THROUGH_INTERPOLATION = {
+        "\x00 총 \x00건 — 위 \x00건 외 \x00건이 더 있다": (
+            "EVENT_ID_CONFLICT 총 7건 — 위 3건 외 4건이 더 있다"
+        ),
+    }
+
+    #: Deliberately still `?`, and not a gap this class may close.
+    #:
+    #: How severe a leaked-credential line is, relative to a stopped
+    #: pipeline, is the open **보안 severity 정책** item in BACKLOG — a policy
+    #: question, not a reading of this module's existing P1 definition, and
+    #: every other phrase in `RULES` is the latter. Deciding it by adding a
+    #: row would decide it by implementation.
+    #:
+    #: The cost of leaving them was checked rather than assumed: `?` sorts
+    #: with P1 rather than at the bottom (`RANK`), so none of these can hide,
+    #: and each line already carries its own remedy in its own text ("해당
+    #: 자격증명을 **교체**해야 한다").
+    #:
+    #: Held as exact substrings so a *new* security line fails this test
+    #: rather than joining a growing exemption quietly.
+    SECURITY_POLICY_PENDING = (
+        "History Candidate의 Decision Context에 Secret 형태의 문자열",
+        "Event 내용에 Secret 형태의 문자열",
+        "Backup Secret 게이트가 **이름을 알아보지 못하는** 파일",
+        "Backup Working Copy에 Secret 형태의 파일",
+        "Backup 원격 history의 Secret 검사를 확인 못 함",
+        "Backup 원격 history에 이미 들어간 Secret 형태 경로",
+    )
+
+    # ------------------------------------------------------------- scanning
+
+    @classmethod
+    def _skeleton(cls, node):
+        """Every whole line `node` can render as, interpolations as `HOLE`.
+
+        A list, not a string, because a conditional expression is two
+        different lines and both reach the operator. Splitting one string on
+        a marker was the first shape of this and it was wrong: it cut
+        `A + (x if p else y) + B` into `A+x` and `y+B`, losing the head of
+        one line and the tail of the other, so a phrase that classifies the
+        real line looked absent — six sites reported as unclassified that
+        are not.
+        """
+        if isinstance(node, ast.Constant):
+            return [node.value if isinstance(node.value, str) else cls.HOLE]
+        if isinstance(node, ast.JoinedStr):
+            return cls._join([cls._skeleton(value) for value in node.values])
+        if isinstance(node, ast.FormattedValue):
+            return [cls.HOLE]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return cls._join([cls._skeleton(node.left), cls._skeleton(node.right)])
+        if isinstance(node, ast.IfExp):
+            return cls._skeleton(node.body) + cls._skeleton(node.orelse)
+        return [cls.HOLE]
+
+    @classmethod
+    def _join(cls, parts):
+        joined = [""]
+        for alternatives in parts:
+            joined = [
+                prefix + alternative
+                for prefix in joined
+                for alternative in alternatives
+            ][: cls.MAX_VARIANTS]
+        return joined
+
+    def _sites(self):
+        """`(where, line)` for every line that can reach ATTENTION.
+
+        Follows `sink.extend(f(...))` into `f`'s returned list literals as
+        well as `sink.append(...)`: `_same_instant_skips_from_the_last_run()`
+        and `_block()` both contribute lines that way, and the first pass of
+        this sweep missed one of them for exactly that reason.
+        """
+        root = Path(__file__).resolve().parents[1]
+        for relative, names in self.SINKS.items():
+            path = root / relative
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            functions = {
+                node.name: node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in names
+                    and node.args
+                ):
+                    continue
+                where = "%s:%d" % (relative, node.lineno)
+                if node.func.attr == "append":
+                    for line in self._skeleton(node.args[0]):
+                        yield where, line
+                elif node.func.attr == "extend":
+                    callee = node.args[0]
+                    if not (
+                        isinstance(callee, ast.Call)
+                        and isinstance(callee.func, ast.Name)
+                        and callee.func.id in functions
+                    ):
+                        self.fail(
+                            where + ": an extend into the ATTENTION list this "
+                            "scan cannot follow — it can no longer promise the "
+                            "list is covered"
+                        )
+                    for inner in ast.walk(functions[callee.func.id]):
+                        if isinstance(inner, ast.Return) and isinstance(
+                            inner.value, ast.List
+                        ):
+                            for element in inner.value.elts:
+                                for line in self._skeleton(element):
+                                    yield "%s:%d" % (relative, inner.lineno), line
+
+    # --------------------------------------------------------------- checks
+
+    def test_the_scan_finds_the_sites_it_is_meant_to(self):
+        """The antecedent. A scan that found nothing — a renamed sink, a
+        rewritten block — would satisfy every assertion below for free."""
+        sites = list(self._sites())
+        self.assertGreaterEqual(
+            len(sites), 85, "the scan collected almost nothing: %d" % len(sites)
+        )
+        lines = {line for _where, line in sites}
+        # One line known to be there per scanned file.
+        self.assertTrue(
+            any("backup state 파일이 손상됨" in line for line in lines),
+            "ops_status.py's ATTENTION sites are no longer being read",
+        )
+        self.assertTrue(
+            any("거부된 Signal" in line for line in lines),
+            "agent/status.py's reasons are no longer being read",
+        )
+        # And the `extend` arm really is contributing, not silently empty.
+        self.assertTrue(
+            any("Notion 프로젝트 행에 반영되지 않았다" in line for line in lines),
+            "the extend-into-ATTENTION path is no longer being followed",
+        )
+
+    def test_every_site_produces_a_line_the_one_classifier_can_read(self):
+        from controltower.attention import UNCLASSIFIED, next_action, severity
+
+        unclassified = []
+        for where, line in self._sites():
+            if any(phrase in line for phrase in self.SECURITY_POLICY_PENDING):
+                continue
+            text = self.THROUGH_INTERPOLATION.get(line, line)
+            level, why = severity(text)
+            if level == UNCLASSIFIED:
+                unclassified.append("%s: %s" % (where, text[:90]))
+                continue
+            with self.subTest(where=where):
+                self.assertTrue(why, where + ": classified with no stated reason")
+                self.assertTrue(
+                    next_action(text), where + ": classified with no remedy"
+                )
+
+        self.assertEqual(
+            unclassified,
+            [],
+            "these ATTENTION lines reach the operator with a `?` badge, no "
+            "severity and no next action, on the terminal, on the Dashboard "
+            "and on the Notion page — add a phrase to "
+            "controltower/attention.py's RULES and a remedy to ACTIONS:\n  "
+            + "\n  ".join(unclassified),
+        )
+
+    def test_the_security_exemption_has_no_stale_entries(self):
+        """An exemption that outlives its sites is how a gate quietly stops
+        covering anything. Each entry must still name a real emission site,
+        and must still be unclassified — the day one is classified this
+        fails and the entry comes out."""
+        from controltower.attention import UNCLASSIFIED, severity
+
+        lines = [line for _where, line in self._sites()]
+        for phrase in self.SECURITY_POLICY_PENDING:
+            with self.subTest(phrase=phrase[:40]):
+                matches = [line for line in lines if phrase in line]
+                self.assertTrue(
+                    matches, "exempted a line nothing emits any more: " + phrase
+                )
+                for line in matches:
+                    self.assertEqual(
+                        severity(line)[0],
+                        UNCLASSIFIED,
+                        "this line is classified now — remove it from "
+                        "SECURITY_POLICY_PENDING: " + phrase,
+                    )
+
+    def test_the_interpolated_exemption_is_still_the_shape_it_claims(self):
+        """The one site whose phrase arrives at runtime rather than in the
+        source. Both halves are asserted: the reconstructed line really is
+        still unclassifiable, and the rendered one really does classify."""
+        from controltower.attention import UNCLASSIFIED, next_action, severity
+
+        lines = [line for _where, line in self._sites()]
+        for skeleton, rendered in self.THROUGH_INTERPOLATION.items():
+            with self.subTest(skeleton=skeleton):
+                self.assertIn(
+                    skeleton, lines, "this site no longer exists in this shape"
+                )
+                self.assertEqual(severity(skeleton)[0], UNCLASSIFIED)
+                self.assertNotEqual(severity(rendered)[0], UNCLASSIFIED)
+                self.assertTrue(next_action(rendered))
+
+    def test_the_scan_would_notice_an_unclassifiable_site(self):
+        """Guards the guard: the assertion above is a negative over a
+        collected list, and a matcher that accepted anything would pass."""
+        from controltower.attention import UNCLASSIFIED, severity
+
+        self.assertEqual(severity("이 줄은 어떤 규칙에도 맞지 않는다")[0], UNCLASSIFIED)
+        # The reconstruction drops interpolations rather than inventing text
+        # that would match…
+        node = ast.parse('f"앞 {x} 뒤"').body[0].value
+        self.assertEqual(self._skeleton(node), ["앞 " + self.HOLE + " 뒤"])
+        # …and a conditional *concatenated into* a line becomes two whole
+        # lines, head and tail intact — the bug the first shape of this scan
+        # had. (A conditional inside an interpolation is a value, not text,
+        # and stays one hole; the sites that matter are the concatenated
+        # ones, `… + (" 외 …" if more else "")`.)
+        both = ast.parse('"머리 " + ("가" if p else "나") + " 꼬리"').body[0].value
+        self.assertEqual(self._skeleton(both), ["머리 가 꼬리", "머리 나 꼬리"])
+        inside = ast.parse("f\"머리 {'가' if p else '나'} 꼬리\"").body[0].value
+        self.assertEqual(self._skeleton(inside), ["머리 " + self.HOLE + " 꼬리"])
+
+    def test_no_two_rules_claim_the_same_phrase(self):
+        """First match wins, so a duplicated phrase is a rule that can never
+        fire and a reason that can never be shown."""
+        from controltower.attention import RULES
+
+        phrases = [phrase for phrase, _level, _why in RULES]
+        self.assertEqual(len(phrases), len(set(phrases)), "duplicated phrase")
+
+    def test_no_rule_is_unreachable_behind_an_earlier_one(self):
+        """A phrase that *contains* an earlier phrase can never be reached:
+        the earlier rule matches every line the later one would, and the
+        later rule's severity and remedy would never be shown."""
+        from controltower.attention import RULES
+
+        phrases = [phrase for phrase, _level, _why in RULES]
+        self.assertEqual(
+            [
+                "%r is unreachable behind %r" % (later, earlier)
+                for index, later in enumerate(phrases)
+                for earlier in phrases[:index]
+                if earlier in later
+            ],
+            [],
         )
 
 

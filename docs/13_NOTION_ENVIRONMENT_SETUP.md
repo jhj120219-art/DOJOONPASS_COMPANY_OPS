@@ -46,6 +46,23 @@
 2. 실행 스크립트가 `.env`를 직접 로드한다.
 3. `scripts/install_agent_task.ps1`을 쓴다 — 이 스크립트는 `COMPANY_OPS_PROFILE` / `COMPANY_OPS_AGENT_SYNC_FOLDER` / `COMPANY_OPS_AGENT_START_DATE` 세 개를 **User 환경변수로 영구 등록한다.** 예약 작업(Task Scheduler)은 대화형 셸의 변수를 상속하지 않으므로 이 경로가 필요하다.
 
+**1번(셸 export)은 예약 실행에는 통하지 않는다.** 위 3번이 그 이유를 Agent 변수에 대해 이미 적고 있는데, 같은 제약이 `NOTION_*`에도 그대로 적용된다 — `install_runner_task.ps1`과 `install_publish_task.ps1`은 Notion 자격증명을 **일부러 받지 않는다**(비밀을 명령줄·프로세스 목록·PowerShell 기록에 남기지 않기 위해서다). 그래서 그 둘은 사람이 직접 User 환경변수로 넣어야 하고, 셸에서 export만 하면 다음이 일어난다:
+
+* 손으로 실행하면 Notion Sync가 동작한다.
+* 예약 실행은 **아무것도 상속하지 않아** Notion 단계를 계속 `미설정`으로 건너뛴다.
+* 그런데도 실행은 **exit 0**으로 끝난다 — Notion은 History critical path 밖이기 때문이다(README RULE 5). 즉 성공처럼 보이는 실패다.
+
+User 환경변수로 넣는다(PowerShell, 값 부분만 바꾼다):
+
+```powershell
+[Environment]::SetEnvironmentVariable('NOTION_API_TOKEN', '<token>', 'User')
+[Environment]::SetEnvironmentVariable('NOTION_PROJECTS_DATABASE_ID', '<database id>', 'User')
+# 선택 (Operations Dashboard)
+[Environment]::SetEnvironmentVariable('NOTION_OPS_RUNS_DATABASE_ID', '<database id>', 'User')
+```
+
+넣은 뒤에는 **새 셸을 연다** — 이미 열려 있는 셸은 예전 환경 블록을 그대로 들고 있다. 아래 확인 명령의 `user=True`가 예약 실행이 실제로 보게 될 값이다.
+
 확인 명령(PowerShell, 값은 찍지 않고 설정 여부만):
 
 ```powershell

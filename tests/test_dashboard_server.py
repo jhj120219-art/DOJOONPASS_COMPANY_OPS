@@ -50,6 +50,7 @@ import re
 import sys
 import tempfile
 import threading
+from unittest import mock
 import unittest
 import urllib.error
 import urllib.request
@@ -1228,7 +1229,75 @@ class ASecondInstanceCannotTakeThePortTests(unittest.TestCase):
         self.assertIn('server = _Server(("127.0.0.1", port), _Handler)', source)
 
 
-class OnlyALoopbackNameGetsAnAnswerTests(PageTestCase):
+class LiveServerTestCase(PageTestCase):
+    """A `PageTestCase` tree served by a real `ThreadingHTTPServer` (C146).
+
+    Three classes need this and two of them had already written it out —
+    same server, same cleanups, same `ops_status.RUNTIME_DIR` rebinding,
+    differing only in whether they kept the port or the URL. The third
+    would have been a third copy, or (worse) a subclass of one of the other
+    two, which re-runs that class's assertions for the sake of its `setUp`.
+
+    Both `self.port` and `self.url` are set, so neither existing class had
+    to change how it builds a request.
+    """
+
+    #: Seconds to wait on the serving thread at teardown. The two classes
+    #: that wrote this out used 5 and 10; the longer one is kept, because
+    #: the shorter is the one that could make a slow machine flake.
+    JOIN_TIMEOUT = 10
+
+    def setUp(self):
+        super().setUp()
+        self.put("E1")
+        # The handler builds from `ops_status.RUNTIME_DIR`, which that module
+        # documents as rebindable for exactly this.
+        self.addCleanup(setattr, ops_status, "RUNTIME_DIR", ops_status.RUNTIME_DIR)
+        ops_status.RUNTIME_DIR = self.runtime
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard_server._Handler)
+        self.addCleanup(self.server.server_close)
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, self.JOIN_TIMEOUT)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+
+    def _get(self, path):
+        with urllib.request.urlopen(self.url + path, timeout=30) as response:
+            return response.status, response.read().decode("utf-8")
+
+    def _raw_request(self, method, path="/"):
+        """One request, one socket, and the bytes exactly as they arrived.
+
+        `urllib` is the right tool everywhere else in this class, and the
+        wrong one for any assertion about whether a body was *sent*: it
+        applies HTTP's own rules on the client side and hides a HEAD body
+        that a broken server did send.
+        """
+        import socket
+
+        host, _, port = self.url.rpartition(":")
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=30)
+        try:
+            connection.sendall(
+                f"{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii")
+            )
+            received = b""
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+        finally:
+            connection.close()
+        head, _, body = received.partition(b"\r\n\r\n")
+        return head, body
+
+
+
+class OnlyALoopbackNameGetsAnAnswerTests(LiveServerTestCase):
     """C82, Security Audit. Binding to 127.0.0.1 is half of the protection.
 
     Binding stops a packet from another machine. It does not stop a browser
@@ -1246,21 +1315,6 @@ class OnlyALoopbackNameGetsAnAnswerTests(PageTestCase):
     fails: `127.0.0.1.evil.com` is an attacker-controlled domain that merely
     *starts with* a loopback address.
     """
-
-    def setUp(self):
-        super().setUp()
-        self.put("E1")
-        self.addCleanup(setattr, ops_status, "RUNTIME_DIR", ops_status.RUNTIME_DIR)
-        ops_status.RUNTIME_DIR = self.runtime
-        self.server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), dashboard_server._Handler
-        )
-        self.addCleanup(self.server.server_close)
-        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(thread.join, 10)
-        self.addCleanup(self.server.shutdown)
-        self.port = self.server.server_address[1]
 
     def _get(self, host, path="/"):
         request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
@@ -1337,61 +1391,12 @@ class OnlyALoopbackNameGetsAnAnswerTests(PageTestCase):
         self.assertEqual(status, 200)
 
 
-class ThePageIsReadOnlyTests(PageTestCase):
+class ThePageIsReadOnlyTests(LiveServerTestCase):
     """The tool an operator opens *because* something already looks wrong.
 
     Served over HTTP, so "it only reads" has to be true of the handler and
     not only of the functions under it.
     """
-
-    def setUp(self):
-        super().setUp()
-        self.put("E1")
-        # The handler builds from `ops_status.RUNTIME_DIR`, which that module
-        # documents as rebindable for exactly this.
-        self.addCleanup(setattr, ops_status, "RUNTIME_DIR", ops_status.RUNTIME_DIR)
-        ops_status.RUNTIME_DIR = self.runtime
-
-        self.server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), dashboard_server._Handler
-        )
-        self.addCleanup(self.server.server_close)
-        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(thread.join, 5)
-        self.addCleanup(self.server.shutdown)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-
-    def _get(self, path):
-        with urllib.request.urlopen(self.url + path, timeout=30) as response:
-            return response.status, response.read().decode("utf-8")
-
-    def _raw_request(self, method, path="/"):
-        """One request, one socket, and the bytes exactly as they arrived.
-
-        `urllib` is the right tool everywhere else in this class, and the
-        wrong one for any assertion about whether a body was *sent*: it
-        applies HTTP's own rules on the client side and hides a HEAD body
-        that a broken server did send.
-        """
-        import socket
-
-        host, _, port = self.url.rpartition(":")
-        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=30)
-        try:
-            connection.sendall(
-                f"{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".encode("ascii")
-            )
-            received = b""
-            while True:
-                chunk = connection.recv(4096)
-                if not chunk:
-                    break
-                received += chunk
-        finally:
-            connection.close()
-        head, _, body = received.partition(b"\r\n\r\n")
-        return head, body
 
     def test_the_page_is_served(self):
         status, body = self._get("/")
@@ -2511,6 +2516,81 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
                 self.assertIn(phrase, attention_module.ACTIONS)
                 self.assertTrue(attention_module.ACTIONS[phrase].strip())
 
+    def test_every_rule_says_who_its_line_is_for(self):
+        """The third answer keyed on the same phrase (C147).
+
+        `severity()` says how broken the pipeline is, `next_action()` says
+        what to do, and `domain()` says **who it is for** — the company, or
+        Company Ops itself. The Notion page groups by it, so a phrase that
+        forgets to answer would fall into `SYSTEM` and put a line meant for
+        a person underneath ten maintenance items. That is the burial this
+        table exists to prevent, so there is no default: every phrase is
+        listed, and this is what says so.
+        """
+        from controltower import attention as attention_module
+
+        for phrase, _level, _why in attention_module.RULES:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, attention_module.DOMAINS)
+                self.assertIn(
+                    attention_module.DOMAINS[phrase],
+                    (attention_module.COMPANY, attention_module.SYSTEM),
+                )
+
+    def test_the_domain_table_has_no_entry_for_a_rule_that_is_gone(self):
+        """The other direction. A stale entry is a reading of a line nothing
+        raises, and it is how the roster drifts away from `RULES`."""
+        from controltower import attention as attention_module
+
+        phrases = {phrase for phrase, _l, _w in attention_module.RULES}
+        self.assertEqual(set(attention_module.DOMAINS) - phrases, set())
+
+    def test_the_two_company_lines_are_the_ones_a_person_acts_on(self):
+        """Pinned by what they are, not by counting them.
+
+        Both name work outside this repository: a team must unblock a
+        Project, a person must decide what enters Company History. Every
+        other phrase's remedy names a script, a state file, a queue or a
+        scheduled task — however important the data behind it.
+        """
+        from controltower import attention as attention_module
+
+        company = {
+            phrase
+            for phrase, value in attention_module.DOMAINS.items()
+            if value == attention_module.COMPANY
+        }
+        self.assertEqual(company, {"막혀 있는 Project", "검토를 기다리"})
+
+    def test_a_line_no_rule_matches_is_never_put_in_front_of_the_company(self):
+        """`?` sorts with P1 inside its group (`RANK`), so it cannot hide —
+        but an unread sentence must not lead the company's list."""
+        from controltower import attention as attention_module
+
+        self.assertEqual(
+            attention_module.domain("이 줄은 어떤 규칙에도 맞지 않는다"),
+            attention_module.SYSTEM,
+        )
+
+    def test_domain_reads_a_real_line_of_each_kind(self):
+        """Driven through the real classifier on real sentences, so a phrase
+        that stops matching is caught here rather than by the table."""
+        from controltower import attention as attention_module
+
+        blocked = (
+            "8일째 막혀 있는 Project: PAYMENT_GATEWAY [CTO Backend] — PG사 "
+            "가맹점 심사가 2주째 회신 없음"
+        )
+        plumbing = (
+            "Runner가 16.1일째 실행되지 않았다 (마지막 실행 2026-08-17T12:07:42+09:00)"
+        )
+        self.assertEqual(
+            attention_module.domain(blocked), attention_module.COMPANY
+        )
+        self.assertEqual(
+            attention_module.domain(plumbing), attention_module.SYSTEM
+        )
+
     def test_the_conditions_the_probe_tree_exposed_are_classified(self):
         """C133. Four real conditions fell through as `?`.
 
@@ -3197,6 +3277,102 @@ class TheServerRefusesAPortItCannotHonourTests(unittest.TestCase):
 class _StopBeforeServing(Exception):
     """Raised by the fake `_Server` so `main()` never reaches
     `serve_forever()`. A test that blocked there would hang the suite."""
+
+
+class AFailureToBuildTheBodyStillAnswersTests(LiveServerTestCase):
+    """The half of `do_GET()`'s error handling that was outside the try (C146).
+
+    `gather()` was guarded and answered a failure with 500 and the traceback
+    — this file's stated posture, *"reported on the page, never swallowed"*.
+    `render_html()` and `json.dumps()` were called outside that try, so an
+    exception in either escaped `do_GET()`, `BaseHTTPRequestHandler` wrote
+    nothing at all, and the socket closed.
+
+    Measured against the running server before the fix:
+
+        gather() raises        HTTP/1.0 500, 1,007 bytes, names the error
+        render_html() raises   **no status line, 0 bytes**
+
+    A browser shows "this site can't be reached" for a *running* server
+    holding perfectly readable data, and the only account of why goes to
+    stderr — which a scheduled `install_publish_task.ps1` deployment
+    discards (C138 measured that discard for the Runner).
+
+    `render_html()` is where this matters: it formats untrusted Event
+    content — `_authored()`, the folding, the KPI tiles, the attention
+    grouping — which is the exact place this project keeps finding an
+    unexpected type. `gather()` is the half that was already covered.
+
+    Uses `LiveServerTestCase` — the property under test is about the handler
+    on a socket, and that fixture is what stands one up. Extracted for this
+    class rather than copied: two classes had already written it out, and
+    subclassing one of them for its `setUp` would have re-run that class's
+    assertions as well.
+    """
+
+    def _status_line(self, path="/"):
+        head, body = self._raw_request("GET", path)
+        return head.decode("utf-8", "replace").splitlines()[0] if head else "", body
+
+    def test_the_premise_a_healthy_request_is_still_a_page(self):
+        """Vacuous otherwise, and it is also the no-change assertion: the
+        success path must be untouched by this."""
+        status, body = self._get("/")
+
+        self.assertEqual(status, 200)
+        self.assertIn("DOJOONPASS Control Tower", body)
+
+    def test_a_rendering_failure_answers_500_and_names_it(self):
+        with mock.patch.object(
+            dashboard_server, "render_html", side_effect=RuntimeError("render blew up")
+        ):
+            line, body = self._status_line("/")
+
+        self.assertIn("500", line)
+        self.assertIn("render blew up", body.decode("utf-8", "replace"))
+
+    def test_a_rendering_failure_is_not_an_empty_socket(self):
+        """Stated separately from the assertion above because this is the
+        defect: not "the wrong status" but *no answer at all*."""
+        with mock.patch.object(
+            dashboard_server, "render_html", side_effect=RuntimeError("render blew up")
+        ):
+            line, _body = self._status_line("/")
+
+        self.assertTrue(line, "the server closed the connection without answering")
+
+    def test_a_serialisation_failure_answers_too(self):
+        """The same gap on the JSON path. `gather()`'s payload is built for
+        `json.dumps()`, so this is the narrower of the two — and it was
+        outside the same try for the same reason."""
+        with mock.patch.object(
+            dashboard_server, "json"
+        ) as fake_json:
+            fake_json.dumps.side_effect = TypeError("not serialisable")
+            line, body = self._status_line("/api/dashboard.json")
+
+        self.assertIn("500", line)
+        self.assertIn("not serialisable", body.decode("utf-8", "replace"))
+
+    def test_a_gather_failure_still_answers_as_it_did(self):
+        """The arm that already worked, kept under the same assertion so a
+        future rearrangement cannot trade one for the other."""
+        with mock.patch.object(
+            dashboard_server, "gather", side_effect=RuntimeError("gather blew up")
+        ):
+            line, body = self._status_line("/")
+
+        self.assertIn("500", line)
+        self.assertIn("gather blew up", body.decode("utf-8", "replace"))
+
+    def test_an_unknown_path_is_still_a_404(self):
+        """The `else` arm of the restructure. It used to be an early return
+        between the two calls; it must still refuse rather than fall into
+        the 500 or the 200."""
+        line, body = self._status_line("/nope")
+
+        self.assertIn("404", line)
+        self.assertIn(b"not found", body)
 
 
 if __name__ == "__main__":

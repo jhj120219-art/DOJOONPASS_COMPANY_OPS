@@ -1245,15 +1245,63 @@ class AgentEntrypointStateMismatchTests(unittest.TestCase):
     def test_the_entrypoint_never_repairs_the_state_file(self):
         """The dangerous 'helpful' fix. Rewriting or deleting the state file
         to make the run proceed is the very data loss `ensure_desktop()`
-        exists to prevent, performed on purpose."""
+        exists to prevent, performed on purpose.
+
+        **Asked of the calls, not of the characters (C146).** This scanned
+        the source text after the word `AgentStateError` for `save_state(`
+        and three siblings, which cannot tell a call from the same name
+        written in a comment — and it fired on a comment explaining *why*
+        `save_state()`'s failure needed handling. A substring is the wrong
+        instrument for a claim about what the code *does*.
+
+        The AST version is also stronger in two ways: it covers the whole of
+        `main()` rather than the tail after one word (measured: `main()`
+        calls nothing that writes — `resolve_profile`, `run_once`, `print`,
+        the formatting helpers and nothing else), and it matches an
+        attribute call (`state.save_state(...)`) that the bare-name
+        substring would still have missed if it were spelled that way.
+        """
+        import ast
         import inspect
+        import textwrap
 
-        source = inspect.getsource(self._entrypoint().main)
-        after_catch = source[source.index("AgentStateError"):]
+        main = ast.parse(
+            textwrap.dedent(inspect.getsource(self._entrypoint().main))
+        ).body[0]
 
-        for repair in ("unlink(", "save_state(", "write_text(", "remove("):
+        called = set()
+        for node in ast.walk(main):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", None)
+                )
+                if name:
+                    called.add(name)
+
+        for repair in ("unlink", "save_state", "write_text", "remove", "rmtree"):
             with self.subTest(repair=repair):
-                self.assertNotIn(repair, after_catch)
+                self.assertNotIn(repair, called)
+
+    def test_that_scan_would_notice_a_repair_call(self):
+        """Guards the guard: a walk that collected nothing, or a set that
+        never matched, would pass the assertion above forever."""
+        import ast
+
+        probe = ast.parse(
+            "def main(argv):\n"
+            "    state.save_state(path, value)\n"
+            "    return 0\n"
+        ).body[0]
+        called = {
+            (node.func.attr if isinstance(node.func, ast.Attribute)
+             else getattr(node.func, "id", None))
+            for node in ast.walk(probe)
+            if isinstance(node, ast.Call)
+        }
+        self.assertIn("save_state", called)
 
     def test_a_second_agent_run_is_reported_as_skipped_not_as_success(self):
         """The overlap branch of the entrypoint, which nothing ran.
@@ -2383,6 +2431,181 @@ class AgentEntrypointConfigurationTests(unittest.TestCase):
         self.assertIn("[FAILED]", err.getvalue())
         self.assertIn("COMPANY_OPS_AGENT_SYNC_FOLDER", err.getvalue())
         self.assertEqual(out.getvalue(), "")
+
+
+class AnAbortedAgentRunIsNotAConfigurationErrorTests(unittest.TestCase):
+    """The exit code an unattended Desktop leaves behind when the run dies
+    after it started (C146).
+
+    `install_agent_task.ps1` registers this script on Desktops 1-3 — the
+    machines that *produce* Company History — and C138 measured what that
+    deployment can see: **stdout is discarded**, so the exit code is the only
+    automatic signal. This file's header, `AGENT.md` §6 and
+    `AgentExitCodeContractTests` all give 1 one meaning: *"configuration
+    error (bad/missing environment)"*.
+
+    Python's default for an escaping exception is 1.
+
+    `agent.run_once()`'s docstring says it "returns rather than raises for
+    every operational failure", naming a corrupt state file as the one
+    exception. `save_state()` is called inside its date loop and is outside
+    that sentence — and on Windows that write fails for ordinary reasons: the
+    file held open by antivirus or a sync client, a full disk, a read-only
+    restore.
+
+    Measured as a real process before the fix, one collectable date and
+    `save_state()` refused with `PermissionError`:
+
+        exit code   1          <- "configuration error"
+        stdout      (nothing)  <- no per-date lines, no watermark line
+        stderr      a 16-line raw traceback
+        sync folder the Event  <- built and DELIVERED
+        sent/       the Event
+
+    So the work reached Desktop 4 and the operator was pointed at
+    `COMPANY_OPS_PROFILE`, a variable that was already correct — the same
+    mis-attribution the `AgentStateError` arm was added to remove, through a
+    third door. `run_company_ops.py` had already fixed the identical problem
+    for itself and wrote down why; this is that reasoning applied to the
+    Agent.
+
+    Driven in-process rather than as a subprocess: what is under test is
+    `main()`'s contract (its return value and what it writes to stderr), and
+    a subprocess would additionally be testing the launcher.
+    """
+
+    def _entrypoint(self):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "run_agent.py"
+        spec = importlib.util.spec_from_file_location("run_agent_exit_probe", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _tree(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        runtime = root / "runtime"
+        agent_dir = runtime / "agent"
+        for sub in ("outbox", "sent", "state", "signals", "signals_rejected",
+                    "locks", "logs"):
+            (agent_dir / sub).mkdir(parents=True, exist_ok=True)
+        (agent_dir / "state" / "agent_state.json").write_text(
+            json.dumps({"desktop_id": "DESKTOP_1"}), encoding="utf-8"
+        )
+        day = agent_dir / "signals" / "2026-08-09"
+        day.mkdir(parents=True)
+        (day / "work.json").write_text(
+            json.dumps(
+                {
+                    "project_id": "P",
+                    "event_type": "MILESTONE_COMPLETED",
+                    "status": "IN_PROGRESS",
+                    "summary": "a day of work",
+                }
+            ),
+            encoding="utf-8",
+        )
+        sync = root / "sync"
+        sync.mkdir()
+        return runtime, agent_dir, sync
+
+    def _run(self, *, break_state_write):
+        """`(exit_code, stderr, agent_dir, sync)` for one `main()` call."""
+        import agent.agent as agent_module
+
+        module = self._entrypoint()
+        runtime, agent_dir, sync = self._tree()
+        module.PROJECT_ROOT = runtime.parent
+        module.RUNTIME_DIR = runtime
+
+        env = {
+            "COMPANY_OPS_PROFILE": "DESKTOP_1",
+            "COMPANY_OPS_AGENT_START_DATE": "2026-08-09",
+            "COMPANY_OPS_AGENT_SYNC_FOLDER": str(sync),
+        }
+        errors = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=False):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(errors))
+                if break_state_write:
+                    # The one write this Agent makes that its own docstring
+                    # does not promise to survive. Injected at the module the
+                    # Agent calls it through, so the real `run_once()` runs.
+                    def refusing(*_args, **_kwargs):
+                        raise PermissionError(
+                            13, "state file is locked by another process"
+                        )
+
+                    stack.enter_context(
+                        mock.patch.object(agent_module, "save_state", refusing)
+                    )
+                code = module.main(["run_agent.py"])
+        return code, errors.getvalue(), agent_dir, sync
+
+    def test_the_premise_a_healthy_run_delivers_and_exits_zero(self):
+        """Vacuous otherwise: a fixture that never reaches the state write
+        would prove nothing about what happens when it fails."""
+        code, errors, agent_dir, sync = self._run(break_state_write=False)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, "")
+        self.assertEqual(len(list(sync.glob("*.json"))), 1)
+        self.assertEqual(len(list((agent_dir / "sent").glob("*.json"))), 1)
+
+    def test_the_work_really_was_delivered_before_the_failure(self):
+        """The fact that makes exit 1 a false statement. If nothing had been
+        delivered, "nothing ran, fix the setup" would be close enough."""
+        _code, _errors, agent_dir, sync = self._run(break_state_write=True)
+
+        self.assertEqual(len(list(sync.glob("*.json"))), 1)
+        self.assertEqual(len(list((agent_dir / "sent").glob("*.json"))), 1)
+
+    def test_it_does_not_exit_as_a_configuration_error(self):
+        code, _errors, _agent_dir, _sync = self._run(break_state_write=True)
+
+        self.assertNotEqual(
+            code,
+            1,
+            "1 means 'nothing ran, fix the setup' — the run had started and "
+            "the Event had already reached Desktop 4",
+        )
+
+    def test_it_exits_with_the_documented_failure_code(self):
+        code, _errors, _agent_dir, _sync = self._run(break_state_write=True)
+
+        self.assertEqual(code, 2)
+
+    def test_the_operator_is_told_what_happened_and_what_it_means(self):
+        """A raw traceback says "the system broke". This says which of the
+        two it was, and that nothing was lost."""
+        _code, errors, _agent_dir, _sync = self._run(break_state_write=True)
+
+        self.assertIn("[FAILED]", errors)
+        self.assertIn("locked by another process", errors)
+        self.assertIn("버려진 것은 없습니다", errors)
+        self.assertIn("다음 실행", errors)
+
+    def test_the_traceback_is_still_printed(self):
+        """Not swallowed: it names the file and the line, and nothing else
+        does. Same posture as `run_company_ops.py`'s identical arm."""
+        _code, errors, _agent_dir, _sync = self._run(break_state_write=True)
+
+        self.assertIn("Traceback (most recent call last)", errors)
+        self.assertIn("PermissionError", errors)
+
+    def test_the_state_file_is_not_repaired_on_the_way_out(self):
+        """The watermark must stay where it was — that is what makes "the
+        next run resumes from the same date" true."""
+        _code, _errors, agent_dir, _sync = self._run(break_state_write=True)
+
+        state = json.loads(
+            (agent_dir / "state" / "agent_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state.get("desktop_id"), "DESKTOP_1")
+        self.assertIsNone(state.get("last_successful_collection_date"))
 
 
 if __name__ == "__main__":

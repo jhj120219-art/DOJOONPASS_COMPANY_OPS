@@ -2064,5 +2064,338 @@ class TheWorkspacePageRanksItsAlertsTooTests(unittest.TestCase):
 
 
 
+class TheCompanysOwnWorkIsNotBehindTheToolsMaintenanceTests(unittest.TestCase):
+    """Who the page is for, decided before how urgent the line is (C147).
+
+    `TheWorkspacePageRanksItsAlertsTooTests` above pins the severity order,
+    and severity is right about what it measures: `attention.RULES` makes a
+    blocked Project P2 on the stated ground that "a blocked Project is a
+    pipeline working perfectly on work that a person has stopped". For
+    `ops_status.py`, read by an operator, that is the correct ordering.
+
+    This page is the one a CEO opens, and its own callout says to read ②
+    from the top. Measured on a tree carrying two real blockers and a
+    stopped pipeline at the same time — the ordinary state of a company
+    whose tooling has not been installed yet:
+
+        🔴 즉시 조치 (6건)   Collector가 거부한 Event · backup state 파일이
+                             손상됨 · Runner가 16일째 · 예약 실행이 등록돼
+                             있지 않다 · Agent가 한 번도…      ← 6/6 도구
+        🟡 확인 필요 (6건)   …3번째와 4번째가 막힌 Project 둘, 그중 하나가
+                             **CEO 본인의 승인을 기다리는 캠페인 예산**
+
+    Six tool-maintenance items before the thing that needed the reader. No
+    single line was wrong; the page had one axis and was asking it to do two
+    jobs. `attention.domain()` is the second axis, and this class is what
+    says the page uses it.
+
+    What is *not* asserted here: any change to severity. `ops_status.py` and
+    the browser page order exactly as they did.
+    """
+
+    BLOCKED = (
+        "8일째 막혀 있는 Project: PAYMENT_GATEWAY [CTO Backend] — PG사 가맹점 "
+        "심사가 2주째 회신 없음"
+    )
+    STOPPED = "Runner가 16.1일째 실행되지 않았다 (마지막 실행 2026-08-17T12:07:42+09:00)"
+    UNREGISTERED = (
+        "Runner 예약 실행이 등록돼 있지 않다 (DOJOONPASS_COMPANY_OPS_DAILY)"
+    )
+    REVIEW = "사람 검토를 기다리는 History Candidate 3건"
+
+    def _payload(self, attention):
+        return {"attention": list(attention), "panels": [], "coverage": {},
+                "generated_at": "2026-08-27T10:00:00+09:00", "events_read": 0}
+
+    def _texts(self, blocks):
+        out = []
+        for block in blocks:
+            body = block.get(block.get("type")) or {}
+            out.append(
+                "".join(
+                    (item.get("plain_text")
+                     or (item.get("text") or {}).get("content") or "")
+                    for item in (body.get("rich_text") or ())
+                )
+            )
+            children = [
+                c for c in (body.get("children") or ())
+                if (c.get("table_row") or {}).get("cells") is None
+            ]
+            out.extend(self._texts(children))
+        return out
+
+    def _bullets(self, attention):
+        blocks, _ = build_control_tower_blocks(self._payload(attention))
+        return [t for t in self._texts(blocks) if t.startswith("[P")]
+
+    def test_the_premise_severity_alone_would_bury_it(self):
+        """Vacuous otherwise. The blocked Project really is the lower
+        severity of the two — that is why the ordering had to change rather
+        than the severity."""
+        from controltower.attention import severity
+
+        self.assertEqual(severity(self.BLOCKED)[0], "P2")
+        self.assertEqual(severity(self.STOPPED)[0], "P1")
+
+    def test_the_company_line_comes_first_even_though_it_is_lower_severity(self):
+        bullets = self._bullets([self.STOPPED, self.UNREGISTERED, self.BLOCKED])
+
+        self.assertEqual(len(bullets), 3)
+        self.assertIn("PAYMENT_GATEWAY", bullets[0])
+        self.assertTrue(bullets[0].startswith("[P2]"), bullets[0])
+
+    def test_both_groups_are_named_so_the_reader_knows_which_is_which(self):
+        blocks, _ = build_control_tower_blocks(
+            self._payload([self.STOPPED, self.BLOCKED])
+        )
+        texts = self._texts(blocks)
+
+        company = next(t for t in texts if t.startswith("회사"))
+        system = next(t for t in texts if t.startswith("시스템"))
+        self.assertIn("1건", company)
+        self.assertIn("1건", system)
+        self.assertLess(texts.index(company), texts.index(system))
+
+    def test_severity_still_orders_inside_a_group(self):
+        """The axis that was already right is untouched: within one
+        audience, the more urgent line is still first."""
+        bullets = self._bullets([self.UNREGISTERED, self.STOPPED, self.BLOCKED])
+        system = [b for b in bullets if "PAYMENT_GATEWAY" not in b]
+
+        self.assertTrue(all(b.startswith("[P1]") for b in system), system)
+
+    def test_a_system_only_page_carries_no_group_headings(self):
+        """The heading earns its place only when there is something to
+        separate from. With one audience it is a title over the whole
+        section, which `②` already is."""
+        blocks, _ = build_control_tower_blocks(
+            self._payload([self.STOPPED, self.UNREGISTERED])
+        )
+        texts = self._texts(blocks)
+
+        self.assertEqual([t for t in texts if t.startswith("회사 —")], [])
+        self.assertEqual([t for t in texts if t.startswith("시스템 —")], [])
+
+    def test_the_review_queue_counts_as_the_companys_work(self):
+        """docs/05 §24 keeps BLOCKED / COMPLETED / CANCELLED out of the
+        rules, so these Candidates are a person's judgement about Company
+        History — not a repair."""
+        bullets = self._bullets([self.STOPPED, self.REVIEW])
+
+        self.assertIn("검토를 기다리는", bullets[0])
+
+    def test_the_summary_says_the_split_too(self):
+        """① is read at a glance. Leaving it counting only severity would
+        keep the confusion ② no longer has — "즉시 조치 6건" where all six
+        are maintenance."""
+        blocks, _ = build_control_tower_blocks(
+            self._payload([self.STOPPED, self.UNREGISTERED, self.BLOCKED])
+        )
+        line = next(
+            t for t in self._texts(blocks) if t.startswith("지금 봐야 할 것:")
+        )
+
+        self.assertIn("회사 1건", line)
+        self.assertIn("시스템", line)
+        self.assertIn("2건", line)
+
+
+class TheHeadlineNumbersAreOutcomesNotInstrumentationTests(unittest.TestCase):
+    """What the five above-the-fold numbers are allowed to be (C148).
+
+    `③ 핵심 숫자` is the whole of what a reader who does not scroll takes
+    away, and `events` held one of the five slots. That metric counts the
+    *files this run read* — instrumentation, not an outcome — and the same
+    count is already printed twice further down (the full nine, and `데이터
+    Coverage`'s "읽은 Event").
+
+    Measured on a simulated month of company work — five projects, three
+    blockers, one completion, one approved decision:
+
+        ③ above the fold   …조용한 Team 0 · **기록된 Event 9**
+        ⑥ collapsed        **완료된 Project 1** · **승인된 Decision 1** ·
+                           해결된 Issue 1
+
+    The month's largest business outcome was one toggle away; "we read nine
+    files" was not. `projects_completed` took the slot as the counterpart to
+    `open_blockers` — what finished against what is stuck.
+
+    Pinned as a property rather than as a list, so a future rearrangement is
+    free as long as it stays outcomes: every headline key must be one the
+    company would recognise, and `events` — the one that is about this
+    program rather than about the company — must not be among them.
+    """
+
+    #: Counts of the company's own work. `teams_silent` is here because a
+    #: team that has reported nothing is a fact about people, not about
+    #: this program's plumbing.
+    OUTCOME_KEYS = frozenset(
+        {
+            "open_blockers",
+            "projects_active",
+            "projects_completed",
+            "milestones_completed",
+            "decisions_approved",
+            "issues_resolved",
+            "teams_silent",
+        }
+    )
+
+    #: Counts of this program's own operation.
+    INSTRUMENTATION_KEYS = frozenset({"events", "desktop_role_mismatches"})
+
+    def test_every_headline_number_is_an_outcome(self):
+        from controltower import verdict
+
+        for key, _icon in verdict.HEADLINE_METRICS:
+            with self.subTest(metric=key):
+                self.assertIn(key, self.OUTCOME_KEYS)
+                self.assertNotIn(key, self.INSTRUMENTATION_KEYS)
+
+    def test_the_project_table_does_not_let_its_order_read_as_a_ranking(self):
+        """④ is a table a reader takes top to bottom, and a table read that
+        way looks ranked (C148).
+
+        It is not. `_projects_panel()` orders blocked-first, then
+        longest-idle, then id — chosen so the table does not reshuffle
+        between runs, which its own docstring states. An Event carries
+        thirteen fields and none is a priority, an owner or a due date, so
+        importance has no source here at all.
+
+        The page says so rather than inventing a rank from elapsed days,
+        which would be its first made-up fact.
+        """
+        import json
+        import tempfile
+        from datetime import datetime, timedelta
+
+        from controltower import build_company_rollup, build_dashboard
+
+        now = datetime.fromisoformat("2026-08-27T10:00:00+09:00")
+        processed = Path(tempfile.mkdtemp())
+        (processed / "E1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0", "event_id": "E1",
+                    "source": "DESKTOP_1", "role": "CTO_BACKEND",
+                    "project_id": "PAYMENTS", "event_type": "BLOCKED",
+                    "status": "BLOCKED", "summary": "s",
+                    "blocker": "외부 심사 지연",
+                    "timestamp": (now - timedelta(days=3)).isoformat(),
+                    "history_candidate": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        model = build_dashboard(
+            build_company_rollup(processed_dir=processed, now=now), now=now
+        )
+        blocks, _ = build_control_tower_blocks({"model": model.to_payload()})
+        text = "\n".join(self._all_text(blocks))
+
+        self.assertIn("순서는 중요도가 아니다", text)
+        self.assertIn("우선순위 필드가 없어", text)
+
+    def test_there_are_still_three_to_five_of_them(self):
+        """The rule the constant cites. Fewer than three is not a summary;
+        more than five is the table it is a summary of."""
+        from controltower import verdict
+
+        self.assertGreaterEqual(len(verdict.HEADLINE_METRICS), 3)
+        self.assertLessEqual(len(verdict.HEADLINE_METRICS), 5)
+
+    def test_the_two_partitions_cover_every_metric_the_model_carries(self):
+        """Guards the guard. A metric added upstream and left out of both
+        sets would make the assertion above pass by not seeing it."""
+        import tempfile
+        from datetime import datetime
+
+        from controltower.rollup import build_company_rollup
+
+        empty = Path(tempfile.mkdtemp())
+        rollup = build_company_rollup(
+            processed_dir=empty,
+            now=datetime.fromisoformat('2026-08-27T10:00:00+09:00'),
+        )
+        keys = {metric.key for metric in rollup.metrics}
+
+        self.assertEqual(
+            keys - (self.OUTCOME_KEYS | self.INSTRUMENTATION_KEYS),
+            set(),
+            "a Model metric this test has no opinion about",
+        )
+
+    def test_dropping_it_lost_nothing__the_count_is_still_on_the_page(self):
+        """The reason the swap is safe: `events` is reported twice more, so
+        removing it from the five hides nothing.
+
+        Built from the real Model rather than a hand-written payload — a
+        fixture dict would keep passing after the Model changed shape, which
+        is the one thing a renderer test must not do.
+        """
+        import json
+        import tempfile
+        from datetime import datetime, timedelta
+
+        from controltower import build_company_rollup, build_dashboard
+
+        now = datetime.fromisoformat("2026-08-27T10:00:00+09:00")
+        processed = Path(tempfile.mkdtemp())
+        for index, (project, etype, status) in enumerate(
+            (
+                ("ONBOARDING", "COMPLETED", "COMPLETED"),
+                ("PAYMENTS", "MILESTONE_COMPLETED", "IN_PROGRESS"),
+            ),
+            1,
+        ):
+            (processed / f"E{index}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0", "event_id": f"E{index}",
+                        "source": "DESKTOP_1", "role": "CTO_BACKEND",
+                        "project_id": project, "event_type": etype,
+                        "status": status, "summary": f"work {index}",
+                        "timestamp": (now - timedelta(days=index)).isoformat(),
+                        "history_candidate": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        model = build_dashboard(
+            build_company_rollup(processed_dir=processed, now=now), now=now
+        )
+        blocks, _ = build_control_tower_blocks({"model": model.to_payload()})
+        text = "\n".join(self._all_text(blocks))
+
+        # the outcome took the headline slot...
+        self.assertIn("완료된 Project", text)
+        # ...and the instrumentation count is still on the page, below.
+        self.assertIn("기록된 Event", text)
+
+    def _all_text(self, blocks):
+        out = []
+        for block in blocks:
+            body = block.get(block.get("type")) or {}
+            out.append(
+                "".join(
+                    (item.get("plain_text")
+                     or (item.get("text") or {}).get("content") or "")
+                    for item in (body.get("rich_text") or ())
+                )
+            )
+            for child in body.get("children") or ():
+                cells = (child.get("table_row") or {}).get("cells")
+                if cells:
+                    out.extend("".join(
+                        (i.get("plain_text")
+                         or (i.get("text") or {}).get("content") or "")
+                        for i in cell) for cell in cells)
+                else:
+                    out.extend(self._all_text([child]))
+        return out
+
+
 if __name__ == "__main__":
     unittest.main()

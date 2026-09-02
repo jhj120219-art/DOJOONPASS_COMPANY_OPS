@@ -33,8 +33,11 @@ trigger it uses.
 Exit codes:
     0   COMPLETED, or skipped because another Agent run holds the lock
     1   configuration error (bad/missing environment)
-    2   FAILED — nothing was lost; the outbox still holds the work and the
-        next run resumes from the same date
+    2   FAILED — nothing was lost, and the next run resumes from the same
+        date. Where the work is depends on how far the run got: still in
+        `signals/` if no Event was built, in `outbox/` if one was built
+        and not delivered, in `sent/` if it was delivered and the run
+        died afterwards. The watermark does not advance in any of them.
 """
 
 from __future__ import annotations
@@ -221,6 +224,63 @@ def main(argv: Sequence[str] = ()) -> int:
             file=sys.stderr,
         )
         return 1
+
+    except Exception as exc:  # noqa: BLE001 — see below
+        # Every OTHER way `run_once()` can end, and the reason this exists is
+        # the one `run_company_ops.py` already wrote down for itself: the
+        # scheduled task only ever sees the exit code, and Python's default
+        # for an escaping exception is **1** — the number this file's own
+        # header, `AGENT.md` §6 and `AgentExitCodeContractTests` all define
+        # as "configuration error (bad/missing environment)".
+        #
+        # `agent.run_once()`'s docstring says it "returns rather than raises
+        # for every operational failure", with a corrupt state file as the
+        # one exception. `save_state()` is called inside its date loop and is
+        # not covered by that sentence, and on Windows that write fails for
+        # ordinary reasons — the file held open by antivirus or a sync
+        # client, a full disk, a read-only restore.
+        #
+        # Measured as a real process, one collectable date, `save_state()`
+        # refused with `PermissionError`:
+        #
+        #     exit code   1          <- "configuration error"
+        #     stdout      (nothing)  <- no per-date lines, no watermark line
+        #     stderr      a 16-line Python traceback
+        #     sync folder the Event  <- it was built and DELIVERED
+        #     sent/       the Event
+        #
+        # So the work reached Desktop 4 and the operator was told to go and
+        # check `COMPANY_OPS_PROFILE` — advice about a variable that is
+        # already correct. That is the same mis-attribution the
+        # `AgentStateError` arm above was added to remove ("Two different
+        # accidents, opposite fixes"), arriving through a third door.
+        #
+        # 2, and 2 is not a new meaning: this file's header already defines
+        # it as "FAILED — nothing was lost; the outbox still holds the work
+        # and the next run resumes from the same date", which is exactly this
+        # state. Dates close in order and nothing here deletes a Signal or a
+        # `sent/` record, so an interrupted run leaves the watermark where it
+        # was and the next run redoes that date — `is_sent()` then skips the
+        # delivery it already made. Never 1: by the time anything here is
+        # reached, the run had started.
+        #
+        # The traceback is printed, not swallowed — it names the file and the
+        # line and nothing else does. Same order, same reason, as
+        # `run_company_ops.py`'s identical arm.
+        import traceback
+
+        print(f"[FAILED] {bounded(redact(one_line(str(exc))))}", file=sys.stderr)
+        print(file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(
+            "\n이 실행은 시작된 뒤 중단됐습니다. 버려진 것은 없습니다 — 이미\n"
+            "전달된 Event는 runtime/agent/sent/ 에 기록돼 있고, 수집 날짜는\n"
+            "전진하지 않았으므로 다음 실행이 같은 날짜부터 다시 시도합니다\n"
+            "(이미 보낸 Event는 다시 보내지 않습니다).\n"
+            "state 파일은 자동으로 지우거나 고치지 않습니다.",
+            file=sys.stderr,
+        )
+        return 2
 
     print(f"Agent: {result.desktop_id} ({result.role}) -> {result.status.value}")
 

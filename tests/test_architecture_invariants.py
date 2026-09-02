@@ -48,6 +48,51 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 
 
+def _first_call_line(source: str, name: str) -> int:
+    """Line number of the first real call to `name` in `source`.
+
+    Not `source.index("name(")`. `_calls_mkstemp()` below already states the
+    reason for a different question — *"a docstring naming the idiom is
+    indistinguishable from a call to it"* — and the ordering gates in this
+    file were asking their question the other way, of raw text.
+
+    Measured on `app.runner.run_once()`: five of the nine step names these
+    gates use first appear **inside a comment**, because each step's comment
+    names the call it is about. So `source.index("monthly_run_once(")` was
+    the position of a sentence, not of the call.
+
+    That is not only fragile, it is vacuous in the direction that matters.
+    Demonstrated by deleting the real `monthly_run_once()` call and leaving
+    its explaining comment in place:
+
+        raw   source.index(...) still finds the comment  -> assertion PASSES
+        AST   the call is gone                           -> assertion FAILS
+
+    A gate that keeps passing after the call it guards is deleted is worse
+    than no gate. One test in `MonthlyBoundaryInvariantTests` had already
+    noticed and stripped `#` lines by hand; this answers it for all of them,
+    and for the string/docstring case that stripping still misses.
+
+    Raises rather than returning a sentinel: "the call is not there" is a
+    failure of the property, and a -1 would quietly compare as "earliest".
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else getattr(node.func, "id", None)
+        )
+        == name
+    ]
+    if not lines:
+        raise AssertionError(f"{name}() is not called at all in this source")
+    return min(lines)
+
+
 def _calls_mkstemp(source: str) -> bool:
     """Whether `source` really calls `tempfile.mkstemp`, as the parser sees it.
 
@@ -4231,8 +4276,8 @@ class AgentBoundaryInvariantTests(unittest.TestCase):
         """
         source = inspect.getsource(runner_module.run_once)
         self.assertLess(
-            source.index("update_daily_history("),
-            source.index("backup_run_once("),
+            _first_call_line(source, "update_daily_history"),
+            _first_call_line(source, "backup_run_once"),
             "Late Event Update must precede Backup",
         )
 
@@ -4530,13 +4575,13 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
         Monthly would sit unbacked-up until something else changed."""
         source = inspect.getsource(runner_module.run_once)
         self.assertLess(
-            source.index("scheduler_run_once("),
-            source.index("monthly_run_once("),
+            _first_call_line(source, "scheduler_run_once"),
+            _first_call_line(source, "monthly_run_once"),
             "Monthly must follow Daily Catch-up",
         )
         self.assertLess(
-            source.index("monthly_run_once("),
-            source.index("backup_run_once("),
+            _first_call_line(source, "monthly_run_once"),
+            _first_call_line(source, "backup_run_once"),
             "Monthly must precede Backup",
         )
 
@@ -4544,17 +4589,14 @@ class MonthlyBoundaryInvariantTests(unittest.TestCase):
         """docs/09 §55-57: the Late Event marks the month, and the same run
         rebuilds it. Marking after consolidation would leave the Monthly
         disagreeing with its Daily until the following run."""
-        # Comment lines stripped: the step's own comment names
-        # monthly_run_once() while explaining the ordering, which would put
-        # the mention before the call it is describing.
-        source = "\n".join(
-            line
-            for line in inspect.getsource(runner_module.run_once).splitlines()
-            if not line.strip().startswith("#")
-        )
+        # The hand-rolled `#`-stripping this used to do is now
+        # `_first_call_line()`, which answers the same question of the parser
+        # — and also survives the name appearing inside a docstring or a
+        # string literal, which stripping comment lines does not.
+        source = inspect.getsource(runner_module.run_once)
         self.assertLess(
-            source.index("mark_month_dirty("),
-            source.index("monthly_run_once("),
+            _first_call_line(source, "mark_month_dirty"),
+            _first_call_line(source, "monthly_run_once"),
         )
 
 
@@ -7658,15 +7700,54 @@ class AgentExitCodeContractTests(unittest.TestCase):
 
     def test_the_operator_guide_documents_the_same_codes(self):
         """`AGENT.md` §6 states them for the operator. Two documents and one
-        program must not disagree about what the scheduled task will show."""
+        program must not disagree about what the scheduled task will show.
+
+        Read as a **paragraph**, not as one physical line (C146). The
+        original took the single line containing the heading and required
+        every code on it, which was a property of the sentence's length
+        rather than of the guide: the day `2` earned an explanation of where
+        the work is, the wrap moved it to the next line and this reported the
+        guide as silent about a code it now documents better than before.
+
+        The paragraph is bounded by the blank line that ends it, so this
+        still cannot be satisfied by the code appearing anywhere else in a
+        1,600-line document.
+        """
         guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
-        line = next(
-            item for item in guide.splitlines() if "`run_agent.py` 종료 코드" in item
+        lines = guide.splitlines()
+        start = next(
+            index
+            for index, item in enumerate(lines)
+            if "`run_agent.py` 종료 코드" in item
         )
+        end = start
+        while end + 1 < len(lines) and lines[end + 1].strip():
+            end += 1
+        paragraph = "\n".join(lines[start : end + 1])
 
         for code in sorted(self._returns()):
             with self.subTest(code=code):
-                self.assertIn(f"`{code}`", line)
+                self.assertIn(f"`{code}`", paragraph)
+
+    def test_that_paragraph_reader_stops_at_the_blank_line(self):
+        """Guards the guard: a reader that ran to the end of the file would
+        make the assertion above unfalsifiable."""
+        guide = (REPO_ROOT / "AGENT.md").read_text(encoding="utf-8")
+        lines = guide.splitlines()
+        start = next(
+            index
+            for index, item in enumerate(lines)
+            if "`run_agent.py` 종료 코드" in item
+        )
+        end = start
+        while end + 1 < len(lines) and lines[end + 1].strip():
+            end += 1
+
+        self.assertLess(end - start, 20, "the paragraph reader ran past its end")
+        self.assertTrue(
+            end + 1 >= len(lines) or not lines[end + 1].strip(),
+            "the paragraph did not end on a blank line",
+        )
 
     def test_three_is_not_used_by_the_agent(self):
         """docs/14 reserves 3 for "a person must look", shared by
@@ -7728,10 +7809,30 @@ class AgentExitCodeContractTests(unittest.TestCase):
         ]
         self.assertEqual(returns, [2])
 
-    def test_every_configuration_error_exits_one(self):
-        """Three separate paths reach it (bad profile, unusable sync folder,
-        unreadable/mismatched state). All three are the same answer to the
-        operator: nothing ran, fix the setup."""
+    #: What each `except` in `run_agent.main()` must leave behind.
+    #:
+    #: Keyed by exception type rather than asserted over "every handler"
+    #: (C146). The old shape walked the handlers and required all of them to
+    #: return 1, which was true only while every handler happened to be a
+    #: configuration error — so it encoded "these three exist" as "every
+    #: handler is a configuration error", and the day a fourth arrived that
+    #: is deliberately *not* one, the test said the fourth was wrong.
+    #:
+    #: Naming the types also makes this stricter than what it replaces: the
+    #: old version passed as long as the handlers agreed with each other, so
+    #: a config handler changed to 2 alongside the others would have gone
+    #: unnoticed.
+    HANDLER_EXITS = {
+        # Nothing ran; fix the setup. docs/14 §4 reserves 1 for exactly this.
+        "(ConfigurationError, ReporterConfigError)": 1,
+        "AgentStateMismatchError": 1,
+        "AgentStateError": 1,
+        # The run had already started. 1 would say the opposite — see the
+        # arm's own comment and `AnAbortedAgentRunIsNotAConfigurationErrorTests`.
+        "Exception": 2,
+    }
+
+    def test_each_handler_exits_with_the_code_its_situation_means(self):
         source = (REPO_ROOT / "run_agent.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         main = next(
@@ -7740,17 +7841,42 @@ class AgentExitCodeContractTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "main"
         )
 
-        handlers = [n for n in ast.walk(main) if isinstance(n, ast.ExceptHandler)]
-        self.assertGreaterEqual(len(handlers), 3, "expected the config/state handlers")
-        for handler in handlers:
+        found = {}
+        for handler in ast.walk(main):
+            if not isinstance(handler, ast.ExceptHandler):
+                continue
             returns = [
                 child.value.value
                 for child in ast.walk(handler)
                 if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant)
             ]
             if returns:
-                with self.subTest(handler=ast.dump(handler.type or ast.Constant(None))[:60]):
-                    self.assertEqual(returns, [1])
+                found[ast.unparse(handler.type) if handler.type else "bare"] = returns
+
+        self.assertEqual(
+            {name: codes[0] for name, codes in found.items()},
+            self.HANDLER_EXITS,
+            "the handlers in run_agent.main() no longer match the exit code "
+            "each situation means. A NEW handler must be added here with the "
+            "reason for its code; a changed one is a contract change.",
+        )
+        for name, codes in found.items():
+            with self.subTest(handler=name):
+                self.assertEqual(
+                    codes, [codes[0]], "one handler, two different exit codes"
+                )
+
+    def test_the_catch_all_is_never_a_configuration_error(self):
+        """The property the table above exists for, stated on its own.
+
+        Python exits 1 for an escaping exception, and 1 is this file's code
+        for "nothing ran, fix the setup" — so a run that dies *after*
+        collecting and delivering would send an operator to check
+        `COMPANY_OPS_PROFILE`. Measured before the arm existed: exit 1, no
+        stdout, a raw traceback, and the Event already in the sync folder.
+        """
+        self.assertNotEqual(self.HANDLER_EXITS["Exception"], 1)
+        self.assertIn(self.HANDLER_EXITS["Exception"], self.DOCUMENTED)
 
 
 class LockSkippedRunContractTests(unittest.TestCase):

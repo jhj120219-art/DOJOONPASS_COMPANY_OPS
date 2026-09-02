@@ -7,7 +7,8 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-09-01 (C145 — **감사 넷, 결함 없음.** 한 번도 구동해
+마지막 갱신: 2026-09-02 (C148 — **회사 한 달치를 넣고 페이지를 읽었다.** 실제 업무 데이터가 들어오면 ④/⑤는 회사처럼 읽힌다. 고친 것 둘: 경영 요약 다섯 칸 중 하나를 **계측값**(`기록된 Event` = 이번 실행이 읽은 파일 수)이 쓰고 있었고 그 달 최대 성과인 `완료된 Project`는 접혀 있었다 — 교체했다(빼도 그 수는 두 곳에 더 있고, 빈 트리 신호는 별도 배너가 나른다). 그리고 ④의 행 순서가 중요도처럼 읽히는데 실제로는 `막힌 것 먼저 → 오래 조용한 순`이라 그렇게 적었다 — Event 필드 13개에 우선순위가 없다. 확인만 한 것: 무관한 ISSUE_RESOLVED가 Blocker를 지우는 것은 docs/04 §27·§20 **명세대로**이며 보고자의 `status` 값이 결정한다(코드 결함 아님). **판정: 충실한 기록계이고 아직 운영계가 아니다** — 모든 event type이 과거형이라 '결정이 필요하다'/'이슈가 제기됐다'를 담을 자리가 없고, 그 넷은 docs/04 §44·§68이 V1에서 의도적으로 제외한 것이다.)
+이전 갱신: 2026-09-01 (C145 — **감사 넷, 결함 없음.** 한 번도 구동해
 보지 않은 경로 넷을 실제로 돌렸다: Notion Retry Queue(미분 3,000 trial + 실
 장애/복구/배치 중간 예외), `review_cli.py`(읽기 전용 파일에서도 저장물 무손상),
 Desktop 4에서 Agent와 Runner 동시 실행 3회(Event 40건 유실 0·중복 0), 성능 측정.
@@ -4652,6 +4653,698 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C148. 회사 한 달치를 넣고 읽었다 — 이 시스템이 말할 수 있는 것의 경계
+
+C147은 이 페이지가 **자기 자신**만 말하고 있다는 것을 보였다(회사 0건 · 시스템
+12건). 이번에는 반대로 **회사 데이터를 채워 넣고** 같은 페이지를 읽었다.
+Event Schema가 허용하는 것만으로 한 달을 만들었다 — Project 5개, Blocker 3건,
+완료 1건, 승인된 Decision 1건, 그리고 동시에 망가진 Runner.
+
+### 1. 좋은 소식부터 — 실제 업무가 들어오면 페이지는 회사처럼 읽힌다
+
+    ④ Project
+      LAUNCH_MARKETING  BLOCKED  캠페인 예산 3천만원 CEO 승인 대기…   6일
+      MOBILE_APP        BLOCKED  애플 심사 반려(2.1)…                4일
+      PAYMENT_GATEWAY   ACTIVE                                        —
+      PRICING           ACTIVE                                        —
+      ONBOARDING_FUNNEL COMPLETE                                      —
+
+    ⑤ 최근 변화   COMPLETED / MILESTONE_COMPLETED / DECISION_APPROVED /
+                  BLOCKED / ISSUE_RESOLVED … 시간 역순
+
+Blocker 원문·경과 일수·판정이 다 있고, C147의 회사/시스템 분리 덕분에 ②에서
+막힌 Project 둘이 도구 정비 9건보다 **위에** 온다. 구조는 작동한다.
+
+### 2. 확인만 하고 고치지 않은 것 — Blocker가 사라지는 경로는 **명세대로다**
+
+시뮬레이션에서 Blocker 3건을 넣었는데 페이지는 2건을 보여줬다. 재현해서
+좁혔다:
+
+    BLOCKED 만                                   BLOCKED · blocker 유지 · open 1
+    BLOCKED + ISSUE_RESOLVED(status=IN_PROGRESS) **ACTIVE · blocker 사라짐 · open 0**
+    BLOCKED + ISSUE_RESOLVED(status=BLOCKED)     BLOCKED · blocker 유지 · open 1
+    BLOCKED + MILESTONE_COMPLETED(status=IN_PROGRESS) BLOCKED · blocker 유지 · open 1
+
+두 번째 줄만 보면 "무관한 이슈 해결이 남의 Blocker를 지운다"처럼 보인다.
+**그런데 명세가 정확히 그렇게 정한다.** docs/04 §27: *"모든 ISSUE_RESOLVED가
+Project 상태를 변경한다고 가정하지 않는다. **Event의 실제 status를 따른다.**"*
+— 그 Event는 `status=IN_PROGRESS`, 즉 보고한 Desktop이 "이 Project는 진행
+중"이라고 **주장한 것**이다. 그리고 네 번째 줄이 구현이 type이 아니라 §20 표를
+따르고 있음을 보여준다(`MILESTONE_COMPLETED | Milestone/Last Updated 갱신` —
+Status·Blocker를 건드리지 않는다).
+
+즉 **코드 결함이 아니라 보고 규율의 문제**다. 아직 막혀 있으면 보고자가
+`status=BLOCKED`로 적어야 하고, 그러면 Blocker는 살아남는다(3번째 줄).
+탐지기를 다는 것은 명세대로 동작하는 것에 경보를 붙이는 일이므로 하지 않는다.
+
+### 3. 고친 것 (1) — 경영 요약에 계측값이 앉아 있었다
+
+`③ 핵심 숫자`는 스크롤하지 않는 사람이 가져가는 전부다. 다섯 칸 중 하나를
+`기록된 Event`가 쓰고 있었다 — **이번 실행이 읽은 파일 수**, 즉 계측값이다.
+같은 한 달에 대해:
+
+    ③ 펼쳐진 곳   열려 있는 Blocker 2 · 움직인 Project 5 · 완료된 Milestone 2 ·
+                  조용한 Team 0 · **기록된 Event 9**
+    ⑥ 접힌 곳     **완료된 Project 1** · **승인된 Decision 1** · 해결된 Issue 1
+
+그 달 최대의 성과가 토글 하나 뒤에 있고 "파일 아홉 개를 읽었다"는 앞에 있었다.
+`HEADLINE_METRICS`의 주석이 이미 *"a Blocker is a decision, an Event count is
+context"*라고 적어 두었는데, 그 context가 다섯 칸 중 하나를 차지하고 있었다.
+
+`projects_completed`로 교체했다 — `open_blockers`의 짝이다(무엇이 막혔나 ↔
+무엇이 끝났나).
+
+**빼도 잃는 것이 없음을 먼저 확인했다.** 그 숫자는 ⑥ 전체 지표와 `데이터
+Coverage`의 "읽은 Event"에 두 번 더 나온다. 그리고 이 칸이 "증거가 없다"
+신호를 나르고 있지 않은지가 손대기 전 확인할 값어치가 있는 유일한 것이었는데,
+빈 트리에서 재 보니 ③은 **자기 배너**를 따로 찍고(*"아래 0은 '일이 없었다'가
+아니라 '셀 Event가 없다'는 뜻이다"*) 모든 지표가 `판정 보류`로 나온다 — 둘 다
+이 항목과 무관하다.
+
+방향(`METRIC_LOWER_IS_BETTER`)은 주지 않았다. 완료가 많을수록 좋다는 것은
+분기마다 참이 아니고, 여기서 판정을 지어내는 것이 이 파일이 없애 온 실패다.
+
+### 4. 고친 것 (2) — ④의 순서가 중요도처럼 읽혔다
+
+표는 위에서부터 읽힌다. ④의 순서는 `막힌 것 먼저 → 오래 조용한 순 → id`이고,
+`_projects_panel()`의 docstring이 그 이유를 **안정성**이라고 적어 두었다
+(실행마다 순서가 바뀌면 읽기 어렵다). 중요도가 아니다.
+
+그런데 페이지는 그 말을 하지 않았다. CEO가 맨 윗줄을 "가장 중요한 Project"로
+읽는 것은 자연스럽고 **틀리다**.
+
+Event는 필드가 **13개**뿐이고 그중 우선순위·담당자·기한은 없다. 그래서
+중요도는 Owner와 똑같이 **원천이 없다**. 이미 그 자리에 있던 문장
+("Owner / Next Action 열은 없다 — …원천이 없다")에 한 절을 붙였다:
+
+> **이 표의 순서는 중요도가 아니다** — 막힌 Project 먼저, 그다음 오래 조용한
+> 순이다(실행마다 순서가 바뀌지 않게 한 것이다). Event에는 우선순위 필드가
+> 없어 이 시스템은 무엇이 더 중요한지 알지 못한다. 중요도는 사람이 정한다.
+
+경과 일수로 순위를 지어내지 않는다 — 그것이 이 페이지의 첫 번째 만들어낸
+사실이 되고, `승인 병목 · 다음 Sprint`가 이미 거절하는 선이다.
+
+### 5. 이 시스템이 말할 수 있는 것의 경계 (실측)
+
+Event 필드 **13개**: schema_version · event_id · timestamp · source · role ·
+project_id · event_type · status · summary · history_candidate · (milestone ·
+blocker · evidence).
+
+Event Type **8개**: STARTED · BLOCKED · RESUMED · COMPLETED · CANCELLED ·
+MILESTONE_COMPLETED · **ISSUE_RESOLVED** · **DECISION_APPROVED**.
+
+여기서 나오는 두 가지 비대칭이 이 시스템의 성격을 정한다:
+
+* `ISSUE_RESOLVED`는 있는데 **`ISSUE_RAISED`가 없다.**
+* `DECISION_APPROVED`는 있는데 **"결정이 필요하다"를 말할 방법이 없다.**
+
+즉 **모든 event type이 이미 일어난 상태 변화를 보고한다.** 아직 일어나지 않은
+것 — 필요한 결정, 제기된 이슈, 다음 행동 — 을 담을 자리가 없다. 유일한 통로는
+`BLOCKED`의 blocker 산문이고, 시뮬레이션의 "캠페인 예산 3천만원 CEO 승인 대기"가
+정확히 그 우회로다. 그래서 CEO 결재 대기와 PG사 심사 지연이 화면에서 **구별되지
+않는다** — 둘 다 "막혀 있는 Project"다.
+
+CEO 질문 11개에 대한 실측 답:
+
+    답한다      막힌 Issue / 왜 막혔나 / 최근 변화 / Risk·Blocker /
+                진행 중 Project / 무엇을 봐야 하나
+    부분        다음 Action — 시스템 줄은 remedy가 있고, 회사 줄은
+                "그 팀이 RESUMED를 보고해야 닫힌다"까지다
+    구조적 불가 어떤 Project가 가장 중요한가(우선순위 필드 없음) /
+                누가 처리해야 하나(Owner는 최초 보고 팀) /
+                어떤 Decision이 필요한가(DECISION_APPROVED만 있음) /
+                CEO가 지금 판단할 것(docs/04 §44·§68이 V1에서 제외)
+
+**넷 다 명세가 의도적으로 제외한 것**이고(docs/04 §44 "자동화하지 않는 COO
+판단", §68 "V1에서 만들지 않는 것"), 페이지는 셋을 ⑥ '원천이 없는 계층'에서
+스스로 밝힌다. 이번에 넷째(중요도)도 §4에서 밝히게 했다.
+
+**판정: Company Ops는 충실한 *기록계*이고 아직 *운영계*가 아니다.** 각 Desktop이
+"무엇을 했다"고 보고한 것을 잃지 않고 모아 보여준다. 무엇이 중요한지, 누가
+해야 하는지, 무엇을 결정해야 하는지는 담을 필드가 없다. 그 셋을 더하는 것은
+Event Schema 변경이고 **명세 결정이므로 SKIP**한다 — 근거를 여기 남긴다.
+
+### 6. 승인이 필요해 하지 않은 것
+
+Event Schema에 priority / owner / next_action / DECISION_REQUESTED /
+ISSUE_RAISED 추가(§5), 실제 Notion workspace 반영, Task Scheduler 등록,
+실제 OneDrive 왕복, git push.
+
+---
+
+## C147. CEO 관점 감사 — 페이지는 잘 만들어져 있었고, **순서가 개발자 것이었다**
+
+이번 목표는 코드 감사가 아니라 *"CEO가 Notion에서 회사를 운영할 수 있는가"* 였다.
+그래서 코드를 읽는 대신 **페이지를 렌더링해서 읽었다**(`build_control_tower_blocks()`
+의 블록을 글자로 되돌리는 스크립트). 그리고 실제 데이터로 파이프라인을 돌려 봤다.
+
+### 1. 먼저 잰 것 — 이 시스템은 실제로 돌았는가
+
+`runtime/`의 증거:
+
+    events/processed        17        local_master/daily        6
+    history_candidates/keep 14        local_master/monthly      0
+    agent/sent               4        backup_working_copy/daily 6
+    runs/last_run.json    DEGRADED exit 3 (backup BACKUP_PENDING)
+    logs/notion_sync.log  **존재하지 않음**
+
+Runner는 2026-08-17에 마지막으로 돌았고 그 실행에서 transport·collector·
+history_filter·daily·late_update·monthly가 전부 SUCCESS였다. Agent도 돌았다
+(`agent_state.json`: 2026-08-10까지 수집, 4건 전달). Backup은 실제 remote
+(`runtime/backup_remote.git`)에 대해 **BACKUP_SUCCESS, 미push 0**이다.
+
+**Notion은 한 번도 도달한 적이 없다.** `notion_sync.log`가 아예 없다 —
+`_log_notion_sync()`는 sync를 시도할 때마다 쓰므로, 파일의 부재가 곧 0회다.
+
+### 2. "돌지 않는 것"과 "못 만든 것"을 갈랐다 — 실제 데이터로
+
+Runner가 16일 멈춰 있고 `monthly/`가 비어 있다. 만들지 못한 것인가, 안 돈 것인가?
+**실제 runtime을 임시 디렉터리로 복사하고**(Backup remote는 새 bare repo로 돌려
+실제 remote를 건드리지 않았다) 거기서 `run_once()`를 한 번 돌렸다:
+
+    overall SUCCESS · exit 0 · 9개 component 전부
+    daily     6 → **28**   (22일치 catch-up)
+    monthly   0 → **1**    (2026-08.md, 내용이 실제로 읽힌다)
+    backup    SUCCESS · 미push 0
+    notion_sync SKIPPED (미설정)
+
+저장소는 한 바이트도 바뀌지 않았다. 결론: **로컬 파이프라인은 완성돼 있고
+동작한다.** 비어 있던 것은 기능이 아니라 실행이었다.
+
+### 3. 진짜 결함 — ②의 순서가 운영자 것이지 CEO 것이 아니었다
+
+페이지 구조(①지금 상태 ②지금 봐야 할 것 ③핵심 숫자 ④Project ⑤최근 변화
+⑥상세)는 CEO용으로 잘 설계돼 있다. 문제는 ②의 **정렬 축**이었다.
+
+실제 회사가 겪을 상태를 만들어 재 봤다 — 막힌 Project 둘(하나는 **CEO 본인의
+3천만원 예산 승인 대기**), 그리고 파이프라인이 멈춘 상태:
+
+    🔴 즉시 조치 (6건)   Collector가 거부한 Event · backup state 손상 ·
+                         Runner 16일째 · 예약 실행 미등록 · Agent 미실행
+                         → **6/6이 Company Ops 자체**
+    🟡 확인 필요 (6건)   …3번째와 4번째가 막힌 Project 둘
+
+페이지 머리말은 *"아래 ②를 위에서부터 읽는다"*고 한다. 그 지시를 따르면 CEO는
+**자기 결재를 기다리는 항목에 닿기 전에 도구 정비 항목 여섯 개를 읽는다.**
+
+어느 줄도 틀리지 않았다. severity는 자기 질문("파이프라인이 얼마나 망가졌는가")에
+정확히 답하고 있고, `RULES`는 막힌 Project를 P2로 두는 이유를 이미 적어 두었다 —
+*"a blocked Project is a pipeline working perfectly on work that a person has
+stopped"*. `ops_status.py`를 읽는 운영자에게는 그 순서가 옳다.
+
+**축이 하나인데 일이 둘이었다.**
+
+### 4. 고친 것 — 두 번째 읽기 하나, 렌더러 하나
+
+`attention.py`에 `DOMAINS` / `domain()`을 더했다. 새 matcher가 아니라 `ACTIONS`
+와 **같은 phrase에 키를 건 세 번째 답**이다(그 표가 이미 "One match, two
+answers"라고 적어 둔 방식). 기준은 주제가 아니라 **조치**다:
+
+> `COMPANY` = 그 줄을 처리하는 사람이 Company Ops를 몰라도 되는 줄.
+> `SYSTEM` = 조치가 스크립트·state 파일·큐·예약 작업을 지목하는 줄.
+
+그 기준으로 75개 중 **2개만 COMPANY**다(`막혀 있는 Project`, `검토를 기다리`).
+그 비율 자체가 결과다 — 이 시스템이 지금 CEO에게 할 수 있는 말은 거의 전부
+자기 자신에 대한 것이다.
+
+Notion 페이지의 ②만 그 축으로 **먼저** 묶고, 그 안에서 severity 순서를 그대로
+유지한다. ①에는 `지금 봐야 할 것: 회사 N건 · 시스템(Company Ops 자체) M건`
+한 줄을 더했다 — ②를 고쳐 놓고 ①이 "즉시 조치 6건"만 말하면 같은 혼동이 한 층
+위에 남기 때문이다.
+
+    회사 — 사람이 풀어야 하는 일 — 2건
+      • 8일째 막혀 있는 Project: PAYMENT_GATEWAY …
+      • 6일째 막혀 있는 Project: LAUNCH_MARKETING … (CEO 승인 대기)
+    시스템 — Company Ops 자체 상태 — 10건
+      🔴 즉시 조치 (6건) …
+
+**severity는 한 글자도 바꾸지 않았다.** `ops_status.py`(운영자 터미널)와
+브라우저 Dashboard는 그대로다 — 그 둘에게는 원래 순서가 옳다.
+
+### 5. 두 번째 결함 — 배포 안내가 조용한 실패로 안내하고 있었다
+
+§1의 "Notion 0회"가 왜인지 좇았다. `install_runner_task.ps1`은 자기 변수를
+User 환경변수로 심으면서 이유까지 적어 둔다 — *"a scheduled task inherits no
+interactive shell"*. 그리고 자기가 심지 않는 세 변수는 **범위를 말하지 않고**
+이름만 찍는다:
+
+    Still required, and NOT set by this script (they are secrets):
+      NOTION_API_TOKEN
+      NOTION_PROJECTS_DATABASE_ID
+
+`.env.example`은 "export these in the shell"이라고 한다. 그대로 하면:
+
+1. 셸에서 export → 손으로 돌리면 Notion이 동작한다 ✓
+2. 예약 작업 등록
+3. 예약 실행은 아무것도 상속하지 않아 Notion을 계속 건너뛴다
+4. 그런데 **exit 0** — Notion은 History critical path 밖이다(README RULE 5)
+
+즉 성공처럼 보이는 실패이고, **이 저장소가 정확히 그 상태다**(`.env`에 값이 있고,
+`notion_sync.log`는 없다).
+
+고친 방법: 두 설치 스크립트가 **범위와 이유**를 말하고 `docs/13 §2.1`을 가리키게
+했다. 명령 자체는 docs/13에만 둔다 — `test_no_installer_stores_a_secret`이
+설치 스크립트 안의 `SetEnvironmentVariable("NOTION` 문자열을 금지하는데, 그것은
+*비밀 저장*에 대한 옳은 게이트이고 호출과 안내문을 구분하지 못한다. **게이트를
+약화시키지 않고** 명령을 문서로 옮기는 쪽을 택했다. `docs/13 §2.1`은 이미 Agent
+변수에 대해 같은 메커니즘을 설명하고 있었다 — 빠져 있던 것은 `NOTION_*`에도
+그대로 적용된다는 문장이다.
+
+### 6. 결함 없음으로 확인한 것
+
+* **CEO 페이지의 publish 경로** — 실제 payload로 `publish()`를 `InMemoryNotionTransport`
+  에 대고 돌렸다: 53 blocks 작성, 두 번째 실행은 같은 페이지를 찾아 53개를
+  archive하고 다시 씀(= 백 번 돌려도 페이지는 하나), warnings 0,
+  보낸 내용에 `ntn_`/`secret_`/`ghp_` 없음. **자격증명만 있으면 그대로 올라간다.**
+* **Run Manifest를 CEO 페이지에 넣지 않은 것** — 목표가 "누가 무엇을 실행했는가"를
+  묻지만, Runner의 단계별 상태는 이 목표가 분리하라고 한 Machine Data다.
+  실행의 *실패*는 이미 ②로 올라오고(`시작조차 되지 못한 단계`, `Runner가 N일째`),
+  Desktop별 보고 현황은 ⑥에 있다. 표를 하나 더 넣지 않는 것이 옳다.
+* **페이지 분량** — 53 blocks, 화면에 펼쳐진 것은 ①~⑤와 callout뿐이고 나머지
+  아홉 섹션은 전부 접혀 있다. 과밀하지 않다.
+
+
+### 7. 나머지 사람 표면 셋을 마저 렌더링했다 — 결함 없음, 그리고 이미 적혀 있음
+
+§3이 ②를 고쳤으므로, 사람이 실제로 보는 나머지 표면도 **읽어 봤다**.
+
+#### (a) PROJECTS Row — docs/04 §8 그대로, 그리고 알려진 모호함 하나
+
+실제 Event 17건을 `ExecutionPlanSync`에 통과시켜 in-memory Notion에 Row를
+만들고 사람이 읽는 형태로 찍었다: `NOTION_CREATED 4 / NOTION_UPDATED 12 /
+NOTION_SKIPPED_OLD_EVENT 1`, Row 4개. 11개 Property가 전부 채워지고 읽힌다.
+
+    Project           Company Ops Runner E2E
+    Owner             CTO Frontend      Source   DESKTOP_3
+    Status            IN_PROGRESS       Last Updated 2026-08-05T20:00…
+    Current Milestone Failure Recovery Check
+
+한 가지가 눈에 걸렸고 재 봤다 — `COMPANY_OPS` Row는 `Owner=COO /
+Source=DESKTOP_4`인데 그 Row의 `Last Event ID`는 **DESKTOP_2(CMO)** 것이다.
+실측: 그 Project에는 네 role이 기여했고(`CMO, COO, CTO_BACKEND,
+CTO_FRONTEND`), Row의 Owner는 **가장 먼저 보고한 팀**이다
+(`build_update_properties()`가 Owner/Source를 일부러 넣지 않는다 — docs/04
+§9-12는 생성 시점 정보로만 설명한다). docs/04 §8의 표는 그 열을 "**현재** 담당
+역할"이라 부른다.
+
+**이미 BACKLOG §7에 특성화돼 있고 SKIP 사유까지 적혀 있다**(*"`Owner`의
+정의(생성자인가 최근 담당인가)"*가 결정 대상). 새 발견이 아니므로 중복해서
+적지 않고, 결정 없이 의미를 바꾸지도 않는다.
+
+#### (b) Daily History의 자기모순 — 코드는 이미 옳고, 파일이 낡았다
+
+디스크의 `2026-08-09.md`는 **"No material company history recorded."**로 시작한
+뒤 `## Late Events` 아래에 여덟 건을 나열한다. 문서가 자기 자신과 모순된다 —
+목표가 말하는 *"데이터는 생성되지만 사람이 이해할 수 없음"* 그 자체다.
+
+그런데 `daily/late_events.py`에 `_without_the_empty_day_sentence()`가 있다.
+낡은 파일인가, 살아 있는 버그인가? **실제 `update_daily_history()`를 돌려서
+갈랐다** — 빈 하루를 렌더링하고 Late Event 하나를 병합:
+
+    병합 후   still claims the day was empty : **False**
+              but lists items                : True
+
+**코드는 옳다.** 그 두 파일은 그 수정 이전에 쓰인 잔여물이고, 그 날짜에 새
+Event가 오지 않는 한 병합 경로가 다시 손대지 않으므로 그대로 남는다.
+
+고치지 않는다. (1) 만들어 낼 수 있는 경로가 없으므로 탐지기를 다는 것은
+**해소될 수 없는 상시 경보**를 만드는 일이고(C26), (2) `local_master/daily/`는
+실제 Company History여서 프로그램이든 나 자신이든 고쳐 쓰는 것은 docs/10 §46과
+승인 게이트에 걸린다. 사람이 손으로 고칠 수 있고(docs/06 §57), 그 판단은
+사람 몫이다.
+
+#### (c) `init_notion.py` — Notion 배포의 첫 단계, 결함 없음
+
+§5가 "Notion 0회"의 원인을 배포 안내에서 찾았으니, 그 배포의 **첫 명령**도
+실제로 돌려 봤다(in-memory transport, 자격증명 없음):
+
+    빈 Database("Name" 하나)   Name→Project **RENAMED**, 나머지 10개 CREATED = 11/11
+    그 결과에 다시 실행        created 0 · kept 11        ← 멱등
+    절반만 있는 Database       빠진 3개만 CREATED · 8개 유지
+
+사람이 읽는 report도 정렬돼 나온다(`Project ... RENAMED (renamed 'Name' ->
+'Project')`). **"두 번 돌려도 안전하다"는 주장이 측정으로 확인됐다.**
+
+즉 Notion 쪽 세 단계가 전부 코드로는 완성돼 있고 double에 대해 검증된다:
+`init_notion.py`(스키마) → Runner의 Notion Sync(PROJECTS Row) →
+`publish_control_tower.py`(CEO 페이지, 53 blocks·멱등). **셋 다 자격증명
+하나에만 막혀 있다.**
+
+### 8. 승인이 필요해 하지 않은 것
+
+실제 Notion workspace 반영(자격증명), Task Scheduler 등록, 실제 OneDrive 왕복,
+실제 GitHub push. 이 넷이 §1의 "만들어졌지만 운영되지 않는다"의 전부다.
+
+---
+
+## C146. C144가 남긴 표를 채웠다 — 그리고 그 과정에서 **검사를 침묵시키는 세 자리**를 찾았다
+
+C144 §4가 다음 작업을 이름까지 적어 두었다: *"AST sweep + 손상 fixture 렌더"*,
+그리고 *"근거 없이 40개를 채우는 것은 이 표를 신뢰할 수 없게 만든다"*. 그대로 했다.
+그리고 각 줄의 결과를 재는 동안, **분류보다 나쁜 것**이 세 자리에서 나왔다 — 줄이
+분류되지 않는 것이 아니라 **줄이 아예 나오지 않는** 자리다.
+
+### 1. sweep을 넓혔다 — 76개가 아니라 90개였다
+
+C144의 AST 측정은 `ops_status.py`의 `attention.append` 만 봤다. 실제 ATTENTION
+리스트에 줄이 들어오는 자리는 셋 더 있다:
+
+    ops_status.py   attention / signal_attention /
+                    delivery_attention / lock_attention      .append
+    ops_status.py   attention.extend(f())  ->  f()가 return하는 리스트 리터럴
+    src/agent/status.py  needs_attention()의 reasons.append
+
+    emission site  90건
+    분류되지 않음   43건
+
+`extend` 갈래가 실제로 한 줄을 숨기고 있었다 — `_same_instant_skips_from_the_last_run()`
+의 `Notion 프로젝트 행에 반영되지 않았다`. 첫 sweep이 그것을 놓쳤고, 그래서 guard는
+이제 `extend`를 호출된 함수까지 따라간다.
+
+**두 줄은 실제로 띄워서 재현했다**(손상된 `backup_state.json`,
+손상된 `monthly_history_state.json`): 둘 다 ATTENTION에 인쇄되고, 둘 다
+`severity() == "?"`, 둘 다 `next_action() is None` — 터미널·Dashboard·Notion
+페이지 셋 다에서.
+
+### 2. 37개를 채웠다 — severity는 전부 **재서** 정했다
+
+C144의 조건("근거 없이 채우지 않는다")을 지켰다. P1은 이 모듈 자신의 정의
+*"work is not reaching Company History, or the pipeline is stopped"* 를 글자
+그대로 적용한 것이고, 줄이 자기 본문에서 "어떤 실행도 다시 만들지 않는다"고 말하면
+P1, "다음 실행이 처리한다"면 P2다. 실측이 필요한 둘은 실제로 돌렸다:
+
+    backup state 파일이 손상됨    실 runner 구동 -> BackupStateError로
+                                 backup 단계 STEP_ABORTED, 그 뒤 단계(dashboard)
+                                 미시작, exit 2                      -> P1
+    monthly state 파일이 손상됨   실 runner 구동 -> MONTHLY_CONSOLIDATION_FAILED,
+                                 Runtime은 계속됨(§74), 그러나 파일이 그대로라
+                                 **매 실행 같은 실패**                -> P1
+
+**보안 줄 6개는 그대로 `?`로 뒀다.** C144 §3의 SKIP을 뒤집지 않는다 — "비밀이
+머신을 떠나려 한다"의 등급은 정책 결정이고, 여기서 표에 줄을 넣는 것은 그것을
+구현으로 결정하는 것이다. 대신 그 6개를 guard의 **명시적 예외 목록**으로 고정했고,
+목록이 낡거나(그 줄이 사라지거나) 누군가 그중 하나를 분류하면 테스트가 깨진다.
+새 보안 줄이 생기면 그때는 통과하지 못한다 — 결정이 조용히 미뤄지지 않는다.
+
+**그리고 이번에는 표가 다시 뒤처지지 않는다.** `EveryAttentionSiteIsClassifiedTests`
+가 매 실행 sweep을 돌린다. 손 fixture가 아니라 소스 sweep인 이유는 C143·C144·C138이
+전부 한 블록씩만 본 이유와 같다 — 90줄을 한꺼번에 띄우는 트리는 없지만, **emitter는
+두 파일에 다 있다.**
+
+**부수 수정 둘.** 새로 쓴 remedy 중 둘이 없는 경로를 가리키고 있었다
+(`runtime/agent/rejected/` -> `signals_rejected/`, `runtime/runs/latest.json` ->
+`last_run.json`). 소스 전체와 대조해 잡았다.
+
+### 3. 그리고 **검사를 침묵시키는 자리** 셋 — 여기가 이번의 진짜 발견이다
+
+#### (a) `_print_history()` — 파일 하나가 나머지 700줄을 껐다
+
+`monthly_history_state.json`을 못 읽으면 handler가 `return attention` 으로
+**함수 전체를 빠져나갔다.** 그 함수는 Company History에 대해 열두 가지를 묻는데,
+그 뒤 것이 전부 건너뛰어지고 **건너뛰었다는 말도 없었다.**
+
+트리 하나에서 그 파일 **하나만** 망가뜨리고 잰 결과 — 13줄 -> 10줄:
+
+    Daily State와 실제 History가 어긋난다     state가 닫혔다는 날의 파일이 없다
+    Daily History 시퀀스에 구멍 2일           어떤 실행도 다시 만들지 않는다
+    Daily State가 미래 날짜를 …               Daily 생성이 통째로 멈춘 상태
+    Decision Context에 Secret 형태의 문자열   backup 원격으로 가는 중인 자격증명
+
+넷 다 Monthly와 아무 상관이 없다. 마지막 줄이 가장 나쁘다 — **다른** state 파일이
+파싱되지 않아서 이 화면이 자격증명 유출 검사를 그만둔다. 그리고 손상된
+`monthly_history_state.json`은 Monthly 파이프라인도 멈추므로(위 §2), 내일도 그대로
+있을 가능성이 가장 높은 파일이다.
+
+`_block()`의 docstring이 이미 이 규칙을 적어 두고 있었다: *"a partial report
+presented as complete, which is the silent-loss shape this project keeps removing."*
+
+고친 방식: `state = None`. 그 파일을 실제로 읽어야 하는 세 자리만 건너뛰고, 그중
+`dirty_months`가 필요한 검사는 **"확인 못 함"이라고 인쇄한다** — 빈 목록으로
+추정하면 재생성 대기 중인 달이 전부 divergence로 오보되기 때문이다. 비어 있는
+`MonthlyState()`를 만들어 넣지 않은 이유도 같다: 읽지 못한 파일에서 "아직 아무것도
+통합되지 않았다"를 지어내면 화면이 **모르는 것을 단언**하게 된다(docs/10 §46).
+
+#### (b) `_print_last_run()` — 손상된 Manifest가 Lock 경보를 데리고 갔다
+
+같은 모양, 한 블록 옆. 이 함수는 Manifest를 열기 **전에** Runner Lock 경보 둘을
+올리고, Manifest의 실패 handler가 `return [ ... ]` 로 **새 리스트**를 돌려줬다.
+
+그 둘은 우연히 같이 생기는 것이 아니라 **같은 사고가 같이 남기는 것**이다. 쓰다가
+죽은 Runner는 안 풀린 lock과 반쯤 쓰인 manifest를 동시에 남긴다. 그리고 그때 지워진
+경보는 코드 자신이 "다른 무엇도 볼 수 없다"고 적어 둔 그 경보다:
+
+    "try_acquire_lock()는 이것을 평범한 경합으로 보고한다. Runner는 그 뒤로
+     예약대로 계속 건너뛰고, 자동 신호는 전부 정상으로 읽힌다 (BUG-42 / F-1)."
+
+실측(48시간 된 lock, 보유 프로세스는 실제로 살아 있음):
+
+    정상 manifest   Runner Lock이 48.0시간째 잡혀 있다   (+ 1건)
+    손상 manifest   (그것뿐) Run Manifest를 읽을 수 없다
+
+`return attention + [ ... ]` — 한 줄.
+
+#### (c) `_print_agent()` — E-9b의 유일한 탐지기가 환경변수 하나로 꺼져 있었다
+
+`COMPANY_OPS_AGENT_SYNC_FOLDER`가 없으면 전달 정합성 검사가 돌지 않는다. 그
+사실은 보고서 **본문**에 한 줄 인쇄되고 ATTENTION에는 아무것도 올라가지 않았다 —
+같은 파일이 다른 두 "확인 못 함"(Local Master 나열 실패, backup 원격 secret 검사)
+은 *"이것은 '없음'이 아니라 '확인 못 함'이다"* 라며 ATTENTION에 올리면서.
+
+여기가 더 중요한 이유는 이 검사가 **이미 측정된 무성 유실**(E-9b)의 유일한
+탐지기이기 때문이다 — sync 폴더 파일은 0바이트인데 `sent/`에 기록되고, watermark가
+넘어가고, exit 0, 경고 없음.
+
+`sent_count`가 0보다 클 때만 올린다. 한 번도 전달한 적 없는 Desktop에는 검증할
+것이 없고, 거기서 울리는 경보는 C26이 경계하는 상시 경보다. **이 저장소의 실제
+트리에서 즉시 발화했다** — Event 4건이 전송 완료로 기록돼 있고 그중 무엇이
+도착했는지 이 머신은 말할 수 없다.
+
+### 4. Backup — 초록으로 덮이던 실패 하나 더
+
+`AFailedBackupIsNotQuietlyDowngradedToNotRequiredTests`가 `BACKUP_FAILED`에 대해
+닫아 둔 구멍의 나머지다. 그 클래스는 이유를 한 문장으로 적어 뒀다 — *"질문을 state
+파일이 아니라 git에게 던진다"* — 그런데 코드는 **git에게 물을지 말지를 state
+파일에게 물었다**(`if state.backup_status is FAILED`). 그래서 state가 FAILED가
+**아닌** 채로 미push commit을 들고 있는 모든 경우가 그대로 남아 있었다.
+
+그중 실제로 생기는 것이 `backup_status`가 **없는** state다: 파일 유실(runtime/은
+.gitignore된다), 사람이 손으로 고친 경우(docs/10 §46이 예상하고,
+`controltower/attention.py`의 복구 안내가 정확히 그것을 시킨다), 부분 복원.
+
+실측(실 git, 실 로컬 bare remote):
+
+    1) 정상                              BACKUP_SUCCESS,       미push 0
+    2) remote 파손 + 새 Daily            raises, PENDING,      미push 1
+    3) 변경 없음 + backup_status 없음    **BACKUP_NOT_REQUIRED**, 미push 1
+
+3번이 결함이다. remote에 없는 Company History를 들고 초록을 보고하고, `save_state`가
+NOT_REQUIRED를 써서 그 상태로 굳힌다.
+
+수정 후 3번은 `BACKUP_FAILED` + `remote에 도달하지 않은 commit 1건`이고 state는
+건드리지 않는다. **push를 다시 하지는 않는다**(docs/08 §62).
+
+**`None`은 넓히지 않았다.** `count_unpushed_commits()`는 upstream이 없으면 `None`을
+돌려주고, 그것은 갓 만든 Working Copy의 영구 상태다. 거기서 매 실행 FAILED를 울리면
+그것이야말로 상시 경보다. 0보다 큰 **수**는 어떤 state에서도 모호하지 않고, 넓힌
+것은 그것뿐이다.
+
+### 5. 재현했지만 고치지 않은 것 — 승인 대상
+
+**손상된 `notion_retry_queue.json`이 Company History와 Backup을 멈춘다.**
+
+    실 runner, 수집 가능한 Event 1건, 절대 실패하지 않는 Notion double
+
+                       정상 큐             손상 큐
+    run_once()         SUCCESS, exit 0     raises RetryQueueError
+    daily history      2건                 **0건**
+    backup             실행됨              **시작도 안 함**
+    기록된 component   9                   3 (notion_sync STEP_ABORTED)
+
+`load_retry_queue()`가 어떤 guard 밖에 있다. CRITICAL 단계 둘 — Company History를
+쓰는 단계와 그것을 이 머신 밖으로 내보내는 단계 — 이 README RULE 5가 History
+critical path **밖**에 둔 통합의 로컬 캐시 파일 때문에 멈추고, 파일을 고치는 실행이
+없으므로 다음 실행도 같은 자리에서 멈춘다. `drain_pending()`은 Dashboard의 동일한
+큐에 대해 정반대를 택하고 그 이유를 적어 두었다.
+
+**고쳤다가 되돌렸다.** `test_corrupt_retry_queue_raises_the_notion_specific_error`의
+docstring이 이것을 이미 결정 대기로 적어 두고 있다: *"Making the Runner absorb it
+was 병목 #3 B안, which was not approved."* 구현으로 결정하지 않는다.
+
+대신 **대가를 그 테스트에 고정했다** — 그 docstring은 열린 결정을 적었지만 값을
+적지 않았다. 이제 Daily가 쓰이지 않는다는 것과 Backup이 시작되지 않는다는 것을
+assert한다. B안(또는 다른 답)이 승인되면 바뀌는 것이 그 두 줄이다.
+
+### 6. 결함 없음으로 확인한 것
+
+* **손상된 증거 전부를 한 트리에** — state 파일 7종을 각각 다른 방식으로 망가뜨리고,
+  Daily 자리에 디렉터리를 두고, 읽을 수 없는 Event/Candidate/Manifest를 넣고 구동:
+  블록 8개 전부 인쇄, exit 3, **ATTENTION 17줄 중 분류 불가 0 · remedy 없는 줄 0**.
+  (수정 전 같은 트리는 14줄이었다 — 셋이 §3(a)에 삼켜지고 있었다.)
+* **대소문자만 다른 event_id** — Windows에서 `EVT-a`가 `EVT-A`를 막는다. 유실은
+  아니다(파일은 `transport/`에 남는다) 그리고 이미 탐지된다. 이번에 그 줄이
+  `?`에서 P1 + remedy가 됐다.
+* **`agent/status.py::needs_attention()` 8개 분기 전부** — 실제 함수를 구동해
+  8줄 전부 분류·remedy 있음.
+* **env 변수 표류 없음** — 코드가 읽는 4개, `.env.example`이 선언하는 8개, 나머지
+  4개는 이름 상수/`NotionConfig`를 통해 읽힌다. 어느 쪽에도 없는 것 0.
+* **성능** — `ops_status.py` 2.2s. 그중 1.83s가 `schedtask.query()`의 PowerShell
+  기동이고 그 비용은 모듈 docstring이 이미 근거와 함께 적어 둔 선택이다. 나머지
+  전부(파일 스캔·rollup·정합성 검사)가 0.09s. 손대지 않았다.
+* **Dashboard 동시 요청** — `gather()`는 **프로세스 전역**인 `sys.stdout`을
+  가로채고 `ThreadingHTTPServer`는 요청마다 스레드를 만든다. 실제 서버에 동시
+  요청 8건(그리고 HTML/JSON 섞어서 8건)을 넣었다: 전부 200, **본문 크기가 전부
+  동일(80,498 bytes)**, 응답 간 유일한 차이는 "생성 ms" 한 숫자. JSON에 HTML이
+  섞이지도, 그 반대도 없다. `_CAPTURE_LOCK`이 실제로 버틴다.
+* **존재 gate 423건** — 순서 gate(§9)와 같은 질문을 존재 gate에 던졌다.
+  production 파일을 CODE와 PROSE(주석 + docstring만; 문자열 리터럴은 코드가 든
+  **데이터**다)로 가르고, 테스트가 소스에 대해 `assertIn`하는 리터럴 423개를
+  대조했다. 주석/docstring만으로 만족되는 gate **0건** — 남은 5건은 전부 docstring
+  자체를 검사하는 테스트이거나 대상이 테스트 파일인 오탐이다. §9의 결함은 순서
+  gate에만 있었다.
+
+
+### 7. 같은 질문을 세 entrypoint에 더 던졌다 — 답이 없는 자리 둘
+
+§3의 질문("검사가 실패하면 다른 검사까지 죽는가")을 **응답 경로**로 옮겼다:
+실패했을 때 사람에게 **무엇이 도착하는가**.
+
+#### (a) `dashboard_server.py` — 렌더가 실패하면 브라우저가 아무것도 못 받았다
+
+`do_GET()`은 `gather()`를 try로 감싸 500과 traceback으로 답한다 — 이 파일이
+한 화면 위에서 스스로 적어 둔 자세다(*"reported on the page, never
+swallowed"*). `render_html()`과 `json.dumps()`는 **그 try 밖**에 있었다.
+
+실측(실제 서버, 실제 소켓, `render_html`을 강제로 raise):
+
+    gather() raises        HTTP/1.0 500, 1,007 bytes, 원인을 말한다
+    render_html() raises   **상태 줄 없음, 0 bytes**
+    같은 요청 /api/dashboard.json   HTTP/1.0 200
+
+읽을 수 있는 데이터를 들고 **돌고 있는** 서버가 브라우저에는 "사이트에 연결할
+수 없음"으로 보이고, 유일한 설명은 stderr로 갔다 — 예약 실행되는 배포가 버리는
+그 stderr다(C138 측정). `render_html()`은 신뢰할 수 없는 Event 내용을 포맷하는
+곳이므로(이 프로젝트가 예상 못 한 타입을 반복해서 발견해 온 자리다) 남겨 둘
+자리가 아니다.
+
+셋을 한 try로 합쳤다. `_send()`는 밖에 남는다 — 클라이언트가 끊어서 실패한
+쓰기는 렌더 실패가 아니고, 죽은 소켓에 두 번째 `_send()`를 하는 것이 더 나쁘다.
+**자연 발생 입력은 찾지 못했다**(§9 참조) — 주입으로 재현했고, 저자가 이미
+`gather()`에 대해 내린 결정을 나머지 절반에 적용한 것이다.
+
+#### (b) `run_agent.py` — 시작한 뒤 죽은 실행이 "설정 오류"로 보고됐다
+
+docs/14 §4가 못박는다: *"`1`은 **설정 오류** 전용이다(실행이 시작조차 못 한
+경우)."* Python이 새어나간 예외에 대해 주는 기본값이 **1**이다.
+
+`agent.run_once()`의 docstring은 *"모든 운영 실패는 raise가 아니라 return"*
+이라고 하고 예외로 손상된 state 파일 하나만 든다. `save_state()`는 그 함수의
+날짜 루프 **안**에서 호출되고 그 문장 밖에 있다 — 그리고 Windows에서 그 쓰기는
+평범한 이유로 실패한다(백신·동기화 클라이언트가 잡고 있는 파일, 디스크 가득,
+읽기 전용 복원).
+
+실측(실제 프로세스, 수집 가능한 날짜 1건, `save_state()`를 `PermissionError`로):
+
+    exit code    1          <- "설정 오류"
+    stdout       (없음)     <- 날짜별 결과도, watermark 줄도 안 나온다
+    stderr       raw traceback 16줄
+    sync 폴더    Event      <- 만들어져서 **전달됐다**
+    sent/        Event
+
+일이 Desktop 4에 도착했는데 운영자는 `COMPANY_OPS_PROFILE`을 확인하라는 —
+이미 올바른 변수에 대한 — 안내를 받는다. `AgentStateError` 팔이 없애려고
+추가됐던 바로 그 오귀속이 세 번째 문으로 들어온 것이고, `run_company_ops.py`는
+자기 몫의 같은 문제를 이미 고치고 이유까지 적어 두었다.
+
+catch-all을 추가해 **2**를 반환한다. 새 의미가 아니다 — 이 파일 헤더가 이미
+2를 그렇게 정의하고 있고, docs/14 §4의 `1` 전용 규칙에 **맞춘** 것이다.
+traceback은 그대로 인쇄한다(파일과 줄을 대는 것이 그것뿐이다).
+
+**헤더와 AGENT.md §6도 고쳤다.** 둘 다 2를 "outbox가 일을 들고 있다"로 적고
+있었는데, 이제 일이 어디 있는지는 어디까지 갔는지에 달렸다(`signals/` /
+`outbox/` / `sent/`). 실제로 보장되는 것은 **수집 날짜가 전진하지 않는다**는
+쪽이고, 그것이 "다음 실행이 같은 날짜부터"를 참으로 만든다. `run_agent.py`의
+FAILED 경로 주석이 이미 같은 부정확함을 지적하고 인쇄 문구를 고쳐 두었는데
+헤더는 남아 있었다.
+
+### 8. 억지로 고치지 않은 것 — `publish_control_tower.py`
+
+같은 질문을 세 번째 예약 도구에 던졌다. `main()`은 `NotionConfigError` /
+`NotionAPIError` / `ControlTowerPageError`를 처리하고, `dashboard_server.gather()`
+호출 하나가 guard 밖에 있다. **그런데 실패를 만들지 못했다.**
+
+    모든 state 파일 손상        gather ok · render 47KB · json 17KB
+    적대적 Event 내용            gather ok · render 59KB · json 456KB
+    완전히 빈 트리               gather ok
+    runtime 디렉터리가 아예 없음  gather ok
+
+네트워크 쪽도 이미 닫혀 있다 — `RealNotionTransport`는 `HTTPError`/`URLError`/
+`TimeoutError`/`OSError`/비-JSON 본문/`RecursionError`를 전부 `NotionAPIError`로
+바꾼다. 실증된 실패가 없으므로 **No change warranted.** guard를 하나 더 얹는 것은
+이 파일이 경계하는 "문제 대신 감시만 추가"다.
+
+### 9. Test Audit — 지워진 호출 위에서도 통과하는 gate 셋
+
+`assertLess(source.index("A("), source.index("B("))` 꼴의 순서 gate를 전수로
+뽑았다(21건). 대부분은 산출물이나 주석이 제거된 `code`를 인덱싱한다. Python
+소스를 **날것으로** 인덱싱하는 것이 셋 있었다.
+
+`app.runner.run_once()`에 대고 재 봤다 — 단계마다 그 단계의 호출 이름을 주석이
+설명하므로, **아홉 개 중 다섯 개의 첫 등장이 주석이다:**
+
+    monthly_run_once(      raw 49675 (주석)   code 16068
+    mark_month_dirty(      raw 50639 (주석)   code 15857
+    update_daily_history(  raw 43408 (주석)   code 13557
+    drain_pending(         raw 63697 (주석)   code 21727
+    dashboard_record_run(  raw 63713 (주석)   code 22304
+
+즉 그 gate들은 문장의 위치를 재고 있었다. 그리고 그것은 fragile한 정도가 아니라
+**중요한 방향으로 vacuous**하다. 진짜 `monthly_run_once()` 호출을 지우고 그것을
+설명하는 주석만 남겨 두고 재 봤다:
+
+    raw  source.index(...)가 주석을 계속 찾는다   -> 단언 **통과**
+    AST  호출이 없다                              -> 단언 실패
+
+지키는 호출이 지워진 뒤에도 계속 통과하는 gate는 없는 것만 못하다.
+
+고친 방법은 이 파일 자신에게서 가져왔다: `_calls_mkstemp()`가 다른 질문에 대해
+같은 이유를 이미 적어 두었다 — *"a docstring naming the idiom is
+indistinguishable from a call to it"*. `_first_call_line()`을 그 옆에 두고 셋을
+전부 파서에게 묻게 했다. `MonthlyBoundaryInvariantTests`의 한 테스트는 이미
+`#` 줄을 손으로 걸러 내고 있었는데(같은 클래스 안에서 형제와 불일치), 그 손질도
+같은 helper로 대체했다 — 주석 제거는 여전히 문자열/docstring 안의 이름을 놓친다.
+
+실측 검증: 실제 호출을 지운 `runner.py` 사본에 대고 새 gate 2건이 실패한다.
+
+### 10. 성능 — 재고 고치지 않았다
+
+Control Tower 페이지에는 숫자가 없었다(ops_status만 있었다). Event 수를 늘리며:
+
+    events   gather    render    json     page
+        16   1.360s    0.002s   0.000s    75KB
+       500   1.741s    0.003s   0.001s   116KB
+     2000    3.409s    0.003s   0.001s   109KB
+     5000    6.836s    0.002s   0.001s   109KB
+
+`render_html()`과 `json.dumps()`는 사실상 공짜이고 **페이지 크기가 Event 수와
+무관하게 ~110KB로 묶여 있다** — folding/cap이 하는 일이다. 비용은 전부
+`gather()`이고, 바닥의 1.3초는 `schedtask.query()`의 PowerShell 기동(그 모듈이
+근거와 함께 이미 선택으로 적어 둔 비용), 그 위는 Event당 약 1.1ms로 **선형**이다.
+
+캐시는 넣지 않는다. 이 서버는 스스로 `Cache-Control: no-store`를 보내며 그
+이유를 적어 두었다 — *"이 페이지는 한 순간의 스냅샷이다. 캐시된 것은 어제를
+보여주는 Control Tower이고, 그건 아무것도 안 보여주는 것보다 나쁘다."* 현재
+배포 규모(Event 16건)에서 1.4초이고, 그중 1.3초가 의도된 선택이다.
+**최적화하지 않는다.**
+
+### 11. 승인이 필요해 하지 않은 것
+
+보안 줄 6개의 severity 정책(C144 §3 유지), 병목 #3 B안(위 §5), E-9의 남은 두
+갈래(0바이트·다른 내용 — 실제 OneDrive 동작 근거 없이 0바이트를 실패 처리하면
+Event가 outbox에 영구히 남아 수집 날짜가 영원히 전진하지 못한다), 실제
+Notion/OneDrive/Task Scheduler 왕복, 실제 git push.
 
 ---
 

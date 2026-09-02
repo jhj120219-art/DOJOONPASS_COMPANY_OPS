@@ -654,8 +654,12 @@ Get-Content runtime\logs\daily_late_update.log        # Desktop 4: 늦게 도착
 Get-Content runtime\logs\scheduled_agent.log -Tail 30 # 예약 실행이 화면에 찍은 것
 ```
 
-`run_agent.py` 종료 코드: `0` 정상/skip, `1` 설정 오류, `2` 전송 실패(유실
-아님 — outbox에 남아 있고 다음 실행에서 같은 날짜부터 재시도).
+`run_agent.py` 종료 코드: `0` 정상/skip, `1` 설정 오류(**아무것도 실행되지
+않았다** — 환경변수를 고친다), `2` 실행은 시작됐고 중간에 실패(유실 아님 —
+다음 실행이 같은 날짜부터 재시도한다). `2`일 때 일이 어디에 있는지는 어디까지
+갔는지에 달렸다: Event를 만들기 전이면 `signals/`, 만들고 못 보냈으면
+`outbox/`, 보낸 뒤 죽었으면 `sent/`. **어느 경우에도 수집 날짜는 전진하지
+않는다** — 그래서 다시 실행하면 같은 날짜부터 이어진다.
 
 ### 6a. Desktop 4 로그에서 실패를 찾는 법
 
