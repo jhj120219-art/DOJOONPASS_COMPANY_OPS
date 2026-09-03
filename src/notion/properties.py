@@ -217,8 +217,29 @@ def _type_specific_properties(event: Event) -> dict[str, Any]:
         # Blocker를 지운다.
         if event.status != "BLOCKED":
             properties["Blocker"] = _rich_text("")
+    # ASSIGNED(§18.1)도 추가 Property가 없다. 누가 맡았는지는 Event의
+    # `role`이고, docs/02 §8이 source→role을 고정하므로 그 값은 **실제로 그
+    # 일을 받은 팀**이다 — 다른 팀이 대신 주장하면 PairMismatch로 잡힌다.
+    #
+    # **다만 그 role이 PROJECTS Row의 `Owner`를 바꾸지는 않는다.** `Owner`는
+    # `build_create_properties()`에만 있고 §9-12에 따라 최초 생성 시점 정보다
+    # (바로 아래 `build_update_properties()`의 주석이 그 근거를 적는다).
+    # 그러므로 담당 이동은 Control Tower의 `OpenItem.assigned_team`이 나르고,
+    # Notion Row의 Owner를 매번 덮어쓰는 것은 spec 변경이며 하지 않았다.
+    #
     # STARTED(§21), CANCELLED(§26), DECISION_APPROVED(§28)는 공통 필드
     # (Status/Last Updated/Last Event ID/Last Event Type) 외 추가 Property가 없다.
+    #
+    # C149가 더한 넷도 같다. `AT_RISK`는 CANCELLED와 같은 자리에 선다 — 자기
+    # `status`를 고정하는 것이 전부이고(그 값은 위 공통 필드의 `Status`가 이미
+    # 쓴다), 위험의 내용은 `summary`에 있다. `ISSUE_RAISED`는 **Blocker를 쓰지
+    # 않는다**: 제기된 Issue가 곧 프로젝트를 멈춘 것은 아니고, 멈췄다면 그것을
+    # 말하는 Event는 §22의 `BLOCKED`다. 여기서 Blocker를 쓰면 두 Event Type이
+    # 같은 사실을 주장하게 되고, §27이 ISSUE_RESOLVED에 대해 피한 바로 그
+    # 겹침이 된다. `DECISION_REQUIRED` / `DECISION_REJECTED`는 §28의
+    # DECISION_APPROVED와 대칭이므로 추가 Property가 없다. `EXECUTED`도 같다 —
+    # 승인된 Decision이 실제로 실행됐다는 사실이며, 그 자체로 Project의
+    # 상태를 바꾸지 않는다(바꿨다면 그것을 말하는 Event가 따로 있다).
 
     return properties
 

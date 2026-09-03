@@ -296,7 +296,8 @@ PANEL_PROJECTIONS: dict[str, PanelProjection] = {
         database="CT_RISKS",
         title="Risk / Blocker",
         # No key column: a RISKS row key is `BLOCKER:<project>` /
-        # `MISMATCH:<event>` / `CONFLICT:<event>`, a composite no single
+        # `MISMATCH:<event>` / `CONFLICT:<event>` / `AT_RISK:<project>` /
+        # `ISSUE:<project>` / `DECISION:<project>`, a composite no single
         # column carries. `Row Key` holds it and `Kind` holds the half that
         # is a vocabulary.
         key_column=None,
@@ -305,6 +306,11 @@ PANEL_PROJECTIONS: dict[str, PanelProjection] = {
             "project_id": ("Project ID", PropertyType.RICH_TEXT),
             "team": ("Team", PropertyType.SELECT),
             "blocker": ("Blocker", PropertyType.RICH_TEXT),
+            # C149. A separate property from `Blocker` for the reason the
+            # column is separate: the two carry different claims, and a
+            # pending Decision's own words filed under "Blocker" would say
+            # the project is stopped when it is not.
+            "detail": ("Detail", PropertyType.RICH_TEXT),
             "since": ("Since", PropertyType.DATE),
             "days_open": ("Days Open", PropertyType.NUMBER),
             "event_id": ("Event ID", PropertyType.RICH_TEXT),
@@ -365,6 +371,20 @@ UNPROJECTED_PANELS: dict[str, str] = {
     "COMPLETIONS": (
         "ACTIVITY와 같은 이유 — 같은 행을 다른 기준으로 고른 것이므로 같은 "
         "무한 성장을 한다."
+    ),
+    "ROLE_KPI": (
+        "METRICS를 역할별로 다시 읽은 것이다 — 계산된 값은 전부 CT_METRICS에 "
+        "이미 있는 같은 수이고 같은 증거를 든다. Database를 하나 더 만들면 "
+        "같은 수가 Notion 안에서 두 곳에 살고, 둘이 어긋나는 날 어느 쪽이 "
+        "맞는지 말해 줄 것이 없다. 계산할 수 없는 KPI(DATA REQUIRED)는 행이 "
+        "아니라 문장이며, notion_page.py가 사람이 읽는 페이지에 싣는다."
+    ),
+    "CODE_CHANGES": (
+        "ACTIVITY와 같은 무한 성장 — commit 1건당 행 하나다. 게다가 이것은 "
+        "Event가 아니라 git의 사실이고, 원본은 저장소 자체이므로 Notion에 "
+        "복사본을 두는 것은 View가 Source를 흉내 내는 것이다(docs/14 §1). "
+        "요약(commit 수·바뀐 파일 수·작성자 수)은 사람이 읽는 페이지에 "
+        "문장으로 실린다."
     ),
 }
 

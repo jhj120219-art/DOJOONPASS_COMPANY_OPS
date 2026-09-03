@@ -128,11 +128,27 @@ MAX_TABLE_ROWS = 20
 #: can show; picking here rather than rendering all of them keeps the table
 #: readable, and `_panel_table()` states the ones it left out.
 PANEL_LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("RISKS", ("kind", "project_id", "team", "blocker", "days_open")),
+    # `detail` joined in C149, and leaving it out was a measured mistake
+    # rather than a hypothetical one: this layout selects five of thirteen
+    # columns, and the three risk kinds added in the same change put their
+    # entire content in `detail`. A `PENDING_DECISION` row rendered without
+    # it says "GROWTH · CMO · 7일" and never says **what** decision — on the
+    # one surface this company's non-developers read, and for the row a CEO
+    # is most likely to act on. `_panel_table()` does announce the dropped
+    # columns in a line underneath, which turns an invisible loss into a
+    # visible one and is not the same as showing the value.
+    ("RISKS", ("kind", "project_id", "team", "blocker", "detail", "days_open")),
     ("PROJECTS", ("project_id", "state", "blocker", "days_blocked", "days_idle", "last_seen")),
     ("TEAMS", ("display_name", "events", "projects", "blocked_project_count", "last_seen")),
     ("DESKTOPS", ("source", "display_name", "events", "last_seen", "days_silent")),
     ("METRICS", ("label", "value", "evidence_count")),
+    # `requires` is on the layout and it is the widest column here on
+    # purpose: for twenty-two of the twenty-nine KPIs it is the entire
+    # content of the row. A KPI table that showed only 지표 / 값 would print
+    # `DATA REQUIRED` twenty-two times and tell a reader nothing about what
+    # would have to exist to change that (C149).
+    ("ROLE_KPI", ("label", "reading", "requires")),
+    ("CODE_CHANGES", ("at", "author", "subject", "files")),
     ("ACTIVITY", ("at", "source", "team", "project_id", "event_type", "summary")),
     ("COMPLETIONS", ("at", "source", "team", "project_id", "event_type", "summary")),
 )
@@ -554,11 +570,28 @@ def build_control_tower_blocks(
         # "할 일 없음"과 "셀 것이 없음"은 다르다. An empty corpus with an
         # empty ATTENTION list is not a healthy company; it is a company
         # nobody has evidence about, and the green callout said the first.
+        #
+        # **And when git has something, this page can say which of the two
+        # it is.** That is the whole reason `CODE_CHANGES` exists, and this
+        # is the one line on the page where it pays: Events 0 with commits
+        # on the same days is not a quiet company, it is delivery that did
+        # not arrive — the failure that has no signal anywhere else.
+        #
+        # Measured on the live tree with a one-day window (2026-09-02):
+        # `events_read: 0`, `CODE_CHANGES rows=1`, one commit touching 21
+        # files. Before this branch the page said only "셀 Event가 없다".
         tone = "warn"
         headline = (
             "셀 Event가 없다 — '문제 없음'이 아니라 '판단할 증거가 없다'. "
             "수집된 Event가 하나도 없어 아래 숫자는 전부 0이다."
         )
+        code_rows = len((panels.get("CODE_CHANGES") or {}).get("rows") or [])
+        if code_rows:
+            headline += (
+                f" **그런데 같은 기간 Git에는 commit이 {code_rows}건 있다** — "
+                "일이 없었던 것이 아니라 보고가 도착하지 않았을 가능성이 크다. "
+                "⑤의 Git 표와 Desktop별 보고 현황을 함께 본다."
+            )
     else:
         tone = "ok"
         headline = (
@@ -786,6 +819,84 @@ def build_control_tower_blocks(
                 }
             )
 
+    # --------------------------------------------- ③b role KPI (C149)
+    #
+    # Inside ③ rather than as a section of its own, and that is the whole
+    # design: ③ *is* the KPI section, and a fourth heading would have put
+    # "the numbers" and "the KPIs" in two places on a page whose stated job
+    # is to be read in ten seconds.
+    #
+    # Three toggles, one per officer, closed by default. The five callouts
+    # above are what everyone reads; this is what each of the three opens
+    # when the answer they need is not in those five.
+    #
+    # The tally callout is computed **here**, from the rows, and not carried
+    # on the panel: `_role_kpi_panel()`'s note deliberately has no count in
+    # it, because panel metadata is the one thing `to_payload()` never
+    # redacts and a note whose text moves with the evidence would break that
+    # claim. Counting rows is the renderer's job.
+    role_kpi = panels.get("ROLE_KPI")
+    if role_kpi is None:
+        warnings.append("panel ROLE_KPI missing from the model")
+    else:
+        kpi_rows = list(role_kpi.get("rows") or [])
+        measurable = sum(
+            1 for row in kpi_rows if (row.get("values") or {}).get("measured")
+        )
+        blocks.append(
+            _callout(
+                f"역할별 KPI {len(kpi_rows)}개 중 {measurable}개만 이 시스템이 "
+                "계산할 수 있다. 나머지는 값 대신 DATA REQUIRED를 싣고, 무엇이 "
+                "있어야 답할 수 있는지 각 행에 적는다 — 추정치를 넣지 않는다. "
+                "이것은 결함이 아니라 이 시스템이 실행을 재고 사업을 재지 "
+                "않는다는 사실이다.",
+                "⚪",
+                "gray_background",
+            )
+        )
+        for role, title in (
+            ("CEO", "CEO 관점 — 회사가 어떻게 되고 있는가"),
+            ("CTO", "CTO 관점 — 개발이 어떻게 흐르고 있는가"),
+            ("COO", "COO 관점 — 무엇이 막혀 있고 무엇을 기다리는가"),
+        ):
+            subset = [
+                row
+                for row in kpi_rows
+                if (row.get("values") or {}).get("role") == role
+            ]
+            if not subset:
+                # Present-and-empty rather than absent, the distinction
+                # `daily/role_summary.py` argues for: a missing toggle and a
+                # role with no KPIs look identical, and only one is fine.
+                blocks.append(
+                    _toggle_heading(
+                        title,
+                        [
+                            _callout(
+                                f"{role} KPI가 모델에 없다 — 이 페이지가 만든 "
+                                "빈 칸이 아니라 읽지 못한 것이다.",
+                                "🟡",
+                                "yellow_background",
+                            )
+                        ],
+                    )
+                )
+                continue
+            role_blocks, role_warnings = _panel_table(
+                payload,
+                # A view of the panel narrowed to one role. `_panel_table()`
+                # is handed the same shape it always gets rather than being
+                # taught about roles: it is the one place that decides how a
+                # panel becomes a table, and a second table builder here
+                # would be the second opinion this module avoids everywhere
+                # else.
+                {**role_kpi, "rows": subset},
+                layout["ROLE_KPI"],
+                heading=None,
+            )
+            warnings.extend(role_warnings)
+            blocks.append(_toggle_heading(title, role_blocks))
+
     # ================================================== (4) PROJECTS
     blocks.append(_heading("④ Project", 2))
     projects = panels.get("PROJECTS")
@@ -839,6 +950,34 @@ def build_control_tower_blocks(
         )
         blocks.extend(panel_blocks)
         warnings.extend(panel_warnings)
+
+    # --------------------------------------------- ⑤b D+1 git changes (C149)
+    #
+    # Inside ⑤ for ③b's reason: this section *is* "최근 변화", and git is the
+    # other record of the same days. Above the toggle is the sentence that
+    # matters — a count, or the fact that git could not be asked — because
+    # the point of the whole panel is what happens on a day nobody reported
+    # an Event: every table above reads that day as quiet, and this one does
+    # not.
+    code = panels.get("CODE_CHANGES")
+    if code is None:
+        warnings.append("panel CODE_CHANGES missing from the model")
+    else:
+        blocks.append(
+            _paragraph(
+                # The window is in `note` and always printed, because this
+                # panel covers whatever period the page was asked for — see
+                # `_code_changes_panel()` on why it is not called "D+1".
+                "Git 기준 변경: " + _fmt(code.get("note"))
+                + " — 위 표는 사람이 **보고한** 것이고, 이것은 저장소에 "
+                "**실제로 기록된** 것이다. 둘이 어긋나면 어긋난 것 자체가 사실이다."
+            )
+        )
+        code_blocks, code_warnings = _panel_table(
+            payload, code, layout["CODE_CHANGES"], heading=None
+        )
+        warnings.extend(code_warnings)
+        blocks.append(_toggle_heading("Commit 목록", code_blocks))
 
     # ================================================== (6) DETAILS
     #

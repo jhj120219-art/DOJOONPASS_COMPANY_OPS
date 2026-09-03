@@ -94,6 +94,11 @@ from typing import Any, Mapping
 from businessdate import business_date
 from oplog import bounded, one_line, redact
 
+from delivery import GitActivity
+from notion.properties import ROLE_DISPLAY_NAMES
+
+from .kpi import ROLES as KPI_ROLES
+from .kpi import build_kpi_set
 from .rollup import (
     RECENT_LIMIT,
     UNSOURCED_LAYERS,
@@ -132,9 +137,19 @@ from .rollup import (
 # defect being fixed rather than a contract break: no reader was entitled to
 # the old answer, because no reader could tell it apart from a checked one.
 #
+# 1.3 adds two panels (`ROLE_KPI`, `CODE_CHANGES`) and their columns.
+# Additive — a 1.2 reader finds every panel and every column it knew, and
+# `project_panels()` skips a panel key it has no projection for — so MINOR.
+#
+# The panel *order* changes, which is a shape change and is why the number
+# moves at all: both new panels sit next to the ones they extend rather than
+# at the end (`ROLE_KPI` beside `METRICS`, `CODE_CHANGES` beside it), because
+# the order is what a person reads down and appending to the tail would put
+# the KPI section below the Event feed.
+#
 # Same role as `runsummary.SCHEMA_VERSION`: the payload is read by something
 # that was written against a version of it.
-DASHBOARD_SCHEMA_VERSION = "1.2"
+DASHBOARD_SCHEMA_VERSION = "1.3"
 
 # How many `EvidenceRef`s one payload row carries. The model keeps every one
 # of them; this bounds only what leaves the machine.
@@ -598,17 +613,30 @@ _JUDGEMENT_NOTE = (
 )
 
 
-def build_dashboard(rollup: CompanyRollup, *, now: datetime) -> DashboardModel:
+def build_dashboard(
+    rollup: CompanyRollup,
+    *,
+    now: datetime,
+    activity: GitActivity | None = None,
+) -> DashboardModel:
     """Arrange one `CompanyRollup` into the Control Tower's panels.
 
     `now` is the instant every age in the model is measured against, and is
     the caller's rather than this function's — see `DashboardModel`.
+
+    `activity` is the git side of the D+1 report (C149). Optional, and its
+    absence is *rendered* rather than hidden: `_code_changes_panel()` says
+    "nobody asked git", which is a different sentence from "git says nothing
+    changed" and from "git could not be read". A caller that does not have
+    it loses one panel's rows, not the dashboard.
     """
     return DashboardModel(
         generated_at=now.isoformat(),
         panels=(
             _goals_panel(),
             _metrics_panel(rollup),
+            _role_kpi_panel(rollup, now, activity),
+            _code_changes_panel(activity),
             _teams_panel(rollup),
             _projects_panel(rollup, now),
             _sprints_panel(),
@@ -650,12 +678,23 @@ def _evidence_day(iso: str | None) -> date_type | None:
         return None
 
 
-def _coverage(rollup: CompanyRollup) -> Coverage:
-    """The evidence range, off the projects the rollup already folded.
+def evidence_window(rollup: CompanyRollup) -> tuple[date_type | None, date_type | None]:
+    """`(first day, last day)` the rollup's evidence actually covers.
 
     Every Event belongs to exactly one `project_id`, so the earliest and
     latest project timestamps are the earliest and latest Event — no second
     pass over the Events for a number the fold already has.
+
+    Public because two things need it, and the second one arrived in C149:
+    `_coverage()` puts it on the model, and `dashboard_server` needs it to
+    ask git about **the same days the panels cover**. A caller computing its
+    own min/max would be a second opinion about which day the evidence
+    starts, and the two disagreeing would put the git half of the D+1 report
+    on a different day from the Event half — the one defect that report
+    cannot survive, because its whole value is that the two are comparable.
+
+    `(None, None)` for a rollup with no projects: there is no window, which
+    is a different thing from an empty one.
     """
     days = [
         day
@@ -666,9 +705,17 @@ def _coverage(rollup: CompanyRollup) -> Coverage:
         )
         if day is not None
     ]
+    if not days:
+        return None, None
+    return min(days), max(days)
+
+
+def _coverage(rollup: CompanyRollup) -> Coverage:
+    """The evidence range and what qualifies it, for the model's header."""
+    first, last = evidence_window(rollup)
     return Coverage(
-        evidence_from=min(days).isoformat() if days else None,
-        evidence_to=max(days).isoformat() if days else None,
+        evidence_from=first.isoformat() if first is not None else None,
+        evidence_to=last.isoformat() if last is not None else None,
         unreadable=len(rollup.unreadable),
         duplicates=len(rollup.duplicates),
     )
@@ -738,6 +785,205 @@ def _metrics_panel(rollup: CompanyRollup) -> DashboardPanel:
         rows=rows,
         source="rollup.Metric — 전부 증거에 대한 count이며 각자 세어진 파일을 들고 있다",
         note="target은 없다. target은 Goal이고 Goal은 원천이 없다 (COMPANY_GOALS 참조).",
+    )
+
+
+_ROLE_KPI_COLUMNS = (
+    "role",
+    "key",
+    "label",
+    "definition",
+    "measured",
+    # `reading`, not `value`, and the name is load-bearing. `value` is a
+    # numeric column across this model — `ThePayloadIsJsonAndDeterministic
+    # Tests.test_numbers_stay_numbers` asserts every `value` in every panel
+    # is an `int`, because a projection writes it into a Notion `number`
+    # property and a stringified count fails at the API rather than in a
+    # test. This column is a *rendering* that is deliberately sometimes the
+    # words `DATA REQUIRED`, so it must not claim that contract's name. The
+    # number itself is already in `METRICS` for every measured KPI, cited to
+    # the same files.
+    "reading",
+    "chain",
+    "derived_from",
+    "requires",
+    "evidence_count",
+)
+
+
+def _role_kpi_panel(
+    rollup: CompanyRollup, now: datetime, activity: GitActivity | None
+) -> DashboardPanel:
+    """① CEO / CTO / COO KPI — measured where possible, refused out loud.
+
+    A second KPI panel beside `METRICS`, and the two are not duplicates.
+    `METRICS` is the count layer: nine numbers with no owner, which is the
+    right shape for evidence and the wrong shape for a person. This is the
+    *role* layer — the standard KPI set each of the three officers would be
+    asked about anywhere else — and most of it this system cannot answer.
+
+    Nothing here is recomputed. `kpi.build_kpi_set()` reads `METRICS`' own
+    rows by key and carries their evidence, so a number shown twice on this
+    dashboard is the same number from the same files (C28). What this panel
+    adds is the rows `METRICS` structurally cannot have: the twenty-two KPIs
+    with **no source at all**, which have no `Metric` to be a row of, and
+    which are the single most useful thing on the page — they say what this
+    system does not know.
+
+    `measured` is a boolean column rather than a status word so a reader
+    sorting on it gets the two groups; `value` is the rendered string, and
+    for an unmeasured KPI it is `DATA REQUIRED` and never `0`.
+    `Kpi.rendered()` is the one place that decides that spelling.
+    """
+    kpis = build_kpi_set(rollup, now=now, activity=activity)
+    rows = tuple(
+        DashboardRow(
+            key=f"{kpi.role}:{kpi.key}",
+            values={
+                "role": kpi.role,
+                "key": kpi.key,
+                "label": kpi.label,
+                "definition": kpi.definition,
+                "measured": kpi.is_measured,
+                "reading": kpi.rendered(),
+                "chain": kpi.chain,
+                "derived_from": kpi.source,
+                "requires": kpi.requires,
+                "evidence_count": len(kpi.evidence),
+            },
+            evidence=kpi.evidence,
+        )
+        # Grouped by role in `ROLES`' order, and inside a role in the order
+        # `build_kpi_set()` emits — which is the standard order each set is
+        # usually quoted in. Not sorted by value or by measured-ness: a KPI
+        # list that reorders itself as the numbers move is one a reader has
+        # to re-learn every morning.
+        for role in KPI_ROLES
+        for kpi in kpis.for_role(role)
+    )
+    return DashboardPanel(
+        key="ROLE_KPI",
+        title="CEO / CTO / COO KPI",
+        status=PanelStatus.SOURCED,
+        columns=_ROLE_KPI_COLUMNS,
+        rows=rows,
+        source="controltower/kpi.py — 계산된 값은 전부 METRICS의 같은 수이며 "
+        "같은 증거 파일을 든다. 새로 세는 것은 없다.",
+        # Deliberately carries **no count**. The first draft said "N개 중
+        # M개만 계산할 수 있다", and `AuthoredValuesAreRedactedOnTheWayOut
+        # Tests` caught it: `title` / `source` / `note` / `columns` are the
+        # only payload strings `_out()` never redacts, on the stated grounds
+        # that this module wrote them and no Event can reach them. A note
+        # whose text moves with the evidence is not a string this module
+        # wrote — and the gate proves that claim by building a model over
+        # poisoned Events and requiring byte-identical panel metadata.
+        #
+        # The tally is a *reading* of the rows and belongs to whoever
+        # renders them; `measured` is a column, so any renderer can count it.
+        note="계산할 수 없는 KPI는 값 대신 DATA REQUIRED를 싣는다. 각 행의 "
+        "requires가 무엇이 있어야 답할 수 있는지 적는다 — 추정치를 넣지 않는다.",
+    )
+
+
+_CODE_CHANGE_COLUMNS = ("commit", "at", "author", "subject", "files")
+
+
+def _code_changes_panel(activity: GitActivity | None) -> DashboardPanel:
+    """개발 변경 (Git) — what git says changed, beside what people reported.
+
+    **Not titled "D+1", and running it once is why.** This panel covers
+    whatever window the caller asked the panels for, and the unbounded
+    default is the whole evidence range — measured on the live tree, the
+    title said `D+1 개발 변경` above `2026-08-05 ~ 2026-08-10 · commit 6건`,
+    a window twenty-four days wide and twenty-four days old. A reader who
+    trusts the title reads six commits as yesterday's work.
+
+    D+1 is a *use* of this panel, not its definition: ask for a one-day
+    window and this is the D+1 report (docs/15). The window is always in
+    `note`, so the panel says what it actually covers rather than promising
+    a period it does not control.
+
+    The half of "어제 무엇이 변경됐는가" that Events cannot answer. Every
+    other panel here is built from Execution Events, which exist only when
+    somebody chose to report one; a day nobody reported is indistinguishable
+    from a day nothing happened, and that is precisely the day an operator
+    most needs to tell those apart.
+
+    `PanelStatus.SOURCED` in all three cases, including the two failures,
+    and the distinction is carried in `note` rather than in `status`:
+    `UNSOURCED` means "this system has no source for this", and git *is* a
+    source — it was asked and could not answer, or was never asked. Marking
+    a temporary read failure `UNSOURCED` would file it beside Company Goal,
+    which is a permanent architectural fact.
+
+    Bounded by `RECENT_LIMIT`, for `_activity_panel()`'s reason: a busy day
+    would otherwise put several hundred rows on a page meant to be read in
+    ten seconds. `note` always carries the true total, so the bound is
+    visible rather than silent.
+    """
+    if activity is None:
+        return DashboardPanel(
+            key="CODE_CHANGES",
+            title="개발 변경 (Git)",
+            status=PanelStatus.SOURCED,
+            columns=_CODE_CHANGE_COLUMNS,
+            rows=(),
+            source="delivery/git_activity.py — 로컬 저장소의 git log",
+            note="Git에 물어보지 않았다 — 이 보고를 만든 호출자가 Git 활동을 "
+            "전달하지 않았다. '변경 없음'이 아니다.",
+        )
+    if not activity.available:
+        return DashboardPanel(
+            key="CODE_CHANGES",
+            title="개발 변경 (Git)",
+            status=PanelStatus.SOURCED,
+            columns=_CODE_CHANGE_COLUMNS,
+            rows=(),
+            source="delivery/git_activity.py — 로컬 저장소의 git log",
+            # `redact` as well as `one_line`: git quotes paths back in its
+            # error messages, and a path under this repository can be
+            # secret-shaped for exactly the reason `to_payload()` gives about
+            # Event filenames. Same order as there — redact last, so a marker
+            # cannot be split by a length cut before anything looks for it.
+            note=f"Git을 읽지 못했다: {redact(one_line(str(activity.reason)))} — "
+            "'변경 없음'이 아니다.",
+        )
+
+    shown = activity.commits[:RECENT_LIMIT]
+    rows = tuple(
+        DashboardRow(
+            key=commit.short_sha,
+            values={
+                "commit": commit.short_sha,
+                "at": commit.at,
+                "author": commit.author,
+                "subject": commit.subject,
+                "files": len(commit.files),
+            },
+        )
+        for commit in shown
+    )
+    window = ""
+    if activity.since is not None and activity.until is not None:
+        window = f"{activity.since.isoformat()} ~ {activity.until.isoformat()} · "
+    note = (
+        f"{window}commit {activity.commit_count}건 · "
+        f"바뀐 파일 {len(activity.files_changed)}개 · "
+        f"작성자 {len(activity.authors)}명"
+    )
+    if activity.commit_count > len(shown):
+        note += f" (아래는 최근 {len(shown)}건만)"
+    if not activity.commit_count:
+        note += " — 이 기간에 commit이 없었다 (Git은 정상적으로 읽혔다)."
+    return DashboardPanel(
+        key="CODE_CHANGES",
+        title="개발 변경 (Git)",
+        status=PanelStatus.SOURCED,
+        columns=_CODE_CHANGE_COLUMNS,
+        rows=rows,
+        source="delivery/git_activity.py — 로컬 저장소의 git log. Event가 아니라 "
+        "실제 commit이며, 배포가 아니라 코드 변경이다.",
+        note=note,
     )
 
 
@@ -823,7 +1069,13 @@ _PROJECT_COLUMNS = (
 # distinction. `ACTIVE` therefore covers both `NOT_STARTED` and
 # `IN_PROGRESS` — "created and never moved" and "in flight" are different
 # facts and `status` is where they are told apart.
-PROJECT_STATES: tuple[str, ...] = ("BLOCKED", "COMPLETE", "CANCELLED", "ACTIVE")
+PROJECT_STATES: tuple[str, ...] = (
+    "BLOCKED",
+    "AT_RISK",
+    "COMPLETE",
+    "CANCELLED",
+    "ACTIVE",
+)
 
 
 def _project_state(project) -> str:
@@ -841,10 +1093,54 @@ def _project_state(project) -> str:
     exists. Without this branch a cancelled project came out `ACTIVE`: the
     screen never showed it (it prints `status` directly) but a projection
     reading `state` would have said a cancelled project was in flight.
+
+    **AT_RISK was added in the same change that added the Event type, and
+    only after reproducing that exact paragraph a second time.** docs/04
+    §28.1 gives `AT_RISK` no property of its own either, so it is read off
+    `status` for CANCELLED's reason — and without a branch here it came out
+    `ACTIVE`:
+
+        GONE     status=CANCELLED    state=CANCELLED
+        VENDOR   status=AT_RISK      state=ACTIVE     <- in flight, it said
+
+    Same consequence, and worse for this state than for CANCELLED: a
+    cancelled project needs nobody, and an at-risk one is the single project
+    a COO can still save. `dashboard_server._project_states()` counts these
+    words for the summary tiles and `CT_PROJECTS.State` is a Notion select
+    built from them, so both would have reported zero projects at risk while
+    the Risk table listed them.
+
+    It sits directly under BLOCKED and above COMPLETE for the reason BLOCKED
+    is above COMPLETE: a project that finished and was then reported at risk
+    is a thing a person has to look at, and `is_complete` never goes back to
+    False.
+
+    **COMPLETE also requires the last reported `status` to still say so, and
+    precedence was hiding the reason (C149).** `is_complete` is "a Completed
+    Date was written, ever" — the right meaning for `projects_completed`,
+    which counts completions in a period and cites the file that made each
+    one. It is the wrong meaning for a *current state* column. Measured, one
+    project, two Events:
+
+        COMPLETED(5th) then STARTED(12th, IN_PROGRESS)
+            state=COMPLETE   status=IN_PROGRESS
+
+    two columns side by side contradicting each other. The BLOCKED and
+    AT_RISK branches above answered the same defect for the two states that
+    happen to outrank COMPLETE; a project simply running again outranks
+    nothing, so it fell through.
+
+    The clause invents no rule, and it lives on the model as
+    `ProjectRollup.completion_stands` — see there for why, and for the two
+    other places that were making the same mistake and were fixed with it.
+    The completion **count** and the completion **state** stay different
+    numbers, which is exactly what they mean.
     """
     if project.is_blocked:
         return "BLOCKED"
-    if project.is_complete:
+    if project.is_at_risk:
+        return "AT_RISK"
+    if project.completion_stands:
         return "COMPLETE"
     if project.status == "CANCELLED":
         return "CANCELLED"
@@ -981,11 +1277,55 @@ def _desktops_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
     )
 
 
+#: `OpenItem.kind` -> the RISKS row kind a person reads.
+#:
+#: A table rather than a conditional, because C149 added a third lifecycle
+#: (`DECISION_EXECUTION`) to the two the conditional was written for, and the
+#: `else` branch would have filed it as an open Issue — silently, with the
+#: right count and the wrong word. That is the same shape of defect as the
+#: `else` in `ops_status.py`'s RISKS dispatch, found in the same change.
+#: A `KeyError` here is loud and immediate; a wrong label is neither.
+def _open_item_detail(item) -> str:
+    """One line: what it says, how many are folded behind it, who owns it.
+
+    Ownership is here rather than in the `team` column on purpose. `team` is
+    who **raised** it and has meant that since the column existed; making it
+    sometimes mean "owner" would give one column two meanings and no way for
+    a reader to tell which one they are looking at. This line can say both.
+
+    `미배정` is stated rather than left blank, because a blank owner and an
+    owner nobody rendered look identical — the distinction this module makes
+    everywhere else between "asked and there is none" and "never asked".
+    """
+    parts = [item.summary]
+    if item.occurrences > 1:
+        parts.append(f"(외 {item.occurrences - 1}건 더 열려 있다)")
+    if item.is_assigned:
+        parts.append(f"· 담당 {ROLE_DISPLAY_NAMES.get(item.assigned_team, item.assigned_team)}")
+    else:
+        parts.append("· 미배정 — 아무도 맡지 않았다")
+    return " ".join(parts)
+
+
+_OPEN_ITEM_RISK_KIND: dict[str, str] = {
+    "ISSUE": "OPEN_ISSUE",
+    "DECISION": "PENDING_DECISION",
+    "DECISION_EXECUTION": "UNEXECUTED_DECISION",
+}
+
+
 _RISK_COLUMNS = (
     "kind",
     "project_id",
     "team",
     "blocker",
+    # The words a person wrote about why this row exists, for the three kinds
+    # C149 added. A separate column from `blocker` rather than reusing it,
+    # and the reason is the header: `columns.LABELS` renders `blocker` as
+    # "Blocker", so a pending Decision's summary shown there would be
+    # labelled as the thing stopping the project — which is a different and
+    # false claim. `blocker` stays exactly what docs/02 §23 says it is.
+    "detail",
     "since",
     "days_open",
     "event_id",
@@ -1023,6 +1363,10 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
                     "project_id": risk.project_id,
                     "team": risk.team,
                     "blocker": risk.blocker,
+                    # The blocker text *is* this row's detail, and it is
+                    # already in its own column. Null rather than a copy:
+                    # one fact, one place.
+                    "detail": None,
                     "since": risk.since,
                     "days_open": risk.days_open(now),
                     "event_id": risk.evidence.event_id,
@@ -1042,6 +1386,91 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
                 evidence=(risk.evidence,),
             )
         )
+    # The three kinds C149 made expressible. Every one of them was a real
+    # company state this panel could not show, and the reason was never the
+    # panel: the Event vocabulary had no way to say them.
+    #
+    #     AT_RISK           a project reported as likely to stop. Before, a
+    #                       project was either fine or already BLOCKED, and
+    #                       "fine" is where a COO can still do something.
+    #     PENDING_DECISION  somebody is waiting on a decision. docs/02 §19
+    #                       explicitly refused to record this as
+    #                       DECISION_APPROVED and gave it nowhere else to go.
+    #     OPEN_ISSUE        an Issue was raised and nothing has closed it.
+    #     UNEXECUTED_DECISION  a decision was approved and nobody has done
+    #                       it. Approval used to close the lifecycle, so
+    #                       "decided and not done" left every list at the
+    #                       moment it started being a problem.
+    #
+    # Ordered after the blockers and before the machine-level rows, because
+    # that is decreasing urgency to the person reading: stopped, about to
+    # stop, waiting on a person, unresolved. `_roll_open_items()` already
+    # sorted the last two oldest-first.
+    # `state_projects`, not `projects`: a risk is a state, and `projects` is
+    # the activity fold (C152). On a windowed view the two differ exactly
+    # when it matters — a project that became at risk before the window is
+    # still at risk inside it.
+    for project in rollup.state_projects or rollup.projects:
+        if not project.is_at_risk or project.is_blocked or project.completion_stands:
+            continue
+        rows.append(
+            DashboardRow(
+                key=f"AT_RISK:{project.project_id}",
+                values={
+                    "kind": "AT_RISK",
+                    "project_id": project.project_id,
+                    "team": project.at_risk_team or "",
+                    "blocker": None,
+                    # docs/04 §28.1 gives AT_RISK no property of its own, so
+                    # the risk is described in the Event's `summary` and the
+                    # fold carries it. `detail` rather than `blocker`,
+                    # because the project is **not** blocked and the column
+                    # headed "Blocker" would say it is.
+                    "detail": project.at_risk_summary,
+                    "since": project.at_risk_since,
+                    "days_open": project.days_at_risk(now),
+                    "event_id": (
+                        project.at_risk_evidence.event_id
+                        if project.at_risk_evidence
+                        else ""
+                    ),
+                    "source": None,
+                    "claimed_role": None,
+                    "expected_role": None,
+                    "kept": None,
+                    "ignored": None,
+                },
+                evidence=(
+                    (project.at_risk_evidence,) if project.at_risk_evidence else ()
+                ),
+            )
+        )
+    for item in rollup.open_items:
+        rows.append(
+            DashboardRow(
+                key=f"{item.kind}:{item.project_id}",
+                values={
+                    "kind": _OPEN_ITEM_RISK_KIND[item.kind],
+                    "project_id": item.project_id,
+                    "team": item.team,
+                    "blocker": None,
+                    # The newest opening's words, plus how many older ones
+                    # are folded behind it. `OpenItem.occurrences` explains
+                    # why the fold cannot keep them apart; saying "외 N건"
+                    # is the difference between a fold and a loss.
+                    "detail": _open_item_detail(item),
+                    "since": item.since,
+                    "days_open": item.age_days(now),
+                    "event_id": item.evidence.event_id,
+                    "source": None,
+                    "claimed_role": None,
+                    "expected_role": None,
+                    "kept": None,
+                    "ignored": None,
+                },
+                evidence=(item.evidence,),
+            )
+        )
     for mismatch in rollup.mismatches:
         rows.append(
             DashboardRow(
@@ -1055,6 +1484,7 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
                     # point: the row is the disagreement.
                     "team": mismatch.expected_role,
                     "blocker": None,
+                    "detail": None,
                     "since": mismatch.evidence.at,
                     "days_open": None,
                     "event_id": mismatch.event_id,
@@ -1084,6 +1514,7 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
                     "project_id": None,
                     "team": "",
                     "blocker": None,
+                    "detail": None,
                     "since": None,
                     "days_open": None,
                     "event_id": duplicate.event_id,
@@ -1101,12 +1532,16 @@ def _risks_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
         status=PanelStatus.SOURCED,
         columns=_RISK_COLUMNS,
         rows=tuple(rows),
-        source="열린 Blocker(docs/02가 요구하는 사람이 쓴 텍스트) + docs/02 §8을 "
-        "어긴 source/role 짝 + 하나의 event_id를 두고 내용이 다른 파일 둘",
+        source="열린 Blocker(docs/02가 요구하는 사람이 쓴 텍스트) + 위험하다고 "
+        "보고된 Project + 닫히지 않은 Decision/Issue + docs/02 §8을 어긴 "
+        "source/role 짝 + 하나의 event_id를 두고 내용이 다른 파일 둘",
         note=(
             "실패 / Pending / Recovery는 여기 없다 — 전부 Run Manifest의 사실이고 "
             "OPS_RUNS 행(`Failed Steps` / `Notion Queued` / `Reused Days` / "
-            "`Deleted Files`)이 이미 나른다. stale은 DESKTOPS의 `days_silent`다."
+            "`Deleted Files`)이 이미 나른다. stale은 DESKTOPS의 `days_silent`다. "
+            "이 표는 **기간이 아니라 시점**이다 — 창의 끝(`until`)까지 열려 있고 "
+            "닫히지 않은 것을 전부 보여준다. 창 이전에 막히거나 제기된 것도 "
+            "여전히 열려 있으면 여기 있다(C152)."
         ),
     )
 
@@ -1294,5 +1729,6 @@ __all__ = [
     "PanelStatus",
     "UNSOURCED_LAYERS",
     "build_dashboard",
+    "evidence_window",
     "unsourced_layer_coverage",
 ]

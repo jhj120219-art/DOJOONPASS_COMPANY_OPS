@@ -30,7 +30,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -52,6 +52,7 @@ from controltower.dashboard import (  # noqa: E402
     _UNAUTHORED_KEYS,
 )
 from controltower.rollup import RECENT_LIMIT  # noqa: E402
+from delivery import Commit, GitActivity  # noqa: E402
 from events import ROLES, Event, create_event  # noqa: E402
 from oplog import one_line, redact  # noqa: E402
 
@@ -85,6 +86,13 @@ SECRET = "ntn_" + "A" * 24
 EXPECTED_PANELS: tuple = (
     "COMPANY_GOALS",
     "METRICS",
+    # C149. Beside METRICS on purpose: it reads METRICS' own rows and adds
+    # role framing plus the twenty-two KPIs that have no `Metric` to be a
+    # row of, because nothing in this system sources them.
+    "ROLE_KPI",
+    # C149. The D+1 half Events cannot answer — a day nobody reported and a
+    # day nothing happened look identical in every other panel here.
+    "CODE_CHANGES",
     "TEAMS",
     "PROJECTS",
     "SPRINTS",
@@ -470,13 +478,22 @@ class EveryRowFillsTheColumnsItsPanelDeclaresTests(DashboardTestCase):
                 keys = [row.key for row in panel.rows]
                 self.assertEqual(len(keys), len(set(keys)))
 
-    def test_the_two_risk_kinds_share_one_row_shape(self):
+    def test_every_risk_kind_shares_one_row_shape(self):
+        """The panel builds one table, not one per kind — a projection maps
+        `RISKS` to a single Notion database, so a row missing a column its
+        siblings have would write a null into a property nobody expected.
+
+        `UNEXECUTED_DECISION` joined the fixture's kinds without the fixture
+        changing (C149): `E4` is a `DECISION_APPROVED`, and approval now
+        **opens** "decided and not done" instead of closing the lifecycle.
+        That is the behaviour change stated as a test rather than described.
+        """
         self._populate()
         rows = self.model().panel("RISKS").rows
 
         self.assertEqual(
             sorted({row.values["kind"] for row in rows}),
-            ["OPEN_BLOCKER", "ROLE_MISMATCH"],
+            ["OPEN_BLOCKER", "ROLE_MISMATCH", "UNEXECUTED_DECISION"],
         )
         for row in rows:
             with self.subTest(row=row.key):
@@ -493,9 +510,35 @@ class EveryRowFillsTheColumnsItsPanelDeclaresTests(DashboardTestCase):
                 # no evidence on purpose, and inventing some here would be
                 # the invention this module refuses.
                 continue
+            if panel.key == "CODE_CHANGES":
+                # Its rows are commits, not Events. `EvidenceRef` is defined
+                # as "one Event, and the file under `processed/` it was read
+                # out of" (`rollup.EvidenceRef`), and a commit has neither —
+                # it has a sha, which the row carries as its key and in its
+                # own column. Manufacturing an `EvidenceRef` whose `path`
+                # named no file would break the one property every other
+                # assertion in this method depends on. C149.
+                continue
             for row in panel.rows:
                 if panel.key in ("TEAMS", "DESKTOPS") and row.values["events"] == 0:
                     continue  # present-and-empty; there is nothing to cite
+                if panel.key == "ROLE_KPI" and not row.values["measured"]:
+                    # A DATA REQUIRED KPI has no evidence *by definition* —
+                    # the whole content of the row is that no source for it
+                    # exists. Citing anything here would be the fabrication
+                    # `kpi.py` is written to refuse, and it would be the
+                    # worst kind: a number nobody can compute, wearing a
+                    # citation. The `measured` column is the discriminator
+                    # rather than a list of keys, so the twenty-two refusals
+                    # cannot silently become twenty-three unnoticed.
+                    #
+                    # `issue_aging` / `decision_aging` are measured with no
+                    # evidence when nothing is open — a real zero over an
+                    # empty set — so they are exempted below by value, not
+                    # by name, for the same reason TEAMS and DESKTOPS are.
+                    continue
+                if panel.key == "ROLE_KPI" and row.values["evidence_count"] == 0:
+                    continue  # measured over an empty set; nothing to cite
                 with self.subTest(panel=panel.key, row=row.key):
                     self.assertTrue(row.evidence, f"{panel.key}/{row.key}")
                     for ref in row.evidence:
@@ -540,7 +583,19 @@ class EveryRowCitesEventsThatBelongToItTests(DashboardTestCase):
         "COMPLETIONS": lambda row, event: event.event_id == row.values["event_id"],
     }
 
-    ELSEWHERE = ("METRICS",)
+    #: Panels whose rows are not keyed by anything an Event carries, and
+    #: where a different check covers the citation.
+    #:
+    #:   METRICS      keyed by a metric name;
+    #:                `EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests`
+    #:   ROLE_KPI     keyed by `role:kpi_key`, and its evidence is *the same
+    #:                refs the METRICS row carries* — `kpi.build_kpi_set()`
+    #:                copies them rather than selecting its own, so the check
+    #:                that they are the right files is that one, one layer
+    #:                down. A rule here would be a second opinion about the
+    #:                same tuple (C28).
+    #:   CODE_CHANGES rows are commits and carry no `EvidenceRef` at all.
+    ELSEWHERE = ("METRICS", "ROLE_KPI", "CODE_CHANGES")
 
     def _populate(self):
         """One row in every panel that carries evidence, and more than one
@@ -2009,7 +2064,18 @@ class ThePayloadShapeIsPinnedToItsVersionTests(DashboardTestCase):
                 ],
                 "JUDGEMENTS": [],
             },
-            "panel_order": list(EXPECTED_PANELS),
+            # Written out rather than `list(EXPECTED_PANELS)`, which is what
+            # both of the older records used to say. That was a live
+            # reference to the *current* order, so the day a panel was added
+            # (C149) every historical record silently claimed to have had it
+            # — a recorded shape that changes when the code changes records
+            # nothing. Nothing compares `panel_order` across versions today,
+            # so this was inert; it was still a false statement in the one
+            # place whose whole job is to be a true statement about the past.
+            "panel_order": [
+                "COMPANY_GOALS", "METRICS", "TEAMS", "PROJECTS", "SPRINTS",
+                "DESKTOPS", "RISKS", "ACTIVITY", "COMPLETIONS", "JUDGEMENTS",
+            ],
         },
         "1.2": {
             "top_level": [
@@ -2061,8 +2127,72 @@ class ThePayloadShapeIsPinnedToItsVersionTests(DashboardTestCase):
                 ],
                 "JUDGEMENTS": [],
             },
+            "panel_order": [
+                "COMPANY_GOALS", "METRICS", "TEAMS", "PROJECTS", "SPRINTS",
+                "DESKTOPS", "RISKS", "ACTIVITY", "COMPLETIONS", "JUDGEMENTS",
+            ],
+        },
+        # 1.3 is 1.2 plus the `ROLE_KPI` and `CODE_CHANGES` panels (C149).
+        # Every 1.2 panel and every 1.2 column is still here, which is what
+        # makes the bump MINOR and what
+        # `test_nothing_recorded_earlier_has_been_removed` checks.
+        "1.3": {
+            "top_level": [
+                "coverage", "events_read", "generated_at", "panels",
+                "schema_version", "since", "unreadable", "until",
+            ],
+            "coverage": [
+                "complete", "duplicates", "evidence_from", "evidence_to",
+                "history_checked", "history_uncovered_from", "unreadable",
+            ],
+            "unreadable_entry": ["file", "reason"],
+            "panel": [
+                "columns", "key", "note", "rows", "source", "status", "title",
+                "unsourced_layers",
+            ],
+            "row": ["evidence", "evidence_count", "evidence_truncated", "key", "values"],
+            "evidence": ["at", "event_id", "path"],
+            "panels": {
+                "COMPANY_GOALS": [],
+                "METRICS": ["key", "label", "value", "derived_from", "evidence_count"],
+                "ROLE_KPI": [
+                    "role", "key", "label", "definition", "measured", "reading",
+                    "chain", "derived_from", "requires", "evidence_count",
+                ],
+                "CODE_CHANGES": ["commit", "at", "author", "subject", "files"],
+                "TEAMS": [
+                    "team", "display_name", "events", "projects",
+                    "blocked_projects", "blocked_project_count", "last_seen",
+                    "has_activity", "current_sprint",
+                ],
+                "PROJECTS": [
+                    "project_id", "teams", "events", "status", "state", "blocker",
+                    "blocker_team", "blocked_since", "days_blocked", "first_seen",
+                    "last_seen", "days_idle", "completed_at", "milestones", "sprint",
+                ],
+                "SPRINTS": [],
+                "DESKTOPS": [
+                    "source", "expected_team", "display_name", "events", "projects",
+                    "last_seen", "days_silent", "has_activity", "role_mismatches",
+                    "mismatched_event_ids",
+                ],
+                "RISKS": [
+                    "kind", "project_id", "team", "blocker", "detail", "since",
+                    "days_open", "event_id", "source", "claimed_role",
+                    "expected_role", "kept", "ignored",
+                ],
+                "ACTIVITY": [
+                    "event_id", "at", "source", "team", "project_id", "event_type",
+                    "status", "summary", "milestone", "of_total", "truncated",
+                ],
+                "COMPLETIONS": [
+                    "event_id", "at", "source", "team", "project_id", "event_type",
+                    "status", "summary", "milestone", "of_total", "truncated",
+                ],
+                "JUDGEMENTS": [],
+            },
             "panel_order": list(EXPECTED_PANELS),
-        }
+        },
     }
 
     def test_the_version_has_a_recorded_shape(self):
@@ -2242,6 +2372,11 @@ class TheNullabilityContractTests(unittest.TestCase):
         ("PROJECTS", "sprint"),
         ("RISKS", "blocker"),
         ("RISKS", "claimed_role"),
+        # C149. Null for every kind except the two that carry a person's
+        # words about a Decision or an Issue — `OPEN_BLOCKER` puts its text
+        # in `blocker`, and `AT_RISK` has no property of its own at all
+        # (docs/04 §28.1).
+        ("RISKS", "detail"),
         ("RISKS", "days_open"),
         ("RISKS", "expected_role"),
         ("RISKS", "ignored"),
@@ -2258,6 +2393,29 @@ class TheNullabilityContractTests(unittest.TestCase):
 
     ALWAYS = {
         ("", "events_read"),
+        # C149's two panels. Every field on both is always present:
+        # `ROLE_KPI` builds each row from a `Kpi` whose fields all default to
+        # a non-None value (`""` / `0` / `Metric` / `False`), and
+        # `_code_changes_panel()` builds a row only from a `Commit`, whose
+        # four strings come out of `git log`'s own format and whose `files`
+        # is a tuple. `reading` in particular can never be null — that is
+        # `Kpi.rendered()`'s whole contract: a KPI with no value renders the
+        # words DATA REQUIRED, never `None` and never `0`.
+        ("CODE_CHANGES", "at"),
+        ("CODE_CHANGES", "author"),
+        ("CODE_CHANGES", "commit"),
+        ("CODE_CHANGES", "files"),
+        ("CODE_CHANGES", "subject"),
+        ("ROLE_KPI", "chain"),
+        ("ROLE_KPI", "definition"),
+        ("ROLE_KPI", "derived_from"),
+        ("ROLE_KPI", "evidence_count"),
+        ("ROLE_KPI", "key"),
+        ("ROLE_KPI", "label"),
+        ("ROLE_KPI", "measured"),
+        ("ROLE_KPI", "reading"),
+        ("ROLE_KPI", "requires"),
+        ("ROLE_KPI", "role"),
         ("", "generated_at"),
         ("", "schema_version"),
         ("", "unreadable"),
@@ -2335,6 +2493,35 @@ class TheNullabilityContractTests(unittest.TestCase):
         data.update(overrides)
         return Event.from_dict(data)
 
+    def _activity(self):
+        """A `GitActivity` with one commit, so `CODE_CHANGES` has a row.
+
+        Without this the panel is present and empty in every state, its five
+        fields are never observed, and `test_neither_list_names_a_field_that
+        _is_gone` would reject them while `test_every_observed_field_is
+        _classified` passed — a contract that silently covers four panels'
+        worth of columns and not the fifth's. The same hole
+        `test_the_fixture_reaches_every_row_kind` exists to name.
+
+        Built directly rather than by running git: the states here are
+        deterministic fixtures, and a test whose contract depended on this
+        repository's real commit log would change meaning every day.
+        """
+        return GitActivity(
+            available=True,
+            since=date(2026, 8, 12),
+            until=date(2026, 8, 12),
+            commits=(
+                Commit(
+                    sha="0" * 40,
+                    at="2026-08-12T11:00:00+09:00",
+                    author="somebody",
+                    subject="a change",
+                    files=("src/x.py",),
+                ),
+            ),
+        )
+
     def _states(self):
         """One state per branch that can leave a field empty.
 
@@ -2366,6 +2553,28 @@ class TheNullabilityContractTests(unittest.TestCase):
                 (e(event_id="X", event_type="CANCELLED", status="CANCELLED"), "X.json"),
             ),
             "mismatch": ((e(event_id="M", source="DESKTOP_3", role="CMO"), "M.json"),),
+            # C149's three risk kinds, each on its own project so no later
+            # Event in the same state closes it.
+            "at_risk": (
+                (
+                    e(event_id="R", project_id="RSK", event_type="AT_RISK",
+                      status="AT_RISK"),
+                    "R.json",
+                ),
+            ),
+            "issue_raised": (
+                (
+                    e(event_id="I", project_id="ISS", event_type="ISSUE_RAISED"),
+                    "I.json",
+                ),
+            ),
+            "decision_required": (
+                (
+                    e(event_id="Q", project_id="DEC",
+                      event_type="DECISION_REQUIRED"),
+                    "Q.json",
+                ),
+            ),
             "conflict": (
                 (e(event_id="K"), "a.json"),
                 (e(event_id="K", project_id="OTHER"), "b.json"),
@@ -2378,7 +2587,9 @@ class TheNullabilityContractTests(unittest.TestCase):
         nullable: set = set()
         for events in self._states().values():
             payload = build_dashboard(
-                build_company_rollup(events=events, now=NOW), now=NOW
+                build_company_rollup(events=events, now=NOW),
+                now=NOW,
+                activity=self._activity(),
             ).to_payload()
             sections = [("", payload), ("coverage", payload["coverage"])]
             for panel in payload["panels"]:
@@ -2412,7 +2623,19 @@ class TheNullabilityContractTests(unittest.TestCase):
                 states.add(row.values["state"])
 
         self.assertEqual(
-            kinds, {"OPEN_BLOCKER", "ROLE_MISMATCH", "EVENT_ID_CONFLICT"}
+            kinds,
+            {
+                "OPEN_BLOCKER",
+                "ROLE_MISMATCH",
+                "EVENT_ID_CONFLICT",
+                # C149's three. Added to the fixture as well as to this
+                # assertion: a row kind the states never produce narrows
+                # `NULLABLE` silently and looks exactly as authoritative,
+                # which is the defect this method's docstring records.
+                "AT_RISK",
+                "OPEN_ISSUE",
+                "PENDING_DECISION",
+            },
         )
         self.assertEqual(states, set(PROJECT_STATES))
 
@@ -2976,7 +3199,7 @@ class SeededChainPropertyTests(unittest.TestCase):
                         self.assertTrue((directory / ref.path).is_file())
                     del model
 
-    def test_the_risk_panel_is_exactly_the_blockers_plus_the_mismatches(self):
+    def test_the_risk_panel_is_exactly_its_sources_kind_by_kind(self):
         import random
         import tempfile
 
@@ -2989,12 +3212,51 @@ class SeededChainPropertyTests(unittest.TestCase):
                     rollup, model = self._build(directory)
 
                     rows = model.panel("RISKS").rows
+                    # A census per kind, against the rollup field each kind
+                    # is built from. The invariant used to be
+                    # `len(rows) == risks + mismatches` — true when the panel
+                    # had two kinds, and it silently stopped describing the
+                    # panel as kinds were added (C149 added three, and the
+                    # duplicate-conflict kind predates them). A single total
+                    # also cannot see a swap: one kind gaining a row while
+                    # another loses one leaves the sum unchanged.
+                    census = {}
+                    for row in rows:
+                        kind = row.values["kind"]
+                        census[kind] = census.get(kind, 0) + 1
+
+                    at_risk = [
+                        p
+                        for p in rollup.projects
+                        if p.is_at_risk and not p.is_blocked and not p.is_complete
+                    ]
+                    open_by_kind = {}
+                    for item in rollup.open_items:
+                        open_by_kind[item.kind] = open_by_kind.get(item.kind, 0) + 1
+                    expected = {
+                        "OPEN_BLOCKER": len(rollup.risks),
+                        "ROLE_MISMATCH": len(rollup.mismatches),
+                        "EVENT_ID_CONFLICT": len(
+                            [d for d in rollup.duplicates if not d.identical]
+                        ),
+                        "AT_RISK": len(at_risk),
+                        "OPEN_ISSUE": open_by_kind.get("ISSUE", 0),
+                        "PENDING_DECISION": open_by_kind.get("DECISION", 0),
+                        "UNEXECUTED_DECISION": open_by_kind.get(
+                            "DECISION_EXECUTION", 0
+                        ),
+                    }
                     self.assertEqual(
-                        len(rows), len(rollup.risks) + len(rollup.mismatches)
+                        census, {k: v for k, v in expected.items() if v}
                     )
                     self.assertEqual(len({row.key for row in rows}), len(rows))
                     for row in rows:
                         # Every risk names one Event, and that file is there.
+                        # `EVENT_ID_CONFLICT` is the one kind that cites
+                        # none — it is about two files disagreeing, and it
+                        # names both in its own columns instead.
+                        if row.values["kind"] == "EVENT_ID_CONFLICT":
+                            continue
                         self.assertEqual(len(row.evidence), 1)
                         self.assertTrue((directory / row.evidence[0].path).is_file())
 

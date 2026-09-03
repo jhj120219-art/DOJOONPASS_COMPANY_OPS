@@ -224,7 +224,16 @@ class NoEvidenceDoesNotRenderAsHealthyTests(PageTestCase):
         """
         page = self.page()
 
-        self.assertEqual(page.count("kpi zero"), 8)
+        # 13, not 8: C149 added five metrics to the rollup, and on an empty
+        # tree every one of them is a zero that must be greyed like the
+        # other eight. The literal is deliberately not derived from the
+        # payload — a count read from the same place it is checking would
+        # pass whatever the renderer did, which is the vacuous pass this
+        # class is about.
+        # 16: C149's execution lifecycle added `decisions_executed` and
+        # `decisions_unexecuted`, and its assignment step added
+        # `items_unassigned` — all zero on an empty tree.
+        self.assertEqual(page.count("kpi zero"), 16)
         self.assertEqual(page.count("kpi live"), 1)
 
     @staticmethod
@@ -544,7 +553,27 @@ class TheScreenShowsTheModelsOwnNumbersTests(PageTestCase):
         added upstream would otherwise be silently filed as 참고 forever."""
         self.assertEqual(
             dashboard_server._KPI_LOWER_IS_BETTER,
-            frozenset({"open_blockers", "teams_silent", "desktop_role_mismatches"}),
+            frozenset(
+                {
+                    "open_blockers",
+                    "teams_silent",
+                    "desktop_role_mismatches",
+                    # C149. Each names something *open* — unresolved,
+                    # waiting, about to stop — which is what gives a count a
+                    # direction. Its two siblings (`issues_raised`,
+                    # `decisions_rejected`) are deliberately absent: both
+                    # count a lifecycle event that already happened, and
+                    # more of either is not a worse company.
+                    "issues_open",
+                    "decisions_pending",
+                    "projects_at_risk",
+                    # Decided and not done. `decisions_executed` beside it is
+                    # deliberately absent: executing more decisions is not a
+                    # better company than needing fewer.
+                    "decisions_unexecuted",
+                    "items_unassigned",
+                }
+            ),
         )
 
     def test_a_kpi_carries_the_number_of_files_it_was_counted_from(self):
@@ -2118,6 +2147,39 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
                     continue
                 self.assertIn(f"<span class='pkey'>{panel['key']}</span>", page)
 
+    def test_a_second_panel_in_the_kpi_region_still_reaches_the_page(self):
+        """The defect this was written after, and the one shape the test
+        above could not see.
+
+        `render_html()` built `regions["KPI"]` and then **ignored it**,
+        rendering `by_key["METRICS"]` directly. So every panel routed to the
+        KPI region other than METRICS was dropped from the page in silence —
+        no error, no empty section, just gone. `test_every_panel_the_model
+        _builds_is_on_the_page` passed throughout, because METRICS was the
+        only panel anyone had ever mapped there and `_PANEL_PLACEMENT` is
+        exactly the file a person edits when adding a second.
+
+        Asserted through the placement map rather than by naming `ROLE_KPI`,
+        so this keeps meaning something if that panel is later moved: it
+        fails for whichever panel occupies the region next.
+        """
+        kpi_panels = [
+            panel
+            for panel in self.payload()["panels"]
+            if dashboard_server.panel_placement(panel) == "KPI"
+        ]
+        others = [p for p in kpi_panels if p["key"] != "METRICS"]
+
+        self.assertTrue(
+            others,
+            "no second KPI-region panel exists, so this test proves nothing "
+            "— it must be given one or deleted",
+        )
+        page = self.page()
+        for panel in others:
+            with self.subTest(panel=panel["key"]):
+                self.assertIn(f"<span class='pkey'>{panel['key']}</span>", page)
+
     def test_no_panel_is_drawn_twice(self):
         """C133 added a third roster — `_PANEL_PLACEMENT`, which routes each
         panel to one of five regions. A key listed in two regions, or a
@@ -2142,7 +2204,12 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
 
         placed = sorted(k for keys in regions.values() for k in keys)
         self.assertEqual(placed, sorted(p["key"] for p in panels))
-        self.assertEqual(regions["KPI"], ["METRICS"])
+        # `ROLE_KPI` joined the region in C149. Listed rather than relaxed
+        # to a membership check: the point of this assertion is that a panel
+        # arrives here deliberately, and a `assertIn` would let the next one
+        # arrive by accident — which is how a panel ends up in the region
+        # whose renderer used to drop everything but METRICS.
+        self.assertEqual(regions["KPI"], ["METRICS", "ROLE_KPI"])
         self.assertIn("PROJECTS", regions["PROJECTS"])
 
     def test_a_panel_this_page_has_never_heard_of_is_still_shown(self):
@@ -2545,13 +2612,22 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
         phrases = {phrase for phrase, _l, _w in attention_module.RULES}
         self.assertEqual(set(attention_module.DOMAINS) - phrases, set())
 
-    def test_the_two_company_lines_are_the_ones_a_person_acts_on(self):
+    def test_the_company_lines_are_the_ones_a_person_acts_on(self):
         """Pinned by what they are, not by counting them.
 
-        Both name work outside this repository: a team must unblock a
-        Project, a person must decide what enters Company History. Every
-        other phrase's remedy names a script, a state file, a queue or a
-        scheduled task — however important the data behind it.
+        Every one names work outside this repository: a team must unblock a
+        Project, a person must decide what enters Company History, somebody
+        with authority must settle a Decision. Every phrase **not** here has
+        a remedy naming a script, a state file, a queue or a scheduled task
+        — however important the data behind it.
+
+        Three joined in C149, and they are the reason the old name of this
+        test ("the two company lines") stopped being true. Each was a state
+        the Event vocabulary could not express until then: a Decision was
+        required and nobody could record it, an Issue was raised and had no
+        start date, a Project was about to stop and could only be reported
+        as fine or already stopped. A list of company-facing lines that grows
+        when the company becomes expressible is the list working correctly.
         """
         from controltower import attention as attention_module
 
@@ -2560,7 +2636,59 @@ class AttentionSaysHowBadAndWhereFromTests(unittest.TestCase):
             for phrase, value in attention_module.DOMAINS.items()
             if value == attention_module.COMPANY
         }
-        self.assertEqual(company, {"막혀 있는 Project", "검토를 기다리"})
+        self.assertEqual(
+            company,
+            {
+                "막혀 있는 Project",
+                "검토를 기다리",
+                "기다리는 Decision",
+                "실행되지 않은 Decision",
+                "열려 있는 Issue",
+                "위험하다고 보고된 Project",
+            },
+        )
+
+    def test_no_company_line_tells_a_person_to_run_something(self):
+        """The rule the roster above is a list of, asserted directly.
+
+        Without this the roster is a set of strings somebody typed, and the
+        sentence explaining it ("the remedy names no script") is unchecked
+        prose. `분류되지 않은 Risk 종류` is the case that proves the rule
+        bites: it is about company work and is filed SYSTEM, because its
+        remedy names two source files.
+        """
+        from controltower import attention as attention_module
+
+        machinery = (".py", ".json", "python ", "runtime/", "`git")
+        # The one honest exception, and writing it down is what the check is
+        # worth: `검토를 기다리` is a *judgement* only a person can make —
+        # docs/05 §24 says these Candidates are not decided by rule — and the
+        # only way to record that judgement is this repository's own CLI. So
+        # the audience is the company and the remedy names a script, which no
+        # other COMPANY line does. Found by this test on its first run,
+        # against a classification that predates it; left as COMPANY because
+        # filing it SYSTEM would bury a decision about Company History under
+        # the tooling section, which is the burial `DOMAINS` was added to
+        # prevent.
+        exceptions = {"검토를 기다리"}
+        # And the exception is still held to the half of the rule that does
+        # apply: it must have a remedy at all.
+        for phrase in sorted(exceptions):
+            self.assertIn(phrase, attention_module.DOMAINS)
+            self.assertTrue(attention_module.ACTIONS.get(phrase, "").strip())
+
+        for phrase, value in sorted(attention_module.DOMAINS.items()):
+            if value != attention_module.COMPANY or phrase in exceptions:
+                continue
+            remedy = attention_module.ACTIONS.get(phrase, "")
+            with self.subTest(phrase=phrase):
+                self.assertTrue(remedy, f"{phrase} is COMPANY with no remedy")
+                for marker in machinery:
+                    self.assertNotIn(
+                        marker,
+                        remedy,
+                        f"{phrase} is filed COMPANY but its remedy names {marker!r}",
+                    )
 
     def test_a_line_no_rule_matches_is_never_put_in_front_of_the_company(self):
         """`?` sorts with P1 inside its group (`RANK`), so it cannot hide —

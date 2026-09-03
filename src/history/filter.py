@@ -10,6 +10,16 @@ explicitly forbids one; three outcomes are enough):
 
     history_candidate == false          -> DROP   (docs/02 section 36)
     DECISION_APPROVED                   -> KEEP   (docs/05 section 25)
+    DECISION_REQUIRED, DECISION_REJECTED,
+    EXECUTED, ISSUE_RAISED              -> KEEP   (C149 — the opening and
+                                                    the refusal of a
+                                                    lifecycle are worth
+                                                    exactly what its
+                                                    settlement is worth,
+                                                    and Issue/Decision
+                                                    Aging cannot be
+                                                    computed from an end
+                                                    with no beginning)
     MILESTONE_COMPLETED, ISSUE_RESOLVED -> KEEP   (docs/05 section 25,
                                                     "주요" qualifier not
                                                     auto-detectable without
@@ -17,14 +27,21 @@ explicitly forbids one; three outcomes are enough):
                                                     forbids — every event of
                                                     this type is treated as
                                                     KEEP; see [ISSUES])
-    STARTED, RESUMED                    -> DROP   (docs/05 section 26)
-    BLOCKED, COMPLETED, CANCELLED       -> REVIEW (docs/05 section 24 names
-                                                    exactly these three as
+    STARTED, RESUMED, ASSIGNED          -> DROP   (docs/05 section 26 —
+                                                    progress, not outcome)
+    AT_RISK, BLOCKED, COMPLETED,
+    CANCELLED                           -> REVIEW (docs/05 section 24 names
+                                                    exactly these four as
                                                     its own REVIEW examples:
                                                     "장기 영향이 불확실한
                                                     BLOCKED", "의미가 애매한
                                                     COMPLETED", "중요도가
-                                                    애매한 CANCELLED")
+                                                    애매한 CANCELLED", and
+                                                    AT_RISK, added by C149
+                                                    to the same list for the
+                                                    same reason — "멈출 것
+                                                    같다" is the most
+                                                    uncertain of the four)
 """
 
 from __future__ import annotations
@@ -33,14 +50,38 @@ from events import Event
 
 from .result import HistoryCandidate, HistoryDecision, HistoryFilterResult
 
-_KEEP_EVENT_TYPES = frozenset({"DECISION_APPROVED", "MILESTONE_COMPLETED", "ISSUE_RESOLVED"})
-_DROP_EVENT_TYPES = frozenset({"STARTED", "RESUMED"})
+_KEEP_EVENT_TYPES = frozenset(
+    {
+        "DECISION_REQUIRED",
+        "DECISION_APPROVED",
+        "DECISION_REJECTED",
+        "EXECUTED",
+        "MILESTONE_COMPLETED",
+        "ISSUE_RAISED",
+        "ISSUE_RESOLVED",
+    }
+)
+# `ASSIGNED` joins them (C149) and the reason is docs/05 §26's own: these
+# are *progress* Events. An Issue changing hands is how the work moved, not
+# what the company achieved, and Company History keeps outcomes. It still
+# matters enormously **now** — `_roll_open_items()` reads it to tell an
+# unowned Issue from an owned one — which is the distinction between a
+# Control Tower (current state) and Company History (the long record).
+_DROP_EVENT_TYPES = frozenset({"STARTED", "RESUMED", "ASSIGNED"})
 
+# AT_RISK deliberately falls through to REVIEW rather than being listed
+# here: docs/05 section 24's REVIEW examples are the ambiguous-impact
+# states, and "likely to stop" is the most ambiguous of them all.
 _CATEGORY_BY_EVENT_TYPE = {
+    "DECISION_REQUIRED": "DECISION",
     "DECISION_APPROVED": "DECISION",
+    "DECISION_REJECTED": "DECISION",
+    "EXECUTED": "DECISION",
     "MILESTONE_COMPLETED": "MILESTONE",
     "COMPLETED": "MILESTONE",
+    "ISSUE_RAISED": "ISSUE",
     "ISSUE_RESOLVED": "ISSUE",
+    "AT_RISK": "ISSUE",
     "BLOCKED": "ISSUE",
 }
 

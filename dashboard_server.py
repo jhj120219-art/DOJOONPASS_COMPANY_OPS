@@ -163,7 +163,12 @@ from oplog import redact as oplog_redact  # noqa: E402
 from runsummary import read_summary as read_run_summary  # noqa: E402
 
 from cli import CONFIG_ERROR_EXIT, unexpected_arguments  # noqa: E402
-from controltower import build_company_rollup, build_dashboard  # noqa: E402
+from controltower import (  # noqa: E402
+    build_company_rollup,
+    build_dashboard,
+    evidence_window,
+)
+from delivery import read_git_activity  # noqa: E402
 from controltower.columns import LABELS as _column_labels  # noqa: E402
 from controltower import verdict as _verdict  # noqa: E402
 from controltower.attention import KIND_LABELS as _ATTENTION_KIND_LABELS  # noqa: E402
@@ -338,7 +343,25 @@ def build_model_payload(
         since=since,
         until=until,
     )
-    model = build_dashboard(rollup, now=now)
+    # The D+1 half Events cannot answer. Read over the **same window** the
+    # panels cover, so "어제 무엇이 변경됐는가" and "어제 무엇이 보고됐는가"
+    # are answers about one day rather than two.
+    #
+    # When the caller gave no window, the git side is asked for the same
+    # unbounded range the rollup used — `since=None` means "everything on
+    # disk" there, and `read_git_activity()` requires concrete dates, so the
+    # window is taken from the evidence the rollup actually found. With no
+    # evidence at all there is nothing to align to and git is not asked; the
+    # panel says "물어보지 않았다", which is true.
+    evidence_from, evidence_to = evidence_window(rollup)
+    window_since = since or evidence_from
+    window_until = until or evidence_to
+    activity = (
+        read_git_activity(since=window_since, until=window_until)
+        if window_since is not None and window_until is not None
+        else None
+    )
+    model = build_dashboard(rollup, now=now, activity=activity)
     older, history_readable = ops_status._company_history_older_than_the_evidence(
         ops_status.RUNTIME_DIR / "local_master" / "daily",
         ops_status._event_day(model.coverage.evidence_from),
@@ -617,6 +640,23 @@ def gather(
         # to the front). An earlier note here blamed the COMPANY block for
         # three quarters of the time; that was this artefact, and COMPANY is
         # a fifth of it.
+        #
+        # **"About three times" is the floor, not the range (C151.)** That
+        # figure is a tree gone cold between runs. A tree whose files were
+        # *just written* is far worse -- re-measured on this machine,
+        # `read_events()` over 6,000 freshly created Event files:
+        #
+        #     first read (just written)   25,809 ms
+        #     second read (same files)       419 ms
+        #     third read                     402 ms
+        #
+        # 60x, not 3x, and it is entirely first-touch: the second read is
+        # already at the warm figure. This is the shape a Runner meets --
+        # `collector` writes into `processed/` and a later step in the same
+        # run reads it back -- so the number an operator sees on the first
+        # dashboard after a large collection is this one, not the 3,130 ms
+        # above. Nothing here can avoid it; it is recorded so the next
+        # person to time this page does not read it as a regression.
         "build_ms": round((time.perf_counter() - started) * 1000),
         "attention": [ops_status.one_line(item) for item in attention],
         "blocks": blocks,
@@ -633,6 +673,11 @@ _STATUS_CLASS = {"SOURCED": "ok", "UNSOURCED": "unsourced"}
 # reading. Everything else renders plain — colouring every cell colours none.
 _STATE_CLASS = {
     "BLOCKED": "bad",
+    # `warn`, not `bad`: the project is still moving. Painting it the same
+    # red as a stopped one would teach a reader that red means "look
+    # eventually", which is the reading `verdict.py` spends its length
+    # preventing.
+    "AT_RISK": "warn",
     "CANCELLED": "warn",
     "COMPLETE": "ok",
     "ACTIVE": "neutral",
@@ -643,12 +688,22 @@ _STATE_CLASS = {
 
 _PANEL_ORDER = (
     "METRICS",
+    # Directly after METRICS, because it is the same numbers with an owner
+    # attached plus the ones nobody can compute — a reader who has just seen
+    # the counts is the reader who needs to know which of them their role
+    # actually answers for (C149).
+    "ROLE_KPI",
     "RISKS",
     "PROJECTS",
     "TEAMS",
     "DESKTOPS",
     "ACTIVITY",
     "COMPLETIONS",
+    # Below the Event feed rather than above it: this is the *other* record
+    # of the same days, and the Events are the one a person acts on. It is
+    # here at all because a day nobody reported and a day nothing happened
+    # look identical in every panel above (C149).
+    "CODE_CHANGES",
     "COMPANY_GOALS",
     "SPRINTS",
     "JUDGEMENTS",
@@ -1762,6 +1817,21 @@ def company_verdict(data: Mapping[str, Any]) -> tuple[str, str, str]:
     if attention:
         return "warn", "주의", f"확인이 필요하다 — {len(attention)}건"
     if not model.get("events_read"):
+        # The same sentence the Notion page carries, and for the same reason
+        # (C149): Events 0 with commits on the same days is not a quiet
+        # company, it is delivery that did not arrive — the failure with no
+        # other signal anywhere on this page. Measured on a one-day window
+        # over the live tree: `events_read: 0`, one commit, 21 files.
+        code_rows = 0
+        for panel in model.get("panels") or []:
+            if panel.get("key") == "CODE_CHANGES":
+                code_rows = len(panel.get("rows") or [])
+                break
+        if code_rows:
+            return "warn", "주의", (
+                f"Event는 0건인데 같은 기간 Git에는 commit이 {code_rows}건 있다 "
+                "— 일이 없었던 것이 아니라 보고가 도착하지 않았을 가능성이 크다"
+            )
         return "warn", "주의", (
             "셀 Event가 없다 — '문제 없음'이 아니라 '판단할 증거가 없다'"
         )
@@ -2201,10 +2271,18 @@ def _execution_html(data: Mapping[str, Any]) -> str:
 #: checks against the model rather than against this dict.
 _PANEL_PLACEMENT = {
     "METRICS": "KPI",
+    # C149. Beside the numbers it frames, not in EVIDENCE where the fallback
+    # would have put it: it is the section a CEO / CTO / COO opens to find
+    # out which of these numbers is theirs, and what this system cannot
+    # answer for them at all.
+    "ROLE_KPI": "KPI",
     "RISKS": "ACTION",
     "PROJECTS": "PROJECTS",
     "ACTIVITY": "RECENT",
     "COMPLETIONS": "RECENT",
+    # Git's account of the same days as ACTIVITY's Event feed. RECENT is
+    # exactly the question it answers.
+    "CODE_CHANGES": "RECENT",
     "TEAMS": "EVIDENCE",
     "DESKTOPS": "EVIDENCE",
     "COMPANY_GOALS": "EVIDENCE",
@@ -2864,6 +2942,17 @@ def render_html(data: Mapping[str, Any]) -> str:
         }
         for panel in ordered:
             regions[panel_placement(panel)].append(panel)
+        # `regions["KPI"]` was computed and **never read** — this section
+        # rendered `by_key["METRICS"]` directly, so any second panel mapped
+        # to the KPI region was dropped from the page in silence. Nothing
+        # caught it: `EveryPanelReachesTheScreenTests` passed because METRICS
+        # was the only panel that had ever been mapped there, and the map is
+        # what a person edits when adding one. Found in C149 while placing
+        # `ROLE_KPI` — which would have vanished.
+        #
+        # METRICS keeps its tile rendering (`_kpi_html`, which reads the
+        # `key`/`value` shape and paints a verdict); every other KPI-region
+        # panel renders as an ordinary table. Neither is dropped.
         kpi_html = (
             "<section class='kpi-section' id='kpi'>"
             "<h2>⑤ 핵심 지표</h2>"
@@ -2871,8 +2960,11 @@ def render_html(data: Mapping[str, Any]) -> str:
             "없으면 어느 숫자도 판정하지 않는다. 방향이 있는 "
             "지표만 <b>정상 / 주의</b>로 읽히고, 나머지는 <b>참고</b>다 — "
             "조용한 주가 나쁜 주는 아니기 때문이다.</p>"
-            + _kpi_html(
-                by_key.get("METRICS"), measured=bool(model.get("events_read"))
+            + "".join(
+                _kpi_html(panel, measured=bool(model.get("events_read")))
+                if panel["key"] == "METRICS"
+                else _panel_html(panel)
+                for panel in regions["KPI"]
             )
             + "</section>"
         )

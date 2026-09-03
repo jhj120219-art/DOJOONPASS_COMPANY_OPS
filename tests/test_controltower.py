@@ -89,6 +89,62 @@ class ControlTowerTestCase(unittest.TestCase):
         return build_company_rollup(processed_dir=self.processed, now=NOW, **kwargs)
 
 
+def one_of_everything(case):
+    """A rollup where every evidenced metric is non-zero.
+
+    Two guard classes below need exactly this fixture — one asks
+    `len(evidence) == value` of every metric, the other reads each cited file
+    back and asks whether that Event is an instance of what the metric
+    counts. Both are vacuous on a metric the fixture leaves at zero, and both
+    carried a byte-identical copy of this function.
+
+    That copy was already a live cost rather than a tidiness one: C149 added
+    five evidenced metrics, and a fixture updated in one copy and not the
+    other silently returns one of the two guards to passing on `0 == 0` —
+    which is the exact failure both classes were written to prevent.
+
+    Every Event here exists to make one metric non-zero, and the projects are
+    kept apart on purpose: an `ISSUE_RAISED` on the same project as a later
+    `COMPLETED` would be *closed* by it (`_OPEN_ITEM_LIFECYCLES`), and
+    `issues_open` would drop back to zero.
+    """
+    case.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5, milestone="M")
+    case.put("E2", "SEARCH", "CTO_BACKEND", "ISSUE_RESOLVED", "IN_PROGRESS", 6)
+    case.put("E3", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 7)
+    case.put("E4", "OPSX", "COO", "BLOCKED", "BLOCKED", 8, blocker="waiting")
+    case.put("E5", "PAY", "CMO", "COMPLETED", "COMPLETED", 9)
+    # C149's four, on projects of their own so the closing Events above do
+    # not close them.
+    case.put("E6", "GROWTH", "CMO", "ISSUE_RAISED", "IN_PROGRESS", 10)
+    case.put("E7", "GROWTH", "CMO", "DECISION_REQUIRED", "IN_PROGRESS", 11)
+    case.put("E8", "LEGAL", "COO", "DECISION_REJECTED", "IN_PROGRESS", 12)
+    case.put("E9", "VENDOR", "COO", "AT_RISK", "AT_RISK", 13)
+    # C149's second Decision half. `E10` is approved and left undone so
+    # `decisions_unexecuted` is non-zero; `E11`/`E12` are a decision that was
+    # actually carried out, so `decisions_executed` is non-zero and the
+    # execution lifecycle is exercised from both ends. Separate projects, so
+    # neither closes the other.
+    case.put("E10", "ROLLOUT", "COO", "DECISION_APPROVED", "IN_PROGRESS", 14)
+    case.put("E11", "HIRING", "COO", "DECISION_APPROVED", "IN_PROGRESS", 15)
+    case.put("E12", "HIRING", "COO", "EXECUTED", "IN_PROGRESS", 16)
+
+    # `put()` derives `source` from `role`, so a pair mismatch has to be
+    # written directly — DESKTOP_1 owns CTO_BACKEND (docs/02 §8).
+    mismatched = create_event(
+        source="DESKTOP_1",
+        role="CMO",
+        project_id="SEARCH",
+        event_type="STARTED",
+        status="IN_PROGRESS",
+        summary="claims a role its Desktop does not own",
+        history_candidate=True,
+        event_id="M1",
+        timestamp="2026-08-04T09:00:00+09:00",
+    )
+    (case.processed / "M1.json").write_text(mismatched.to_json(), encoding="utf-8")
+    return case.rollup()
+
+
 class BlockerStateIsFoldedTests(ControlTowerTestCase):
     """The property a "latest Event wins" rollup gets wrong.
 
@@ -330,34 +386,7 @@ class EveryMetricIsClassifiedByHowItCitesItsFilesTests(ControlTowerTestCase):
         ),
     }
 
-    def _one_of_everything(self):
-        """A rollup where every evidenced metric is non-zero.
-
-        Without that this class passes on `0 == 0` for whichever metric the
-        fixture happens not to exercise — the vacuous pass its own subject
-        matter is about.
-        """
-        self.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5, milestone="M")
-        self.put("E2", "SEARCH", "CTO_BACKEND", "ISSUE_RESOLVED", "IN_PROGRESS", 6)
-        self.put("E3", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 7)
-        self.put("E4", "OPSX", "COO", "BLOCKED", "BLOCKED", 8, blocker="waiting")
-        self.put("E5", "PAY", "CMO", "COMPLETED", "COMPLETED", 9)
-
-        # `put()` derives `source` from `role`, so a pair mismatch has to be
-        # written directly — DESKTOP_1 owns CTO_BACKEND (docs/02 §8).
-        mismatched = create_event(
-            source="DESKTOP_1",
-            role="CMO",
-            project_id="SEARCH",
-            event_type="STARTED",
-            status="IN_PROGRESS",
-            summary="claims a role its Desktop does not own",
-            history_candidate=True,
-            event_id="M1",
-            timestamp="2026-08-04T09:00:00+09:00",
-        )
-        (self.processed / "M1.json").write_text(mismatched.to_json(), encoding="utf-8")
-        return self.rollup()
+    _one_of_everything = one_of_everything
 
     def test_the_fixture_exercises_every_evidenced_metric(self):
         """The vacuous-pass guard, first: a metric left at zero would satisfy
@@ -471,6 +500,35 @@ class EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests(ControlTowerTestCase)
             "milestones_completed": lambda event: event.event_type == "MILESTONE_COMPLETED",
             "decisions_approved": lambda event: event.event_type == "DECISION_APPROVED",
             "issues_resolved": lambda event: event.event_type == "ISSUE_RESOLVED",
+            "issues_raised": lambda event: event.event_type == "ISSUE_RAISED",
+            "decisions_rejected": lambda event: event.event_type == "DECISION_REJECTED",
+            "decisions_executed": lambda event: event.event_type == "EXECUTED",
+            # Cites the APPROVAL, not the execution — the approval is what
+            # opened "decided and not done", and it is the instant the age
+            # is measured from.
+            "decisions_unexecuted": (
+                lambda event: event.event_type == "DECISION_APPROVED"
+            ),
+            # The open-item metrics cite the Event that OPENED the lifecycle
+            # — the fact C149 made recordable and the one an aging number is
+            # measured from. Citing the closing Event, or the project's last
+            # Event of any kind, would be the swapped citation this class
+            # exists to catch.
+            "issues_open": lambda event: event.event_type == "ISSUE_RAISED",
+            # Cites whatever OPENED the unowned item, which is an
+            # `ISSUE_RAISED` or a `DECISION_APPROVED` depending on the
+            # lifecycle — never the `ASSIGNED`, because an assignment is
+            # precisely what these rows do **not** have.
+            "items_unassigned": (
+                lambda event: event.event_type
+                in ("ISSUE_RAISED", "DECISION_REQUIRED", "DECISION_APPROVED")
+            ),
+            "decisions_pending": lambda event: event.event_type == "DECISION_REQUIRED",
+            # `projects_at_risk` cites the Event that PUT the project at
+            # risk, so the predicate is on `status`, not `event_type`: docs/04
+            # §28.1 gives AT_RISK no property of its own, and the rollup folds
+            # `status` for exactly that reason.
+            "projects_at_risk": lambda event: event.status == "AT_RISK",
             # The risk's evidence is the Event that *set* the blocker, which
             # is exactly what `_blocker_change()` reports a value for.
             "open_blockers": lambda event: _blocker_change(event)[1] is not None,
@@ -484,26 +542,7 @@ class EveryCitedFileIsAnInstanceOfWhatTheMetricCountsTests(ControlTowerTestCase)
     #: nothing here for a predicate to be about.
     NO_EVIDENCE = ("projects_active", "teams_silent")
 
-    def _one_of_everything(self):
-        self.put("E1", "SEARCH", "CTO_BACKEND", "MILESTONE_COMPLETED", "IN_PROGRESS", 5, milestone="M")
-        self.put("E2", "SEARCH", "CTO_BACKEND", "ISSUE_RESOLVED", "IN_PROGRESS", 6)
-        self.put("E3", "PAY", "CMO", "DECISION_APPROVED", "IN_PROGRESS", 7)
-        self.put("E4", "OPSX", "COO", "BLOCKED", "BLOCKED", 8, blocker="waiting")
-        self.put("E5", "PAY", "CMO", "COMPLETED", "COMPLETED", 9)
-
-        mismatched = create_event(
-            source="DESKTOP_1",
-            role="CMO",
-            project_id="SEARCH",
-            event_type="STARTED",
-            status="IN_PROGRESS",
-            summary="claims a role its Desktop does not own",
-            history_candidate=True,
-            event_id="M1",
-            timestamp="2026-08-04T09:00:00+09:00",
-        )
-        (self.processed / "M1.json").write_text(mismatched.to_json(), encoding="utf-8")
-        return self.rollup()
+    _one_of_everything = one_of_everything
 
     def _event_at(self, ref):
         from events import Event
@@ -636,7 +675,32 @@ class ThePredicatesTheEvidenceGateBorrowsAreThemselvesPinnedTests(ControlTowerTe
     SETS_A_BLOCKER = {"BLOCKED"}
     CLEARS_A_BLOCKER = {"RESUMED", "COMPLETED", "ISSUE_RESOLVED"}
 
-    STATUS_FOR = {"COMPLETED": "COMPLETED", "CANCELLED": "CANCELLED", "BLOCKED": "BLOCKED"}
+    #: The four C149 added. None of them touches `Completed Date` or
+    #: `Blocker`, and docs/04 §28.1 says why for each — the one worth
+    #: restating is `ISSUE_RAISED`, which does **not** set a Blocker: an
+    #: Issue being raised is not the project having stopped, and if it has
+    #: stopped, §22's `BLOCKED` is the Event that says so. Listing them here
+    #: rather than only in the roster below means the two predicate tests
+    #: assert it, instead of the roster merely accounting for them.
+    LEAVES_BOTH_ALONE = {
+        "STARTED",
+        "CANCELLED",
+        "MILESTONE_COMPLETED",
+        "AT_RISK",
+        "ISSUE_RAISED",
+        "ASSIGNED",
+        "DECISION_REQUIRED",
+        "DECISION_APPROVED",
+        "DECISION_REJECTED",
+        "EXECUTED",
+    }
+
+    STATUS_FOR = {
+        "COMPLETED": "COMPLETED",
+        "CANCELLED": "CANCELLED",
+        "BLOCKED": "BLOCKED",
+        "AT_RISK": "AT_RISK",
+    }
 
     def _event(self, event_type):
         return create_event(
@@ -660,9 +724,24 @@ class ThePredicatesTheEvidenceGateBorrowsAreThemselvesPinnedTests(ControlTowerTe
 
         self.assertEqual(
             self.COMPLETES | self.SETS_A_BLOCKER | self.CLEARS_A_BLOCKER
-            | {"STARTED", "CANCELLED", "MILESTONE_COMPLETED", "DECISION_APPROVED"},
+            | self.LEAVES_BOTH_ALONE,
             set(EVENT_TYPES),
         )
+
+    def test_the_types_that_leave_both_predicates_alone_really_do(self):
+        """The roster above only accounts for them; this asserts the claim.
+
+        Without it, `LEAVES_BOTH_ALONE` is a name and nothing checks that an
+        `ISSUE_RAISED` has not quietly started writing `Blocker` — the exact
+        overlap docs/04 §28.1 forbids.
+        """
+        from controltower.rollup import _blocker_change, _completes
+
+        for event_type in sorted(self.LEAVES_BOTH_ALONE):
+            with self.subTest(event_type=event_type):
+                event = self._event(event_type)
+                self.assertFalse(_completes(event))
+                self.assertFalse(_blocker_change(event)[0])
 
     def test_exactly_one_event_type_completes_a_project(self):
         from controltower.rollup import _completes

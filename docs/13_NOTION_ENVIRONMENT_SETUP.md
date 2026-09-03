@@ -33,10 +33,32 @@
 | `NOTION_OPS_RUNS_DATABASE_ID` | 선택 | `src/notion/config.py` | Operations Dashboard(CEO Decision ④)의 `OPS_RUNS` Database ID. **미설정이면 Dashboard 기록은 매 실행 SKIPPED_NOT_CONFIGURED다.** Notion Sync는 영향받지 않는다. 아래 §3-⑧ 참고. |
 | `COMPANY_OPS_HISTORY_START_DATE` | **필수(Runner)** | `run_company_ops.py`, `ops_status.py` | Company History를 언제부터 기록할지. 절대 추측하지 않는다(docs/07 §50). **없으면 `run_company_ops.py`는 첫 줄에서 exit 1이며 아무 단계도 실행되지 않는다.** 형식 `YYYY-MM-DD`. |
 | `COMPANY_OPS_PROFILE` | **필수(Agent)** | `src/reporter/profiles.py`, `run_agent.py` | 이 Desktop의 프로필(`DESKTOP_1`~`DESKTOP_4`). role은 따로 설정하지 않는다 — docs/02 §8의 source→role 표에서 나온다. |
-| `COMPANY_OPS_AGENT_SYNC_FOLDER` | **필수(Agent)** | `run_agent.py`, `ops_status.py` | 이 Desktop이 Event를 쓰는 OneDrive Sync Folder. `ops_status.py`에서는 전달 정합성 확인에만 쓰이며, 없으면 "확인 불가"로 보고된다. |
+| `COMPANY_OPS_AGENT_SYNC_FOLDER` | **필수(Agent)** | `run_agent.py`, `ops_status.py` | 이 Desktop이 Event를 쓰는 OneDrive Sync Folder. `ops_status.py`에서는 전달 정합성 확인에만 쓰이며, 없으면 "확인 불가"로 보고된다. **Agent에만 필수다** — 아래 §2.0.1 참고. |
 | `COMPANY_OPS_AGENT_START_DATE` | **필수(Agent)** | `run_agent.py`, `ops_status.py` | 이 Desktop이 최초 실행에서 수집을 시작할 날짜. `COMPANY_OPS_HISTORY_START_DATE`와 분리돼 있다 — Desktop은 Company History보다 늦게 보고를 시작할 수 있다. |
 
 `src/notion/transport.py`의 `NOTION_API_BASE_URL` / `NOTION_API_VERSION`은 환경변수가 아니라 코드 내 상수다.
+
+### 2.0.1 OneDrive 없이 돌아가는 것과 돌아가지 않는 것 (C149)
+
+`COMPANY_OPS_AGENT_SYNC_FOLDER`는 **Event를 다른 Desktop으로 보내는** 쪽에만
+필수다. 표의 "필수(Agent)"는 그 뜻이며, Runner 쪽에는 필수가 아니다.
+
+이 변수가 없거나 그 폴더가 죽어 있을 때 실제로 무엇이 되는지:
+
+| | OneDrive 정상 | OneDrive 없음/죽음 |
+|---|---|---|
+| 이 Desktop의 Event 전달 | 됨 | **안 됨** (Agent가 보고한다) |
+| Company History / Daily / Backup | 됨 | 됨 (이미 수집된 Event 기준) |
+| Notion Sync / Dashboard | 됨 | 됨 |
+| D+1 "어제 무엇이 바뀌었나" | Event + Git | **Git으로 답한다** |
+
+마지막 줄이 C149에서 바뀐 것이다. 그전에는 Event가 유일한 원천이어서
+"아무도 일하지 않은 날"과 "일했지만 전달이 안 된 날"이 화면에서 똑같이
+조용했다. `src/delivery/git_activity.py`가 로컬 저장소를 직접 읽으므로,
+이제 그 두 날은 다르게 보인다.
+
+Git은 회사의 Source of Truth가 아니다 — Project·Blocker·Decision은 여전히
+Event가 든다. 자세한 것은 `docs/15_D1_COMPANY_UPDATE_SPEC.md`.
 
 ### 2.1 `.env`는 자동으로 읽히지 않는다
 

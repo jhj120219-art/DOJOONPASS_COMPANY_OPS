@@ -43,18 +43,50 @@ STATES: dict[str, tuple[str, str, str, str]] = {
 
 #: The metrics where a smaller number is a better company.
 #:
-#: **Only three of the nine have a direction, and pretending otherwise would
-#: be the worse failure.** `기록된 Event 0` is not bad — a quiet week is a
+#: **Six of the fourteen have a direction, and pretending otherwise would be
+#: the worse failure.** `기록된 Event 0` is not bad — a quiet week is a
 #: quiet week — and painting it amber teaches an operator to ignore amber.
-#: The other six are volume, and both surfaces say so in a word rather than
+#: The other eight are volume, and both surfaces say so in a word rather than
 #: leaving a reader to guess whether a silent number means healthy or
 #: unmeasured.
+#:
+#: C149 added five metrics and three of them belong here. The line between
+#: the two halves is *open versus done*:
+#:
+#:     issues_open         something is unresolved right now  -> direction
+#:     decisions_pending   somebody is waiting on a decision  -> direction
+#:     projects_at_risk    something is about to stop         -> direction
+#:
+#:     issues_raised       an Issue was found and written down. Finding more
+#:                         Issues is not a worse company — a company that
+#:                         raises none is usually not looking. Volume.
+#:     decisions_rejected  a decision was actually made. Rejecting more is
+#:                         not worse than approving more; both close a
+#:                         lifecycle, and only `decisions_pending` measures
+#:                         the state anyone should act on. Volume.
 #:
 #: Keyed on the Model's `key`, never on the Korean `label`: a wording change
 #: upstream would silently stop the verdict applying, which is the
 #: "정상을 보고하는 채로" failure this project keeps removing elsewhere.
 METRIC_LOWER_IS_BETTER = frozenset(
-    {"open_blockers", "teams_silent", "desktop_role_mismatches"}
+    {
+        "open_blockers",
+        "teams_silent",
+        "desktop_role_mismatches",
+        "issues_open",
+        "decisions_pending",
+        "projects_at_risk",
+        # Decided and not done. Directional for `decisions_pending`'s exact
+        # reason — it names something outstanding right now — while
+        # `decisions_executed` beside it is volume: executing more decisions
+        # is not a better company than needing fewer.
+        "decisions_unexecuted",
+        # Nobody has taken it. Directional for the same reason as the rest of
+        # this list — it names something outstanding right now — and it is
+        # the one a COO acts on first, because an unowned item is not being
+        # worked on by anybody at all.
+        "items_unassigned",
+    }
 )
 
 #: The five numbers a reader gets before they scroll, in reading order.

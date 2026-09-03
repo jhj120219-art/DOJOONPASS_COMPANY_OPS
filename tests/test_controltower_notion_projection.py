@@ -1253,7 +1253,12 @@ class ARenamedPropertyIsNotAFreeChangeTests(unittest.TestCase):
             "Retired At": "date", "Evidence": "rich_text",
             "Evidence Count": "number", "Evidence Truncated": "checkbox",
             "Kind": "select", "Project ID": "rich_text", "Team": "select",
-            "Blocker": "rich_text", "Since": "date", "Days Open": "number",
+            "Blocker": "rich_text",
+            # C149. New property, not a rename — `Blocker` is unchanged and
+            # still `rich_text`, so no existing row loses a value and the
+            # rule this class enforces is not the one being exercised.
+            "Detail": "rich_text",
+            "Since": "date", "Days Open": "number",
             "Event ID": "rich_text", "Source": "select",
             "Claimed Role": "select", "Expected Role": "select",
             "Kept File": "rich_text", "Ignored File": "rich_text",

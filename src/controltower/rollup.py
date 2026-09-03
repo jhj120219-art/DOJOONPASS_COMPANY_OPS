@@ -81,7 +81,7 @@ Same posture as `history/reconciliation.py`, and for the same reason.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date as date_type
 from datetime import datetime
 from pathlib import Path
@@ -245,6 +245,32 @@ class ProjectRollup:
     # team silently moved the blocker's owner. Measured: PAY blocked by
     # CTO_BACKEND, one later CMO Event, ATTENTION named CMO.
     open_blocker_team: str | None = None
+    # The Event that last put this project into `status = AT_RISK`, and when.
+    # Folded rather than read off the newest Event for `is_blocked`'s reason:
+    # a project reported AT_RISK on Monday and IN_PROGRESS on Wednesday is
+    # not at risk, and only replaying the sequence says so.
+    #
+    # `is_at_risk` reads `status` (the last report) while these two remember
+    # *which* report; they cannot disagree, because both are written by the
+    # same pass over the same ordered Events. The pair exists so a risk can
+    # be cited and aged — `projects_at_risk` used to cite `evidence[-1]`,
+    # whichever Event happened last, which is the same wrong-citation defect
+    # `completed_evidence` was added to fix.
+    at_risk_since: str | None = None
+    at_risk_evidence: EvidenceRef | None = None
+    # The `role` of the Event that reported the risk, for
+    # `open_blocker_team`'s reason and to avoid its measured defect: reading
+    # "which team owns this" off `teams[-1]` gives whichever team logged the
+    # most recent Event of any kind, so one unrelated report moves the owner.
+    at_risk_team: str | None = None
+    # The `summary` of that same Event — the only place the risk is
+    # described, because docs/04 §28.1 gives `AT_RISK` no property of its
+    # own. Carried here rather than left to the Event feed: measured on a
+    # real run, the RISKS row read "AT_RISK  VENDOR  1일" and said nothing
+    # about *what* the risk was, while the two other open-state kinds beside
+    # it carried a person's own words. A row a reader cannot act on is the
+    # kind of row that teaches them to skip the table.
+    at_risk_summary: str | None = None
     completed_at: str | None = None
     # The Event that wrote §25's Completed Date, not simply the last Event of
     # a completed project. `projects_completed`'s evidence used to be
@@ -263,13 +289,78 @@ class ProjectRollup:
 
     @property
     def is_complete(self) -> bool:
+        """A `Completed Date` was written for this project, ever.
+
+        Deliberately **not** "and is still complete". This answers "did this
+        project complete in the period", which is what `projects_completed`
+        counts and what `completed_evidence` cites — a project that finished
+        and later restarted really did finish once, and dropping it would
+        make the completion count disagree with the file it names.
+
+        Whether the completion is still the project's current state is a
+        different question with a different answer, and
+        `dashboard._project_state()` is where it is asked (C149).
+        """
         return self.completed_at is not None
+
+    @property
+    def completion_stands(self) -> bool:
+        """This project completed **and** the last report still says so.
+
+        `is_complete` is "a Completed Date was written, ever" — the right
+        meaning for counting completions in a period. This is the current
+        state, and the two are different questions with different answers
+        for a project that finished and started moving again.
+
+        One property with three callers, because the same conflation was
+        made three times and fixed once. C150 corrected
+        `dashboard._project_state()` — which was reading `is_complete` as
+        "is currently complete" — and left the other two, so a project
+        completed and then reported AT_RISK came out:
+
+            PROJECTS panel   state=AT_RISK
+            RISKS panel      (empty)
+            projects_at_risk 0
+
+        One company state, three surfaces, two of them wrong. Both of the
+        wrong ones were suppressing the risk with `not p.is_complete`.
+
+        The rule is not invented here: `validate_event()` requires a
+        `COMPLETED` Event to carry `status = COMPLETED`, so the two agree at
+        the moment of completion and a later Event reporting something else
+        is the reporter's own word (docs/04 §27's stance). Precedence
+        between BLOCKED / AT_RISK / COMPLETE stays in `PROJECT_STATES`'
+        order and is deliberately **not** repeated here — this answers one
+        narrow question and `_project_state()` composes it.
+        """
+        return self.is_complete and self.status == "COMPLETED"
+
+    @property
+    def is_at_risk(self) -> bool:
+        """Last reported `status` is AT_RISK, and nothing worse has happened.
+
+        Read off `status` and not off an Event type, for the reason
+        `dashboard._project_state()` already gives for CANCELLED: docs/04
+        §28.1 gives `AT_RISK` **no property of its own**, so there is no
+        folded fact to read and the last reported `status` is the only place
+        the risk exists.
+
+        `is_blocked` and `is_complete` win over it, and neither of those is
+        checked here — `PROJECT_STATES`' order does that in one place, and a
+        second precedence rule here would be the second one to keep in step.
+        What this answers is narrower and exact: *did the last report say
+        AT_RISK*.
+        """
+        return self.status == "AT_RISK"
 
     def days_since_last_event(self, now: datetime) -> int | None:
         return _whole_days_between(self.last_seen, now)
 
     def days_blocked(self, now: datetime) -> int | None:
         return _whole_days_between(self.open_blocker_since, now)
+
+    def days_at_risk(self, now: datetime) -> int | None:
+        return _whole_days_between(self.at_risk_since, now)
 
 
 @dataclass(frozen=True)
@@ -439,9 +530,154 @@ class Metric:
     evidence: tuple[EvidenceRef, ...] = ()
 
 
+# The two lifecycles whose *open* state C149 made expressible, and the Event
+# types that open and close each one. Read as a table on purpose: the whole
+# defect this replaces was that the closing halves existed and the opening
+# halves did not, so the pairing is the thing worth being able to see at a
+# glance.
+#
+#     ISSUE     opened by ISSUE_RAISED
+#               closed by ISSUE_RESOLVED
+#     DECISION  opened by DECISION_REQUIRED
+#               closed by DECISION_APPROVED / DECISION_REJECTED
+#
+# `COMPLETED` and `CANCELLED` close both: a project that finished or was
+# abandoned has no open questions left to age, and leaving them open would
+# put dead work at the top of every aging list forever.
+#
+# Keyed by `project_id` and not by an issue id, because there is no issue id
+# — `events.Event` has thirteen fields and none of them identifies one Issue
+# across two Events. So this counts *projects with something open*, not
+# individual issues, and `KpiValue`'s note says so wherever the number is
+# shown. Inventing an id here would be inventing a source.
+# Each entry is `(opens, assigns, closes)`.
+#
+# `assigns` is the third role, and it is neither of the other two: an
+# `ASSIGNED` Event must not restart the clock (the age runs from when the
+# Issue was **raised**, not from when somebody finally picked it up) and
+# must not close anything. It records who owns the open item now.
+#
+# A third slot in this one table rather than a second parallel map, so that
+# "what does this Event do to an open item" has exactly one place to be
+# read — the mistake `_OPEN_ITEM_RISK_KIND` was introduced to undo one
+# module over.
+_OPEN_ITEM_LIFECYCLES: dict[str, tuple[frozenset, frozenset, frozenset]] = {
+    "ISSUE": (
+        frozenset({"ISSUE_RAISED"}),
+        frozenset({"ASSIGNED"}),
+        frozenset({"ISSUE_RESOLVED", "COMPLETED", "CANCELLED"}),
+    ),
+    "DECISION": (
+        frozenset({"DECISION_REQUIRED"}),
+        # A Decision is not assigned to a team — it waits on an authority,
+        # and this system has no source for who that is. Empty rather than
+        # absent, so the shape is uniform and the silence is deliberate.
+        frozenset(),
+        frozenset({"DECISION_APPROVED", "DECISION_REJECTED", "COMPLETED", "CANCELLED"}),
+    ),
+    # The second half of the Decision lifecycle, and the reason it is a
+    # lifecycle of its own rather than a longer first one: **an approval is
+    # not the work.** `DECISION_APPROVED` closes "waiting for a decision"
+    # and opens "decided, not yet done", which is an ordinary way for a
+    # company to stall and was invisible here — approval removed the item
+    # from every list this module produces.
+    #
+    # `DECISION_REJECTED` deliberately does **not** open this one. A
+    # rejection settles the question and leaves nothing to carry out;
+    # putting it here would report every "no" as outstanding work forever.
+    "DECISION_EXECUTION": (
+        frozenset({"DECISION_APPROVED"}),
+        # The team that carries a decision out can be named the same way an
+        # Issue's owner is, and for the same reason it matters: "approved,
+        # and nobody has picked it up" is worse than "approved, and CTO
+        # Backend has it".
+        frozenset({"ASSIGNED"}),
+        frozenset({"EXECUTED", "COMPLETED", "CANCELLED"}),
+    ),
+}
+
+
+@dataclass(frozen=True)
+class OpenItem:
+    """One project with an Issue or a Decision still open, and since when.
+
+    The `since` is the *opening* Event's timestamp, which is the fact this
+    system could not record before C149 and without which "how long has this
+    been open" has no answer at all — not a missing feature, an impossible
+    computation.
+    """
+
+    kind: str
+    project_id: str
+    team: str
+    summary: str
+    since: str
+    evidence: EvidenceRef
+    #: How many opening Events this entry stands for — 1 unless the same
+    #: project opened another before anything closed it.
+    #:
+    #: Never dropped in silence, which is this module's rule for
+    #: `DuplicateEvent` and `unreadable` and is the same rule here.
+    #: Measured before this field existed, one project with two unresolved
+    #: `ISSUE_RAISED`:
+    #:
+    #:     제기된 Issue    2
+    #:     열려 있는 Issue  1
+    #:     해결된 Issue    0
+    #:
+    #: Arithmetically impossible as read, and the first Issue's own words
+    #: ("invoice totals drift") were nowhere on the screen at all.
+    #:
+    #: The fold cannot do better than one entry per project, and that is a
+    #: property of the Event Schema rather than of this code: `events.Event`
+    #: has thirteen fields and none identifies one Issue across two Events,
+    #: so an `ISSUE_RESOLVED` does not say *which* Issue it resolved. Keeping
+    #: both openings would mean guessing which one a resolution closed. So
+    #: the count is carried instead of the identity, and the views say
+    #: "외 N건".
+    occurrences: int = 1
+    #: The team that took this on, or None when nobody has.
+    #:
+    #: `team` above is who **raised** it; this is who **owns** it, and the
+    #: two are different questions that were the same field. Measured on the
+    #: shape a COO actually reads: "10일째 열려 있는 Issue: BILLING [CMO]"
+    #: said the same thing whether CMO had been working on it for ten days
+    #: or nobody had looked at it once, and those are opposite situations
+    #: with opposite next actions.
+    #:
+    #: `None` and not the raiser: an Issue is not assigned by being raised,
+    #: and defaulting to the raiser would make every Issue look owned — the
+    #: exact "reads as fine" failure this module keeps removing.
+    assigned_team: str | None = None
+
+    @property
+    def is_assigned(self) -> bool:
+        return self.assigned_team is not None
+
+    def age_days(self, now: datetime) -> int | None:
+        """Whole days this has been open, or None if that cannot be told.
+
+        `_whole_days_between()` and not a subtraction of its own, for the
+        reason that function's docstring gives: it is already this module's
+        one answer to "how many days", it counts in business days, and it
+        refuses to guess across a naive/aware mix rather than being off by
+        one. `ProjectRollup.days_blocked()` is the same call on the same
+        kind of question.
+        """
+        return _whole_days_between(self.since, now)
+
+
 @dataclass(frozen=True)
 class CompanyRollup:
     projects: tuple[ProjectRollup, ...] = ()
+    #: Every project's state **as of** `until`, ignoring `since`.
+    #:
+    #: `projects` above is "what moved in this period" and is the right
+    #: answer for the PROJECTS panel and for counting activity. It is the
+    #: wrong answer for "what is blocked", and using it for that was the D+1
+    #: view's whole failure — see `build_company_rollup()`'s note. Identical
+    #: to `projects` (and the same object) whenever no `since` was given.
+    state_projects: tuple[ProjectRollup, ...] = ()
     teams: tuple[TeamRollup, ...] = ()
     risks: tuple[Risk, ...] = ()
     metrics: tuple[Metric, ...] = ()
@@ -474,6 +710,9 @@ class CompanyRollup:
     completions_total: int = 0
     events_read: int = 0
     unreadable: tuple[tuple[str, str], ...] = ()
+    # Projects with an Issue or a Decision opened in this period and not
+    # closed in it. Oldest first — the order a COO reads them in.
+    open_items: tuple[OpenItem, ...] = ()
     since: date_type | None = None
     until: date_type | None = None
 
@@ -757,7 +996,33 @@ def build_company_rollup(
     else:
         pairs, unreadable = tuple(events), ()
 
+    # Two windows, because there are two kinds of question and only one of
+    # them has a "how far back" (C152).
+    #
+    #     activity   what happened in this period -- Events, completions,
+    #                milestones, the recent feed. `since` and `until` both
+    #                apply, and that is what a period means.
+    #     state      what is open **as of** `until` -- blockers, at-risk
+    #                projects, unresolved Issues, undecided Decisions.
+    #                `until` applies ("as of when"); `since` does not,
+    #                because a state has no "how far back". Nothing is
+    #                "blocked only since yesterday" -- it is blocked or it
+    #                is not, on a date.
+    #
+    # Applying `since` to a state fold was a category error, and it was the
+    # D+1 view's whole answer. Measured on a company with one blocker, one
+    # open Issue, one pending Decision and one approved-but-unexecuted
+    # Decision, asking for a single day on which none of them was opened:
+    #
+    #     whole period   blockers=1 issues_open=1 pending=1 unexec=1
+    #     D+1 (one day)  blockers=0 issues_open=0 pending=0 unexec=0
+    #                    RISKS table empty
+    #
+    # Every one of those labels is a state word -- `열려 있는`, `기다리는`,
+    # `위험한` -- and the page a COO reads every morning said the company
+    # had nothing open. docs/15 makes that page the D+1 report.
     in_period: list[tuple[Event, str]] = []
+    as_of: list[tuple[Event, str]] = []
     # An Event whose own date cannot be read cannot be placed in a period —
     # but it must not vanish quietly. It joins `unreadable`, which is the
     # field that already means "this one is in the directory and this rollup
@@ -775,32 +1040,57 @@ def build_company_rollup(
         if day is None:
             undated.append((name, f"timestamp is not a date: {event.timestamp!r}"))
             continue
-        if since is not None and day < since:
-            continue
         if until is not None and day > until:
+            continue
+        # Everything up to `until` is the state corpus, regardless of
+        # `since`. The window narrows it to the activity corpus below.
+        as_of.append((event, name))
+        if since is not None and day < since:
             continue
         in_period.append((event, name))
 
     in_period.sort(key=lambda pair: (event_instant_key(pair[0]), pair[0].event_id))
+    as_of.sort(key=lambda pair: (event_instant_key(pair[0]), pair[0].event_id))
 
     # One Event, one entry — see `DuplicateEvent`. Deterministic without a
     # third sort key: `read_events()` returns the directory in name order and
     # Python's sort is stable, so two files with the same instant and the
     # same id keep that order and the same one is always kept.
     in_period, duplicates = _fold_duplicates(in_period)
+    # Same rule over the wider corpus. Its `duplicates` are discarded on
+    # purpose: `duplicates` on the model reports what the **window** held,
+    # and a file outside the window is not a duplicate this view collected.
+    as_of, _as_of_duplicates = _fold_duplicates(as_of)
 
+    # `projects` answers "which projects moved in this period" — the PROJECTS
+    # panel, `projects_active`, `projects_completed`, each team's Event count
+    # and the coverage range. Windowed, and right to be.
     projects = _roll_projects(in_period)
-    teams = _roll_teams(in_period, projects)
+    # `state_projects` answers "what is the state of every project as of
+    # `until`". The same fold over the wider corpus, not a second derivation
+    # — one function, two questions, two inputs.
+    #
+    # Reused rather than recomputed when there is no `since`, which is the
+    # ordinary unbounded call: the two corpora are then identical and the
+    # fold is the most expensive thing this module does.
+    state_projects = projects if since is None else _roll_projects(as_of)
+    # Blocked projects on a Team are a state, so they come from the state
+    # fold; the Event counts beside them are activity and stay windowed.
+    teams = _roll_teams(in_period, state_projects)
     desktops = _roll_desktops(in_period)
     mismatches = tuple(
         mismatch for desktop in desktops for mismatch in desktop.mismatched
     )
-    risks = _roll_risks(projects)
-    metrics = _roll_metrics(projects, teams, risks, in_period, mismatches)
+    risks = _roll_risks(state_projects)
+    open_items = _roll_open_items(as_of)
+    metrics = _roll_metrics(
+        projects, teams, risks, in_period, mismatches, open_items, state_projects
+    )
     recent, completions, completions_total = _roll_recent(in_period)
 
     return CompanyRollup(
         projects=projects,
+        state_projects=state_projects,
         teams=teams,
         desktops=desktops,
         mismatches=mismatches,
@@ -812,6 +1102,7 @@ def build_company_rollup(
         completions_total=completions_total,
         events_read=len(in_period),
         unreadable=tuple(unreadable) + tuple(undated),
+        open_items=open_items,
         since=since,
         until=until,
     )
@@ -934,6 +1225,10 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
                 "blocker_since": None,
                 "blocker_ref": None,
                 "blocker_team": None,
+                "at_risk_since": None,
+                "at_risk_ref": None,
+                "at_risk_team": None,
+                "at_risk_summary": None,
                 "completed_at": None,
                 "completed_ref": None,
                 "milestones": [],
@@ -957,6 +1252,22 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
             # disagree the Event is already a `PairMismatch` and the Desktop
             # layer says so — one fact, one place to see it named wrong.
             bucket["blocker_team"] = event.role if value else None
+        # Every Event carries a `status`, so every Event either puts the
+        # project at risk or takes it out — there is no "leaves it alone"
+        # case, which is what makes this a fold over `status` rather than
+        # over `event_type` (docs/04 §28.1 gives AT_RISK no property of its
+        # own, so there is nothing else to read).
+        if event.status == "AT_RISK":
+            if bucket["at_risk_since"] is None:
+                bucket["at_risk_since"] = event.timestamp
+                bucket["at_risk_ref"] = _ref(event, name)
+                bucket["at_risk_team"] = event.role
+                bucket["at_risk_summary"] = event.summary
+        else:
+            bucket["at_risk_since"] = None
+            bucket["at_risk_ref"] = None
+            bucket["at_risk_team"] = None
+            bucket["at_risk_summary"] = None
         if _completes(event):
             bucket["completed_at"] = event.timestamp
             bucket["completed_ref"] = _ref(event, name)
@@ -976,6 +1287,10 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
             open_blocker_since=state[key]["blocker_since"],
             open_blocker_evidence=state[key]["blocker_ref"],
             open_blocker_team=state[key]["blocker_team"],
+            at_risk_since=state[key]["at_risk_since"],
+            at_risk_evidence=state[key]["at_risk_ref"],
+            at_risk_team=state[key]["at_risk_team"],
+            at_risk_summary=state[key]["at_risk_summary"],
             completed_at=state[key]["completed_at"],
             completed_evidence=state[key]["completed_ref"],
             milestones=tuple(state[key]["milestones"]),
@@ -1133,12 +1448,84 @@ def _roll_risks(projects: Sequence[ProjectRollup]) -> tuple[Risk, ...]:
     return tuple(risks)
 
 
+def _roll_open_items(pairs: Sequence[tuple[Event, str]]) -> tuple[OpenItem, ...]:
+    """Issues and Decisions open as of the end of the corpus it is given.
+
+    Folded in instant order, exactly as `_roll_projects()` folds a blocker
+    and for the same reason: a Decision required on Monday and approved on
+    Wednesday is not pending, and only replaying the sequence says so.
+
+    Re-opening is handled by the fold rather than forbidden — a second
+    `ISSUE_RAISED` after an `ISSUE_RESOLVED` starts a new clock, which is
+    what actually happened. The `since` is always the *most recent* opening,
+    not the first, so an item that was resolved and came back does not
+    report an age that spans the time it was closed.
+
+    **Handed the as-of corpus, not the window (C152).** An Issue raised
+    before `since` is still open inside it, so `build_company_rollup()`
+    passes every Event up to `until` here. Bounding this by `since` was a
+    category error — an open state has no "how far back" — and the D+1 view
+    reported a company with four open items as having none.
+
+    `until` still bounds it, and that is the one bound a state has: this
+    answers "what is open as of that date".
+    """
+    open_state: dict[tuple[str, str], OpenItem] = {}
+    for event, name in pairs:
+        for kind, (opens, assigns, closes) in _OPEN_ITEM_LIFECYCLES.items():
+            key = (kind, event.project_id)
+            if event.event_type in assigns:
+                # Only ever updates something already open. An `ASSIGNED`
+                # for an Issue nobody raised is not an open Issue — it is a
+                # report about nothing, and inventing an item from it would
+                # put a row on the Risk table with no beginning and no age.
+                held = open_state.get(key)
+                if held is not None:
+                    open_state[key] = replace(held, assigned_team=event.role)
+                continue
+            if event.event_type in opens:
+                # `since` is the newest opening and `occurrences` counts them
+                # all. Aging from the newest is deliberate — see this
+                # function's docstring on re-opening — and the count is what
+                # keeps the older ones from vanishing.
+                seen = open_state.get(key)
+                open_state[key] = OpenItem(
+                    kind=kind,
+                    project_id=event.project_id,
+                    team=event.role,
+                    summary=event.summary,
+                    since=event.timestamp,
+                    evidence=_ref(event, name),
+                    occurrences=(seen.occurrences + 1) if seen is not None else 1,
+                )
+            elif event.event_type in closes:
+                open_state.pop(key, None)
+
+    # Oldest first: the order a COO reads an aging list in. `event_instant_key`
+    # is not reusable here (it takes an Event, and these have outlived theirs),
+    # so the tie-break is the same two-tier shape spelled out on the text —
+    # an unparseable timestamp sorts last rather than deciding the order of
+    # everything around it.
+    def _order(item: OpenItem) -> tuple[int, object, str, str]:
+        try:
+            parsed = datetime.fromisoformat(item.since)
+        except (TypeError, ValueError):  # pragma: no cover - validate_event blocks it
+            return (1, str(item.since), item.kind, item.project_id)
+        if parsed.tzinfo is None:
+            return (1, str(item.since), item.kind, item.project_id)
+        return (0, parsed.timestamp(), item.kind, item.project_id)
+
+    return tuple(sorted(open_state.values(), key=_order))
+
+
 def _roll_metrics(
     projects: Sequence[ProjectRollup],
     teams: Sequence[TeamRollup],
     risks: Sequence[Risk],
     pairs: Sequence[tuple[Event, str]],
     mismatches: Sequence[PairMismatch] = (),
+    open_items: Sequence[OpenItem] = (),
+    state_projects: Sequence[ProjectRollup] | None = None,
 ) -> tuple[Metric, ...]:
     """The KPI layer, derived rather than declared.
 
@@ -1161,7 +1548,32 @@ def _roll_metrics(
         for event, name in pairs
         if event.event_type == "DECISION_APPROVED"
     )
+    rejected_refs = tuple(
+        _ref(event, name)
+        for event, name in pairs
+        if event.event_type == "DECISION_REJECTED"
+    )
+    raised_refs = tuple(
+        _ref(event, name) for event, name in pairs if event.event_type == "ISSUE_RAISED"
+    )
     completed = tuple(p for p in projects if p.is_complete)
+    # A state, so it is counted over the state fold. `projects` is the
+    # activity fold and would answer "became at risk in this window", which
+    # is not what "위험한 Project" says.
+    at_risk = tuple(
+        p
+        for p in (projects if state_projects is None else state_projects)
+        if p.is_at_risk and not p.is_blocked and not p.completion_stands
+    )
+    open_issues = tuple(item for item in open_items if item.kind == "ISSUE")
+    unassigned = tuple(item for item in open_items if not item.is_assigned)
+    open_decisions = tuple(item for item in open_items if item.kind == "DECISION")
+    unexecuted = tuple(
+        item for item in open_items if item.kind == "DECISION_EXECUTION"
+    )
+    executed_refs = tuple(
+        _ref(event, name) for event, name in pairs if event.event_type == "EXECUTED"
+    )
 
     return (
         Metric(
@@ -1206,6 +1618,87 @@ def _roll_metrics(
             value=len(resolved_refs),
             source="event_type=ISSUE_RESOLVED",
             evidence=resolved_refs,
+        ),
+        # The five below are what C149's Event vocabulary made countable.
+        # Each is the *opening* half of a lifecycle whose closing half was
+        # already counted above, and every one of them was structurally
+        # uncountable before — not unimplemented.
+        Metric(
+            key="issues_raised",
+            label="제기된 Issue",
+            value=len(raised_refs),
+            source="event_type=ISSUE_RAISED",
+            evidence=raised_refs,
+        ),
+        Metric(
+            key="decisions_rejected",
+            label="거절된 Decision",
+            value=len(rejected_refs),
+            source="event_type=DECISION_REJECTED",
+            evidence=rejected_refs,
+        ),
+        # The labels name **Projects**, not Issues, and that is the fix
+        # rather than the wording. Called "열려 있는 Issue" beside "제기된
+        # Issue 2" and "해결된 Issue 0", the value 1 reads as "one of the two
+        # was resolved" — an arithmetic a reader performs without being asked
+        # and which is false. One project with two unresolved Issues is one
+        # entry here, because no field identifies an Issue across two Events
+        # (`_OPEN_ITEM_LIFECYCLES`), and the label is where that has to be
+        # visible.
+        Metric(
+            key="issues_open",
+            label="열린 Issue가 있는 Project",
+            value=len(open_issues),
+            source="`until` 시점까지 ISSUE_RAISED가 있고 ISSUE_RESOLVED / COMPLETED / "
+            "CANCELLED가 뒤따르지 않은 Project 수. Event에 Issue 식별자가 없어 "
+            "한 Project의 여러 Issue는 한 건으로 센다 — 몇 건이 접혔는지는 "
+            "Risk 표의 각 행이 말한다",
+            evidence=tuple(item.evidence for item in open_issues),
+        ),
+        Metric(
+            key="decisions_pending",
+            label="Decision을 기다리는 Project",
+            value=len(open_decisions),
+            source="`until` 시점까지 DECISION_REQUIRED가 있고 DECISION_APPROVED / "
+            "DECISION_REJECTED / COMPLETED / CANCELLED가 뒤따르지 않은 Project 수. "
+            "Event에 Decision 식별자가 없어 한 Project의 여러 Decision은 한 "
+            "건으로 센다",
+            evidence=tuple(item.evidence for item in open_decisions),
+        ),
+        Metric(
+            key="items_unassigned",
+            label="아무도 맡지 않은 Issue/Decision",
+            value=len(unassigned),
+            source="열려 있는 Issue/Decision 중 ASSIGNED가 한 번도 오지 않은 것. "
+            "제기한 팀은 맡은 팀이 아니다 — 아무도 받지 않은 것과 누군가 "
+            "붙어 있는 것은 반대 상황이고 다음 행동이 다르다",
+            evidence=tuple(item.evidence for item in unassigned),
+        ),
+        Metric(
+            key="decisions_executed",
+            label="실행된 Decision",
+            value=len(executed_refs),
+            source="event_type=EXECUTED",
+            evidence=executed_refs,
+        ),
+        Metric(
+            key="decisions_unexecuted",
+            label="실행되지 않은 Decision이 있는 Project",
+            value=len(unexecuted),
+            source="`until` 시점까지 DECISION_APPROVED가 있고 EXECUTED / COMPLETED / "
+            "CANCELLED가 뒤따르지 않은 Project 수. 승인은 일이 아니다 — 이 수는 "
+            "'정해 놓고 하지 않은 것'을 센다",
+            evidence=tuple(item.evidence for item in unexecuted),
+        ),
+        Metric(
+            key="projects_at_risk",
+            label="위험한 Project",
+            value=len(at_risk),
+            source="마지막으로 보고된 status=AT_RISK이고 아직 막히지도 "
+            "끝나지도 않은 Project",
+            evidence=tuple(
+                p.at_risk_evidence for p in at_risk if p.at_risk_evidence
+            ),
         ),
         Metric(
             key="open_blockers",

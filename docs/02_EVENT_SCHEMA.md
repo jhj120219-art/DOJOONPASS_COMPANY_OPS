@@ -265,15 +265,64 @@ Event의 성격을 정의한다.
 V1 허용값:
 
     STARTED
+    AT_RISK
     BLOCKED
     RESUMED
     MILESTONE_COMPLETED
     COMPLETED
     CANCELLED
+    ISSUE_RAISED
+    ASSIGNED
     ISSUE_RESOLVED
+    DECISION_REQUIRED
     DECISION_APPROVED
+    DECISION_REJECTED
+    EXECUTED
 
 이외의 Event Type은 V1에서 정상 Event로 처리하지 않는다.
+
+### 11.1 Lifecycle 대칭성 (C149)
+
+이 목록의 앞 여덟 개는 전부 **과거형**이었다. 끝난 일, 해결된 일,
+승인된 일만 적을 수 있었고, 그 앞에 오는 **열린 상태**는 적을 자리가
+없었다. 회사가 실제로 관리하는 것은 결과가 아니라 열린 상태다.
+
+세 Lifecycle이 절반만 있었다.
+
+    Issue      ISSUE_RESOLVED   -> 시작이 없어서 Issue Aging이
+                                   구현되지 않은 것이 아니라
+                                   원리적으로 계산 불가능했다.
+    Decision   DECISION_APPROVED-> §19가 "CEO Decision Required를
+                                   DECISION_APPROVED로 적지 말라"고
+                                   명시하면서 적을 곳을 주지 않았다.
+                                   거절도 같다.
+    Project    BLOCKED          -> 이미 멈춘 것만 있었다. 아직
+                                   움직이지만 멈출 것 같은 상태는
+                                   "정상" 또는 "정지" 둘 중 하나로만
+                                   보고할 수 있었다.
+
+추가된 넷은 정확히 그 셋을 닫는다. 새 필드는 하나도 늘리지 않았고,
+넷 다 이미 있는 Event Type을 본떴다.
+
+    ISSUE_RAISED       §18과 대칭. 고유 Property 없음(§28형).
+    ASSIGNED           §18의 **가운데**. 고유 Property 없음(§28형).
+    DECISION_REQUIRED  §19와 대칭. 고유 Property 없음(§28형).
+    DECISION_REJECTED  §19와 대칭. 고유 Property 없음(§28형).
+    EXECUTED           §19의 **뒤쪽** 끝. 고유 Property 없음(§28형).
+    AT_RISK            자기 status를 고정하는 상태 Event(§25·§26형).
+
+Decision Lifecycle은 두 구간이며, 승인은 그 **가운데**다.
+
+    DECISION_REQUIRED ──(결정 대기)── DECISION_APPROVED ──(실행 대기)── EXECUTED
+                       └─────────────  DECISION_REJECTED  (여기서 끝)
+
+`DECISION_APPROVED`가 Lifecycle을 닫는다고 보면, **승인됐지만 아무도 하지
+않은 결정**이 모든 목록에서 사라진다 — 그것이 문제가 되기 시작하는 바로 그
+시점에. `EXECUTED`가 그 뒤쪽 끝이다.
+
+`DECISION_REJECTED`는 실행 대기를 열지 않는다. 거절은 질문을 닫고 할 일을
+남기지 않으므로, 여기에 넣으면 모든 "아니오"가 영원히 미완료 작업으로
+보고된다.
 
 ---
 
@@ -499,6 +548,216 @@ Company Ops가 Decision을 생성하거나 승인하는 것이 아니다.
 
 CEO의 실제 확정이 존재해야 한다.
 
+`CEO Decision Required`는 이제 적을 자리가 있다 — `DECISION_REQUIRED`(§19.2)다.
+
+---
+
+## 18.1 ASSIGNED
+
+의미:
+
+> 열려 있는 Issue 또는 승인된 Decision을 어느 Team이 맡았다.
+
+예:
+
+    {
+      "event_type": "ASSIGNED",
+      "status": "IN_PROGRESS",
+      "summary": "checkout drop-off — frontend가 가져감"
+    }
+
+Notion:
+
+    반영 (공통 필드만)
+
+History:
+
+    기본 제외 (docs/05 §26 — 진행이지 성과가 아니다)
+
+**누가 맡았는지는 이 Event의 `role`이다.** docs/02 §8이 source→role을
+고정하므로 그 값은 실제로 그 일을 받은 팀이며, 다른 팀이 대신 주장하면
+PairMismatch로 잡힌다. 별도 담당자 필드를 만들지 않는다.
+
+이 Event는 아무것도 열지 않고 아무것도 닫지 않는다. Issue Aging의 기준은
+여전히 `ISSUE_RAISED`의 시각이다 — 배정이 시계를 되돌리면 "얼마나 오래
+열려 있었나"가 조용히 "배정된 지 얼마나 됐나"로 바뀐다.
+
+없을 때 무엇이 안 되는가:
+
+> 아무도 맡지 않은 Issue와 누군가 붙어 있는 Issue가 목록에서 똑같이
+> 보인다. 그 둘은 반대 상황이고 다음 행동이 다르며, aging 목록은 바로
+> 그것을 구분하려고 읽는다.
+
+주의: `ASSIGNED`는 PROJECTS Row의 `Owner`를 바꾸지 않는다. `Owner`는 §9-12에
+따라 최초 생성 시점 정보이며, 담당 이동은 Control Tower가 나른다.
+
+---
+
+## 19.0 EXECUTED
+
+의미:
+
+> 승인된 Decision이 실제로 실행되었다.
+
+예:
+
+    {
+      "event_type": "EXECUTED",
+      "status": "IN_PROGRESS",
+      "summary": "closed beta scope cut to 3 features; sprint replanned"
+    }
+
+Notion:
+
+    반영
+
+History:
+
+    자동 Candidate
+
+`DECISION_APPROVED`(§19)의 뒤쪽 끝이며, Execution Aging의 시작 시각은
+승인 시각이다.
+
+**승인은 일이 아니다.** 이 Event가 없으면 "정해 놓고 하지 않은 것"을 셀
+수 없고, 그것은 회사가 멈추는 가장 흔한 방식 중 하나다.
+
+이 Event 자체는 Project의 상태를 바꾸지 않는다. 실행이 Project 상태를
+바꿨다면 그것을 말하는 Event(§15 MILESTONE_COMPLETED, §16 COMPLETED 등)를
+따로 보고한다.
+
+---
+
+## 19.1 AT_RISK
+
+의미:
+
+> 프로젝트가 아직 진행 중이지만, 알려진 사유로 멈출 가능성이 크다.
+
+예:
+
+    {
+      "event_type": "AT_RISK",
+      "status": "AT_RISK",
+      "summary": "vendor contract renewal unsigned; blocks launch in 2 weeks"
+    }
+
+Notion:
+
+    반영 (Status = AT_RISK)
+
+History:
+
+    조건부 Candidate (REVIEW)
+
+`BLOCKED`와의 차이:
+
+    BLOCKED   이미 멈췄다. 재개하려면 blocker가 해소되어야 한다.
+    AT_RISK   아직 움직인다. 지금 개입하면 멈추지 않을 수 있다.
+
+`AT_RISK`는 `status = AT_RISK`를 요구한다. 상태를 정하는 Event가
+동시에 다른 상태를 주장하면 아무도 행동할 수 없기 때문이다.
+`COMPLETED`(§25)·`CANCELLED`(§26)와 같은 규칙이다.
+
+위험의 내용은 `summary`에 적는다. `blocker`를 쓰지 않는다 —
+`blocker`는 §22가 "무엇이 멈췄는가"에 배정한 필드이고, 아직 멈추지
+않은 것에 그 필드를 쓰면 두 Event Type이 같은 사실을 주장하게 된다.
+
+위험이 해소되면 `RESUMED` 또는 다음 정상 Event가 `status`를 되돌린다.
+위험이 현실이 되면 `BLOCKED`를 보고한다.
+
+---
+
+## 19.2 DECISION_REQUIRED
+
+의미:
+
+> CEO 권한에 해당하는 Decision이 필요하며, 아직 확정되지 않았다.
+
+예:
+
+    {
+      "event_type": "DECISION_REQUIRED",
+      "status": "IN_PROGRESS",
+      "summary": "Closed Beta scope: 3 features or 5? blocks sprint planning"
+    }
+
+Notion:
+
+    반영
+
+History:
+
+    자동 Candidate
+
+이 Event는 Decision Aging의 **시작 시각**이다. 이것이 없으면
+"결정이 며칠째 밀려 있는가"는 계산할 수 없다.
+
+`DECISION_APPROVED` 또는 `DECISION_REJECTED`가 같은 `project_id`로
+도착하면 그 Decision은 닫힌 것으로 본다.
+
+Company Ops가 Decision을 만들거나 재촉하지 않는다. 이미 존재하는
+"결정이 필요한 상태"를 기록할 뿐이다.
+
+---
+
+## 19.3 DECISION_REJECTED
+
+의미:
+
+> CEO 권한에 해당하는 Decision이 실제로 거절되었다.
+
+예:
+
+    {
+      "event_type": "DECISION_REJECTED",
+      "status": "IN_PROGRESS",
+      "summary": "Q4 paid ads budget increase rejected"
+    }
+
+Notion:
+
+    반영
+
+History:
+
+    자동 Candidate
+
+`DECISION_APPROVED`와 완전히 대칭이다. 거절을 기록하지 않으면
+실제로는 끝난 Decision이 영원히 Pending으로 남는다 — 거절을 승인으로
+적는 것은 거짓이고, 적지 않는 것도 거짓이다.
+
+---
+
+## 19.4 ISSUE_RAISED
+
+의미:
+
+> 프로젝트 또는 서비스에 중요한 영향을 주는 Issue가 제기되었다.
+
+예:
+
+    {
+      "event_type": "ISSUE_RAISED",
+      "status": "IN_PROGRESS",
+      "summary": "auction_item sync drifts under concurrent writes"
+    }
+
+Notion:
+
+    반영
+
+History:
+
+    자동 Candidate
+
+`ISSUE_RESOLVED`(§18)의 시작이며, Issue Aging의 시작 시각이다.
+
+Issue가 제기되었다는 것이 곧 프로젝트가 멈췄다는 뜻은 아니다.
+멈췄다면 그것을 말하는 Event는 §22의 `BLOCKED`다. 따라서
+`ISSUE_RAISED`는 `Blocker` Property를 쓰지 않는다.
+
+사소한 Bug 보고마다 사용하지 않는다 — §18과 같은 기준이다.
+
 ---
 
 ## 20. status
@@ -507,9 +766,19 @@ V1 기본 Status:
 
     NOT_STARTED
     IN_PROGRESS
+    AT_RISK
     BLOCKED
     COMPLETED
     CANCELLED
+
+`AT_RISK`(C149)는 IN_PROGRESS와 BLOCKED 사이에 있다 — 아직 움직이지만
+멈출 가능성이 크다. Event Type이자 Status인 이유는 `BLOCKED`와 같다:
+프로젝트는 그 위험을 언급하지 않는 이후 Event들을 가로질러 계속
+위험한 상태이고, 그렇게 살아남는 필드는 `status`다.
+
+Notion 쪽 마이그레이션은 필요 없다. `src/notion/bootstrap.py`가 `Status`를
+고정 option 없는 `{"select": {}}`로 선언하므로 첫 쓰기에서 option이
+생성된다.
 
 Status는 Event Type과 동일한 개념이 아니다.
 
@@ -648,13 +917,19 @@ History 검토 대상 여부를 나타낸다.
 | Event Type | 기본값 |
 |---|---:|
 | STARTED | false |
+| AT_RISK | 조건부 |
 | BLOCKED | 조건부 |
 | RESUMED | false |
 | MILESTONE_COMPLETED | true |
 | COMPLETED | 조건부 |
 | CANCELLED | 조건부 |
+| ISSUE_RAISED | true |
+| ASSIGNED | false |
 | ISSUE_RESOLVED | true |
+| DECISION_REQUIRED | true |
 | DECISION_APPROVED | true |
+| DECISION_REJECTED | true |
+| EXECUTED | true |
 
 `history_candidate = true`는 공식 History 확정을 의미하지 않는다.
 
@@ -673,13 +948,19 @@ History 검토 대상 여부를 나타낸다.
 | Event Type | 일반적인 Status |
 |---|---|
 | STARTED | IN_PROGRESS |
+| AT_RISK | AT_RISK (강제) |
 | BLOCKED | BLOCKED |
 | RESUMED | IN_PROGRESS |
 | MILESTONE_COMPLETED | IN_PROGRESS 또는 COMPLETED |
 | COMPLETED | COMPLETED |
 | CANCELLED | CANCELLED |
+| ISSUE_RAISED | IN_PROGRESS 또는 AT_RISK 또는 BLOCKED |
+| ASSIGNED | 현재 프로젝트 상태 유지 |
 | ISSUE_RESOLVED | IN_PROGRESS 또는 COMPLETED |
+| DECISION_REQUIRED | 현재 프로젝트 상태 유지 |
 | DECISION_APPROVED | 현재 프로젝트 상태 유지 |
+| DECISION_REJECTED | 현재 프로젝트 상태 유지 |
+| EXECUTED | 현재 프로젝트 상태 유지 |
 
 명백하게 모순되는 조합은 Validation에서 거부한다.
 

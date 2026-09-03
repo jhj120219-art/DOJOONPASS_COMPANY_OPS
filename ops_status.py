@@ -150,9 +150,11 @@ from controltower import (  # noqa: E402
     UNSOURCED_LAYERS,
     build_company_rollup,
     build_dashboard,
+    evidence_window,
     read_events,
     unsourced_layer_coverage,
 )
+from delivery import read_git_activity  # noqa: E402
 from notion.properties import ROLE_DISPLAY_NAMES  # noqa: E402
 from cli import (  # noqa: E402
     CONFIG_ERROR_EXIT,
@@ -4701,7 +4703,22 @@ def _print_control_tower(now: datetime) -> list[str]:
     # "what is on the screen" and "what leaves the machine" cannot drift into
     # two derivations -- which is the one failure a second consumer of a
     # rollup reliably produces.
-    model = build_dashboard(rollup, now=now)
+    # Git's account of the same days as the panels (C149). Read over the
+    # evidence's own window through `evidence_window()`, the same function
+    # `dashboard._coverage()` uses, so the terminal and the browser page ask
+    # git about one period rather than two — the halves of a D+1 report only
+    # mean anything side by side if they cover the same days.
+    #
+    # `None` when there is no evidence at all: there is nothing to align to,
+    # and the panel then says "물어보지 않았다", which is true. It never says
+    # "no changes".
+    evidence_from, evidence_to = evidence_window(rollup)
+    activity = (
+        read_git_activity(since=evidence_from, until=evidence_to)
+        if evidence_from is not None and evidence_to is not None
+        else None
+    )
+    model = build_dashboard(rollup, now=now, activity=activity)
     attention: list[str] = []
 
     def _rows(key: str):
@@ -4824,6 +4841,39 @@ def _print_control_tower(now: datetime) -> list[str]:
         f"{_value('decisions_approved')} / {_value('issues_resolved')}"
     )
     print(f"  열려 있는 Blocker   : {_value('open_blockers')}")
+    # C149's three open-state counts, on one line beside the blockers. They
+    # are the same shape of question — "what is unfinished right now" — and
+    # the reason they are here rather than one screen down is that all three
+    # were structurally uncountable until the Event vocabulary gained the
+    # opening half of each lifecycle.
+    print(
+        f"  위험/열린 Issue/대기 Decision: {_value('projects_at_risk')} / "
+        f"{_value('issues_open')} / {_value('decisions_pending')}"
+    )
+    # Separate line, not a fourth number on the one above: "decided and not
+    # done" is a different question from "not decided yet", and the two
+    # sitting in one slash-separated row read as one thing (C149).
+    print(f"  실행 안 된 Decision : {_value('decisions_unexecuted')}")
+
+    # Git's account of the same days. One line, and it says which of three
+    # things happened — read and non-empty, read and empty, or not read —
+    # because the whole point of asking git is that the last two are
+    # different and every Event-derived number above renders them the same.
+    code_panel = model.panel("CODE_CHANGES")
+    if code_panel is not None:
+        print(f"  Git 기준 변경       : {one_line(code_panel.note or '')}")
+
+    # How much of the role KPI set this tree can actually answer. A count and
+    # not the KPIs themselves: the full set is on the browser page and the
+    # Notion page, and a terminal block that printed twenty-nine rows would
+    # bury the eleven lines above it.
+    kpi_panel = model.panel("ROLE_KPI")
+    if kpi_panel is not None:
+        answerable = sum(1 for row in kpi_panel.rows if row.values["measured"])
+        print(
+            f"  역할별 KPI          : {len(kpi_panel.rows)}개 중 {answerable}개 계산 "
+            f"가능 (나머지는 DATA REQUIRED — 원천이 없다)"
+        )
 
     # No `if rows:` guard, and none below for Desktops: both folds seed every
     # entry in docs/02 §8's table and return it silent rather than absent.
@@ -4969,7 +5019,58 @@ def _print_control_tower(now: datetime) -> list[str]:
                 "자기가 말하는 그 Event가 아니며, 어느 쪽을 셀지는 파일 이름 "
                 "순서가 정한다 — 두 파일을 열어 보고 아닌 쪽을 치워야 한다"
             )
-        else:
+        elif values["kind"] == "AT_RISK":
+            days = values["days_open"]
+            age = f"{days}일째 " if days is not None else ""
+            attention.append(
+                f"{age}위험하다고 보고된 Project: {_authored(values['project_id'])} "
+                f"[{one_line(ROLE_DISPLAY_NAMES.get(values['team'], values['team']))}] — "
+                f"{_authored(values['detail'])} "
+                f"(증거 {_authored(row.evidence[0].describe())}) — 아직 멈추지는 "
+                "않았다. 상태는 그 팀이 다른 status를 보고할 때까지 AT_RISK로 남는다"
+            )
+        elif values["kind"] == "PENDING_DECISION":
+            days = values["days_open"]
+            age = f"{days}일째 " if days is not None else ""
+            attention.append(
+                f"{age}기다리는 Decision: {_authored(values['project_id'])} "
+                f"[{one_line(ROLE_DISPLAY_NAMES.get(values['team'], values['team']))}] — "
+                f"{_authored(values['detail'])} "
+                f"(증거 {_authored(row.evidence[0].describe())}) — 사람이 정해야 "
+                "닫힌다. DECISION_APPROVED 또는 DECISION_REJECTED를 보고할 때까지 "
+                "열려 있다"
+            )
+        elif values["kind"] == "UNEXECUTED_DECISION":
+            days = values["days_open"]
+            age = f"{days}일째 " if days is not None else ""
+            attention.append(
+                f"{age}실행되지 않은 Decision: {_authored(values['project_id'])} "
+                f"[{one_line(ROLE_DISPLAY_NAMES.get(values['team'], values['team']))}] — "
+                f"{_authored(values['detail'])} "
+                f"(증거 {_authored(row.evidence[0].describe())}) — 승인은 끝났고 "
+                "일이 남았다. EXECUTED를 보고할 때까지 열려 있다"
+            )
+        elif values["kind"] == "OPEN_ISSUE":
+            days = values["days_open"]
+            age = f"{days}일째 " if days is not None else ""
+            attention.append(
+                f"{age}열려 있는 Issue: {_authored(values['project_id'])} "
+                f"[{one_line(ROLE_DISPLAY_NAMES.get(values['team'], values['team']))}] — "
+                f"{_authored(values['detail'])} "
+                f"(증거 {_authored(row.evidence[0].describe())}) — 그 팀이 "
+                "ISSUE_RESOLVED를 보고할 때까지 열려 있다"
+            )
+        # ROLE_MISMATCH. Named rather than left as the `else`, and that is
+        # the fix rather than a tidy-up: this branch **was** the `else`, so
+        # every RISKS kind added later fell into it and was announced as a
+        # Desktop/role mismatch. Measured on the two kinds C149 added, before
+        # this: "Desktop과 role이 어긋난 Event: R1 — None에서 왔는데 role은
+        # None이라고 말한다" — a paragraph of confident, wrong diagnosis with
+        # three `None`s in it, on the line an operator reads first.
+        #
+        # `_risk_totals`' overflow loop below already had this right: it
+        # names each kind and has a generic branch that says only the count.
+        elif values["kind"] == "ROLE_MISMATCH":
             attention.append(
                 f"Desktop과 role이 어긋난 Event: {_authored(values['event_id'])} — "
                 f"{one_line(values['source'])}에서 왔는데 role은 "
@@ -4980,6 +5081,18 @@ def _print_control_tower(now: datetime) -> list[str]:
                 f"Owner와 Source가 서로 다른 Desktop을 가리킨다. `validate_event()`는 두 "
                 f"필드를 각각만 검사하고 짝은 검사하지 않으므로 손으로 쓴 Event나 복원된 "
                 f"파일이 이 모양이 될 수 있다. 거부하지 않는 이유와 필요한 결정은 BACKLOG"
+            )
+        else:
+            # A kind this function has no sentence for. Named as itself
+            # rather than described as something else — the whole point of
+            # the branch above. `attention.severity()` will file it as `?`
+            # ("분류 불가"), which is the honest reading of a line nobody
+            # has written a rule for, and every surface renders that badge.
+            attention.append(
+                f"분류되지 않은 Risk 종류 {one_line(values['kind'])}: "
+                f"{_authored(values['project_id'] or values['event_id'])} — "
+                "이 화면은 이 종류에 대해 할 말이 정해져 있지 않다. "
+                "CONTROL TOWER의 Risk 표에서 직접 확인한다"
             )
 
     # One line per kind that was cut, naming the true total. Never silent:

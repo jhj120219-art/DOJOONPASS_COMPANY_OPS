@@ -2239,6 +2239,25 @@ class TheHeadlineNumbersAreOutcomesNotInstrumentationTests(unittest.TestCase):
             "decisions_approved",
             "issues_resolved",
             "teams_silent",
+            # C149's five. All outcomes rather than instrumentation, and the
+            # test above is what that claim buys: any of them may take a
+            # headline slot. Each counts something that happened to the
+            # company — an Issue was raised, a Decision is waiting, a
+            # project is about to stop — and none counts anything this
+            # program did to its own files.
+            "issues_raised",
+            "issues_open",
+            "decisions_pending",
+            "decisions_rejected",
+            "projects_at_risk",
+            # C149's execution half. Both are outcomes: one counts decisions
+            # actually carried out, the other counts decisions the company
+            # made and has not acted on. Neither is about this program.
+            "decisions_executed",
+            "decisions_unexecuted",
+            # An outcome about people, like `teams_silent`: it counts work
+            # the company has not picked up, not anything this program did.
+            "items_unassigned",
         }
     )
 

@@ -7,7 +7,11 @@
 `docs/` 명세와 충돌하면 명세가 이긴다. 이 파일은 "아직 결정되지 않은 것"의
 목록일 뿐이다.
 
-마지막 갱신: 2026-09-02 (C148 — **회사 한 달치를 넣고 페이지를 읽었다.** 실제 업무 데이터가 들어오면 ④/⑤는 회사처럼 읽힌다. 고친 것 둘: 경영 요약 다섯 칸 중 하나를 **계측값**(`기록된 Event` = 이번 실행이 읽은 파일 수)이 쓰고 있었고 그 달 최대 성과인 `완료된 Project`는 접혀 있었다 — 교체했다(빼도 그 수는 두 곳에 더 있고, 빈 트리 신호는 별도 배너가 나른다). 그리고 ④의 행 순서가 중요도처럼 읽히는데 실제로는 `막힌 것 먼저 → 오래 조용한 순`이라 그렇게 적었다 — Event 필드 13개에 우선순위가 없다. 확인만 한 것: 무관한 ISSUE_RESOLVED가 Blocker를 지우는 것은 docs/04 §27·§20 **명세대로**이며 보고자의 `status` 값이 결정한다(코드 결함 아님). **판정: 충실한 기록계이고 아직 운영계가 아니다** — 모든 event type이 과거형이라 '결정이 필요하다'/'이슈가 제기됐다'를 담을 자리가 없고, 그 넷은 docs/04 §44·§68이 V1에서 의도적으로 제외한 것이다.)
+마지막 갱신: 2026-09-03 (C152 — **D+1 화면이 "회사에 열려 있는 것이 없다"고 말하고 있었다.** 후보 넷 중 셋(CEO 재무 원천 / BUG-55 / 기한 기반 KPI)은 전부 승인 Gate라 SKIP하고 실제 evidence로 다시 탐색했다. 발견: `build_company_rollup(since, until)`이 **상태 질문에 기간 필터를 적용**하고 있었다. 실측 — Blocker 1건, 열린 Issue 1건, 대기 Decision 1건, 미실행 Decision 1건, 위험 Project 1건인 회사에 대해 그중 아무것도 열리지 않은 하루를 요청하면 `blockers=0 issues_open=0 pending=0 unexec=0 at_risk=0`, **RISKS 표 비어 있음.** 이 라벨은 전부 상태어(`열려 있는`, `기다리는`, `위험한`)이고, docs/15가 그 페이지를 매일 읽는 D+1 보고로 정의한다. 근본 원인은 정책이 아니라 **범주 오류**다: 열린 상태에는 "얼마나 거슬러"가 없다 — 무엇도 "어제부터만 막혀 있"지 않고, 어느 날짜 기준으로 막혔거나 아니거나다. 그래서 `until`("언제 기준")은 상태에 적용하고 `since`("얼마나 거슬러")는 적용하지 않는다. 활동(Event 수·PROJECTS 행·완료·Milestone·최근 feed)은 여전히 양쪽 다 적용받는다 — 그것이 기간의 뜻이다. `_roll_projects`를 두 corpus에 두 번 부르는 것은 중복이 아니라 **한 함수, 두 질문**이며, `since`가 없는 일반 호출에서는 같은 객체를 재사용한다. 전체 suite 4855 passed — **기존 테스트 중 잘못된 옛 동작을 고정하던 것은 하나도 없었다.** 승인 필요로 SKIP: Notion 반영, commit/push, BUG-55 계약, CEO 재무 원천.)
+이전 갱신: 2026-09-03 (C151 — **C150이 고친 결함의 나머지 두 자리, 그리고 고치지 **않기로** 한 것 하나.** C150은 `is_complete`("완료한 적이 있다")를 "지금 완료 상태다"로 읽는 혼동을 `_project_state()`에서 고쳤고 **같은 혼동을 하던 다른 두 곳을 남겼다.** 실측: 완료 보고 후 AT_RISK를 보고한 Project가 `PROJECTS state=AT_RISK` / `RISKS 표 비어 있음` / `projects_at_risk=0` — **한 회사 상태, 세 화면, 둘이 틀렸다.** COO가 Risk 표에서 그 Project를 못 본다. `ProjectRollup.completion_stands` 하나로 세 소비자가 같은 답을 쓰게 했다(우선순위는 여전히 `PROJECT_STATES` 순서에만 있다). 그리고 **BUG-55는 고치지 않았다** — `_is_in_scope()`의 대소문자 비교를 접는 것은 `_misnamed_scope_directories()`의 docstring이 "BUG-55 자신의 열린 결정이며 Backup이 덮는 파일 집합을 바꾼다"고 이미 적어 둔 결정이고, docs/08 §13/§46이 프로그램의 Company History 개명을 금지한다. 실측으로 확인한 것: 결함은 재현되고(History 2일치가 `added=()`로 조용히 누락), 탐지기는 **실제로 발화하며** P1 + 정확한 처방("`daily/`로 이름을 바꾼다")을 낸다. 감시만 늘린 것이 아니라 **수리가 사람의 행동**인 경우다. 부수: cold read 주석이 "약 3배"라고 적혀 있었는데 방금 쓴 파일에 대해서는 **60배**(6,000건 25,809ms → 419ms)로 재측정해 정정. 승인 필요로 SKIP: Notion 반영, commit/push, BUG-55 계약 결정.)
+이전 갱신: 2026-09-03 (C150 — **C149가 닫은 비대칭의 나머지, 그리고 C149 자신이 만든 결함 하나.** 세 Lifecycle을 양끝까지 채웠다: `ASSIGNED`(Issue를 누가 맡았는가)와 `EXECUTED`(승인된 Decision을 실제로 했는가). 후자가 핵심이다 — `DECISION_APPROVED`가 Lifecycle을 닫고 있어서, **"정해 놓고 아무도 하지 않은 것"이 문제가 되기 시작하는 바로 그 순간 모든 목록에서 사라졌다.** 승인은 일이 아니다. `ASSIGNED`는 열지도 닫지도 않고 담당만 기록한다(나이는 여전히 제기 시각부터). 새 Event 필드는 여전히 0개 — 담당은 docs/02 §8이 고정한 `role`이 나른다. 그리고 **C149가 만든 결함**: `_project_state()`가 COMPLETED 뒤 다시 시작된 Project를 `state=COMPLETE / status=IN_PROGRESS`로 두 칸이 서로 모순되게 표시했다. C149가 BLOCKED·AT_RISK에 대해 precedence로 덮었던 바로 그 결함이고, 그냥 다시 도는 Project는 아무것도 앞서지 않아 빠져나갔다. 처음엔 `is_complete` 자체를 고쳤다가 **인용 계약을 깨는 과잉 수정**임을 테스트가 잡아냈다(완료 수는 기간 내 완료를 세고 그 파일을 인용한다) — 표시 계층으로 좁혔다. COO KPI 10 → 13. 승인 필요로 SKIP: Notion 반영, commit/push.)
+이전 갱신: 2026-09-03 (C149 — **C148의 판정을 근본 원인에서 고쳤다.** C148은 "충실한 기록계이고 아직 운영계가 아니다 — 모든 event type이 과거형이라 '결정이 필요하다'/'이슈가 제기됐다'를 담을 자리가 없다"로 끝났다. 그 자리를 만들었다: `ISSUE_RAISED` / `DECISION_REQUIRED` / `DECISION_REJECTED` / `AT_RISK` 넷. 이것은 기능 추가가 아니라 **계산 불가능을 계산 가능으로** 바꾼 것이다 — 끝난 시각만으로는 얼마나 걸렸는지 알 수 없으므로 Issue Aging과 Decision Aging은 미구현이 아니라 정의되지 않았다. 그 위에 역할별 KPI(`src/controltower/kpi.py`, CEO 12 / CTO 10 / COO 10)를 얹되 **계산 가능한 것만 계산**했다: 32개 중 10개. 나머지는 `DATA REQUIRED`와 "무엇이 있어야 답할 수 있는가"를 싣는다 — 이것이 결함 목록이 아니라 판정이다. **이 시스템은 실행을 재고 사업을 재지 않는다.** 그리고 D+1의 나머지 절반을 Git에서 읽었다(`src/delivery/git_activity.py`): 그전에는 "아무도 일하지 않은 날"과 "일했지만 Event가 전달되지 않은 날"이 구별되지 않았고, 후자는 신호가 없는 실패였다. OneDrive는 Desktop 간 Event 전달 수단으로 남되 **D+1 보고의 필수 경로에서 빠졌다**. 실제로 찾은 결함 셋: git `--name-only` 파싱이 **모든 파일 목록을 다음 commit에 붙이고 있었고**(최신 commit이 파일 0개로 보고됨 — 수가 맞아서 조용했다), `projects_at_risk`가 **아무 Event나 인용**하고 있었으며(`completed_evidence`가 고친 것과 같은 결함), dead-capability 검사기가 **이름이 겹치면 죽은 것을 산 것으로 본다**는 한계를 드러냈다. 승인 필요로 SKIP: 실제 Notion 반영, commit/push.)
+이전 갱신: 2026-09-02 (C148 — **회사 한 달치를 넣고 페이지를 읽었다.** 실제 업무 데이터가 들어오면 ④/⑤는 회사처럼 읽힌다. 고친 것 둘: 경영 요약 다섯 칸 중 하나를 **계측값**(`기록된 Event` = 이번 실행이 읽은 파일 수)이 쓰고 있었고 그 달 최대 성과인 `완료된 Project`는 접혀 있었다 — 교체했다(빼도 그 수는 두 곳에 더 있고, 빈 트리 신호는 별도 배너가 나른다). 그리고 ④의 행 순서가 중요도처럼 읽히는데 실제로는 `막힌 것 먼저 → 오래 조용한 순`이라 그렇게 적었다 — Event 필드 13개에 우선순위가 없다. 확인만 한 것: 무관한 ISSUE_RESOLVED가 Blocker를 지우는 것은 docs/04 §27·§20 **명세대로**이며 보고자의 `status` 값이 결정한다(코드 결함 아님). **판정: 충실한 기록계이고 아직 운영계가 아니다** — 모든 event type이 과거형이라 '결정이 필요하다'/'이슈가 제기됐다'를 담을 자리가 없고, 그 넷은 docs/04 §44·§68이 V1에서 의도적으로 제외한 것이다.)
 이전 갱신: 2026-09-01 (C145 — **감사 넷, 결함 없음.** 한 번도 구동해
 보지 않은 경로 넷을 실제로 돌렸다: Notion Retry Queue(미분 3,000 trial + 실
 장애/복구/배치 중간 예외), `review_cli.py`(읽기 전용 파일에서도 저장물 무손상),
@@ -4653,6 +4657,388 @@ E-11이 예측한 것의 반대 방향 사례다. E-11은 "고쳤다는 기록�
 필요하므로 **E-11은 여전히 SKIP**이지만, 그 대조를 Sprint 시작 절차에 넣는
 것은 승인이 필요 없다.
 
+
+---
+
+## C152. 상태에 기간을 적용하고 있었다 — D+1 화면이 "열려 있는 것이 없다"고 말했다
+
+### 1. 후보를 evidence로 다시 골랐다
+
+직전 Sprint가 남긴 TOP 5 중 셋(CEO 재무 원천 / BUG-55 계약 / 기한 기반
+Cycle Time)은 전부 **승인 Gate**다. `DEPLOYED`는 아무도 하지 않는 보고
+행동을 전제하는 어휘 추가다. 그래서 순서대로 구현하지 않고 실제 evidence로
+다시 탐색했다.
+
+먼저 확인한 것(고칠 것 없음):
+
+- 세 화면(터미널·브라우저·Notion)이 같은 회사에 대해 **정확히 일치**
+  (3 blocker / 1 at-risk / 1 issue / 1 pending / 1 unexec / 8 project,
+  ATTENTION 7줄 = RISK 7행)
+- 상태 술어 소비자 전수 — C151 이후 전부 정합
+- KPI 35개 중 DATA REQUIRED에 값이 설정된 것 0개
+
+### 2. 발견 — 상태 질문에 기간 필터
+
+`build_company_rollup(since, until)`이 **모든** fold에 창을 적용하고 있었다.
+실측:
+
+    전체 기간        blockers=1 issues_open=1 pending=1 unexec=1 at_risk=1
+    D+1 (하루)      blockers=0 issues_open=0 pending=0 unexec=0 at_risk=0
+                    RISKS 표 비어 있음
+
+그 하루에 아무것도 *열리지* 않았을 뿐, 다섯 건 모두 여전히 열려 있다.
+라벨은 전부 상태어이고 docs/15는 그 페이지를 매일 읽는 D+1 보고로 정의한다.
+**COO에게 "회사에 열려 있는 것이 없다"고 말하고 있었다.**
+
+### 3. 근본 원인 — 정책이 아니라 범주 오류
+
+이것을 "창이 좁으면 그렇게 보이는 게 맞다"는 계약으로 볼 수도 있었다.
+그렇지 않다:
+
+> 열린 상태에는 "얼마나 거슬러"가 없다. 무엇도 *어제부터만 막혀 있지*
+> 않다 — 어느 **날짜 기준으로** 막혔거나 아니거나다.
+
+    activity   이 기간에 무슨 일이 있었나 — Event, 완료, Milestone, 최근 feed
+               `since`와 `until` 둘 다 적용. 그것이 기간의 뜻이다.
+    state      `until` 시점에 무엇이 열려 있나 — Blocker, 위험, Issue, Decision
+               `until`은 적용("언제 기준"), `since`는 적용 안 함.
+
+어느 spec도 창 안의 상태가 무엇을 뜻하는지 주장한 적이 없다 — 그래서
+계약 변경이 아니라 누락의 수정이다.
+
+### 4. 수정
+
+`build_company_rollup`이 corpus 둘을 만든다: `in_period`(활동)와
+`as_of`(`until`까지 전부). 상태 fold는 `as_of`를, 활동 fold는 `in_period`를
+받는다. `_roll_projects`를 두 번 부르는 것은 **중복이 아니라 한 함수 두
+질문**이고, `since`가 없는 일반 호출에서는 같은 객체를 재사용해 비용이 0이다.
+
+`CompanyRollup.state_projects`가 추가됐다. `projects`는 여전히 "이 기간에
+움직인 Project"이며 PROJECTS 패널·`projects_active`·coverage·git 창이 그것을
+쓴다 — 그쪽은 창 기준이 옳다.
+
+검증:
+
+    D+1 (하루)  events=1  PROJECTS행=1   ← 활동은 여전히 창 기준
+                blockers=1 at_risk=1 issues_open=1 pending=1 unexec=1
+                RISKS 5종 전부 표시       ← 상태는 시점 기준
+
+`until`은 여전히 상태를 자른다: 8/9 기준으로 물으면 8/8의 Blocker는 보이고
+8/10에 제기된 Issue는 보이지 않는다.
+
+### 5. 전체 suite 4855 passed
+
+**기존 테스트 중 잘못된 옛 동작을 고정하던 것은 하나도 없었다.** 창 안의
+상태가 무엇을 뜻하는지 아무도 주장한 적이 없다는 것의 증거다.
+
+---
+
+## C151. 같은 혼동의 나머지 두 자리 — 그리고 고치지 **않기로** 한 것
+
+### 1. 한 회사 상태, 세 화면, 둘이 틀렸다
+
+C150이 `is_complete`를 `_project_state()`에서 고쳤다. 같은 혼동을 하던
+**다른 두 곳은 그대로 남아 있었다.** 실측(완료 보고 후 AT_RISK 보고):
+
+    PROJECTS 패널      state=AT_RISK
+    RISKS 패널         (비어 있음)
+    projects_at_risk   0
+
+아무것도 raise하지 않고, 각 층은 따로 보면 말이 되고, COO는 Project 표가
+위험하다고 부르는 Project를 Risk 표에서 볼 수 없다. 원인은 하나의 혼동이
+세 번 반복된 것 — `is_complete`는 "완료한 적이 있다"(완료 **횟수**에 옳다)인데
+두 가드가 그것을 "지금 완료 상태다"로 읽고 `not p.is_complete`로 위험을
+억눌렀다.
+
+`ProjectRollup.completion_stands` 하나를 두고 세 소비자가 같은 답을 쓴다.
+우선순위(BLOCKED > AT_RISK > COMPLETE)는 `PROJECT_STATES` 순서에만 있고
+여기서 반복하지 않는다 — 중복이 문제였으므로 중복을 더하지 않는다.
+
+검증한 여덟 조합(정상 / 완료 / 재시작 / Blocked / 완료 후 Blocked /
+모순 status 2종 / 완료 후 AT_RISK): 전부 `state`가 `status`와 모순되지 않고,
+세 화면이 일치한다. 완료 **횟수**는 그대로 1이며 그 파일을 인용한다.
+
+### 2. BUG-55 — 고치지 않았다
+
+`_is_in_scope()`가 경로 첫 조각을 대소문자 구분으로 비교하고, Windows는
+`Daily`와 `daily`를 같은 디렉터리로 취급한다. 실측으로 재현했다:
+
+    master/Daily/ 에 History 2일치
+    (파이프라인이 소문자 경로로 쓴 것도 같은 디렉터리에 들어간다)
+    sync_to_working_copy -> added=() deleted=() working copy 비어 있음
+
+**깨끗하게 성공한 것처럼 보이는, 아무것도 복사하지 않은 백업.**
+
+고치려다 멈췄다. `_misnamed_scope_directories()`의 docstring이 이미
+적어 두었다:
+
+> Detection only. Case-folding the comparison in `_is_in_scope()` is
+> BUG-55's own open decision — it changes which files Backup covers — and
+> renaming a directory under Local Master is an operator action this code
+> must not take (docs/08 §13/§46).
+
+POSIX에서 `Daily/`는 **정말로** 다른 디렉터리다. 접으면 규격 밖 디렉터리를
+모든 플랫폼에서 조용히 백업 범위로 끌어들이며, 그것이 정확히 그 문장이
+말하는 계약 변경이다. 내 처음 판단("OS가 이미 정했다")은 한 가지 읽기일 뿐
+자명하지 않았다.
+
+그래서 대신 **탐지기가 실제로 동작하는지 측정했다** — docstring을 믿지 않고:
+
+    _misnamed_scope_directories(master) -> (('Daily', 'daily'),) checked=True
+    severity  P1 (Backup이 보지 않는 디렉터리 — 한 번도 백업되지 않는다)
+    next_action  "그 디렉터리 이름을 줄이 말하는 소문자 이름으로 바꾼다…"
+
+발화하고, P1이고, 정확한 처방을 낸다. **감시만 늘린 경우가 아니라 수리가
+사람의 행동인 경우다.** 계약 결정은 승인 Gate이므로 SKIP.
+
+### 3. 부수 — 성능 주석이 20배 낮게 적혀 있었다
+
+`dashboard_server.py`가 cold read를 "약 3배"라고 적고 있었다. 방금 쓴
+파일에 대해 재측정:
+
+    첫 읽기(막 쓴 6,000건)   25,809 ms
+    두 번째 읽기                419 ms
+    세 번째                     402 ms
+
+60배이며 전부 first-touch다. 이것이 Runner가 실제로 만나는 모양이다 —
+`collector`가 `processed/`에 쓰고 같은 실행의 뒤 단계가 그것을 읽는다.
+피할 수 없으므로 다음 사람이 회귀로 오해하지 않도록 기록만 했다.
+
+---
+
+## C150. Lifecycle의 나머지 절반 — 그리고 C149가 만든 결함 하나
+
+C149는 세 Lifecycle의 **시작**을 만들었다. 이번에는 나머지를 채웠고, 그
+과정에서 C149 자신이 재생산한 결함 하나를 찾았다.
+
+### 1. 승인은 일이 아니다
+
+`DECISION_APPROVED`가 Decision Lifecycle을 닫고 있었다. 결과:
+
+    DECISION_REQUIRED  →  대기 목록에 있다
+    DECISION_APPROVED  →  **모든 목록에서 사라진다**
+    (그리고 아무도 그것을 하지 않는다)
+
+승인된 Decision이 실행되지 않는 것은 회사가 멈추는 가장 흔한 방식 중
+하나이고, 이 시스템에서는 **문제가 되기 시작하는 바로 그 순간 보이지 않게**
+됐다. `EXECUTED`가 뒤쪽 끝이다.
+
+`DECISION_REJECTED`는 실행 대기를 열지 않는다 — 거절은 질문을 닫고 할 일을
+남기지 않는다. 넣었다면 모든 "아니오"가 영원히 미완료 작업이 됐을 것이다.
+
+E2E로 확인(실제 Runner 완주):
+
+    ROLLOUT  required → approved              → UNEXECUTED_DECISION 4일
+    HIRING   required → approved → EXECUTED   → 어느 목록에도 없음
+
+### 2. 아무도 안 맡은 것과 누가 붙은 것
+
+    10일째 열려 있는 Issue: BILLING [CMO]
+
+이 줄은 CMO가 10일 동안 작업 중이든 아무도 한 번도 안 봤든 **똑같이**
+보였다. 반대 상황이고 다음 행동이 다르다. aging 목록은 바로 그것을
+구분하려고 읽는다.
+
+`ASSIGNED`는 아무것도 열지 않고 닫지도 않는다. 나이는 여전히
+`ISSUE_RAISED` 시각부터 잰다 — 배정이 시계를 되돌리면 "얼마나 오래 열려
+있었나"가 조용히 "배정된 지 얼마나 됐나"로 바뀐다.
+
+담당자 필드를 만들지 않았다. docs/02 §8이 source→role을 고정하므로 이
+Event의 `role`이 **실제로 그 일을 받은 팀**이고, 다른 팀이 대신 주장하면
+PairMismatch로 잡힌다. 교차 팀 사례가 그것을 증명한다 — CMO가 제기하고
+CTO_FRONTEND가 받으면 owner ≠ raiser이며 추론으로는 알 수 없다.
+
+주의 하나를 실측으로 고쳤다: `Owner`는 `build_create_properties()`에만 있고
+UPDATE에는 없다. 그러므로 담당 이동은 Notion Row의 Owner를 바꾸지 **않고**
+Control Tower의 `OpenItem.assigned_team`이 나른다. 처음 쓴 주석은
+"Owner가 이미 쓴다"고 했고 그것은 거짓이었다.
+
+### 3. C149가 만든 결함 — 그리고 첫 수정이 과잉이었던 것
+
+    COMPLETED(5일) → STARTED(12일, IN_PROGRESS)
+        state=COMPLETE   status=IN_PROGRESS
+
+두 칸이 나란히 서로를 부정하고 있었다. C149의 `_project_state()`는 BLOCKED와
+AT_RISK에 대해 이 결함을 precedence로 답했는데, **그냥 다시 도는 Project는
+아무것도 앞서지 않아** 빠져나갔다.
+
+첫 수정은 `is_complete` 자체를 `completed_at is not None and status ==
+"COMPLETED"`로 바꾼 것이었다. 테스트가 그것을 **과잉 수정**으로 잡아냈다:
+`projects_completed`는 *기간 내에 완료가 일어났는가*를 세고 그 파일을
+인용하며, 완료 후 재시작한 Project도 한 번은 진짜로 완료했다. 수를 바꾸면
+그 수가 인용하는 파일과 어긋난다.
+
+그래서 표시 계층으로 좁혔다. **완료 횟수와 완료 상태는 서로 다른 질문이고,
+이제 서로 다른 답을 가진다.**
+
+    COMPLETED만            state=COMPLETE  completed=1
+    COMPLETED → STARTED    state=ACTIVE    completed=1
+
+규칙은 발명이 아니다. `validate_event()`가 COMPLETED Event에
+`status = COMPLETED`를 요구하므로 둘은 완료 시점에 일치하고, 이후 다른
+status를 보고한 것은 보고자 자신의 말이다 — docs/04 §27의 태도를 Lifecycle
+반대쪽 끝에 적용한 것이다.
+
+### 4. 부수적으로 찾은 것
+
+- `_risks_panel()`의 kind 결정이 `if DECISION else ISSUE` 조건문이었다.
+  세 번째 Lifecycle이 생기면 `else`가 그것을 **조용히 Issue로** 분류했을
+  것이다 — 수는 맞고 낱말은 틀린 채로. `_OPEN_ITEM_RISK_KIND` 표로 바꿔
+  `KeyError`가 즉시 나게 했다.
+- 속성 property 테스트가 `RISKS == blockers + mismatches`를 주장하고
+  있었다. 패널이 두 종류였을 때 참이었고 종류가 늘면서 조용히 패널을
+  설명하지 못하게 됐다. 종류별 census로 바꿨다 — 총합은 swap을 못 본다.
+- ATTENTION 처방이 "그 Team이 해결한다"고 했는데 미배정 Issue에는 Team이
+  없다. 두 경우 모두에 참인 문장으로 고쳤다.
+
+### 5. 승인 필요 — SKIP
+
+    실제 Notion workspace 반영 / git commit / push / Task Scheduler
+
+---
+
+## C149. 과거형만 있던 어휘 — 그리고 그 때문에 **계산할 수 없던** KPI 넷
+
+C148의 판정은 이랬다:
+
+> **충실한 기록계이고 아직 운영계가 아니다** — 모든 event type이 과거형이라
+> '결정이 필요하다'/'이슈가 제기됐다'를 담을 자리가 없고, 그 넷은 docs/04
+> §44·§68이 V1에서 의도적으로 제외한 것이다.
+
+이번에는 그 자리를 만들었다.
+
+### 1. 비대칭은 셋이었고, 전부 같은 모양이었다
+
+`EVENT_TYPES` 여덟 개는 전부 **끝**이었다.
+
+    ISSUE_RESOLVED     있었다.  ISSUE_RAISED       없었다.
+    DECISION_APPROVED  있었다.  DECISION_REQUIRED  없었다.
+                                DECISION_REJECTED  없었다.
+    BLOCKED (이미 멈춤) 있었다.  AT_RISK (멈출 것 같음) 없었다.
+
+이것이 왜 기능 부족이 아니라 **원리적 불가능**이었는가:
+
+    Issue Aging      = 지금 - 제기된 시각
+    Decision Aging   = 지금 - 요청된 시각
+
+시작 시각을 기록할 필드도 Event Type도 없었으므로, 이 둘은 "구현되지
+않은" 것이 아니라 **정의되지 않은** 것이었다. 어떤 대시보드 코드를 써도
+나오지 않는다. 그래서 고칠 자리는 `kpi.py`가 아니라 `events/schema.py`였다.
+
+`AT_RISK`는 다른 종류의 손실이다. 프로젝트는 "정상" 아니면 "이미 멈춤"
+둘 중 하나로만 보고할 수 있었는데, COO가 실제로 개입할 수 있는 유일한
+상태는 그 사이다.
+
+넷 다 **새 필드를 하나도 늘리지 않았다.** `AT_RISK`는 `COMPLETED`·
+`CANCELLED`처럼 자기 `status`를 고정하는 상태 Event이고, 나머지 셋은
+§28의 `DECISION_APPROVED`처럼 고유 Property가 없다.
+
+`ISSUE_RAISED`가 `Blocker`를 쓰지 않는 것은 의도다 — Issue가 제기된 것이
+프로젝트가 멈춘 것은 아니고, 멈췄다면 그것을 말하는 Event는 §22의
+`BLOCKED`다. 두 Event Type이 같은 사실을 주장하게 하지 않는다.
+
+### 2. KPI — 32개 중 10개. 나머지는 숫자를 만들지 않았다
+
+    CEO   12개  전부 DATA REQUIRED
+    CTO   10개  DORA 7종 DATA REQUIRED · git 기반 3종 계산 가능
+    COO   10개  7개 계산 가능 · 3개 DATA REQUIRED
+
+**이것이 결함 목록이 아니라 판정이다.** 매출도 고객도 계약도 Event Schema
+13개 필드와 git commit 어디에도 없다. 어떻게 배열해도 나오지 않는다.
+
+가장 유혹적인 자리는 DORA였다. git이 바로 거기 있고 commit은 셀 수 있다.
+그래서 `Deployment Frequency = commit 수`로 두면 DORA처럼 보이는 수가
+나오고, **그 수는 실제로 의사결정에 쓰인다.** Commit은 배포가 아니다.
+DORA 7종은 git이 읽히고 commit이 9건 있는 상태에서도 DATA REQUIRED로
+남으며, 정직한 수는 `Commits` / `Files Changed` / `Contributors`라는
+오해할 수 없는 이름으로 그 옆에 있다.
+
+계산된 KPI는 전부 `rollup.Metric`의 **같은 수**이며 같은 증거 파일을
+든다. 다시 세지 않는다 — 한 대시보드에 같은 수가 둘 나오면 어긋나는 날
+어느 쪽이 맞는지 말해 줄 것이 없다.
+
+연결에 대한 정직한 답: **어떤 KPI도 Goal에 닿지 않는다.** Goal은 원천이
+없다(`UNSOURCED_LAYERS`). 닿는 곳은 `Metric → Project → Issue`이고,
+`EvidenceRef`가 그 경로다.
+
+### 3. D+1 — Event가 답할 수 없는 절반
+
+Event는 사람이 **보고하기로 결정했을 때만** 존재한다. 그래서 이 둘이
+구별되지 않았다:
+
+    아무도 일하지 않은 날
+    일했지만 Event가 전달되지 않은 날 (OneDrive 용량·로그아웃·기계 꺼짐)
+
+두 번째는 **신호가 없는 실패**다. 모든 표가 "조용한 날"을 그린다.
+
+`src/delivery/git_activity.py`가 로컬 저장소에서 `git log`를 읽는다.
+네트워크도 계정도 쓰지 않는다. 읽지 못하면 0을 보고하지 않고
+`available=False`와 git 자신의 이유를 든다.
+
+OneDrive는 Desktop 간 Event 전달 수단으로 **남는다**. 바뀐 것은 그것이
+D+1 보고의 필수 경로가 아니게 되었다는 것이다. docs/12 §16의 "Transport
+구체 기술 — COO 결정 대기 중"은 이미 3년 전에 결정되고 배포된 항목이었고,
+그 줄도 이번에 정정했다.
+
+### 4. 실제로 찾은 결함 셋
+
+**(a) git 파싱이 모든 파일 목록을 한 칸씩 밀고 있었다.**
+`--name-only`는 commit의 파일 목록을 `--format` 줄 **뒤에** 찍는다.
+record separator를 format 끝에 두면 분리선이 commit의 머리와 자기 파일
+사이에 떨어져서, 모든 파일 목록이 **다음** commit에 붙는다. 이 저장소에서
+실측: 창 안에 commit 1건, `commit_count=1` (맞음), `files_changed=()` —
+실제로는 26개 파일을 건드린 commit이었다. **수가 맞아서 조용했다.**
+separator를 format 앞으로 옮겼다. 테스트는 진짜 git 저장소를 만들어서
+돌린다 — 캔드 텍스트를 돌려주는 stub이었다면 파서에 동의했을 뿐이다.
+
+**(b) `projects_at_risk`가 아무 Event나 인용하고 있었다.**
+첫 구현이 `p.evidence[-1]`(그 프로젝트의 마지막 Event)을 증거로 썼다.
+`completed_evidence`가 고쳤던 것과 **같은 결함**이다 — 확인 가능하면서
+틀린 인용은 추적 불가능한 수보다 나쁘다. `at_risk_evidence` /
+`at_risk_since` / `at_risk_team`을 접어서 위험을 만든 그 Event를 인용한다.
+`at_risk_team`이 따로 있는 이유도 같다: `teams[-1]`은 무관한 Event 하나로
+담당 팀이 바뀐다.
+
+**(c) dead-capability 검사기는 이름이 겹치면 죽은 것을 산 것으로 본다.**
+`KpiSet.for_role()`이 생기자 `RoleSummary.for_role()`이 목록에서 조용히
+빠졌다. 후자는 여전히 호출되지 않는다. `called`가 평평한 이름 집합이라
+`.for_role` 둘을 구별하려면 수신자의 타입이 필요하고 AST에는 없다.
+`defined`를 파일로 한정해 봤지만 소용없다 — 충돌은 `called` 쪽에 있다.
+**우회하지 않고 기록했다.** 이름 기반 검사기의 일반적 한계이며, 그것을
+아는 것이 모르는 채로 초록을 보는 것보다 낫다.
+
+### 5. 시나리오 검증 — "3개 만들었는데 2개 보인다"를 겨눈 것
+
+`tests/test_company_scenarios.py`. 회사 하나에 열 가지 상황을 동시에
+넣고 실제 읽기 경로를 한 번 돌린 뒤 **센다**.
+
+Blocked Project는 셋으로 만들었다 — 하나로는 off-by-one이 잡히지 않는다.
+세는 곳도 넷이다(fold · risk 목록 · metric · panel). 각각 다른 코드
+경로여서, 어느 하나가 잃으면 모두가 똑같이 틀리는 게 아니라 **서로
+어긋난다**.
+
+세 개가 셋으로 나왔고, 각자 자기 blocker 텍스트·자기 팀·자기 나이를
+들고 있었다. 해결된 Issue는 열린 목록에 없고 여전히 "해결됨"으로 세어진다.
+승인된 Decision도 같다. AT_RISK 프로젝트는 blocker 수에 섞이지 않는다.
+
+### 6. 승인 필요 — SKIP
+
+    실제 Notion workspace 반영    자격증명 없음 (A-8). 코드는 준비됐고
+                                  publish_control_tower.py가 실행 지점이다.
+    git commit / push             금지
+    Task Scheduler 등록           금지
+
+### 7. 원천이 필요해 열려 있는 것
+
+1. **CEO KPI 12종** — 재무/고객 원천을 어디에 둘지는 승인이 필요한 결정.
+   docs/14 §1이 Notion을 View로 고정하므로 Notion 입력은 원천이 아니다.
+2. **DORA 7종** — 배포 사건 원천. 가장 작은 길은 Event Type
+   `DEPLOYED` 하나이며, docs/02 변경이다.
+3. **Process Cycle Time / On-time Rate** — 기간에 의존하지 않는 Project
+   개체와 기한. 지금 Project는 `project_id`를 공유하는 Event들의 집합이다.
+4. **기간 경계** — 열린 Issue/Decision은 읽은 창 **안에서** 열린 것만
+   보인다. 창 이전에 열린 것은 나이를 알 수 없다. `_roll_open_items()`가
+   docstring에, RISKS 패널의 `note`가 화면에 이 한계를 적는다.
 
 ---
 

@@ -566,7 +566,21 @@ Collector → History Filter → Daily Close → Backup  (실행 순서를 지�
 
 다음은 본 문서가 흐름을 설계하면서도 일부러 확정하지 않은 부분이다. Runtime 구현 전에 별도 결정이 필요하다.
 
-1. Transport 구체 기술 (GitHub / OneDrive / USB / SharedFolder) — 이미 별도 분석 및 COO 결정 대기 중.
+1. ~~Transport 구체 기술 (GitHub / OneDrive / USB / SharedFolder) — 이미 별도 분석 및 COO 결정 대기 중.~~
+   **결정되었고 구현되었다.** `src/transport/onedrive.py`(`OneDriveTransport`)가
+   유일한 production Transport이며 `run_agent.py`가 이것을 만든다. USB /
+   SharedFolder / GitHub Transport는 작성된 적이 없다.
+   `src/transport/interface.py`의 모듈 docstring이 같은 정정을 이미 담고
+   있고(C122), 그 파일의 테스트가 두 사실을 트리에 대고 검사한다. 이 줄은
+   그 정정이 도달하지 못한 마지막 자리였다 — "아직 정하지 않았다"고 적힌
+   목록에 이미 정해지고 배포된 항목이 남아 있으면, 그 목록 전체를 읽을 수
+   없게 된다.
+
+   **다만 Transport는 D+1 운영보고의 필수 경로가 아니다 (C149).**
+   `src/delivery/git_activity.py`가 개발 활동을 로컬 git에서 직접 읽으므로,
+   OneDrive가 가득 찼거나 로그아웃됐거나 그 기계가 꺼져 있던 날에도 "어제
+   무엇이 바뀌었는가"는 답이 있다. 그전에는 그런 날이 "조용한 날"과 구별되지
+   않았다 — 신호가 없는 실패였다. 자세한 것은 `docs/15_D1_COMPANY_UPDATE_SPEC.md`.
 2. `runtime/events/processed/`의 장기 누적을 완화할 archive 정책 — V1에서는 불필요, 향후 검토.
 3. Collector Runtime의 `SeenEventStore` 실제 구현(파일 기반 `collector_state.json` 등) — Interface만 존재.
 4. History Filter의 KEEP/DROP/REVIEW 자동 판정 로직의 구체 규칙 엔진 (AI 사용 여부 포함, `05_HISTORY_PIPELINE_SPEC.md` §56-57).

@@ -50,6 +50,22 @@ from history import (  # noqa: E402
 from notion.properties import build_create_properties, build_update_properties  # noqa: E402
 
 
+# The `status` each Event Type has to carry for `validate_event()` to accept
+# it — docs/02 §26 plus the three coherence rules in `events/schema.py`. Two
+# guard classes below build probe Events over *every* type in `EVENT_TYPES`,
+# and both carried a byte-identical copy of this table inline; when AT_RISK
+# arrived with a coherence rule of its own (C149), each copy would have had
+# to learn it separately, and a probe that fails to construct is a guard
+# that silently stops guarding. Anything not named here is valid with
+# IN_PROGRESS.
+_COHERENT_STATUS = {
+    "AT_RISK": "AT_RISK",
+    "BLOCKED": "BLOCKED",
+    "COMPLETED": "COMPLETED",
+    "CANCELLED": "CANCELLED",
+}
+
+
 def _source_files():
     return [p for p in SRC.rglob("*.py") if "__pycache__" not in str(p)]
 
@@ -172,6 +188,29 @@ class GitProhibitionGuardTests(unittest.TestCase):
                 "alone. Read-only: walks history, touches no ref."
             ),
         },
+        # C149. The D+1 report's git half. Unlike the two above it, this one
+        # runs with `cwd=` **this** repository rather than the Backup Working
+        # Copy, and it is on a page a person loads: every Dashboard request
+        # runs it. Both commands are reads and neither touches a remote, so
+        # there is no credential prompt to hang on and nothing to classify.
+        "git_activity.py": {
+            "rev-parse --git-dir": (
+                "Whether this directory is a git repository at all, asked "
+                "before `log` so that 'this is not a checkout' is reported "
+                "as itself rather than as a broken query. Read-only: "
+                "resolves a path, changes nothing."
+            ),
+            "log --name-only --no-merges --date-order": (
+                "The commits authored in the reported window, with the files "
+                "each touched -- the half of 'what changed yesterday' that "
+                "Execution Events cannot answer, because an Event exists "
+                "only when somebody chose to report one. Read-only: walks "
+                "history, touches no ref and no working tree. The window "
+                "itself is passed as `--since=` / `--until=` / `--format=` "
+                "f-strings, which this scan does not read -- they carry "
+                "dates and a format string, never a verb."
+            ),
+        },
     }
 
     @staticmethod
@@ -187,6 +226,25 @@ class GitProhibitionGuardTests(unittest.TestCase):
 
         By AST, so a call split across lines -- which both of the real ones
         are -- is seen the same as a one-liner.
+
+        **A file may funnel too, and C149 found the hole that opened.**
+        `delivery/git_activity.py` wraps its calls in a local `_run()`
+        exactly the way `git_ops.py` wraps its own, so its
+        `subprocess.run(["git", *args])` is `Starred` and skipped -- and the
+        first roster only reads `git_ops.py`. Both of its commands were
+        therefore reviewed by **neither** gate, which is precisely the scope
+        defect `APPROVED_COMMANDS_ELSEWHERE` was created to close, reappearing
+        one level in. Measured: adding the module changed this scan's output
+        not at all.
+
+        So a file containing a starred `["git", *...]` call gets a second
+        pass, which collects the constant words of every list literal handed
+        as a first positional argument to any call in that file -- i.e. the
+        funnel's own call sites. `git_ops.py` is excluded by name because it
+        already has a dedicated roster and a dedicated gate, and collecting
+        it twice would mean two rosters permitting the same command with no
+        rule about which one is authoritative (`test_the_two_scans_do_not_
+        overlap` states that boundary and still holds).
         """
         import ast
 
@@ -195,6 +253,45 @@ class GitProhibitionGuardTests(unittest.TestCase):
         paths += sorted(REPO_ROOT.glob("*.py"))
         for path in paths:
             tree = ast.parse(path.read_text(encoding="utf-8"))
+            funnels = path.name != "git_ops.py" and any(
+                isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) == "run"
+                and node.args
+                and isinstance(node.args[0], ast.List)
+                and node.args[0].elts
+                and isinstance(node.args[0].elts[0], ast.Constant)
+                and node.args[0].elts[0].value == "git"
+                and any(isinstance(e, ast.Starred) for e in node.args[0].elts)
+                for node in ast.walk(tree)
+            )
+            if funnels:
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call) or not node.args:
+                        continue
+                    # A plain name, not an attribute: `_run([...], dir)` is
+                    # the funnel's call site and `_SEP.join([...])` is a list
+                    # literal that has nothing to do with git. Without this
+                    # the scan reported `_LOG_FORMAT`'s `["%H", "%aI", ...]`
+                    # as a git command, which would have put a git-format
+                    # string on a roster of approved commands.
+                    if not isinstance(node.func, ast.Name):
+                        continue
+                    first = node.args[0]
+                    if not isinstance(first, ast.List) or not first.elts:
+                        continue
+                    if not isinstance(first.elts[0], ast.Constant):
+                        continue
+                    if not isinstance(first.elts[0].value, str):
+                        continue
+                    if first.elts[0].value == "git":
+                        continue  # the funnel's own `["git", *args]`
+                    words = [
+                        element.value
+                        for element in first.elts
+                        if isinstance(element, ast.Constant)
+                        and isinstance(element.value, str)
+                    ]
+                    found.setdefault(path.name, set()).add(" ".join(words))
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
@@ -377,23 +474,30 @@ class NotionPropertyMappingGuardTests(unittest.TestCase):
 
     # docs/04: section 21 STARTED, 22 BLOCKED, 23 RESUMED, 24 MILESTONE_COMPLETED,
     # 25 COMPLETED, 26 CANCELLED, 27 ISSUE_RESOLVED, 28 DECISION_APPROVED
+    # C149's four carry no extra Property, and the reason each one does not
+    # is written at `_type_specific_properties()`'s tail. The point of
+    # listing them here is that the guard below proves it rather than
+    # assuming it: an `ISSUE_RAISED` that quietly started writing `Blocker`
+    # would be a second Event Type claiming BLOCKED's fact.
     EXPECTED_EXTRA = {
         "STARTED": set(),
+        "AT_RISK": set(),
         "BLOCKED": {"Blocker"},
         "RESUMED": {"Blocker"},
         "MILESTONE_COMPLETED": {"Current Milestone"},
         "COMPLETED": {"Blocker", "Completed Date"},
         "CANCELLED": set(),
+        "ISSUE_RAISED": set(),
+        "ASSIGNED": set(),
         "ISSUE_RESOLVED": {"Blocker"},
+        "DECISION_REQUIRED": set(),
         "DECISION_APPROVED": set(),
+        "DECISION_REJECTED": set(),
+        "EXECUTED": set(),
     }
 
     def _event(self, event_type):
-        status = {
-            "COMPLETED": "COMPLETED",
-            "CANCELLED": "CANCELLED",
-            "BLOCKED": "BLOCKED",
-        }.get(event_type, "IN_PROGRESS")
+        status = _COHERENT_STATUS.get(event_type, "IN_PROGRESS")
         return create_event(
             source="DESKTOP_1",
             role="COO",
@@ -478,33 +582,43 @@ class HistoryFilterDecisionMatrixGuardTests(unittest.TestCase):
 
     # docs/05 sections 24-26 + docs/02 section 36.
     EXPECTED = {
+        "DECISION_REQUIRED": HistoryDecision.KEEP,
         "DECISION_APPROVED": HistoryDecision.KEEP,
+        "DECISION_REJECTED": HistoryDecision.KEEP,
+        "EXECUTED": HistoryDecision.KEEP,
         "MILESTONE_COMPLETED": HistoryDecision.KEEP,
+        "ISSUE_RAISED": HistoryDecision.KEEP,
         "ISSUE_RESOLVED": HistoryDecision.KEEP,
         "STARTED": HistoryDecision.DROP,
         "RESUMED": HistoryDecision.DROP,
+        # Progress, not outcome — docs/05 §26. It matters to the Control
+        # Tower (who owns this open Issue *now*) and not to the long record.
+        "ASSIGNED": HistoryDecision.DROP,
+        "AT_RISK": HistoryDecision.REVIEW,
         "BLOCKED": HistoryDecision.REVIEW,
         "COMPLETED": HistoryDecision.REVIEW,
         "CANCELLED": HistoryDecision.REVIEW,
     }
 
     EXPECTED_CATEGORY = {
+        "DECISION_REQUIRED": "DECISION",
         "DECISION_APPROVED": "DECISION",
+        "DECISION_REJECTED": "DECISION",
+        "EXECUTED": "DECISION",
         "MILESTONE_COMPLETED": "MILESTONE",
         "COMPLETED": "MILESTONE",
+        "ISSUE_RAISED": "ISSUE",
         "ISSUE_RESOLVED": "ISSUE",
+        "AT_RISK": "ISSUE",
         "BLOCKED": "ISSUE",
         "STARTED": None,
         "RESUMED": None,
+        "ASSIGNED": None,
         "CANCELLED": None,
     }
 
     def _event(self, event_type, *, history_candidate=True):
-        status = {
-            "COMPLETED": "COMPLETED",
-            "CANCELLED": "CANCELLED",
-            "BLOCKED": "BLOCKED",
-        }.get(event_type, "IN_PROGRESS")
+        status = _COHERENT_STATUS.get(event_type, "IN_PROGRESS")
         return create_event(
             source="DESKTOP_1",
             role="COO",
@@ -1105,7 +1219,16 @@ class EventTypeStatusCoherenceTests(unittest.TestCase):
         """The structural cause, so a refactor cannot lose the finding."""
         source = (SRC / "events" / "schema.py").read_text(encoding="utf-8")
         rules = re.findall(r'if event_type == "(\w+)" and status != "(\w+)"', source)
-        self.assertEqual(sorted(r[0] for r in rules), ["CANCELLED", "COMPLETED"])
+        # AT_RISK joined the list in C149 for the same reason the other two
+        # are on it: it is a state-setting Event, so a report that sets the
+        # state and then contradicts it in `status` is not a report anyone
+        # can act on. The finding this test records is unchanged — the *other*
+        # nine types still have no coherence rule, so a MILESTONE_COMPLETED
+        # with status NOT_STARTED is still accepted and still reaches Company
+        # History (the two tests above measure exactly that).
+        self.assertEqual(
+            sorted(r[0] for r in rules), ["AT_RISK", "CANCELLED", "COMPLETED"]
+        )
 
 
 class KeepIndexContractTests(unittest.TestCase):

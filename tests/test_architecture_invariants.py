@@ -4856,7 +4856,23 @@ class LayeringInvariantTests(unittest.TestCase):
         # other derivations rather than under them. `reporter` is a writer
         # package, but the edge reaches `profiles.py` — pure vocabulary — and
         # `reporter` imports nothing from here, so the graph stays acyclic.
-        "controltower": {"businessdate", "events", "notion", "oplog", "reporter"},
+        #   delivery  `kpi.py` reports code change volume beside the DORA
+        #             KPIs it refuses. A leaf (`{businessdate}`), so it
+        #             closes no cycle, and the edge is one-way: nothing in
+        #             `delivery` knows a Project, a Team or an Event exists.
+        "controltower": {
+            "businessdate",
+            "delivery",
+            "events",
+            "notion",
+            "oplog",
+            "reporter",
+        },
+        # Read-only `git log` over the local repository, for the half of the
+        # D+1 report that must still say something when Event delivery is
+        # down. A leaf on purpose: it must not learn what a Project is, or
+        # git starts competing with Events for the same answer.
+        "delivery": {"businessdate"},
         "app": None,  # composition root: unrestricted
     }
 

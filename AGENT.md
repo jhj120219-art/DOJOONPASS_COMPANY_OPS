@@ -26,6 +26,26 @@ Transport 이후는 **전부 기존 코드**다. Agent는 새 Company Ops를 만
 `Reporter / Transport / Collector / History / Scheduler / Backup / Notion`을
 그대로 사용한다.
 
+### 1.1 이 그림에 없는 두 번째 원천 (C149)
+
+위 경로는 **사람이 보고하기로 결정한 것**만 나른다. 그래서 "아무도 일하지
+않은 날"과 "일했지만 OneDrive가 가득 찼던 날"이 구별되지 않았다 — 두 번째는
+신호가 없는 실패이며, 모든 표가 조용한 날을 그린다.
+
+`src/delivery/git_activity.py`가 Desktop 4에서 **로컬 저장소의 git log를
+직접** 읽어 D+1 보고의 나머지 절반을 만든다.
+
+```
+Desktop 4 로컬 저장소 ─ git log ─┐
+                                 ▼
+                    Control Tower / Notion 페이지 ⑤
+```
+
+네트워크도 계정도 쓰지 않으므로 이 경로는 Transport가 죽어 있어도 답한다.
+Git이 회사의 Source of Truth가 되는 것은 아니다 — Project도 Blocker도
+Decision도 Commit에서 유도되지 않으며, 그 전부는 여전히 Event가 든다.
+자세한 것은 `docs/15_D1_COMPANY_UPDATE_SPEC.md`.
+
 Desktop 4도 예외가 아니다. COO의 업무 역시 같은 Agent로 같은 Transport를
 거쳐 자기 자신의 `runtime/events/transport/`에 들어가고, 기존
 `run_intake()`가 `incoming/`으로 승격시킨다. 우회 경로는 없다.

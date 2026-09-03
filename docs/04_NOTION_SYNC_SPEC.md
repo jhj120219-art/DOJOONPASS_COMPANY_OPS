@@ -601,6 +601,27 @@ Decision이 특정 Project의 Current State를 변경하는 경우에만 관련 
 
 ---
 
+## 28.1 AT_RISK / ISSUE_RAISED / DECISION_REQUIRED / DECISION_REJECTED 처리 (C149)
+
+넷 다 공통 필드(Status / Last Updated / Last Event ID / Last Event Type)
+외에 **추가 Property가 없다**. §28의 DECISION_APPROVED와 같은 자리다.
+
+`AT_RISK`는 §26의 CANCELLED와 정확히 같다 — 자기 `status`를 고정하는
+것이 전부이고, 그 값은 공통 필드의 `Status`가 이미 쓴다. 위험의 내용은
+`summary`에 있고, PROJECTS Database의 Property가 되지 않는다.
+
+`ISSUE_RAISED`는 **`Blocker`를 쓰지 않는다**. 제기된 Issue가 곧
+프로젝트를 멈춘 것은 아니다. 멈췄다면 그것을 말하는 Event는 §22의
+`BLOCKED`이며, 여기서 `Blocker`를 쓰면 두 Event Type이 같은 사실을
+주장하게 된다 — §27이 ISSUE_RESOLVED에 대해 피한 바로 그 겹침이다.
+
+`DECISION_REQUIRED` / `DECISION_REJECTED` / `EXECUTED`는 §28과 대칭이므로
+같은 이유로 추가 Property가 없다. `EXECUTED`는 승인된 Decision이 실제로
+실행됐다는 사실이며, 그 자체로 Project 상태를 바꾸지 않는다 — 바꿨다면
+그것을 말하는 Event(§24 MILESTONE_COMPLETED, §25 COMPLETED)를 따로 보고한다.
+
+---
+
 ## 29. Late Event 보호
 
 Notion은 Current State이므로 과거 Event가 최신 상태를 역전시키면 안 된다.
@@ -1310,7 +1331,7 @@ Notion V1에서는 다음을 만들지 않는다.
 - 자동 Launch Readiness 점수
 - 자동 Go / No-Go
 - 자동 CEO Decision
-- KPI Dashboard
+- KPI Dashboard (단, §68.1 참조)
 - VOC Dashboard
 - M&A Dashboard
 - IPO Dashboard
@@ -1319,6 +1340,21 @@ Notion V1에서는 다음을 만들지 않는다.
 - Task Management 전체 대체
 - Event Log 전체 저장
 - AI 경영판단 Agent
+
+---
+
+## 68.1 KPI에 대한 단서 (C149)
+
+§68의 "KPI Dashboard"는 **Notion 안에 KPI를 선언하고 목표를 입력하는
+Database를 만들지 않는다**는 뜻이다. 그 금지는 유지된다 — docs/14 §1이
+Notion을 "View이며 절대 Source가 아니다"로 고정하기 때문이다.
+
+Event Evidence에서 **파생된** 수를 Notion 페이지에 문장으로 싣는 것은
+여기 해당하지 않는다. `src/controltower/rollup.py`가 이미 그렇게 하고
+있고(KPI 층은 선언되지 않고 계산된다), C149의 `src/controltower/kpi.py`도
+같다: 계산할 수 없는 KPI는 숫자 대신 `DATA REQUIRED`를 싣는다.
+
+금지선은 "Notion에 KPI가 보이는가"가 아니라 "Notion이 KPI의 Source인가"다.
 
 ---
 

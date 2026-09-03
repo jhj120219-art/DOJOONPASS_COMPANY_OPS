@@ -1224,10 +1224,11 @@ class DocumentationGapCharacterizationTests(unittest.TestCase):
         """The count is asserted so a spec cannot be *deleted* unnoticed —
         the README cross-check above already catches an added one."""
         names = sorted(p.name for p in DOCS.glob("*.md"))
-        self.assertEqual(len(names), 15)
+        self.assertEqual(len(names), 16)
         self.assertIn("12_APPLICATION_FLOW_SPEC.md", names)
         self.assertIn("13_NOTION_ENVIRONMENT_SETUP.md", names)
         self.assertIn("14_RUN_CONTRACT.md", names)
+        self.assertIn("15_D1_COMPANY_UPDATE_SPEC.md", names)
 
     def test_readme_document_list_names_every_spec_that_exists(self):
         """FIXED — and now a guard rather than a record of the gap.
@@ -2733,7 +2734,26 @@ class DeadCapabilityInventoryTests(unittest.TestCase):
         "remove_pending",                 # B-7: deletion is the open decision
         # --- unwired capability, recorded ---------------------------------
         "build_role_summary",             # C31 §16 (A-3's record corrected)
-        "for_role",                       # same module, same reason
+        # `for_role` was on this list beside `build_role_summary` — same
+        # module, same reason — and left it in C149 **without becoming
+        # reachable**. `daily/role_summary.RoleSummary.for_role()` still has
+        # no caller. What changed is that `controltower/kpi.KpiSet` grew a
+        # method of the same name that does, and this scanner keys `called`
+        # on the bare attribute name: it cannot tell one `.for_role` from
+        # another, because that needs the receiver's type and an AST does not
+        # have it.
+        #
+        # Recorded rather than worked around. Qualifying `defined` by file
+        # was tried and does not help — the collision is in `called`, which
+        # is a flat set of names by construction. So the limit is real and
+        # general: **any dead capability whose name is reused by a live one
+        # anywhere in `src/` silently leaves this inventory.** That is worth
+        # knowing about the guard, and a name-based detector that pretended
+        # otherwise would be worse than one that says so.
+        #
+        # `days_at_risk` is the honest kind of departure from this list in
+        # the same change: `dashboard._risks_panel()` calls it, on the AT_RISK
+        # rows it renders.
         "of_category",                    # same module, same reason
         # --- superseded by a better mechanism -----------------------------
         "report_and_write",               # the outbox gives durability

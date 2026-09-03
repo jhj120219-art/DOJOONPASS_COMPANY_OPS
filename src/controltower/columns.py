@@ -47,6 +47,10 @@ LABELS: dict[str, str] = {
     "status": "상태",
     "state": "판정",
     "blocker": "Blocker",
+    # RISKS의 OPEN_ISSUE / PENDING_DECISION이 든 사람의 말 (C149).
+    # `blocker`와 같은 칸을 쓰지 않는 이유는 머리글이다 — 기다리는 Decision의
+    # 요약을 "Blocker"라고 붙여 놓으면 틀린 주장을 하게 된다.
+    "detail": "내용",
     "blocker_team": "Blocker Team",
     "blocked_since": "막힌 시점",
     "days_blocked": "막힌 일수",
@@ -74,6 +78,21 @@ LABELS: dict[str, str] = {
     "milestone": "Milestone",
     "of_total": "전체 중",
     "truncated": "잘림",
+    # ROLE_KPI (C149). `role`은 KPI를 읽는 사람이고, `measured`는 이 수를
+    # 실제로 계산했는지다 — 계산하지 못한 행은 `reading`이 값 대신
+    # `DATA REQUIRED`를 들고 `requires`가 무엇이 있어야 답할 수 있는지
+    # 적는다.
+    "role": "역할",
+    "definition": "정의",
+    "measured": "계산됨",
+    "reading": "값",
+    "chain": "연결",
+    "requires": "필요한 원천",
+    # CODE_CHANGES (C149). Event가 아니라 git commit이다.
+    "commit": "Commit",
+    "author": "작성자",
+    "subject": "제목",
+    "files": "파일",
 }
 
 

@@ -14,19 +14,71 @@ SUPPORTED_SCHEMA_VERSION = "1.0"
 
 SOURCES = frozenset({"DESKTOP_1", "DESKTOP_2", "DESKTOP_3", "DESKTOP_4"})
 ROLES = frozenset({"CTO_BACKEND", "CTO_FRONTEND", "CMO", "COO"})
+# docs/02 §11. Every lifecycle this vocabulary can express has both of its
+# ends here, which was not true before C149.
+#
+# The eight types this file shipped with are all *past tense*: something
+# finished, resolved, or was approved. A company does not only produce
+# outcomes — it produces the open states that precede them, and those are
+# what a COO and a CEO actually act on. Three lifecycles were half-written:
+#
+#     Issue      ISSUE_RESOLVED existed; nothing could say an Issue was
+#                RAISED, so "how long has this been open" had no start date
+#                and Issue Aging was uncomputable in principle, not just
+#                unimplemented. `ASSIGNED` is the step between: an Issue
+#                nobody has taken and an Issue being worked on looked
+#                identical, and they are the two halves an aging list is
+#                read to tell apart.
+#     Decision   DECISION_APPROVED existed; docs/02 §19 goes out of its way
+#                to say "CEO Decision Required" must NOT be recorded as
+#                DECISION_APPROVED — and then gave it nowhere else to go.
+#                A rejection had the same problem: recording it as an
+#                approval is false, and omitting it makes a decision that
+#                was actually settled look permanently pending.
+#                And the lifecycle closed one step early: an approval is
+#                not the work. `EXECUTED` is the other end of it — a
+#                decision approved and never carried out is one of the most
+#                ordinary ways a company stalls, and it was invisible
+#                because approval removed it from every list.
+#     Project    BLOCKED (stopped) existed; AT_RISK (moving, but likely to
+#                stop) did not, so the one state a COO can still act on
+#                early had to be reported as either "fine" or "stopped".
+#
+# The four added here close exactly those three gaps and nothing more. Each
+# is modelled on a type that already exists rather than inventing a new
+# shape: ISSUE_RAISED / DECISION_REQUIRED / DECISION_REJECTED carry no
+# property of their own (like DECISION_APPROVED, docs/04 §28), and AT_RISK
+# is a state-setting event that pins its own `status` (like COMPLETED
+# §25 and CANCELLED §26). No new Event field was added for any of them.
 EVENT_TYPES = frozenset(
     {
         "STARTED",
+        "AT_RISK",
         "BLOCKED",
         "RESUMED",
         "MILESTONE_COMPLETED",
         "COMPLETED",
         "CANCELLED",
+        "ISSUE_RAISED",
+        "ASSIGNED",
         "ISSUE_RESOLVED",
+        "DECISION_REQUIRED",
         "DECISION_APPROVED",
+        "DECISION_REJECTED",
+        "EXECUTED",
     }
 )
-STATUSES = frozenset({"NOT_STARTED", "IN_PROGRESS", "BLOCKED", "COMPLETED", "CANCELLED"})
+
+# `AT_RISK` sits between IN_PROGRESS and BLOCKED: work is still moving, and
+# something known is likely to stop it. It is a `status` and not only an
+# event_type for the same reason BLOCKED is — a project stays at risk across
+# the later Events that do not mention the risk, and `status` is the field
+# that survives. Notion needs no migration for it: `bootstrap.py` declares
+# `"Status": {"select": {}}` with no fixed option list, so the API creates
+# the option on first write.
+STATUSES = frozenset(
+    {"NOT_STARTED", "IN_PROGRESS", "AT_RISK", "BLOCKED", "COMPLETED", "CANCELLED"}
+)
 
 REQUIRED_FIELDS = (
     "schema_version",
@@ -193,6 +245,14 @@ def validate_event(data: Mapping[str, Any]) -> list[str]:
 
     if event_type == "BLOCKED" and not data.get("blocker"):
         errors.append("BLOCKED event requires a non-null blocker")
+
+    # The three state-setting types pin their own status, so a report cannot
+    # say "this project is at risk" while also saying it is COMPLETED.
+    # AT_RISK joins COMPLETED/CANCELLED here rather than joining BLOCKED's
+    # rule above, because a risk is described in `summary` — it has no
+    # dedicated field and needs none (see EVENT_TYPES' note).
+    if event_type == "AT_RISK" and status != "AT_RISK":
+        errors.append("AT_RISK event requires status = AT_RISK")
 
     if event_type == "COMPLETED" and status != "COMPLETED":
         errors.append("COMPLETED event requires status = COMPLETED")

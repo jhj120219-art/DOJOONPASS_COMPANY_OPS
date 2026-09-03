@@ -27,6 +27,24 @@ client at all). Those five are omitted rather than filled:
                           both just ISSUE and cannot be paired. Adding
                           `event_type` is a docs/05 schema change.
 
+                          **Still true here, and no longer true of the
+                          system (C149.)** `controltower/rollup.py`'s
+                          `_roll_open_items()` now answers exactly this
+                          question — which Issues and Decisions were opened
+                          and not closed — because the Event vocabulary
+                          gained `ISSUE_RAISED` and `DECISION_REQUIRED`.
+                          It reads Execution Evidence (docs/14 §2) rather
+                          than Candidates, so it is a different source and
+                          not a drop-in: routing Monthly to that evidence is
+                          a docs/09 decision, and this module still has only
+                          the Candidates it is given — and the directory
+                          that evidence lives in is deliberately not named
+                          here, because `MonthlyBoundaryInvariantTests`
+                          reads path *components* and would see the mention
+                          as a coupling. Recorded so the omission does not
+                          keep reading as "impossible" when what it now is,
+                          is "not wired".
+
 §14 settles what to do about that: "내용이 없는 Section은 억지로 채우지
 않는다." Omitting is also the only safe direction — §30, §64 and §65 all
 forbid the alternative, which is a machine writing something plausible that

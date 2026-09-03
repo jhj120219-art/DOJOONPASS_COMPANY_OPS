@@ -535,17 +535,36 @@ class ThreeDesktopsReachNotionTests(_ThreeDesktopPipeline, unittest.TestCase):
             for row in panel["rows"]
         ]
 
-        self.assertEqual(len(risks), 1)
-        self.assertEqual(risks[0]["values"]["project_id"], "SEARCH_BACKEND")
-        self.assertEqual(risks[0]["values"]["team"], "CTO_BACKEND")
-        self.assertEqual(risks[0]["values"]["kind"], "OPEN_BLOCKER")
+        # Two rows, and the second is the feature rather than noise: this
+        # fixture's CMO approves the August campaign and nobody reports
+        # carrying it out, which C149 made visible as an
+        # `UNEXECUTED_DECISION`. Asserted by kind rather than by a total, so
+        # a blocker quietly turning into something else cannot pass.
+        by_kind = {row["values"]["kind"]: row for row in risks}
+        self.assertEqual(
+            sorted(by_kind), ["OPEN_BLOCKER", "UNEXECUTED_DECISION"]
+        )
+
+        blocker = by_kind["OPEN_BLOCKER"]
+        self.assertEqual(blocker["values"]["project_id"], "SEARCH_BACKEND")
+        self.assertEqual(blocker["values"]["team"], "CTO_BACKEND")
+
+        unexecuted = by_kind["UNEXECUTED_DECISION"]
+        self.assertEqual(unexecuted["values"]["project_id"], "BRAND_CAMPAIGN")
+        self.assertEqual(unexecuted["values"]["team"], "CMO")
+
         # Traceable to a file that is really there — the whole reason every
         # row carries evidence.
-        self.assertTrue(
-            (
-                self.runtime / "events" / "processed" / risks[0]["evidence"][0]["path"]
-            ).is_file()
-        )
+        for row in risks:
+            with self.subTest(kind=row["values"]["kind"]):
+                self.assertTrue(
+                    (
+                        self.runtime
+                        / "events"
+                        / "processed"
+                        / row["evidence"][0]["path"]
+                    ).is_file()
+                )
 
     def test_a_second_run_changes_no_number_in_the_payload(self):
         """The duplicate-collection property, stated at the payload level."""
@@ -1328,13 +1347,21 @@ class TheControlTowerReachesTheNotionDashboardTests(
         self.assertEqual(
             _prop(risk["properties"], "Retired At"), later.isoformat()
         )
+        # No **blocker** is present any more. Not "no risk row at all": the
+        # same fixture has an approved campaign nobody reported executing,
+        # which C149 keeps on the board as an `UNEXECUTED_DECISION` — an
+        # approval used to close that lifecycle and the item vanished at the
+        # moment it became a problem. Narrowed to the kind this test is
+        # about rather than relaxed, so a blocker that failed to retire
+        # still fails here.
+        present = [
+            page
+            for page in self._rows_in("CT_RISKS")
+            if page["properties"]["Present"]["checkbox"]
+        ]
         self.assertEqual(
-            [
-                page
-                for page in self._rows_in("CT_RISKS")
-                if page["properties"]["Present"]["checkbox"]
-            ],
-            [],
+            [_prop(page["properties"], "Kind") for page in present],
+            ["UNEXECUTED_DECISION"],
         )
 
     def test_the_ops_runs_row_and_the_control_tower_rows_agree(self):

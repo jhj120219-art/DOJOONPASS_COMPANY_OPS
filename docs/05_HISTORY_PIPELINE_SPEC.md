@@ -537,6 +537,11 @@ Event 원본은 Runtime 정책에 따라 존재할 수 있지만 Daily Company H
 - 중요도가 애매한 CANCELLED
 - 장기 영향이 불확실한 BLOCKED
 - 의미가 애매한 COMPLETED
+- AT_RISK (C149)
+
+`AT_RISK`가 여기 있는 이유: "멈출 것 같다"는 이 목록에서 가장 애매한
+판정이다. 위험이 현실이 되면 `BLOCKED`가 따라오고, 해소되면 아무 일도
+없었던 것이 된다 — 어느 쪽인지는 그 Event 하나로 정해지지 않는다.
 
 REVIEW가 지나치게 많이 발생하도록 설계하지 않는다.
 
@@ -546,11 +551,25 @@ REVIEW가 지나치게 많이 발생하도록 설계하지 않는다.
 
 V1에서 다음은 기본적으로 KEEP 후보로 처리할 수 있다.
 
+    DECISION_REQUIRED
+
     DECISION_APPROVED
+
+    DECISION_REJECTED
+
+    EXECUTED
 
     주요 MILESTONE_COMPLETED
 
+    주요 ISSUE_RAISED
+
     주요 ISSUE_RESOLVED
+
+Lifecycle의 **시작**(`DECISION_REQUIRED` / `ISSUE_RAISED`)과 **거절**
+(`DECISION_REJECTED`)이 KEEP인 이유는 그 **끝**이 KEEP인 이유와 같다
+(C149). 셋 다 회사가 실제로 행동한 지점이고, 시작이 기록되지 않으면
+Issue Aging / Decision Aging은 구현되지 않은 것이 아니라 계산할 수
+없는 것이 된다 — 끝났다는 사실만으로는 얼마나 걸렸는지 알 수 없다.
 
 단, Event 자체가 명백하게 사소한 내용이면 Filter에서 제외할 수 있다.
 
@@ -563,6 +582,15 @@ V1에서 다음은 기본적으로 KEEP 후보로 처리할 수 있다.
     STARTED
 
     RESUMED
+
+    ASSIGNED
+
+`ASSIGNED`(C149)가 여기 있는 이유는 위 둘과 같다 — **진행이지 성과가
+아니다.** Issue가 손을 바꾼 것은 일이 어떻게 움직였는가이고, Company
+History는 회사가 무엇을 이뤘는가를 남긴다. 다만 **지금**은 대단히 중요하다:
+Control Tower가 이것을 읽어 "아무도 맡지 않은 Issue"와 "누군가 붙어 있는
+Issue"를 구분한다. 그 차이가 현재 상태(Control Tower)와 장기 기록(Company
+History)의 차이다.
 
 그리고 다음과 같은 내용:
 

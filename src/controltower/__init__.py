@@ -22,6 +22,7 @@ from .dashboard import (
     DashboardRow,
     PanelStatus,
     build_dashboard,
+    evidence_window,
     unsourced_layer_coverage,
 )
 from .projection import (
@@ -66,6 +67,7 @@ __all__ = [
     "build_company_rollup",
     "build_dashboard",
     "event_instant_key",
+    "evidence_window",
     "ops_runs_fields",
     "read_events",
     "unsourced_layer_coverage",

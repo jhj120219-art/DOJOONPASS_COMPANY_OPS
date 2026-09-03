@@ -924,7 +924,12 @@ class NotionTextLimitTests(unittest.TestCase):
             # here rather than by excluding the types that have them: the
             # point of the sweep is that no Event type escapes the bound.
             fields = dict(overrides)
-            if event_type in ("COMPLETED", "CANCELLED"):
+            # AT_RISK joined COMPLETED/CANCELLED in C149: all three are
+            # state-setting Events whose `status` must match their type. The
+            # membership test rather than a fourth branch, because that is
+            # exactly the rule — `validate_event()` writes it three times in
+            # the same shape.
+            if event_type in ("COMPLETED", "CANCELLED", "AT_RISK"):
                 fields["status"] = event_type
             if event_type == "BLOCKED":
                 fields.setdefault("blocker", "b")

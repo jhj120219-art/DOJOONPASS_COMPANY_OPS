@@ -61,6 +61,35 @@ RULES: tuple[tuple[str, str, str], ...] = (
     # never leave the machine. "Work is not reaching Company History" by
     # the letter of the definition above.
     ("Desktop ID와 다르다", "P1", "등록된 Task가 다른 Desktop의 것 — 매번 거부된다"),
+    # C149. Three company states that could not be reported before the Event
+    # vocabulary gained the opening half of each lifecycle. None of them is
+    # P1 by this module's own definition — no work is failing to reach
+    # Company History and no pipeline is stopped — but every one of them is
+    # a person waiting on another person, which is what P2 is for here.
+    #
+    # `기다리는 Decision` is listed above the other two on purpose: it is the
+    # only one of the three whose remedy is a decision somebody has the
+    # authority to make today, and docs/02 §19 went out of its way to say
+    # this state must not be recorded as an approval — it had nowhere to go
+    # at all until now.
+    # The RISKS panel's own fallback line, for a `kind` `ops_status.py` has
+    # no sentence for. Classified rather than left as `?`, and the two are
+    # not the same thing: `?` means *this table has no reading of the line*,
+    # while this line's whole content is "there is a Risk row here and this
+    # screen does not know what kind" — which is a reading, and a P2 one. A
+    # person has to open the table.
+    #
+    # It exists at all because the branch it replaced was an `else` that
+    # announced every unknown kind as a Desktop/role mismatch (C149).
+    ("분류되지 않은 Risk 종류", "P2", "이 화면이 설명을 갖고 있지 않은 Risk"),
+    ("기다리는 Decision", "P2", "사람의 결정을 기다리는 중"),
+    # C149. Approval is not the work. This is the state a company most often
+    # mistakes for done, and it did not exist here at all — `DECISION_APPROVED`
+    # closed the lifecycle and the item left every list at the moment it
+    # started being a problem.
+    ("실행되지 않은 Decision", "P2", "승인됐으나 아직 실행되지 않음"),
+    ("열려 있는 Issue", "P2", "제기된 Issue가 아직 닫히지 않음"),
+    ("위험하다고 보고된 Project", "P2", "아직 멈추지는 않았으나 멈출 가능성이 보고됨"),
     # C143. The **damaged-evidence family** — seven lines, every one of them
     # `?`. Measured by running `dashboard_server.py` against a runtime with
     # corrupted state files: the clean tree renders zero unclassified
@@ -427,6 +456,34 @@ ACTIONS: dict[str, str] = {
         "파이프라인은 이것을 스스로 지우지 않는다. 그 Team이 RESUMED / "
         "ISSUE_RESOLVED / COMPLETED를 보고해야 닫힌다."
     ),
+    "분류되지 않은 Risk 종류": (
+        "CONTROL TOWER의 Risk 표에서 그 행을 직접 읽는다. 이 종류가 계속 "
+        "나온다면 `controltower/attention.py`의 RULES와 `ops_status.py`의 "
+        "RISKS 분기에 문장을 하나 더해야 한다."
+    ),
+    # C149's three. Each remedy names a person and no command at all, which
+    # is the test `DOMAINS` applies below and the reason all three are
+    # `COMPANY` rather than `SYSTEM`.
+    "기다리는 Decision": (
+        "권한 있는 사람이 정하면 닫힌다. 정해진 뒤에는 DECISION_APPROVED "
+        "또는 DECISION_REJECTED를 보고해야 이 줄이 사라진다 — 거절도 결정이며, "
+        "적지 않으면 영원히 대기 중으로 남는다."
+    ),
+    "실행되지 않은 Decision": (
+        "결정은 이미 났다 — 남은 것은 그 일을 하는 것이다. 미배정이면 먼저 "
+        "누가 할지 정하고, 끝나면 그 Team이 EXECUTED를 보고해야 닫힌다. "
+        "승인만으로 닫히지 않는다."
+    ),
+    "열려 있는 Issue": (
+        "줄이 담당 Team을 적었으면 그 Team이 ISSUE_RESOLVED를 보고해야 닫힌다. "
+        "**미배정이면 먼저 누가 맡을지 정한다** — 제기한 Team이 맡은 Team이 "
+        "아니다. 파이프라인은 이것을 스스로 지우지 않는다."
+    ),
+    "위험하다고 보고된 Project": (
+        "아직 멈추지 않았으므로 지금이 개입할 수 있는 시점이다. 해소되면 "
+        "다음 Event가 status를 되돌리고, 현실이 되면 그 팀이 BLOCKED를 "
+        "보고하게 된다 — 그때는 이미 멈춰 있다."
+    ),
     "Desktop과 role이 어긋난": (
         "건별로 보기 전에 그 Desktop의 role 설정을 먼저 확인한다 — "
         "한 대가 잘못 설정되면 그 Desktop의 모든 Event가 여기 들어온다."
@@ -709,6 +766,20 @@ DOMAINS: dict[str, str] = {
     # A team has stopped on something a person outside this repository has
     # to resolve. `ACTIONS` for this phrase names no command at all.
     "막혀 있는 Project": COMPANY,
+    # C149's three, and each is COMPANY by the test at the top of this
+    # comment: the remedy names a team or an authority, never a script, a
+    # state file or a scheduled task. A pending Decision in particular is the
+    # clearest COMPANY line this system can produce — nothing about Company
+    # Ops is involved in answering it.
+    "기다리는 Decision": COMPANY,
+    "실행되지 않은 Decision": COMPANY,
+    "열려 있는 Issue": COMPANY,
+    "위험하다고 보고된 Project": COMPANY,
+    # SYSTEM, unlike the three above it: the remedy names two source files.
+    # The row itself may well be about the company, but the reason this
+    # *line* exists is that Company Ops has no sentence for it, and that is
+    # a gap in the tooling.
+    "분류되지 않은 Risk 종류": SYSTEM,
     # docs/05 §24: BLOCKED / COMPLETED / CANCELLED are not decided by rule.
     # These Candidates are work waiting for a person's judgement about what
     # belongs in Company History — `kind()` already calls it DECIDE.
