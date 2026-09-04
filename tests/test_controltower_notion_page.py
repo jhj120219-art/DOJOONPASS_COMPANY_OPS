@@ -2416,5 +2416,186 @@ class TheHeadlineNumbersAreOutcomesNotInstrumentationTests(unittest.TestCase):
         return out
 
 
+class AFinishedProjectIsNotQuietTests(unittest.TestCase):
+    """The same defect as the PROJECTS ordering, on the surface where it is
+    written into the company's own workspace.
+
+    `build_project_note()` fills the `Notes` column of the real PROJECTS
+    database. For a project with no blocker it printed `⚠ N일째 조용함`,
+    computed from `days_idle` alone — so a project that **shipped in March**
+    carried a warning triangle and "186일째 조용함" on the row a person opens.
+    `_row_page_blocks()` repeated the sentence on the project's own page.
+
+    Neither is a rendering nicety: a warning in a workspace is read as
+    something to do, and the thing was done.
+    """
+
+    def _row(self, **values):
+        base = {
+            "project_id": "P",
+            "state": "ACTIVE",
+            "status": "IN_PROGRESS",
+            "teams": ["COO"],
+            "events": 3,
+            "blocker": None,
+            "blocker_team": None,
+            "days_blocked": None,
+            "days_idle": 186,
+            "last_seen": "2026-03-02T09:00:00+09:00",
+            "completed_at": None,
+            "milestones": [],
+        }
+        base.update(values)
+        payload = _payload()
+        payload["model"]["panels"] = [
+            p for p in payload["model"]["panels"] if p["key"] != "PROJECTS"
+        ] + [
+            _panel(
+                "PROJECTS", "Project", columns=tuple(base), rows=(base,)
+            )
+        ]
+        return payload
+
+    def test_a_completed_project_is_not_reported_as_quiet(self):
+        note = build_project_note(
+            self._row(state="COMPLETE", completed_at="2026-03-02T09:00:00+09:00"),
+            "P",
+        )
+
+        self.assertNotIn("조용함", note)
+        self.assertNotIn("⚠", note)
+        self.assertIn("완료", note)
+        self.assertIn("2026-03-02", note)
+
+    def test_a_cancelled_project_is_not_reported_as_quiet_either(self):
+        note = build_project_note(self._row(state="CANCELLED"), "P")
+
+        self.assertNotIn("조용함", note)
+        self.assertIn("취소", note)
+
+    def test_a_running_project_still_gets_its_warning(self):
+        """The half that must not change: a project that really has gone quiet
+        past the threshold is exactly what this line is for."""
+        note = build_project_note(self._row(state="ACTIVE"), "P")
+
+        self.assertIn("186일째 조용함", note)
+        self.assertIn("⚠", note)
+
+    def test_a_blocker_still_wins_over_both(self):
+        note = build_project_note(
+            self._row(state="ACTIVE", blocker="waiting on legal", days_blocked=4), "P"
+        )
+
+        self.assertIn("Blocker", note)
+        self.assertNotIn("조용함", note)
+
+
+class TheCohortReachesTheNotionPageTests(unittest.TestCase):
+    """③c, and the one sentence that has to survive the trip.
+
+    This is the surface this company's non-developers read, so a `DATA REQUIRED`
+    cell arriving without its explanation is worse here than anywhere else: every
+    other number on this page is a count, where zero means zero, and a reader who
+    carries that habit into this table reads an unelapsed window as a company
+    that stopped working.
+    """
+
+    COLUMNS = (
+        "cohort", "size",
+        "d1", "d1_retained", "d1_base", "d1_settled",
+        "d7", "d7_retained", "d7_base", "d7_settled",
+        "d30", "d30_retained", "d30_base", "d30_settled",
+    )
+
+    def _payload_with(self, *rows):
+        payload = _payload()
+        payload["model"]["panels"].append(
+            _panel("COHORT", "Cohort", columns=self.COLUMNS, rows=rows)
+        )
+        return payload
+
+    def _mature_and_young(self):
+        return self._payload_with(
+            {
+                "cohort": "2026-07", "size": 3,
+                "d1": "66.7%", "d1_retained": 2, "d1_base": 3, "d1_settled": 0,
+                "d7": "100.0%", "d7_retained": 3, "d7_base": 3, "d7_settled": 0,
+                "d30": "33.3%", "d30_retained": 1, "d30_base": 3, "d30_settled": 0,
+            },
+            {
+                "cohort": "2026-08", "size": 1,
+                "d1": "0.0%", "d1_retained": 0, "d1_base": 1, "d1_settled": 0,
+                "d7": "DATA REQUIRED", "d7_retained": 0, "d7_base": 0,
+                "d7_settled": 0,
+                "d30": "DATA REQUIRED", "d30_retained": 0, "d30_base": 0,
+                "d30_settled": 0,
+            },
+        )
+
+    @staticmethod
+    def _text(blocks):
+        """The page as one string.
+
+        `_all_text()` returns one entry per rendered string, and the sentences
+        below are *inside* those entries — `assertIn` against the list would
+        demand an exact element and pass only by accident.
+        """
+        return "\n".join(_all_text(blocks))
+
+    def test_the_table_is_rendered_with_both_cohorts(self):
+        blocks, warnings = build_control_tower_blocks(self._mature_and_young())
+        text = self._text(blocks)
+
+        self.assertNotIn("panel COHORT missing from the model", warnings)
+        self.assertIn("2026-07", text)
+        self.assertIn("2026-08", text)
+        self.assertIn("66.7%", text)
+
+    def test_a_refusal_arrives_with_the_sentence_that_explains_it(self):
+        """`DATA REQUIRED` and "0%가 아니다" must be on the page together. The
+        cell alone is the number a reader misreads."""
+        text = self._text(build_control_tower_blocks(self._mature_and_young())[0])
+
+        self.assertIn("DATA REQUIRED", text)
+        self.assertIn("0%가 아니라 DATA REQUIRED", text)
+
+    def test_every_reading_is_shown_beside_its_denominator(self):
+        """A percentage quoted in a meeting without its `n` is the failure this
+        panel is built against, and this page is where quoting happens."""
+        headers = _all_text(build_control_tower_blocks(self._mature_and_young())[0])
+
+        for column in (
+            "D+1", "D+1 분모", "D+1 종료",
+            "D+7", "D+7 분모", "D+7 종료",
+            "D+30", "D+30 분모", "D+30 종료",
+        ):
+            with self.subTest(column=column):
+                self.assertIn(column, headers)
+
+    def test_the_unit_is_stated_as_project_and_not_customer(self):
+        text = self._text(build_control_tower_blocks(self._mature_and_young())[0])
+
+        self.assertIn("단위는 고객이 아니라 Project다", text)
+
+    def test_an_empty_cohort_panel_says_so_rather_than_rendering_nothing(self):
+        """Present-and-empty, the distinction this whole page is built on: a
+        missing section and a company with no Projects yet look identical
+        otherwise, and only one of them is fine."""
+        blocks, warnings = build_control_tower_blocks(self._payload_with())
+        text = self._text(blocks)
+
+        self.assertNotIn("panel COHORT missing from the model", warnings)
+        self.assertIn("아직 Cohort를 이룰 Project가 없다", text)
+        self.assertIn("원천이 없는 것이 아니라", text)
+
+    def test_a_missing_cohort_panel_is_a_warning_not_a_silent_gap(self):
+        """The third state. A model that did not carry the panel is a fact the
+        publisher has to surface — the same treatment every other panel gets."""
+        blocks, warnings = build_control_tower_blocks(_payload())
+
+        self.assertIn("panel COHORT missing from the model", warnings)
+        self.assertNotIn("Cohort", self._text(blocks))
+
+
 if __name__ == "__main__":
     unittest.main()

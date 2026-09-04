@@ -2209,7 +2209,7 @@ class EveryPanelReachesTheScreenTests(PageTestCase):
         # arrives here deliberately, and a `assertIn` would let the next one
         # arrive by accident — which is how a panel ends up in the region
         # whose renderer used to drop everything but METRICS.
-        self.assertEqual(regions["KPI"], ["METRICS", "ROLE_KPI"])
+        self.assertEqual(regions["KPI"], ["METRICS", "ROLE_KPI", "COHORT"])
         self.assertIn("PROJECTS", regions["PROJECTS"])
 
     def test_a_panel_this_page_has_never_heard_of_is_still_shown(self):
@@ -3501,6 +3501,267 @@ class AFailureToBuildTheBodyStillAnswersTests(LiveServerTestCase):
 
         self.assertIn("404", line)
         self.assertIn(b"not found", body)
+
+
+class TheKpiWallIsAnswersFirstTests(PageTestCase):
+    """⑤ 핵심 지표 is the section a CEO opens to find out how the company is
+    doing, and this panel is two thirds of it.
+
+    Measured on the live tree before this: **35 rows, 22 of them
+    `DATA REQUIRED`**, rendered flat and unfolded. Every row true, every row
+    worth keeping — and together a wall in front of the thirteen numbers that
+    are actually answers. The Notion page has folded the same panel since
+    C149, so the two surfaces disagreed about one model and the browser was
+    the wrong one.
+    """
+
+    def _company(self):
+        self.put("K1", project="PAY", day=10)
+        self.put("K2", project="PAY", day=12, event_type="BLOCKED",
+                 status="BLOCKED", blocker="waiting on a vendor")
+
+    #: The fold this class is about. Spelled out because every *row* also
+    #: carries a `<details>` — the evidence cell — so splitting on the bare
+    #: tag cuts the card at the first row instead of at the fold, and the
+    #: counts below then pass or fail for the wrong reason.
+    FOLD = "<details class='fold-section'>"
+
+    def _card(self, page):
+        body = page[page.index("</style>") :]
+        start = body.index("ROLE_KPI</span>")
+        return body[start : body.index("</div>", body.index("출처:", start))]
+
+    def _tables(self, card):
+        """`(answers, refusals)` — the card either side of the fold."""
+        above, folded = card.split(self.FOLD, 1)
+        return above[above.index("<tbody>") :], folded
+
+    def test_the_measured_kpis_are_visible_without_opening_anything(self):
+        self._company()
+        answers, _ = self._tables(self._card(self.page()))
+
+        # `blocked_items` is measured on this fixture and must be readable
+        # without a click, and no refusal may sit among the answers.
+        self.assertIn("Blocked Items", answers)
+        self.assertNotIn("DATA REQUIRED", answers)
+
+    def test_every_refusal_is_still_on_the_page_with_its_requires(self):
+        """Folded is not dropped. `requires` is the most useful column here —
+        it names the source that would answer the KPI — and it must survive."""
+        self._company()
+        _, folded = self._tables(self._card(self.page()))
+
+        self.assertIn("DATA REQUIRED", folded)
+        self.assertIn("Runway", folded)
+        self.assertIn("Revenue", folded)
+
+    def test_the_two_tables_together_are_the_whole_panel(self):
+        """Nothing added, nothing lost: the split is a rendering of the same
+        rows and the counts have to prove it."""
+        self._company()
+        panel = next(
+            p for p in self.payload()["panels"] if p["key"] == "ROLE_KPI"
+        )
+        card = self._card(self.page())
+        measured = sum(1 for r in panel["rows"] if r["values"]["measured"])
+        refused = len(panel["rows"]) - measured
+
+        answers, folded = self._tables(card)
+        self.assertEqual(answers.count("<tr>"), measured)
+        self.assertEqual(folded.count("<tr>") - 1, refused)
+
+    def test_the_tally_says_how_many_before_anyone_opens_it(self):
+        self._company()
+        panel = next(
+            p for p in self.payload()["panels"] if p["key"] == "ROLE_KPI"
+        )
+        measured = sum(1 for r in panel["rows"] if r["values"]["measured"])
+        card = self._card(self.page())
+
+        self.assertIn(f"{len(panel['rows'])}개 중 <b>{measured}개</b>", card)
+
+    def test_the_panel_is_still_drawn_exactly_once(self):
+        """The split must not become a second panel — `_PANEL_PLACEMENT` and
+        `test_no_panel_is_drawn_twice` both key on this span."""
+        self._company()
+        page = self.page()
+
+        self.assertEqual(
+            re.findall(r"<span class='pkey'>ROLE_KPI</span>", page).__len__(), 1
+        )
+
+    def test_a_company_with_nothing_measurable_says_so_rather_than_showing_a_gap(self):
+        """An empty corpus measures a few KPIs (aging over nothing open is a
+        real zero), so this asserts the *shape* holds rather than a count: the
+        card renders, the tally is there, and the refusals are reachable."""
+        card = self._card(self.page())
+
+        self.assertIn("개 중 <b>", card)
+        self.assertIn(self.FOLD, card)
+
+
+class TheCohortChartIsDrawnFromTheSameRowsAsItsTableTests(PageTestCase):
+    """The one panel on this page that gets a picture, and the two ways a
+    picture can lie about the table under it.
+
+    A retention chart is read across, at a glance, so the two failures are not
+    symmetric. A wrong bar is noticed. A bar drawn for a window nobody could
+    answer yet is **not** noticed — it looks exactly like a real low score, and
+    the reader draws a trend through it.
+    """
+
+    def _two_cohorts(self):
+        """One mature cohort and one opened the day before `NOW`.
+
+        The second is the whole point: at 2026-08-19 its D+30 has not elapsed,
+        so the page must show a refusal for it while showing a real percentage
+        for the first — on one chart, side by side.
+        """
+        self.put("A1", project="OLD", timestamp="2026-07-02T09:00:00+09:00")
+        self.put("A2", project="OLD", timestamp="2026-07-03T09:00:00+09:00")
+        self.put("B1", project="NEW", timestamp="2026-08-18T09:00:00+09:00")
+
+    @staticmethod
+    def _body(page):
+        """The document, without the stylesheet.
+
+        `_CSS` names `.cohort-chart` in its own rules, so a bare `index()` over
+        the whole page finds the stylesheet and every position test below
+        measures the `<style>` block instead of the document. The blockers test
+        in this file already had to make this same cut, for the same reason.
+        """
+        return page[page.index("</style>") :]
+
+    def test_the_page_carries_a_chart_for_the_cohort_panel(self):
+        self._two_cohorts()
+
+        body = self._body(self.page())
+
+        self.assertIn("<figure class='cohort-chart'>", body)
+        self.assertIn("<svg", body[body.index("cohort-chart") :])
+
+    def test_the_chart_sits_in_the_kpi_section_beside_the_numbers(self):
+        """Not in ⑦ 근거, where the fallback placement would have put it: a
+        trend nobody scrolls to is a trend nobody reads."""
+        self._two_cohorts()
+        body = self._body(self.page())
+
+        self.assertGreater(body.index("cohort-chart"), body.index("id='kpi'"))
+        self.assertLess(body.index("cohort-chart"), body.index("<footer>"))
+
+    def test_the_table_is_rendered_too_and_is_not_behind_a_disclosure(self):
+        """The chart cannot show a denominator. A reader who cannot see
+        `dN_base` beside it will misread the first young cohort they meet, so
+        the table is on the page and not folded away."""
+        self._two_cohorts()
+        body = self._body(self.page())
+
+        chart = body.index("cohort-chart")
+        table = body.index("COHORT</span>")
+
+        self.assertIn("<table>", body[table:])
+        # No *unclosed* `<details>` above the chart — i.e. neither it nor the
+        # table it introduces is nested inside a disclosure.
+        head = body[:chart]
+        self.assertEqual(head.count("<details"), head.count("</details>"), head[-400:])
+
+    def test_a_refusal_is_drawn_as_an_absence_and_never_as_a_bar(self):
+        """The property this class exists for. The unelapsed window gets a
+        dashed empty column carrying the words; a zero-height rectangle would
+        be the same pixels as a real 0%."""
+        self._two_cohorts()
+        body = self._body(self.page())
+        chart = body[body.index("cohort-chart") : body.index("</figure>")]
+
+        self.assertIn("stroke-dasharray", chart)
+        self.assertIn("DATA REQUIRED", chart)
+        # ...and the mature cohort's real figures are on the same chart.
+        self.assertIn("100.0%", chart)
+
+    def test_every_bar_names_its_window_and_its_denominator(self):
+        """Colour is never the only carrier (WCAG 1.4.1), and a percentage
+        without `n/m` is the number this panel is built to stop being quoted
+        on its own."""
+        self._two_cohorts()
+        body = self._body(self.page())
+        chart = body[body.index("cohort-chart") : body.index("</figure>")]
+
+        for days in (1, 7, 30):
+            with self.subTest(days=days):
+                self.assertIn(f"D+{days}", chart)
+        self.assertIn("Project)", chart)  # the "(1/1 Project)" in a bar title
+
+    def test_the_chart_reads_the_panel_rather_than_recomputing_it(self):
+        """Every value drawn is a value the payload row carries. A renderer
+        that derived its own percentage would be the second derivation this
+        whole change is written to avoid — and the two would be side by side
+        on one screen."""
+        self._two_cohorts()
+        row = next(
+            row
+            for panel in self.payload()["panels"]
+            if panel["key"] == "COHORT"
+            for row in panel["rows"]
+            if row["key"] == "2026-07"
+        )
+        body = self._body(self.page())
+        chart = body[body.index("cohort-chart") : body.index("</figure>")]
+
+        self.assertIn(str(row["values"]["d7"]), chart)
+        self.assertIn(
+            f"({row['values']['d7_retained']}/{row['values']['d7_base']} Project)",
+            chart,
+        )
+
+    def test_a_finished_cohort_is_drawn_as_an_absence_not_as_a_zero(self):
+        """The third reading, on the chart. A cohort whose Projects all ended
+        inside the window has no rate — and `해당 없음` there is the *best*
+        outcome this panel can report, while a bar at zero would be the worst.
+        They must not be the same pixels."""
+        self.put("Z1", project="SHIP", timestamp="2026-07-02T09:00:00+09:00",
+                 event_type="STARTED", status="IN_PROGRESS")
+        self.put("Z2", project="SHIP", timestamp="2026-07-03T09:00:00+09:00",
+                 event_type="COMPLETED", status="COMPLETED")
+        body = self._body(self.page())
+        chart = body[body.index("cohort-chart") : body.index("</figure>")]
+
+        self.assertIn("해당 없음", chart)
+        self.assertIn("전부 완료·취소로 끝났다", chart)
+        self.assertNotIn("0.0%", chart)
+
+    def test_a_bar_names_how_many_of_its_cohort_ended_inside_the_window(self):
+        """`0.0% (0/1)` beside `끝남 4` is a cohort that mostly *finished*.
+        Without the third figure the same bar reads as a cohort that died."""
+        self.put("Y1", project="SHIP", timestamp="2026-07-02T09:00:00+09:00",
+                 event_type="STARTED", status="IN_PROGRESS")
+        self.put("Y2", project="SHIP", timestamp="2026-07-03T09:00:00+09:00",
+                 event_type="COMPLETED", status="COMPLETED")
+        self.put("Y3", project="STALLED", timestamp="2026-07-02T09:00:00+09:00",
+                 event_type="STARTED", status="IN_PROGRESS")
+        body = self._body(self.page())
+        chart = body[body.index("cohort-chart") : body.index("</figure>")]
+
+        self.assertIn("(0/1 Project)", chart)
+        self.assertIn("창 안에 끝남 1", chart)
+
+    def test_the_panel_names_where_to_look_next(self):
+        """§KPI→Action. A retention number with no next step is a number a
+        reader can only feel bad about. The chain already exists — the PROJECTS
+        table is ordered blocked-first then longest-idle — and nothing on the
+        page said so."""
+        self._two_cohorts()
+        body = self._body(self.page())
+
+        self.assertIn("다음에 볼 곳은 PROJECTS 표다", body)
+        self.assertIn("PROJECTS", body)
+
+    def test_an_empty_company_gets_no_chart_and_says_so_in_words(self):
+        """A grid drawn over nothing reads as "retention is zero". The panel's
+        own "해당 없음" sentence is the true one."""
+        body = self._body(self.page())
+
+        self.assertNotIn("<figure class='cohort-chart'>", body)
+        self.assertIn("COHORT</span>", body)
 
 
 if __name__ == "__main__":

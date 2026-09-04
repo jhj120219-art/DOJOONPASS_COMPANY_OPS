@@ -74,6 +74,7 @@ from .attention import rank as _attention_rank
 from .attention import severity as _attention_severity
 from .attention import tally as _attention_tally
 from .columns import labels as _column_labels
+from .dashboard import is_settled as _is_settled
 
 # ------------------------------------------------------------------ limits
 
@@ -148,6 +149,21 @@ PANEL_LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
     # `DATA REQUIRED` twenty-two times and tell a reader nothing about what
     # would have to exist to change that (C149).
     ("ROLE_KPI", ("label", "reading", "requires")),
+    # `dN_base` beside every `dN`, and the pairing is the point rather than a
+    # preference: the reading alone ("D+30 33.3%") is the one number on this
+    # page a person will quote in a meeting, and it means something different
+    # over three matured Projects than over eleven. The `dN_retained` columns
+    # are the ones left out — the pair `dN` / `dN_base` already says
+    # "33.3% of 3", and `_panel_table()` names the dropped columns underneath.
+    (
+        "COHORT",
+        (
+            "cohort", "size",
+            "d1", "d1_base", "d1_settled",
+            "d7", "d7_base", "d7_settled",
+            "d30", "d30_base", "d30_settled",
+        ),
+    ),
     ("CODE_CHANGES", ("at", "author", "subject", "files")),
     ("ACTIVITY", ("at", "source", "team", "project_id", "event_type", "summary")),
     ("COMPLETIONS", ("at", "source", "team", "project_id", "event_type", "summary")),
@@ -897,6 +913,54 @@ def build_control_tower_blocks(
             warnings.extend(role_warnings)
             blocks.append(_toggle_heading(title, role_blocks))
 
+    # --------------------------------------------- ③c cohort
+    #
+    # Inside ③ for ③b's reason, and last inside it: it is the same Projects
+    # read a third way, and it is the only thing on this page that answers
+    # "나아지고 있는가" rather than "지금 얼마인가". A toggle, closed, because
+    # a trend is what somebody opens after the five callouts have told them
+    # nothing is on fire.
+    #
+    # The sentence above the toggle is the one thing a reader must not have to
+    # open the table for: a `DATA REQUIRED` in this table is **not** a zero,
+    # and every other number on this page is a count where zero means zero.
+    cohort = panels.get("COHORT")
+    if cohort is None:
+        warnings.append("panel COHORT missing from the model")
+    elif not cohort.get("rows"):
+        blocks.append(
+            _paragraph(
+                "Cohort: 아직 Cohort를 이룰 Project가 없다 — 원천이 없는 것이 "
+                "아니라 이 기간까지의 증거에 처음 나타난 Project가 없다."
+            )
+        )
+    else:
+        cohort_blocks, cohort_warnings = _panel_table(
+            payload, cohort, layout["COHORT"], heading=None
+        )
+        warnings.extend(cohort_warnings)
+        blocks.append(
+            _toggle_heading(
+                "시작한 달로 묶어 본 진행 (Cohort)",
+                [
+                    _callout(
+                        "각 Project의 **첫 Event가 속한 달**로 묶고, 그때까지 "
+                        "**아직 돌아가고 있던** Project가 그 뒤 N일 안에 다시 "
+                        "움직였는지를 본다. 분모(`D+N 분모`)는 Cohort 크기가 "
+                        "아니다 — 창이 아직 지나지 않은 것과, 창 안에 완료·취소로 "
+                        "**끝난 것**(`D+N 종료`)을 뺀 수다. 끝난 것을 빼지 않으면 "
+                        "취소된 Project가 '계속 움직였다'로, 첫날 끝낸 Project가 "
+                        "'멈췄다'로 세어진다 — 둘 다 거꾸로다. 아직 지나지 않은 "
+                        "창은 0%가 아니라 DATA REQUIRED이고, 창 안에 전부 "
+                        "끝났으면 해당 없음이다. 단위는 고객이 아니라 Project다.",
+                        "⚪",
+                        "gray_background",
+                    ),
+                    *cohort_blocks,
+                ],
+            )
+        )
+
     # ================================================== (4) PROJECTS
     blocks.append(_heading("④ Project", 2))
     projects = panels.get("PROJECTS")
@@ -1278,6 +1342,18 @@ def build_project_note(payload: Mapping[str, Any], project_id: str) -> str | Non
         parts.append(
             f"\u26d4 Blocker {_fmt(days)}일째: {one_line_head(str(blocker), 60)}"
         )
+    elif _is_settled(values.get("state")):
+        # A project that has **ended** is not quiet, it is finished — and this
+        # sentence is written into the company's own Notion row, where a
+        # warning triangle is read as something to do. Measured before this,
+        # on a project that shipped in March: `⚠ 186일째 조용함`.
+        #
+        # `state` rather than a second reading of `completed_at` / `status`:
+        # the Model already folded those into one word and
+        # `dashboard.is_settled()` is where that word is interpreted (C28).
+        done = "완료" if values.get("state") == "COMPLETE" else "취소"
+        when = str(values.get("completed_at") or values.get("last_seen") or "")[:10]
+        parts.append("✅ " + done + (f" {when}" if when else ""))
     else:
         idle = values.get("days_idle")
         if isinstance(idle, int):
@@ -1430,7 +1506,14 @@ def build_project_row_blocks(
             f"  ·  팀 {_fmt(values.get('teams'))}"
             f"  ·  Event {_fmt(values.get('events'))}건"
             f"  ·  마지막 {_fmt(values.get('last_seen'))}"
-            f"  ·  {_fmt(values.get('days_idle'))}일째 조용함"
+            # Same correction as `build_project_note()`, on the page a person
+            # lands on from the row: "N일째 조용함" about a finished project is
+            # a false alarm, and this surface repeated it word for word.
+            + (
+                f"  ·  끝난 뒤 {_fmt(values.get('days_idle'))}일"
+                if _is_settled(values.get("state"))
+                else f"  ·  {_fmt(values.get('days_idle'))}일째 조용함"
+            )
         ),
     ]
 

@@ -97,6 +97,7 @@ from oplog import bounded, one_line, redact
 from delivery import GitActivity
 from notion.properties import ROLE_DISPLAY_NAMES
 
+from .cohort import COHORT_UNIT, COHORT_WINDOWS, build_cohort_analysis
 from .kpi import ROLES as KPI_ROLES
 from .kpi import build_kpi_set
 from .rollup import (
@@ -149,7 +150,7 @@ from .rollup import (
 #
 # Same role as `runsummary.SCHEMA_VERSION`: the payload is read by something
 # that was written against a version of it.
-DASHBOARD_SCHEMA_VERSION = "1.3"
+DASHBOARD_SCHEMA_VERSION = "1.5"
 
 # How many `EvidenceRef`s one payload row carries. The model keeps every one
 # of them; this bounds only what leaves the machine.
@@ -636,6 +637,7 @@ def build_dashboard(
             _goals_panel(),
             _metrics_panel(rollup),
             _role_kpi_panel(rollup, now, activity),
+            _cohort_panel(rollup, now),
             _code_changes_panel(activity),
             _teams_panel(rollup),
             _projects_panel(rollup, now),
@@ -885,6 +887,109 @@ def _role_kpi_panel(
     )
 
 
+#: One column per window, in `COHORT_WINDOWS`' order, and three columns per
+#: window rather than one.
+#:
+#: `dN` is the *rendering* — a percentage or the words `DATA REQUIRED` — and it
+#: is deliberately not called `value`, for `_ROLE_KPI_COLUMNS`' stated reason:
+#: `value` is a numeric column across this model and a projection writes it into
+#: a Notion `number` property.
+#:
+#: `dN_base` is the denominator and it is the column that makes the panel
+#: honest. A retention of 33.3% over three matured members and one over eleven
+#: are different claims, and a table that showed only the percentage would let
+#: the first be read as the second — which is the same conversion
+#: `issues_open`'s label was rewritten to prevent.
+#:
+#: `dN_settled` is the second half of that honesty and it was added by the
+#: audit that found the rate itself wrong: it is the members whose Project
+#: **ended** inside the window, which are neither retained nor lost. Without
+#: the column, `size - base` would say "still inside the window" about
+#: Projects that had in fact finished — the good outcome, reported as a gap.
+_COHORT_COLUMNS: tuple[str, ...] = ("cohort", "size") + tuple(
+    part
+    for days in COHORT_WINDOWS
+    for part in (
+        f"d{days}",
+        f"d{days}_retained",
+        f"d{days}_base",
+        f"d{days}_settled",
+    )
+)
+
+_COHORT_NOTE = (
+    "Cohort = Project의 **첫 Event**가 속한 달이고, D+N은 **그때까지 아직 "
+    "돌아가고 있던** Project가 첫날 **이후** N일 안에 Event를 한 번이라도 더 "
+    "남겼는지다. 분모(`dN_base`)는 Cohort 크기가 아니다 — 창이 아직 지나지 않은 "
+    "구성원과, 창 안에 완료·취소로 **끝난** 구성원(`dN_settled`)을 뺀 수다. "
+    "끝난 것을 빼는 이유는 측정된 것이다: 빼기 전에는 취소된 Project가 '계속 "
+    "움직였다'로, 첫날 완료한 Project가 '멈췄다'로 세어졌다. 둘 다 거꾸로다. "
+    "아직 지나지 않은 창은 0%가 아니라 DATA REQUIRED이고, 창 안에 전부 끝났으면 "
+    "해당 없음이다. 단위는 고객이 아니라 Project다: 이 시스템에 고객이라는 개체가 "
+    "없다는 것은 ROLE_KPI의 retention / churn / NRR 행이 이미 DATA REQUIRED로 "
+    "말하고 있다.\n"
+    "**낮은 D+N을 보면 다음에 볼 곳은 PROJECTS 표다** — 분모에 남은 것은 그 달에 "
+    "시작해 아직 끝나지 않은 Project이고, 그중 조용한 것이 이 수를 낮춘 것이다. "
+    "그 표는 이미 막힌 것 먼저, 그다음 오래 조용한 순으로 정렬돼 있다. 막혀 있다면 "
+    "RISKS 표와 ②의 다음 행동이 이유를 들고 있고, 막히지도 않았는데 조용하다면 "
+    "이 시스템에는 그 이유를 아는 원천이 없다 — 사람이 물어봐야 한다."
+)
+
+
+def _cohort_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
+    """① Cohort — the question a period total cannot answer.
+
+    Every other number on this dashboard is bounded by `since`/`until` and says
+    what happened *in a period*. This one groups Projects by when they first
+    appeared and follows each group forward, which is how "이번 달 Event 40건"
+    becomes "시작한 일의 절반은 일주일 안에 멈춘다".
+
+    Nothing is recounted: `cohort.build_cohort_analysis()` reads
+    `state_projects` — the fold the rollup already made — and their
+    `EvidenceRef.at`. There is no second read of `processed/` and no second
+    definition of when a Project started (C28).
+
+    SOURCED even with no rows, and the distinction is the usual one: an empty
+    table means no Project has appeared yet, which is a true statement about a
+    real source. `PanelStatus.UNSOURCED` would say the opposite — that there is
+    no such thing as a Project here.
+    """
+    analysis = build_cohort_analysis(rollup, now=now)
+    rows = []
+    for cohort in analysis.cohorts:
+        values: dict[str, Any] = {"cohort": cohort.key, "size": cohort.size}
+        # Driven by the windows the analysis produced, not by `COHORT_WINDOWS`
+        # with a fallback for a window that might be missing. There is no such
+        # fallback to write: `build_cohort_analysis()` emits one window per
+        # entry for every cohort. And if that ever stopped being true, this
+        # shape fails loudly at `EveryRowFillsTheColumnsItsPanelDeclaresTests`
+        # — the row would be short a column its panel declares — where a
+        # defensive `else 0` would instead put a confident zero on screen for a
+        # window nobody computed. That is the exact conversion this whole panel
+        # exists to refuse, arriving through the guard meant to prevent it.
+        for window in cohort.windows:
+            values[f"d{window.days}"] = window.rendered()
+            values[f"d{window.days}_retained"] = window.retained
+            values[f"d{window.days}_base"] = window.base
+            values[f"d{window.days}_settled"] = window.settled
+        rows.append(
+            DashboardRow(key=cohort.key, values=values, evidence=cohort.evidence)
+        )
+    return DashboardPanel(
+        key="COHORT",
+        title="Cohort — 시작한 일이 계속 움직이는가",
+        status=PanelStatus.SOURCED,
+        columns=_COHORT_COLUMNS,
+        rows=tuple(rows),
+        source=(
+            f"controltower/cohort.py — 단위는 {COHORT_UNIT}이고, 각 Project의 "
+            "첫 Event(rollup의 first_seen)와 그 Project가 Event를 남긴 날들"
+            "(EvidenceRef.at)만으로 계산한다. 새로 세는 Event는 없다."
+        ),
+        note=_COHORT_NOTE,
+    )
+
+
 _CODE_CHANGE_COLUMNS = ("commit", "at", "author", "subject", "files")
 
 
@@ -1077,6 +1182,41 @@ PROJECT_STATES: tuple[str, ...] = (
     "ACTIVE",
 )
 
+#: The states that mean **this project's lifecycle has ended**.
+#:
+#: One roster, because four surfaces were each deciding it privately by not
+#: deciding it at all — they read `days_idle` as "days stalled" without asking
+#: whether the project had finished. Measured on one tree:
+#:
+#:     PROJECTS row order   SHIPPED_LONG_AGO (COMPLETE, 186일)  <- first
+#:                          KILLED_LONG_AGO  (CANCELLED, 183일)
+#:                          REALLY_STALLED   (ACTIVE, 21일)     <- the actual
+#:                          HEALTHY          (ACTIVE, 1일)         problem
+#:     Notion `Notes`       "⚠ 186일째 조용함" on a project that shipped
+#:     Notion row page      the same sentence again
+#:
+#: The first is the worst: `ops_status.py` prints only the first
+#: `_CONTROL_TOWER_PROJECT_LINES` rows, so enough finished projects push the
+#: stalled ones off the terminal entirely — a COO reads a list headed by work
+#: that is done and never sees the work that stopped.
+#:
+#: Not `("COMPLETE", "CANCELLED")` written at each call site: that is how the
+#: four disagreements happened. `BLOCKED` and `AT_RISK` are deliberately absent
+#: — a blocked project has not ended, it is the one that needs somebody.
+SETTLED_STATES: frozenset[str] = frozenset({"COMPLETE", "CANCELLED"})
+
+
+def is_settled(state: str | None) -> bool:
+    """Whether `state` (a `PROJECT_STATES` word) means the project has ended.
+
+    Takes the *word* rather than a `ProjectRollup` so the two surfaces that
+    only ever see a payload row — `notion_page.build_project_note()` and the
+    row page — can ask the same question as the model-side caller. Asking
+    `settled_at` there would mean putting a new column on the panel for a fact
+    `state` already carries.
+    """
+    return state in SETTLED_STATES
+
 
 def _project_state(project) -> str:
     """The one word for this project's state, in `PROJECT_STATES`' order.
@@ -1158,12 +1298,29 @@ def _projects_panel(rollup: CompanyRollup, now: datetime) -> DashboardPanel:
     """
 
     def _order(project):
-        idle = project.days_since_last_event(now)
-        return (
-            0 if project.is_blocked else 1,
-            -(idle if idle is not None else 0),
-            project.project_id,
-        )
+        """Blocked, then running (longest quiet first), then ended.
+
+        Three tiers, not two. The second boundary is the one this table was
+        getting wrong: "quiet" for a **finished** project is not a fact about
+        the company, it is elapsed time since it ended, and sorting on it put
+        work that is done above work that has stopped — see `SETTLED_STATES`
+        for the measurement.
+
+        `is_blocked` is tested first rather than `state`'s precedence being
+        restated, and the two cannot disagree because `_project_state()` puts
+        BLOCKED first for its own stated reason. So a project that completed
+        and was then blocked stays in tier 0, where a person will see it.
+
+        Inside the settled tier the sign flips: **most recently ended first.**
+        What shipped last week is worth a glance; what shipped in March is the
+        least interesting row on the page.
+        """
+        idle = project.days_since_last_event(now) or 0
+        if project.is_blocked:
+            return (0, 0, project.project_id)
+        if is_settled(_project_state(project)):
+            return (2, idle, project.project_id)
+        return (1, -idle, project.project_id)
 
     rows = tuple(
         DashboardRow(

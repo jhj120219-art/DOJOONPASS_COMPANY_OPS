@@ -90,6 +90,10 @@ EXPECTED_PANELS: tuple = (
     # role framing plus the twenty-two KPIs that have no `Metric` to be a
     # row of, because nothing in this system sources them.
     "ROLE_KPI",
+    # The one panel that follows a group of Projects forward instead of
+    # counting a period. Beside the two KPI panels because it re-reads the
+    # same Projects — no Event is counted a second time for it.
+    "COHORT",
     # C149. The D+1 half Events cannot answer — a day nobody reported and a
     # day nothing happened look identical in every other panel here.
     "CODE_CHANGES",
@@ -545,6 +549,19 @@ class EveryRowFillsTheColumnsItsPanelDeclaresTests(DashboardTestCase):
                         self.assertTrue((self.processed / ref.path).is_file())
 
 
+def _month_of(timestamp: str) -> str:
+    """The Seoul month an Event timestamp falls in, as `cohort.py` keys it.
+
+    Written here rather than imported so the check is an independent reading
+    of the Event: a predicate that called the module under test would agree
+    with it by construction, including when both are wrong.
+    """
+    from businessdate import business_date
+
+    day = business_date(datetime.fromisoformat(timestamp))
+    return f"{day.year:04d}-{day.month:02d}"
+
+
 class EveryRowCitesEventsThatBelongToItTests(DashboardTestCase):
     """`test_every_row_carries_the_evidence_it_was_built_from` asks two things
     of every panel row: that `evidence` is non-empty, and that each cited path
@@ -581,6 +598,12 @@ class EveryRowCitesEventsThatBelongToItTests(DashboardTestCase):
         "RISKS": lambda row, event: event.event_id == row.values["event_id"],
         "ACTIVITY": lambda row, event: event.event_id == row.values["event_id"],
         "COMPLETIONS": lambda row, event: event.event_id == row.values["event_id"],
+        # The row key **is** the cohort month, and a cited Event is the one
+        # that put a member in it — its first. So the check is the cohort
+        # assignment itself: a citation whose Event fell in another month is a
+        # Project filed under the wrong cohort, which is the one error this
+        # panel can make that still renders as a plausible chart.
+        "COHORT": lambda row, event: _month_of(event.timestamp) == row.key,
     }
 
     #: Panels whose rows are not keyed by anything an Event carries, and
@@ -1475,6 +1498,90 @@ class ProjectRowsAreOrderedForTheQuestionsAskedTests(DashboardTestCase):
             [row.key for row in self.model().panel("PROJECTS").rows], ["OLD", "RECENT"]
         )
 
+    def test_a_finished_project_does_not_outrank_a_stalled_one(self):
+        """The boundary the class above could not see.
+
+        `test_the_quietest_unblocked_project_comes_next` puts two **ACTIVE**
+        projects in the tree, so it asserts the ordering rule over a fixture
+        that cannot exercise the running/ended split — and the defect lived
+        under it for the whole life of this panel. Measured:
+
+            1. SHIPPED_LONG_AGO   COMPLETE   186일
+            2. KILLED_LONG_AGO    CANCELLED  183일
+            3. REALLY_STALLED     ACTIVE      21일   <- the actual problem
+            4. HEALTHY            ACTIVE       1일
+
+        `ops_status.py` prints only the first `_CONTROL_TOWER_PROJECT_LINES`
+        rows, so enough finished work pushes the stopped work off the terminal
+        entirely.
+        """
+        self.put("S1", "SHIPPED", "COO", "STARTED", "IN_PROGRESS", 1)
+        self.put("S2", "SHIPPED", "COO", "COMPLETED", "COMPLETED", 2)
+        self.put("K1", "KILLED", "CMO", "CANCELLED", "CANCELLED", 3)
+        self.put("R1", "STALLED", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 14)
+        self.put("H1", "HEALTHY", "CTO_FRONTEND", "STARTED", "IN_PROGRESS", 20)
+
+        order = [row.key for row in self.model().panel("PROJECTS").rows]
+
+        self.assertEqual(order[:2], ["STALLED", "HEALTHY"])
+        self.assertEqual(sorted(order[2:]), ["KILLED", "SHIPPED"])
+
+    def test_a_blocked_project_still_comes_first_however_old(self):
+        """The other boundary: "ended" must not swallow "needs somebody".
+        BLOCKED outranks everything in `PROJECT_STATES` and the sort has to
+        agree, or the fix would have hidden the one row that matters most."""
+        self.put("S1", "SHIPPED", "COO", "COMPLETED", "COMPLETED", 20)
+        self.put("B1", "BLOCKED_OLD", "CMO", "BLOCKED", "BLOCKED", 1, blocker="vendor")
+        self.put("A1", "RUNNING", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 15)
+
+        order = [row.key for row in self.model().panel("PROJECTS").rows]
+
+        self.assertEqual(order, ["BLOCKED_OLD", "RUNNING", "SHIPPED"])
+
+    def test_the_most_recently_ended_project_leads_the_settled_group(self):
+        """Inside the tier the sign flips. What shipped last week is worth a
+        glance; what shipped in March is the least interesting row here."""
+        self.put("O1", "ENDED_EARLY", "COO", "COMPLETED", "COMPLETED", 2)
+        self.put("N1", "ENDED_LATE", "COO", "COMPLETED", "COMPLETED", 20)
+
+        order = [row.key for row in self.model().panel("PROJECTS").rows]
+
+        self.assertEqual(order, ["ENDED_LATE", "ENDED_EARLY"])
+
+    def test_the_running_tier_is_still_longest_quiet_first(self):
+        """Guards the guard: the three-tier key must not have quietly reversed
+        the rule the class was written for."""
+        self.put("A1", "RECENT", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 18)
+        self.put("B1", "OLD", "CMO", "STARTED", "IN_PROGRESS", 2)
+        self.put("S1", "SHIPPED", "COO", "COMPLETED", "COMPLETED", 10)
+
+        order = [row.key for row in self.model().panel("PROJECTS").rows]
+
+        self.assertEqual(order, ["OLD", "RECENT", "SHIPPED"])
+
+    def test_every_settled_row_is_below_every_running_row(self):
+        """The property rather than one arrangement, so a future key that gets
+        one pair right and another wrong still fails."""
+        from controltower.dashboard import is_settled
+
+        self.put("S1", "SHIPPED", "COO", "COMPLETED", "COMPLETED", 1)
+        self.put("K1", "KILLED", "CMO", "CANCELLED", "CANCELLED", 25)
+        self.put("R1", "STALLED", "CTO_BACKEND", "STARTED", "IN_PROGRESS", 3)
+        self.put("H1", "HEALTHY", "CTO_FRONTEND", "STARTED", "IN_PROGRESS", 27)
+        rows = self.model().panel("PROJECTS").rows
+
+        settled_seen = False
+        for row in rows:
+            ended = is_settled(row.values["state"])
+            if ended:
+                settled_seen = True
+            else:
+                self.assertFalse(
+                    settled_seen,
+                    f"{row.key} (running) sorted below a finished project",
+                )
+        self.assertTrue(settled_seen, "fixture produced no settled project")
+
     def test_the_order_does_not_follow_the_filename(self):
         """The fold is by Event instant; so is the order here."""
         self.put("ZZZ_FIRST", "OLD", "CMO", "STARTED", "IN_PROGRESS", 2)
@@ -1520,15 +1627,48 @@ class ProjectRowsAreOrderedForTheQuestionsAskedTests(DashboardTestCase):
         self.assertEqual(row.values["state"], "CANCELLED")
         self.assertEqual(row.values["status"], "CANCELLED")
 
-    def test_a_cancelled_project_that_is_blocked_still_reads_as_blocked(self):
-        """A person has to look at it either way, and only one of the two
-        words says so."""
+    def test_a_project_cancelled_after_being_blocked_reads_as_cancelled(self):
+        """This assertion used to say `BLOCKED`, and it was the defect written
+        down as a contract.
+
+        Its whole justification was one sentence — "a person has to look at it
+        either way" — and that is the part that is false. The cancellation came
+        **after** the block: somebody already looked, and decided. Measured on
+        the old behaviour, one project BLOCKED on the 5th and CANCELLED on the
+        7th:
+
+            open_blockers   1
+            state           BLOCKED       (the cancellation invisible)
+            RISKS           OPEN_BLOCKER
+            ATTENTION       "…막혀 있는 Project … 그 팀이 RESUMED /
+                             ISSUE_RESOLVED / COMPLETED를 보고할 때까지
+                             열려 있다"
+
+        ② 지금 해야 할 일 sent a COO to unblock a project the company had
+        killed, and the remedy it printed names three Event types that do not
+        include CANCELLED — so doing as told could never close the line.
+
+        The order is what decides, and its sibling
+        `test_a_project_blocked_after_completing_reads_as_blocked` is the other
+        arrangement: block **last** means somebody reopened it, and that still
+        reads BLOCKED. Both are asserted, so neither can be "fixed" into the
+        other by accident.
+        """
         self.put("C1", "OPSX", "COO", "BLOCKED", "BLOCKED", 5, blocker="legal")
         self.put("C2", "OPSX", "COO", "CANCELLED", "CANCELLED", 7)
+        model = self.model()
+        row = model.panel("PROJECTS").rows[0]
 
+        self.assertEqual(row.values["state"], "CANCELLED")
+        # The consequences, not just the word — this is what the reader acts on.
+        self.assertEqual(model.panel("RISKS").rows, ())
         self.assertEqual(
-            self.model().panel("PROJECTS").rows[0].values["state"], "BLOCKED"
+            [r.values["value"] for r in model.panel("METRICS").rows
+             if r.key == "open_blockers"],
+            [0],
         )
+        # ...and the blocker itself is kept as history rather than erased.
+        self.assertEqual(row.values["blocker"], "legal")
 
     def test_the_state_is_always_one_of_the_declared_words(self):
         from controltower.dashboard import PROJECT_STATES
@@ -2191,6 +2331,156 @@ class ThePayloadShapeIsPinnedToItsVersionTests(DashboardTestCase):
                 ],
                 "JUDGEMENTS": [],
             },
+            "panel_order": [
+                "COMPANY_GOALS", "METRICS", "ROLE_KPI", "CODE_CHANGES",
+                "TEAMS", "PROJECTS", "SPRINTS", "DESKTOPS", "RISKS",
+                "ACTIVITY", "COMPLETIONS", "JUDGEMENTS",
+            ],
+        },
+        # 1.4 is 1.3 plus the `COHORT` panel. Every 1.3 panel and every 1.3
+        # column is still here — the bump is MINOR, and nothing about the
+        # existing panels moved: the cohort is derived from `state_projects`,
+        # which the rollup already folded, so no metric changed meaning.
+        "1.4": {
+            "top_level": [
+                "coverage", "events_read", "generated_at", "panels",
+                "schema_version", "since", "unreadable", "until",
+            ],
+            "coverage": [
+                "complete", "duplicates", "evidence_from", "evidence_to",
+                "history_checked", "history_uncovered_from", "unreadable",
+            ],
+            "unreadable_entry": ["file", "reason"],
+            "panel": [
+                "columns", "key", "note", "rows", "source", "status", "title",
+                "unsourced_layers",
+            ],
+            "row": ["evidence", "evidence_count", "evidence_truncated", "key", "values"],
+            "evidence": ["at", "event_id", "path"],
+            "panels": {
+                "COMPANY_GOALS": [],
+                "METRICS": ["key", "label", "value", "derived_from", "evidence_count"],
+                "ROLE_KPI": [
+                    "role", "key", "label", "definition", "measured", "reading",
+                    "chain", "derived_from", "requires", "evidence_count",
+                ],
+                # Three columns per window, not one. `dN` is the reading —
+                # a percentage or the words DATA REQUIRED — and `dN_base` is
+                # the denominator that stops a rate over three matured
+                # members being read as a rate over eleven.
+                "COHORT": [
+                    "cohort", "size",
+                    "d1", "d1_retained", "d1_base",
+                    "d7", "d7_retained", "d7_base",
+                    "d30", "d30_retained", "d30_base",
+                ],
+                "CODE_CHANGES": ["commit", "at", "author", "subject", "files"],
+                "TEAMS": [
+                    "team", "display_name", "events", "projects",
+                    "blocked_projects", "blocked_project_count", "last_seen",
+                    "has_activity", "current_sprint",
+                ],
+                "PROJECTS": [
+                    "project_id", "teams", "events", "status", "state", "blocker",
+                    "blocker_team", "blocked_since", "days_blocked", "first_seen",
+                    "last_seen", "days_idle", "completed_at", "milestones", "sprint",
+                ],
+                "SPRINTS": [],
+                "DESKTOPS": [
+                    "source", "expected_team", "display_name", "events", "projects",
+                    "last_seen", "days_silent", "has_activity", "role_mismatches",
+                    "mismatched_event_ids",
+                ],
+                "RISKS": [
+                    "kind", "project_id", "team", "blocker", "detail", "since",
+                    "days_open", "event_id", "source", "claimed_role",
+                    "expected_role", "kept", "ignored",
+                ],
+                "ACTIVITY": [
+                    "event_id", "at", "source", "team", "project_id", "event_type",
+                    "status", "summary", "milestone", "of_total", "truncated",
+                ],
+                "COMPLETIONS": [
+                    "event_id", "at", "source", "team", "project_id", "event_type",
+                    "status", "summary", "milestone", "of_total", "truncated",
+                ],
+                "JUDGEMENTS": [],
+            },
+            "panel_order": [
+                "COMPANY_GOALS", "METRICS", "ROLE_KPI", "COHORT",
+                "CODE_CHANGES", "TEAMS", "PROJECTS", "SPRINTS", "DESKTOPS",
+                "RISKS", "ACTIVITY", "COMPLETIONS", "JUDGEMENTS",
+            ],
+        },
+        # 1.5 is 1.4 plus one column per cohort window: `dN_settled`, the
+        # members whose Project **ended** inside the window. The bump is MINOR
+        # — nothing was removed — but the numbers behind two existing columns
+        # changed meaning and that is recorded here rather than only in the
+        # code: `dN_base` no longer counts a Project that had finished, and
+        # `dN` is therefore a rate over the Projects that were still running.
+        # A consumer reading 1.4 finds every key it knew; it will read a
+        # *truer* rate than it did before.
+        "1.5": {
+            "top_level": [
+                "coverage", "events_read", "generated_at", "panels",
+                "schema_version", "since", "unreadable", "until",
+            ],
+            "coverage": [
+                "complete", "duplicates", "evidence_from", "evidence_to",
+                "history_checked", "history_uncovered_from", "unreadable",
+            ],
+            "unreadable_entry": ["file", "reason"],
+            "panel": [
+                "columns", "key", "note", "rows", "source", "status", "title",
+                "unsourced_layers",
+            ],
+            "row": ["evidence", "evidence_count", "evidence_truncated", "key", "values"],
+            "evidence": ["at", "event_id", "path"],
+            "panels": {
+                "COMPANY_GOALS": [],
+                "METRICS": ["key", "label", "value", "derived_from", "evidence_count"],
+                "ROLE_KPI": [
+                    "role", "key", "label", "definition", "measured", "reading",
+                    "chain", "derived_from", "requires", "evidence_count",
+                ],
+                "COHORT": [
+                    "cohort", "size",
+                    "d1", "d1_retained", "d1_base", "d1_settled",
+                    "d7", "d7_retained", "d7_base", "d7_settled",
+                    "d30", "d30_retained", "d30_base", "d30_settled",
+                ],
+                "CODE_CHANGES": ["commit", "at", "author", "subject", "files"],
+                "TEAMS": [
+                    "team", "display_name", "events", "projects",
+                    "blocked_projects", "blocked_project_count", "last_seen",
+                    "has_activity", "current_sprint",
+                ],
+                "PROJECTS": [
+                    "project_id", "teams", "events", "status", "state", "blocker",
+                    "blocker_team", "blocked_since", "days_blocked", "first_seen",
+                    "last_seen", "days_idle", "completed_at", "milestones", "sprint",
+                ],
+                "SPRINTS": [],
+                "DESKTOPS": [
+                    "source", "expected_team", "display_name", "events", "projects",
+                    "last_seen", "days_silent", "has_activity", "role_mismatches",
+                    "mismatched_event_ids",
+                ],
+                "RISKS": [
+                    "kind", "project_id", "team", "blocker", "detail", "since",
+                    "days_open", "event_id", "source", "claimed_role",
+                    "expected_role", "kept", "ignored",
+                ],
+                "ACTIVITY": [
+                    "event_id", "at", "source", "team", "project_id", "event_type",
+                    "status", "summary", "milestone", "of_total", "truncated",
+                ],
+                "COMPLETIONS": [
+                    "event_id", "at", "source", "team", "project_id", "event_type",
+                    "status", "summary", "milestone", "of_total", "truncated",
+                ],
+                "JUDGEMENTS": [],
+            },
             "panel_order": list(EXPECTED_PANELS),
         },
     }
@@ -2401,6 +2691,25 @@ class TheNullabilityContractTests(unittest.TestCase):
         # is a tuple. `reading` in particular can never be null — that is
         # `Kpi.rendered()`'s whole contract: a KPI with no value renders the
         # words DATA REQUIRED, never `None` and never `0`.
+        # COHORT. Every field is always present and never null: a row exists
+        # only for a cohort that has members, `size` and every `dN_base` /
+        # `dN_retained` is a count, and `dN` is `CohortWindow.rendered()` —
+        # whose whole contract is that a window nobody can answer yet renders
+        # the words DATA REQUIRED, never `None` and never `0%`.
+        ("COHORT", "cohort"),
+        ("COHORT", "size"),
+        ("COHORT", "d1"),
+        ("COHORT", "d1_retained"),
+        ("COHORT", "d1_base"),
+        ("COHORT", "d1_settled"),
+        ("COHORT", "d7"),
+        ("COHORT", "d7_retained"),
+        ("COHORT", "d7_base"),
+        ("COHORT", "d7_settled"),
+        ("COHORT", "d30"),
+        ("COHORT", "d30_retained"),
+        ("COHORT", "d30_base"),
+        ("COHORT", "d30_settled"),
         ("CODE_CHANGES", "at"),
         ("CODE_CHANGES", "author"),
         ("CODE_CHANGES", "commit"),

@@ -271,6 +271,21 @@ class ProjectRollup:
     # it carried a person's own words. A row a reader cannot act on is the
     # kind of row that teaches them to skip the table.
     at_risk_summary: str | None = None
+    # When the **still-standing** cancellation was declared, folded the way
+    # `at_risk_since` is and for the same reason: a project cancelled on Monday
+    # and restarted on Wednesday is not cancelled, and only replaying the
+    # sequence says so.
+    #
+    # It exists because this model could date a completion (`completed_at`) and
+    # could not date a cancellation — docs/04 §26 gives `CANCELLED` no property
+    # of its own, so `_project_state()` reads it off the last `status` and there
+    # was nothing to read a *date* from. That asymmetry is fine while the only
+    # question is "what state is this project in now"; it is not fine for
+    # anything asking **when did this project's lifecycle end**, which is what
+    # `settled_at` answers and what `cohort.py` needs to stop reporting a
+    # cancelled project as one that is still running.
+    cancelled_at: str | None = None
+    cancelled_evidence: EvidenceRef | None = None
     completed_at: str | None = None
     # The Event that wrote §25's Completed Date, not simply the last Event of
     # a completed project. `projects_completed`'s evidence used to be
@@ -285,7 +300,45 @@ class ProjectRollup:
 
     @property
     def is_blocked(self) -> bool:
-        return self.open_blocker is not None
+        """A Blocker is open **and this project is still running**.
+
+        The second half was missing, and it produced the worst instance of
+        this model's recurring conflation — a settled lifecycle still being
+        treated as work in progress. Measured, one project BLOCKED on the 1st
+        and CANCELLED on the 5th:
+
+            open_blockers   1
+            PROJECTS state  BLOCKED        (the cancellation invisible)
+            RISKS           OPEN_BLOCKER
+            ATTENTION       "…막혀 있는 Project: … — Blocker는 파이프라인이
+                             스스로 지우지 않는다. 그 팀이 RESUMED /
+                             ISSUE_RESOLVED / COMPLETED를 보고할 때까지
+                             열려 있다"
+
+        ② 지금 해야 할 일 told a COO to go and unblock a project the company
+        had killed a month earlier — and the remedy it printed lists three
+        Event types that do **not** include CANCELLED, so following the
+        instruction could never close the line.
+
+        `_roll_open_items()` has always had this right: an Issue or a Decision
+        is closed by `COMPLETED` / `CANCELLED` as well as by its own resolving
+        Event. The rule existed; the blocker fold simply never asked, because
+        docs/04 §26 gives `CANCELLED` no Blocker property to clear — which is
+        a statement about the *Notion sync*, not about whether somebody still
+        has to call the vendor.
+
+        Fixed here, at the one property, rather than at the four places that
+        read it (`_roll_risks`, `_roll_teams`, `_project_state`,
+        `_projects_panel`'s sort). Four copies of a condition is how this
+        defect got four surfaces in the first place.
+
+        `open_blocker` and its `since` / `team` / `evidence` are deliberately
+        **not** cleared: they are the record of what the blocker was, the
+        PROJECTS row still shows it beside a `state` of CANCELLED, and erasing
+        history to express a state change is the one thing this fold does not
+        do anywhere else.
+        """
+        return self.open_blocker is not None and self.settled_at is None
 
     @property
     def is_complete(self) -> bool:
@@ -334,6 +387,38 @@ class ProjectRollup:
         narrow question and `_project_state()` composes it.
         """
         return self.is_complete and self.status == "COMPLETED"
+
+    @property
+    def settled_at(self) -> str | None:
+        """When this project's lifecycle **ended**, or None if it has not.
+
+        One place, because the alternative is every caller restating
+        `_project_state()`'s precedence — and this is the third time that
+        restatement would have been written (`completion_stands` records the
+        first two).
+
+        Exactly one of the two can stand at a time and the model enforces it
+        rather than this property choosing: `completion_stands` requires the
+        last reported `status` to be `COMPLETED`, and `cancelled_at` is cleared
+        by any Event whose `status` is not `CANCELLED`. A project completed and
+        then cancelled therefore reports the cancellation, which is what
+        happened.
+
+        "Ended" is deliberately narrower than "not running". A **blocked** or
+        **at-risk** project has not ended — it is the one a person still has to
+        act on — so neither appears here. `PROJECT_STATES` keeps that
+        precedence for the *current state* column; this answers a different
+        question and does not repeat it.
+        """
+        if self.completion_stands:
+            return self.completed_at
+        # No `status == "CANCELLED"` test beside this, and its absence is the
+        # point: the fold **clears** `cancelled_at` on any Event whose status
+        # is not CANCELLED, so the field being set already *is* that condition.
+        # Writing it again would be the same rule in two places, one of which
+        # could later be edited alone — which is the whole reason
+        # `completion_stands` exists one property up.
+        return self.cancelled_at
 
     @property
     def is_at_risk(self) -> bool:
@@ -1229,6 +1314,8 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
                 "at_risk_ref": None,
                 "at_risk_team": None,
                 "at_risk_summary": None,
+                "cancelled_at": None,
+                "cancelled_ref": None,
                 "completed_at": None,
                 "completed_ref": None,
                 "milestones": [],
@@ -1268,6 +1355,19 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
             bucket["at_risk_ref"] = None
             bucket["at_risk_team"] = None
             bucket["at_risk_summary"] = None
+        # Cancellation, folded exactly like AT_RISK directly above and for the
+        # identical reason: docs/04 §26 gives `CANCELLED` no property of its
+        # own, so `status` is the only place it exists, and a project cancelled
+        # on Monday and restarted on Wednesday is not cancelled. The pair is
+        # the *date* of the standing cancellation — `status` alone said that it
+        # happened and never when.
+        if event.status == "CANCELLED":
+            if bucket["cancelled_at"] is None:
+                bucket["cancelled_at"] = event.timestamp
+                bucket["cancelled_ref"] = _ref(event, name)
+        else:
+            bucket["cancelled_at"] = None
+            bucket["cancelled_ref"] = None
         if _completes(event):
             bucket["completed_at"] = event.timestamp
             bucket["completed_ref"] = _ref(event, name)
@@ -1291,6 +1391,8 @@ def _roll_projects(pairs: Sequence[tuple[Event, str]]) -> tuple[ProjectRollup, .
             at_risk_evidence=state[key]["at_risk_ref"],
             at_risk_team=state[key]["at_risk_team"],
             at_risk_summary=state[key]["at_risk_summary"],
+            cancelled_at=state[key]["cancelled_at"],
+            cancelled_evidence=state[key]["cancelled_ref"],
             completed_at=state[key]["completed_at"],
             completed_evidence=state[key]["completed_ref"],
             milestones=tuple(state[key]["milestones"]),

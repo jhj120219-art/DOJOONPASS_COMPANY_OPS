@@ -1162,6 +1162,105 @@ class ARefusedEvidenceDirectoryIsReportedNotFatalTests(ControlTowerTestCase):
         self.assertEqual(unreadable, ())
 
 
+class WhenAProjectsLifecycleEndedTests(ControlTowerTestCase):
+    """`cancelled_at` / `settled_at` — the model could date a completion and
+    could not date a cancellation.
+
+    docs/04 §26 gives `CANCELLED` no property of its own, so `_project_state()`
+    reads it off the last reported `status`. That is enough for "what state is
+    this project in now" and it is not enough for **when did this project's
+    lifecycle end** — the question anything measuring elapsed time has to ask.
+    `cohort.py` was reporting a cancelled Project as one that kept moving
+    because it had no other answer available.
+
+    The fold is `at_risk_since`'s, deliberately: a state read off `status` has
+    to be cleared by the Events that change it, or a project cancelled on
+    Monday and resumed on Wednesday stays cancelled forever.
+    """
+
+    def test_a_cancellation_is_dated(self):
+        self.put("A1", "GONE", "COO", "STARTED", "IN_PROGRESS", 3)
+        self.put("A2", "GONE", "COO", "CANCELLED", "CANCELLED", 5)
+
+        project = self.rollup().project("GONE")
+
+        self.assertEqual(project.cancelled_at[:10], "2026-08-05")
+        self.assertEqual(project.cancelled_evidence.event_id, "A2")
+        self.assertEqual(project.settled_at, project.cancelled_at)
+
+    def test_a_resumed_project_is_no_longer_cancelled_and_has_no_end_date(self):
+        """The clearing half. Without it a reversed cancellation would keep a
+        Project permanently out of every elapsed-time measurement."""
+        self.put("B1", "BACK", "COO", "CANCELLED", "CANCELLED", 3)
+        self.put("B2", "BACK", "COO", "RESUMED", "IN_PROGRESS", 6)
+
+        project = self.rollup().project("BACK")
+
+        self.assertIsNone(project.cancelled_at)
+        self.assertIsNone(project.cancelled_evidence)
+        self.assertIsNone(project.settled_at)
+
+    def test_a_completion_that_stands_is_the_end_date(self):
+        self.put("C1", "SHIP", "COO", "STARTED", "IN_PROGRESS", 3)
+        self.put("C2", "SHIP", "COO", "COMPLETED", "COMPLETED", 4)
+
+        project = self.rollup().project("SHIP")
+
+        self.assertEqual(project.settled_at, project.completed_at)
+
+    def test_a_completed_project_that_started_again_has_not_ended(self):
+        """`is_complete` is "ever completed" and never goes back to False —
+        the right meaning for counting completions in a period and the wrong
+        one for "has this ended". `settled_at` reads `completion_stands`, so
+        the two stay different questions with different answers."""
+        self.put("D1", "REDO", "COO", "COMPLETED", "COMPLETED", 4)
+        self.put("D2", "REDO", "COO", "STARTED", "IN_PROGRESS", 9)
+
+        project = self.rollup().project("REDO")
+
+        self.assertTrue(project.is_complete)
+        self.assertFalse(project.completion_stands)
+        self.assertIsNone(project.settled_at)
+
+    def test_a_blocked_project_has_not_ended(self):
+        """"Ended" is narrower than "not running". A blocked project is the one
+        a person still has to act on, and removing it from an elapsed-time
+        measurement would hide exactly the case that measurement is for."""
+        self.put("E1", "STUCK", "COO", "BLOCKED", "BLOCKED", 4, blocker="vendor")
+
+        project = self.rollup().project("STUCK")
+
+        self.assertTrue(project.is_blocked)
+        self.assertIsNone(project.settled_at)
+
+    def test_an_ordinary_running_project_has_no_end_date(self):
+        self.put("F1", "LIVE", "COO", "STARTED", "IN_PROGRESS", 4)
+
+        self.assertIsNone(self.rollup().project("LIVE").settled_at)
+
+    def test_the_dated_cancellation_and_the_state_word_cannot_disagree(self):
+        """`settled_at` drops the `status == "CANCELLED"` test because the fold
+        already enforces it. That is a real invariant and this is where it is
+        held: every project the *state* column calls CANCELLED must carry a
+        date, and no project carrying one may be called anything else.
+
+        Without it the property is one careless edit to the fold away from
+        returning a stale cancellation date for a project that is running.
+        """
+        from controltower.dashboard import _project_state
+
+        self.put("G1", "GONE", "COO", "CANCELLED", "CANCELLED", 3)
+        self.put("G2", "BACK", "COO", "CANCELLED", "CANCELLED", 3)
+        self.put("G3", "BACK", "COO", "RESUMED", "IN_PROGRESS", 6)
+        self.put("G4", "LIVE2", "COO", "STARTED", "IN_PROGRESS", 3)
+        self.put("G5", "STUCK2", "COO", "BLOCKED", "BLOCKED", 3, blocker="v")
+
+        for project in self.rollup().state_projects:
+            with self.subTest(project=project.project_id):
+                cancelled = _project_state(project) == "CANCELLED"
+                self.assertEqual(cancelled, project.cancelled_at is not None)
+
+
 class TheTwoDoorsDisagreeAboutAnEmptyProjectIdTests(ControlTowerTestCase):
     """CHARACTERIZATION (A-15). The Agent refuses an empty `project_id`; the
     Collector accepts one.

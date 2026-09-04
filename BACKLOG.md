@@ -30191,3 +30191,138 @@ rejected 카운트에 필요하다. 실측: processed 10,000 + incoming/rejected
 `::StuckIncomingInStatusViewTests`(2건). 그중 하나는 카운트가 Collector의
 실제 동작을 예측하는지를 3회 실행으로 확인한다 — 설명하려는 단계와 어긋나는
 카운터는 없는 것보다 나쁘기 때문이다.
+
+### F-11. Cohort — 다음 단위와 다음 창은 데이터가 정한다
+
+**한 것:** `src/controltower/cohort.py` — Project를 **첫 Event의 달**로 묶고
+D+1 / D+7 / D+30 지속률을 계산한다. Dashboard의 `COHORT` 패널과 브라우저
+화면의 막대 그래프, `ops_status.py`의 한 줄이 같은 모델을 읽는다. 기존 KPI는
+하나도 바뀌지 않았다 — 새로 세는 Event 없이 rollup이 이미 접어 둔
+`state_projects`의 `first_seen`과 `EvidenceRef.at`만 읽는다.
+
+**단위를 Project로 고른 이유는 데이터다.** 후보 넷 중 셋은 원천이 없어서
+탈락했고, 그것을 "나중에 하자"가 아니라 여기 적어 둔다:
+
+    사용자/고객 획득 월   고객이라는 개체가 이 시스템에 아예 없다. `kpi.py`가
+                         CEO KPI 열둘을 이미 그 근거로 거절하고 있고, Cohort를
+                         만들었다고 해서 그것이 생기지 않는다. Event Schema에
+                         고객 식별자 필드가 생기거나 CRM이 원천으로 들어오는
+                         것이 선행 조건이며, 그것은 **명세 결정**이다.
+    Issue 생성 월        `ISSUE_RAISED`는 C149에 어휘로는 있는데 이 저장소의
+                         증거에 한 건도 없다. 게다가 Event에 Issue 식별자가
+                         없어(`_OPEN_ITEM_LIFECYCLES`) 한 Project의 여러 Issue를
+                         가를 수 없다 — Event가 쌓여도 "Issue의 Cohort"는
+                         식별자 없이는 셀 수 없다. 두 조건 모두 열려 있다.
+    Project 생성 월      채택. 모든 Event가 `project_id`와 `timestamp`를 든다.
+
+**남은 것 (전부 데이터 대기이며, 코드 작업이 아니다):**
+
+- **D+60 / D+90.** 지금 넣으면 앞으로 한 분기 동안 모든 Cohort에서
+  `DATA REQUIRED`다. 증거가 두 달 폭을 넘기면 `COHORT_WINDOWS`에 한 줄을
+  더하는 것으로 끝나지만, 그때까지는 표를 건너뛰게 가르치는 열이다.
+- **Cohort 간 비교의 판정.** 지금 화면은 수를 보여주고 **좋다/나쁘다를 말하지
+  않는다.** `verdict.METRIC_LOWER_IS_BETTER`가 아홉 지표 중 셋에만 방향을 준
+  것과 같은 이유다 — "D+7 40%가 나쁜가"는 목표가 있어야 답할 수 있고, 목표는
+  Goal이며 Goal은 원천이 없다(`UNSOURCED_LAYERS`). Cohort **끼리**의 증감은
+  방향이 있지만, 두 Cohort의 성숙도가 다르면 그 비교 자체가 성립하지 않는다.
+- **월보다 잘게 자르기(주 단위 Cohort).** 이 저장소의 증거는 6일 폭이라 주
+  Cohort는 한 칸뿐이다. Project 시작이 달마다 여러 건 쌓이기 전에는 월이 맞다.
+
+**Evidence:** `tests/test_controltower_cohort.py`(42건),
+`tests/test_dashboard_server.py::TheCohortChartIsDrawnFromTheSameRowsAsItsTableTests`(7건).
+
+### F-12. 저장소에 셸 사고로 만들어진 파일 하나가 **커밋돼 있다**
+
+**발견:** 저장소 루트에 `audit` + U+F022(사설 영역 문자)라는 이름의 파일이
+tracked 상태로 있다. `git ls-files`가 `"auditï¢"`로 내놓는다.
+내용은 C149 무렵의 `git diff --stat` 출력에 ANSI 색 코드가 그대로 섞인
+것으로, 리다이렉트 한 번이 잘못 따옴표된 결과다(`... > audit"` 같은 꼴).
+
+**왜 아무도 몰랐나:** `test_repository_hygiene.py`는 UTF-8 여부, 줄바꿈, BOM,
+`.env` 유출, 의존성을 검사하지만 **파일이 여기 있어야 하는가**는 묻지 않는다.
+이 파일은 그 검사를 전부 통과한다 — 유효한 UTF-8이고 LF이고 비밀도 없다.
+
+**하지 않은 것:** 지우지 않았다. tracked 파일의 삭제는 커밋이 있어야 완결되고,
+이번 작업의 실행 규칙이 git commit을 금지한다. 지워 놓고 커밋하지 않으면
+작업 트리만 어긋난 채 남는다.
+
+**남은 결정:** (1) 지우고 커밋한다 — 사람이 한 번 확인하면 끝나는 일이다.
+(2) 이런 파일이 다시 커밋되지 못하게 하는 hygiene gate를 둘 것인가. 두 번째는
+"루트에 있어도 되는 파일"의 목록을 누가 들 것인지가 실제 질문이고, 지금
+루트에는 entrypoint 6개와 문서 3개뿐이므로 목록이 짧다.
+
+### F-13. 2차 Audit — 성과지표가 거꾸로 읽히던 두 곳
+
+Cohort를 붙인 직후 KPI/Cohort 전체를 다시 감사했고, **실제로 틀린 수 두
+개**를 찾았다. 둘 다 테스트는 통과하고 있었고 화면에서도 그럴듯해 보였다 —
+그것이 이 종류 결함의 특징이다.
+
+**(1) Cohort 지속률이 완료를 이탈로, 취소를 지속으로 셌다.**
+
+지속의 정의가 "첫날 이후 Event를 한 번이라도 더 남겼는가"였다. 실측 —
+완료 1(첫날 완료) / 취소 1(3일째) / 방치 1인 Cohort:
+
+    D+7  33.3%   (3개 중 1개가 "계속 움직였다")
+
+움직였다고 세어진 하나가 **취소된 Project**였고, 멈췄다고 세어진 하나가
+**완료한 Project**였다. 둘 다 거꾸로다. 이 수를 보고 움직이는 COO는 엉뚱한
+Project를 찾아간다.
+
+고친 것: 창 안에 **끝난**(완료·취소) 구성원은 분모에서 빠지고
+`dN_settled`로 따로 센다. 남은 분모는 "아직 돌아가고 있어서 멈출 수 있었던"
+Project뿐이다. 같은 Cohort가 이제 `D+7 0.0% (0/1, 끝남 2)`로 나온다.
+
+이를 위해 `ProjectRollup`에 `cancelled_at` / `cancelled_evidence` /
+`settled_at`을 더했다 — 이 모델은 **완료 시각은 알고 취소 시각은 몰랐다**.
+docs/04 §26이 CANCELLED에 고유 Property를 주지 않아 `_project_state()`가
+마지막 `status`로만 읽고 있었고, 그것으로는 "언제 끝났는가"를 답할 수 없다.
+fold는 `at_risk_since`의 것을 그대로 따랐다(취소했다가 재개하면 풀린다).
+
+**(2) `Open Risk Count`의 정의가 자기 숫자와 모순됐다.**
+
+정의는 "막혔거나 위험하다고 보고된 Project 수"였는데 읽는 metric
+(`projects_at_risk`)은 **막힌 것을 제외**한다. 실측 — 막힌 Project 2개,
+위험 1개:
+
+    Blocked Items      2건
+    Open Risk Count    1건   "막혔거나 위험하다고 보고된 Project 수"
+
+손이 필요한 Project가 셋인 회사에서, 전부 세겠다고 적힌 문장이 1을 말한다.
+metric 쪽이 옳다(막힌 것을 넣으면 `blocked_items`의 두 번째 count가 된다) —
+틀린 것은 문장이었고, 사람이 읽는 것은 문장이다. 이름을 `At-Risk Projects`로
+바꾸고 정의가 나머지 절반이 어디 있는지 말하게 했다.
+
+**(3) 역할별 KPI 35행이 ⑤의 벽이었다.**
+
+브라우저 화면이 이 패널을 **35행 평면 표, 그중 22행이 DATA REQUIRED**로,
+접지 않고 그렸다. CEO가 회사 상태를 보러 여는 구역의 3분의 2가 "이 시스템이
+못 재는 것" 목록이었다. Notion 페이지는 C149부터 같은 패널을 tally 한 줄 +
+toggle로 그리고 있었으므로, 한 모델을 두 화면이 다르게 그리고 있었고 틀린
+쪽이 브라우저였다. 계산되는 13개를 먼저 보이고 22개는 `requires`와 함께 한
+번 클릭 아래로 옮겼다 — **아무것도 지우지 않았다.**
+
+**남은 것 하나 — 조용히 멈춘 Project에는 ATTENTION이 없다 (DEFER).**
+
+② 지금 해야 할 일에 줄이 생기는 조건은 RISKS 표의 행이다: 막힘 · 위험 ·
+열린 Issue · 기다리는 Decision · 실행 안 된 Decision · role 불일치.
+**막히지도 않고 Issue도 없이 그냥 조용한 Project는 어디에도 줄이 없다** —
+PROJECTS 표의 `정지 일수` 칸에 숫자로만 있다. Cohort의 `dN_base - dN_retained`가
+지금 정확히 그 인원을 세지만, 그것을 경보로 만들려면 **며칠부터 문제인가**를
+정해야 한다.
+
+그 임계값은 이 저장소가 일관되게 사람에게 돌려보내는 종류의 결정이다 —
+`verdict.METRIC_LOWER_IS_BETTER`가 14개 지표 중 6개에만 방향을 준 이유와 같고
+(`기록된 Event 0`은 나쁜 것이 아니다), target은 Goal이며 Goal에는 원천이
+없다(`UNSOURCED_LAYERS`). Desktop 침묵에는 이미 `SILENT_AFTER_DAYS`가 있지만
+Desktop이 조용한 것과 Project가 조용한 것은 다른 사실이고, 그 수를 옮겨 쓰는
+것은 측정이 아니라 짐작이다.
+
+그래서 지금 한 것은 **연결을 보이게 만든 것까지**다: Cohort 패널의 note가
+"낮은 D+N을 보면 다음에 볼 곳은 PROJECTS 표"라고 적고, 그 표는 이미 막힌 것
+먼저 · 오래 조용한 순으로 정렬돼 있다. 임계값이 정해지면 RISKS에 종류 하나를
+더하는 것으로 끝난다(`attention.RULES`에 문구 하나, `_risks_panel`에 분기 하나).
+
+**Evidence:** `tests/test_controltower_cohort.py::AFinishedProjectHasNotStalledTests`(7),
+`tests/test_controltower.py::WhenAProjectsLifecycleEndedTests`(7),
+`tests/test_controltower_kpi.py::EveryDefinitionDescribesTheNumberBesideItTests`(4),
+`tests/test_dashboard_server.py::TheKpiWallIsAnswersFirstTests`(6).

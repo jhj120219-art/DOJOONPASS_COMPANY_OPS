@@ -474,5 +474,59 @@ class TheSetItselfIsWellFormedTests(KpiTestCase):
         self.assertEqual(kpi.rendered(), "50.0%")
 
 
+class EveryDefinitionDescribesTheNumberBesideItTests(KpiTestCase):
+    """A KPI's `definition` is the sentence a person reads to decide what the
+    number means. When it describes a **wider** set than the metric counts,
+    the reader under-counts the company and cannot tell.
+
+    Measured before this, two blocked Projects and one at risk:
+
+        Blocked Items      2건
+        Open Risk Count    1건   "막혔거나 위험하다고 보고된 Project 수"
+
+    Three Projects need somebody and the sentence promising to count all of
+    them said one. The metric was right — excluding the blocked ones is what
+    keeps it from being a second count of `blocked_items` — so the words were
+    the defect, and the words are what reaches a COO.
+    """
+
+    def _three_in_trouble(self):
+        self.put("R1", "PAY", "CTO_BACKEND", "BLOCKED", "BLOCKED", 3, blocker="vendor")
+        self.put("R2", "ADS", "CTO_BACKEND", "BLOCKED", "BLOCKED", 3, blocker="legal")
+        self.put("R3", "SEARCH", "CTO_BACKEND", "AT_RISK", "AT_RISK", 3)
+
+    def test_the_at_risk_count_excludes_the_blocked_ones(self):
+        """The behaviour, pinned. This is deliberate — the two KPIs must not
+        both count one Project — and it is the reason the sentence had to
+        change rather than the number."""
+        self._three_in_trouble()
+        kpis = self.kpis()
+
+        self.assertEqual(kpis.get("blocked_items").value, 2)
+        self.assertEqual(kpis.get("critical_risk_count").value, 1)
+
+    def test_the_definition_does_not_claim_to_count_the_blocked_ones(self):
+        self._three_in_trouble()
+        definition = self.kpis().get("critical_risk_count").definition
+
+        self.assertIn("아직 막히지는 않았", definition)
+        self.assertNotIn("막혔거나", definition)
+
+    def test_the_definition_says_where_the_rest_of_the_risk_is(self):
+        """The reader's next question is "then what is the whole number", and
+        the answer is one row up. Saying so costs a clause."""
+        self._three_in_trouble()
+
+        self.assertIn("Blocked Items", self.kpis().get("critical_risk_count").definition)
+
+    def test_no_measured_kpi_is_left_without_a_definition(self):
+        """The property behind the fix: a number with no sentence is one every
+        reader defines for themselves."""
+        self._three_in_trouble()
+
+        for kpi in self.kpis().kpis:
+            with self.subTest(kpi=kpi.key):
+                self.assertTrue(kpi.definition.strip(), kpi.key)
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

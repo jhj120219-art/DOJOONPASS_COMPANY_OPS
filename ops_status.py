@@ -147,6 +147,7 @@ from oplog import SECRET_RE  # noqa: E402
 # `_print_control_tower()`, which renders from `build_dashboard()`'s model so
 # that the screen and any projection of it are one arrangement of one fold.
 from controltower import (  # noqa: E402
+    COHORT_WINDOWS,
     UNSOURCED_LAYERS,
     build_company_rollup,
     build_dashboard,
@@ -4873,6 +4874,39 @@ def _print_control_tower(now: datetime) -> list[str]:
         print(
             f"  역할별 KPI          : {len(kpi_panel.rows)}개 중 {answerable}개 계산 "
             f"가능 (나머지는 DATA REQUIRED — 원천이 없다)"
+        )
+
+    # Cohort — the newest Cohort only, and the reason it is one line is the
+    # same as the KPI line above: the full table (every cohort, every window,
+    # every denominator) is on the browser page, and a terminal block that
+    # printed a matrix would bury the lines an operator opens this for.
+    #
+    # The **newest** rather than a company-wide average, because an average
+    # over cohorts is the one number this analysis exists to stop being asked
+    # for: it mixes a mature cohort with one whose window has not elapsed and
+    # calls the result a trend. `_cohort_line()` renders each window's own
+    # reading, so a D+30 nobody can answer yet says so here too.
+    cohort_panel = model.panel("COHORT")
+    if cohort_panel is not None and cohort_panel.rows:
+        newest = cohort_panel.rows[-1]
+        # `n/m` only where there **is** a rate. A window with no denominator
+        # printed `DATA REQUIRED (0/0)` before the second audit, which reads as
+        # "0 of 0" — a fraction offered for a question the same line has just
+        # said cannot be answered. Where the window did end, the count that
+        # matters instead is how many Projects **finished** inside it.
+        parts = []
+        for days in COHORT_WINDOWS:
+            reading = one_line(str(newest.values[f"d{days}"]))
+            base = newest.values[f"d{days}_base"]
+            settled = newest.values[f"d{days}_settled"]
+            detail = f" ({newest.values[f'd{days}_retained']}/{base})" if base else ""
+            if settled:
+                detail += f" 끝남 {settled}"
+            parts.append(f"D+{days} {reading}{detail}")
+        marks = "  ".join(parts)
+        print(
+            f"  Cohort {one_line(newest.values['cohort'])}      : "
+            f"Project {newest.values['size']}개 시작   {marks}"
         )
 
     # No `if rows:` guard, and none below for Desktops: both folds seed every

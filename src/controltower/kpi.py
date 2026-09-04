@@ -81,6 +81,15 @@ ROLES: tuple[str, ...] = ("CEO", "CTO", "COO")
 MEASURED = "MEASURED"
 DATA_REQUIRED = "DATA_REQUIRED"
 
+#: How a refusal is spelled on every surface.
+#:
+#: A constant rather than a literal in `Kpi.rendered()` because `cohort.py` now
+#: makes the same refusal for the same reason — a D+30 whose window has not
+#: elapsed — and two modules spelling it two ways would put `DATA REQUIRED` and
+#: `데이터 없음` on one screen for one meaning. The screen, the payload and the
+#: Notion page all read this through `rendered()`, so there is one string.
+DATA_REQUIRED_READING = "DATA REQUIRED"
+
 
 @dataclass(frozen=True)
 class Kpi:
@@ -121,7 +130,7 @@ class Kpi:
         them can accidentally spell it `0`.
         """
         if not self.is_measured or self.value is None:
-            return "DATA REQUIRED"
+            return DATA_REQUIRED_READING
         if isinstance(self.value, float):
             return f"{self.value:.1f}{self.unit}"
         return f"{self.value}{self.unit}"
@@ -476,11 +485,27 @@ def build_kpi_set(
                 "open_blockers",
                 "건",
             ),
+            # The definition said "막혔거나 위험하다고 보고된 Project 수" —
+            # blocked **or** at risk — and the metric it reads counts neither
+            # the blocked nor the finished ones (`_roll_metrics`: "마지막으로
+            # 보고된 status=AT_RISK이고 아직 막히지도 끝나지도 않은 Project").
+            # Measured, two blocked Projects and one at risk:
+            #
+            #     Blocked Items      2건
+            #     Open Risk Count    1건   "막혔거나 위험하다고 보고된 Project 수"
+            #
+            # A COO reading the second sentence reads `1` as the whole risk
+            # surface of a company with three Projects in trouble. The metric
+            # is right — excluding the blocked ones is what stops this being a
+            # second count of `blocked_items` — so the sentence was the wrong
+            # half, and it is the half a person actually reads.
             _from_metric(
                 "critical_risk_count",
                 "COO",
-                "Open Risk Count",
-                "막혔거나 위험하다고 보고된 Project 수",
+                "At-Risk Projects",
+                "아직 막히지는 않았지만 위험하다고 보고된 Project 수 — 이미 막힌 "
+                "것은 Blocked Items가 센다. 두 수를 더하면 지금 손이 필요한 "
+                "Project의 전부다",
                 "projects_at_risk",
                 "건",
             ),

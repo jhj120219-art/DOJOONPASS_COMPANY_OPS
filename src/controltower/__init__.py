@@ -15,6 +15,14 @@ it by name (`from controltower import notion_projection`), which is also the
 one place a reader learns it is a separate contract.
 """
 
+from .cohort import (
+    COHORT_UNIT,
+    COHORT_WINDOWS,
+    Cohort,
+    CohortAnalysis,
+    CohortWindow,
+    build_cohort_analysis,
+)
 from .dashboard import (
     DASHBOARD_SCHEMA_VERSION,
     DashboardModel,
@@ -47,6 +55,11 @@ from .rollup import (
 )
 
 __all__ = [
+    "COHORT_UNIT",
+    "COHORT_WINDOWS",
+    "Cohort",
+    "CohortAnalysis",
+    "CohortWindow",
     "CompanyRollup",
     "DASHBOARD_SCHEMA_VERSION",
     "DashboardModel",
@@ -64,6 +77,7 @@ __all__ = [
     "PanelStatus",
     "TeamRollup",
     "UNSOURCED_LAYERS",
+    "build_cohort_analysis",
     "build_company_rollup",
     "build_dashboard",
     "event_instant_key",

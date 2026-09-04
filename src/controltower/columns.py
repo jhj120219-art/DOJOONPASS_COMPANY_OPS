@@ -55,7 +55,10 @@ LABELS: dict[str, str] = {
     "blocked_since": "막힌 시점",
     "days_blocked": "막힌 일수",
     "first_seen": "처음",
-    "days_idle": "정지 일수",
+    # "정지 일수" was a claim rather than a name: the field is days since the
+    # last Event, which means "stalled" only for a project that has not ended.
+    # A finished project carried `정지 186일` under it.
+    "days_idle": "마지막 이후",
     "completed_at": "완료",
     "milestones": "Milestone",
     "sprint": "Sprint",
@@ -88,6 +91,23 @@ LABELS: dict[str, str] = {
     "reading": "값",
     "chain": "연결",
     "requires": "필요한 원천",
+    # COHORT. `size`는 Cohort 전체 인원이고 `dN_base`는 N일이 실제로 지난
+    # 인원 — 둘이 다를 수 있다는 것이 이 표의 핵심이라 머리글에서 갈라 놓는다.
+    # `dN`은 값이 아니라 '읽는 값'이라 `reading`과 같은 이름을 쓴다.
+    "cohort": "Cohort",
+    "size": "Project 수",
+    "d1": "D+1",
+    "d1_retained": "D+1 지속",
+    "d1_base": "D+1 분모",
+    "d1_settled": "D+1 종료",
+    "d7": "D+7",
+    "d7_retained": "D+7 지속",
+    "d7_base": "D+7 분모",
+    "d7_settled": "D+7 종료",
+    "d30": "D+30",
+    "d30_retained": "D+30 지속",
+    "d30_base": "D+30 분모",
+    "d30_settled": "D+30 종료",
     # CODE_CHANGES (C149). Event가 아니라 git commit이다.
     "commit": "Commit",
     "author": "작성자",

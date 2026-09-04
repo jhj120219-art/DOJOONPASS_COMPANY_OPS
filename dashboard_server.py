@@ -169,7 +169,9 @@ from controltower import (  # noqa: E402
     evidence_window,
 )
 from delivery import read_git_activity  # noqa: E402
+from controltower.cohort import COHORT_WINDOWS  # noqa: E402
 from controltower.columns import LABELS as _column_labels  # noqa: E402
+from controltower.kpi import DATA_REQUIRED_READING  # noqa: E402
 from controltower import verdict as _verdict  # noqa: E402
 from controltower.attention import KIND_LABELS as _ATTENTION_KIND_LABELS  # noqa: E402
 from controltower.attention import RANK as _ATTENTION_RANK  # noqa: E402
@@ -693,6 +695,12 @@ _PANEL_ORDER = (
     # the counts is the reader who needs to know which of them their role
     # actually answers for (C149).
     "ROLE_KPI",
+    # Third, and after the two count panels rather than before them: a cohort
+    # is a *reading* of the same Projects over time, and it only means
+    # something to a reader who has just seen how many there are. It is the
+    # one panel here that answers "이게 나아지고 있는가" instead of "지금
+    # 얼마인가".
+    "COHORT",
     "RISKS",
     "PROJECTS",
     "TEAMS",
@@ -1053,6 +1061,39 @@ def _ordered_columns(key: str, columns: Sequence[str]) -> list[str]:
     return present + [c for c in columns if c not in present]
 
 
+def _panel_table_html(panel: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> str:
+    """The `<table>` for `rows` of `panel`, with its folded-column line.
+
+    Extracted from `_panel_html()` because a second caller arrived and the
+    alternative was a second table builder: `_role_kpi_html()` draws the same
+    panel as **two** tables — the KPIs this system can answer, and the ones it
+    cannot — and a copy of this loop would be two renderings of one panel that
+    could disagree about column order, labels or folding.
+
+    `rows` is passed rather than read off `panel` for exactly that: the caller
+    decides which subset this table is.
+    """
+    columns = _ordered_columns(
+        str(panel.get("key") or ""), list(panel.get("columns") or [])
+    )
+    columns, folded = _fold_constant_columns(columns, rows)
+    header = "".join(
+        f"<th>{html.escape(_COLUMN_LABELS.get(c, c))}</th>" for c in columns
+    )
+    lines = []
+    for row in rows:
+        values = row.get("values") or {}
+        cells = "".join(_cell(c, values.get(c)) for c in columns)
+        lines.append(f"<tr>{cells}{_evidence_cell(row)}</tr>")
+    return (
+        "<div class='scroll'><table><thead><tr>"
+        f"{header}<th>증거</th></tr></thead><tbody>"
+        + "".join(lines)
+        + "</tbody></table></div>"
+        + _folded_html(folded, len(rows))
+    )
+
+
 def _panel_html(panel: Mapping[str, Any]) -> str:
     status = str(panel.get("status"))
     cls = _STATUS_CLASS.get(status, "neutral")
@@ -1079,32 +1120,14 @@ def _panel_html(panel: Mapping[str, Any]) -> str:
             + "</div>"
         )
 
-    body = ""
-    if not rows:
-        body = (
+    body = (
+        _panel_table_html(panel, rows)
+        if rows
+        else (
             "<p class='empty'>해당 없음 — 이 기간의 증거에 이 항목이 "
             "<b>하나도 없었다</b>. (원천은 있다)</p>"
         )
-    else:
-        columns = _ordered_columns(
-            str(panel.get("key") or ""), list(panel.get("columns") or [])
-        )
-        columns, folded = _fold_constant_columns(columns, rows)
-        header = "".join(
-            f"<th>{html.escape(_COLUMN_LABELS.get(c, c))}</th>" for c in columns
-        )
-        lines = []
-        for row in rows:
-            values = row.get("values") or {}
-            cells = "".join(_cell(c, values.get(c)) for c in columns)
-            lines.append(f"<tr>{cells}{_evidence_cell(row)}</tr>")
-        body = (
-            "<div class='scroll'><table><thead><tr>"
-            f"{header}<th>증거</th></tr></thead><tbody>"
-            + "".join(lines)
-            + "</tbody></table></div>"
-            + _folded_html(folded, len(rows))
-        )
+    )
 
     # `_inline_markup()`, not `html.escape()` (C129). These notes are written
     # in the same `**bold**` / `` `code` `` convention `ops_status.py` uses,
@@ -1241,6 +1264,244 @@ def _kpi_html(panel: Mapping[str, Any] | None, *, measured: bool = True) -> str:
         f"<span class='sub'>{len(sources)}개</span></summary>"
         f"<dl class='kpi-defs'>{''.join(sources)}</dl></details>"
     )
+
+
+#: The colour of each D+N series, and the one place it is decided.
+#:
+#: Colour is never the only carrier here (WCAG 1.4.1): every bar is labelled
+#: with its own D+N under the axis, carries its reading as text above it, and
+#: the same rows are in the table underneath. The chart is a second reading of
+#: the table it sits on, not a replacement for it — which is also why the table
+#: is not folded away behind a `<details>`.
+_COHORT_SERIES_COLOURS: dict[int, str] = {1: "#58a6ff", 7: "#7ee787", 30: "#e3b341"}
+
+# Chart geometry. Fixed numbers rather than a layout engine: this is one small
+# SVG with no script, and a `viewBox` makes it scale.
+_CH_BAR = 20
+_CH_GAP = 6
+_CH_PAD = 26  # between one cohort's group and the next
+_CH_PLOT = 150  # 0% .. 100%
+_CH_TOP = 18  # room for the value label above a full-height bar
+_CH_LEFT = 38  # y-axis labels
+_CH_FOOT = 34  # cohort name + series legend row
+
+
+def _cohort_bar(
+    x: int, base_y: int, days: int, reading, retained, base, settled
+) -> str:
+    """One bar — or, when there is no rate, the absence of one.
+
+    A window with no rate is drawn as a **dashed empty column** carrying its
+    own words, never as a zero-height bar. They would be the same pixels, and
+    they are opposite claims: "아무도 다시 움직이지 않았다" against "이 창은
+    아직 지나지 않았다" and against "창 안에 전부 끝났다".
+    `cohort.CohortWindow.rendered()` already decided which of the three this
+    is, so the branch here is on **its answer** rather than on a second reading
+    of `base` — one place decides, and a renderer that re-derived it could
+    disagree with the table directly underneath.
+
+    The bar's *height* is `retained / base` while its *label* is the `dN`
+    string the model rendered. Both come from the same two integers, so they
+    cannot disagree about the company — the height simply does not round to one
+    decimal, because a rectangle is not a claim a reader quotes.
+    """
+    colour = _COHORT_SERIES_COLOURS.get(days, "#8b949e")
+    text = str(reading)
+    if not text.endswith("%") or not isinstance(base, int) or base <= 0:
+        why = (
+            f"{days}일이 지난 구성원이 아직 없다"
+            if text == DATA_REQUIRED_READING
+            else f"{days}일 안에 전부 완료·취소로 끝났다 ({settled} Project)"
+        )
+        middle = f"{base_y - _CH_PLOT / 2:.0f}"
+        return (
+            f"<g><title>D+{days}: {html.escape(text)} — {html.escape(why)}"
+            "</title>"
+            f"<rect x='{x}' y='{base_y - _CH_PLOT}' width='{_CH_BAR}' "
+            f"height='{_CH_PLOT}' fill='none' stroke='#484f58' "
+            "stroke-dasharray='3 3'/>"
+            f"<text x='{x + _CH_BAR / 2:.1f}' y='{middle}' "
+            "text-anchor='middle' font-size='9' fill='#8b949e'"
+            f" transform='rotate(-90 {x + _CH_BAR / 2:.1f} {middle})'>"
+            f"{html.escape(text)}</text></g>"
+        )
+    height = _CH_PLOT * (retained or 0) / base
+    top = base_y - height
+    # The tooltip carries `settled` too, and it is the number that stops the
+    # bar being misread on the one cohort where it matters: `0.0% (0/1)` beside
+    # `종료 4` is a cohort that mostly *finished*, and without the third figure
+    # it reads as a cohort that mostly died.
+    ended = f" · 창 안에 끝남 {settled}" if settled else ""
+    return (
+        f"<g><title>D+{days}: {html.escape(text)} "
+        f"({retained}/{base} Project){html.escape(ended)}</title>"
+        f"<rect x='{x}' y='{top:.1f}' width='{_CH_BAR}' "
+        f"height='{max(height, 1):.1f}' fill='{colour}' rx='2'/>"
+        f"<text x='{x + _CH_BAR / 2:.1f}' y='{top - 5:.1f}' text-anchor='middle' "
+        f"font-size='10' fill='#e6edf3'>{html.escape(text)}</text></g>"
+    )
+
+
+def _cohort_chart(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The COHORT panel's rows as one grouped bar chart.
+
+    X is the cohort, Y is retention, and the three bars in each group are
+    D+1 / D+7 / D+30 — the comparison the table can only be read down a row at
+    a time. No library and no script: an inline `<svg>` with a `viewBox`, so it
+    scales, prints, and works with scripting off like the rest of this page.
+
+    Empty when there are no rows. A chart drawn over nothing is an empty grid
+    that reads as "retention is zero", and `_panel_html()`'s own "해당 없음 —
+    이 기간의 증거에 이 항목이 하나도 없었다" is the true sentence for it.
+    """
+    if not rows:
+        return ""
+    group = _CH_BAR * len(COHORT_WINDOWS) + _CH_GAP * (len(COHORT_WINDOWS) - 1)
+    width = _CH_LEFT + len(rows) * (group + _CH_PAD) + _CH_PAD
+    height = _CH_TOP + _CH_PLOT + _CH_FOOT
+    base_y = _CH_TOP + _CH_PLOT
+
+    parts = []
+    for percent in (0, 25, 50, 75, 100):
+        y = base_y - _CH_PLOT * percent / 100
+        parts.append(
+            f"<line x1='{_CH_LEFT}' y1='{y:.1f}' x2='{width - 6}' y2='{y:.1f}' "
+            "stroke='#21262d'/>"
+            f"<text x='{_CH_LEFT - 6}' y='{y + 3.5:.1f}' text-anchor='end' "
+            f"font-size='10' fill='#6e7681'>{percent}%</text>"
+        )
+
+    for index, row in enumerate(rows):
+        values = row.get("values") or {}
+        left = _CH_LEFT + _CH_PAD / 2 + index * (group + _CH_PAD)
+        for slot, days in enumerate(COHORT_WINDOWS):
+            parts.append(
+                _cohort_bar(
+                    int(left + slot * (_CH_BAR + _CH_GAP)),
+                    base_y,
+                    days,
+                    values.get(f"d{days}"),
+                    values.get(f"d{days}_retained"),
+                    values.get(f"d{days}_base"),
+                    values.get(f"d{days}_settled") or 0,
+                )
+            )
+        centre = left + group / 2
+        parts.append(
+            f"<text x='{centre:.1f}' y='{base_y + 15}' text-anchor='middle' "
+            f"font-size='11' fill='#e6edf3'>{_e(values.get('cohort'))}</text>"
+            f"<text x='{centre:.1f}' y='{base_y + 28}' text-anchor='middle' "
+            f"font-size='10' fill='#8b949e'>Project "
+            f"{_e(values.get('size'))}</text>"
+        )
+
+    legend = " · ".join(
+        f"<span class='ch-key'><i style='background:"
+        f"{_COHORT_SERIES_COLOURS.get(days, '#8b949e')}'></i>D+{days}</span>"
+        for days in COHORT_WINDOWS
+    )
+    return (
+        "<figure class='cohort-chart'>"
+        # `width='100%'` with a `min-width` of the drawn width, and the pair is
+        # what makes both ends work. Percentage alone squeezes twenty cohorts
+        # into the card and the bars become 8px slivers with unreadable labels;
+        # a fixed pixel width alone leaves a single cohort as a 162px stamp in
+        # a 1400px card. Together the chart fills the card when it fits and
+        # scrolls inside `.cohort-chart` when it does not — which is the rule
+        # every wide table on this page already follows.
+        f"<svg viewBox='0 0 {width} {height}' width='100%' height='{height}' "
+        f"style='min-width:{width}px' "
+        "role='img' preserveAspectRatio='xMinYMid meet' "
+        "aria-label='Cohort별 D+1 / D+7 / D+30 지속률'>"
+        f"<line x1='{_CH_LEFT}' y1='{base_y}' x2='{width - 6}' y2='{base_y}' "
+        "stroke='#484f58'/>" + "".join(parts) + "</svg>"
+        f"<figcaption class='ch-legend'>{legend}"
+        " · <span class='ch-key'><i class='ch-none'></i>점선 = 비율이 없다 "
+        "(창이 아직 지나지 않았거나, 창 안에 전부 끝났다 — 0%가 아니다)</span>"
+        "</figcaption></figure>"
+    )
+
+
+def _cohort_html(panel: Mapping[str, Any]) -> str:
+    """The COHORT panel: the chart, then the table it was drawn from.
+
+    Both, in that order, and neither behind a disclosure. The chart is what
+    makes three cohorts comparable at a glance; the table is where the
+    denominators live, and a reader who does not check `dN_base` will misread
+    the chart the first time a cohort is young.
+    """
+    return _cohort_chart(panel.get("rows") or []) + _panel_html(panel)
+
+
+def _role_kpi_html(panel: Mapping[str, Any]) -> str:
+    """CEO / CTO / COO KPI — the answers first, the refusals one click down.
+
+    Same rows, same order, same panel card. What changes is what a reader
+    meets, and it was measured on the live page: ⑤ 핵심 지표 rendered this
+    panel as **one flat table of 35 rows, 22 of them `DATA REQUIRED`**, above
+    the fold and unfolded. So two thirds of the section a CEO opens to find
+    out how the company is doing was a list of things this system cannot
+    measure — each row true, each row correct to keep, and together a wall
+    that buries the thirteen numbers that *are* answers.
+
+    The Notion page has drawn the same panel correctly since C149: a one-line
+    tally, then the detail behind toggles. Two surfaces, one model, and only
+    one of them readable — so this is the browser page catching up rather than
+    a new idea.
+
+    **Nothing is hidden and nothing is dropped.** The refusals keep their own
+    table with `requires` on every row — which is the single most useful column
+    on this page, because it says what would have to exist — and the summary
+    line above says how many there are before anyone opens it. That is the
+    distinction this project keeps: a refusal is a finding, and a finding
+    nobody can reach past is a wall.
+
+    The tally is computed here rather than carried on the panel, for
+    `_role_kpi_panel()`'s stated reason: panel metadata is the one payload text
+    `to_payload()` never redacts, so a note whose wording moves with the
+    evidence would break that claim. Counting rows is the renderer's job — and
+    `notion_page.py` already counts them the same way.
+    """
+    rows = list(panel.get("rows") or [])
+    measured = [r for r in rows if (r.get("values") or {}).get("measured")]
+    refused = [r for r in rows if not (r.get("values") or {}).get("measured")]
+    status = str(panel.get("status"))
+    cls = _STATUS_CLASS.get(status, "neutral")
+    head = (
+        f"<div class='panel {cls}'>"
+        "<div class='panel-head'>"
+        f"<h3>{html.escape(str(panel.get('title')))}"
+        f"<span class='pkey'>{html.escape(str(panel.get('key')))}</span></h3>"
+        f"<span class='badge {cls}'>{html.escape(status)}</span></div>"
+    )
+    tally = (
+        f"<p class='sub'>{len(rows)}개 중 <b>{len(measured)}개</b>를 이 시스템이 "
+        f"계산할 수 있다. 나머지 {len(refused)}개는 값 대신 DATA REQUIRED를 "
+        "싣는다 — 결함이 아니라, 이 시스템이 실행을 재고 사업을 재지 않는다는 "
+        "사실이다.</p>"
+    )
+    body = (
+        _panel_table_html(panel, measured)
+        if measured
+        else "<p class='empty'>이 기간의 증거로 계산할 수 있는 KPI가 하나도 없다.</p>"
+    )
+    folded = ""
+    if refused:
+        folded = (
+            "<details class='fold-section'><summary>"
+            f"<span class='fold-h2'>계산할 수 없는 KPI {len(refused)}개 — "
+            "무엇이 있어야 답할 수 있는가</span>"
+            f"<span class='sub'>{len(refused)}개</span></summary>"
+            + _panel_table_html(panel, refused)
+            + "</details>"
+        )
+    note = panel.get("note")
+    note_html = f"<p class='note'>{_inline_markup(str(note))}</p>" if note else ""
+    source = panel.get("source")
+    src_html = (
+        f"<p class='source'>출처: {_inline_markup(str(source))}</p>" if source else ""
+    )
+    return head + tally + body + folded + note_html + src_html + "</div>"
 
 
 def _evidence_age_days(model: Mapping[str, Any]) -> int | None:
@@ -2276,6 +2537,10 @@ _PANEL_PLACEMENT = {
     # out which of these numbers is theirs, and what this system cannot
     # answer for them at all.
     "ROLE_KPI": "KPI",
+    # Beside the numbers it re-reads. Not ACTION: a falling retention is a
+    # trend to decide about, not an item to work today, and putting a trend at
+    # the top of ② would push a real Blocker down the page.
+    "COHORT": "KPI",
     "RISKS": "ACTION",
     "PROJECTS": "PROJECTS",
     "ACTIVITY": "RECENT",
@@ -2615,6 +2880,17 @@ section:first-of-type h2{margin-top:0}
 .badge.bad{background:#4a1418;color:#ff9d9d;border-color:#8b2b32}
 .unsourced-line{color:#c9a0dc;margin:4px 0}
 .layers{margin:4px 0;font-size:12px;color:#8b949e}
+/* ------------------------------------------------ COHORT chart
+   An inline SVG, no library and no script. `overflow-x:auto` so a year of
+   cohorts scrolls sideways inside its own card instead of widening the page,
+   which is the rule every wide table on this screen already follows. */
+.cohort-chart{margin:0 0 10px;padding:0;overflow-x:auto}
+.cohort-chart svg{display:block}
+.ch-legend{color:#8b949e;font-size:11.5px;margin-top:4px;display:flex;
+ flex-wrap:wrap;gap:4px 10px;align-items:center}
+.ch-key{display:inline-flex;align-items:center;gap:5px}
+.ch-key i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.ch-key i.ch-none{background:none;border:1px dashed #484f58}
 .note{color:#8b949e;font-size:12px;margin:8px 0 0}
 .source{color:#6e7681;font-size:11px;margin:6px 0 0;font-style:italic}
 .empty{color:#e3b341;margin:6px 0}
@@ -2963,6 +3239,15 @@ def render_html(data: Mapping[str, Any]) -> str:
             + "".join(
                 _kpi_html(panel, measured=bool(model.get("events_read")))
                 if panel["key"] == "METRICS"
+                # The one panel whose comparison is across rows rather than
+                # down one, so it gets a chart above its table. Everything
+                # else in this region is a table and stays one.
+                else _cohort_html(panel)
+                if panel["key"] == "COHORT"
+                # 35 rows, 22 of them DATA REQUIRED, is a wall rather than a
+                # panel — measured on the live page. Same rows, answers first.
+                else _role_kpi_html(panel)
+                if panel["key"] == "ROLE_KPI"
                 else _panel_html(panel)
                 for panel in regions["KPI"]
             )

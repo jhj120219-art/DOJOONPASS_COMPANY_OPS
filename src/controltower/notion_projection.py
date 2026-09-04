@@ -379,6 +379,16 @@ UNPROJECTED_PANELS: dict[str, str] = {
         "맞는지 말해 줄 것이 없다. 계산할 수 없는 KPI(DATA REQUIRED)는 행이 "
         "아니라 문장이며, notion_page.py가 사람이 읽는 페이지에 싣는다."
     ),
+    "COHORT": (
+        "CT_PROJECTS를 다시 읽은 것이다 — Cohort 배정도 D+N 판정도 각 Project의 "
+        "first_seen과 그 Project가 Event를 남긴 날들만으로 나오고, 그 두 사실은 "
+        "이미 CT_PROJECTS의 `First Seen` / `Last Seen`과 CT_METRICS의 증거로 "
+        "Notion에 있다. Database를 하나 더 만들면 같은 사실에서 나온 수가 "
+        "Notion 안에서 두 곳에 살고, 달이 바뀔 때마다 행이 늘면서 어느 쪽이 "
+        "맞는지 말해 줄 것이 없어진다. 아직 창이 지나지 않아 계산할 수 없는 "
+        "D+N은 행이 아니라 문장이며(ROLE_KPI의 DATA REQUIRED와 같은 이유), "
+        "사람이 읽는 페이지가 그 문장을 싣는다."
+    ),
     "CODE_CHANGES": (
         "ACTIVITY와 같은 무한 성장 — commit 1건당 행 하나다. 게다가 이것은 "
         "Event가 아니라 git의 사실이고, 원본은 저장소 자체이므로 Notion에 "
